@@ -62,15 +62,28 @@ class TidalPlayer(commands.Cog):
     
     def _get_quality(self, track) -> tuple:
         """Get highest quality available"""
-        if hasattr(track, 'audio_quality'):
-            quality_map = {
-                'HI_RES': (Quality.hi_res, "HI_RES (MQA)"),
-                'LOSSLESS': (Quality.lossless, "LOSSLESS (FLAC)"),
-                'HIGH': (Quality.high_320k, "HIGH (320kbps)"),
-                'LOW': (Quality.low_96k, "LOW (96kbps)")
-            }
-            return quality_map.get(track.audio_quality, (Quality.hi_res, "HI_RES (MQA)"))
-        return Quality.hi_res, "HI_RES (MQA)"
+        # Available Quality values in tidalapi:
+        # Quality.hi_res_lossless (for HI_RES/MQA)
+        # Quality.lossless (for LOSSLESS)
+        # Quality.high (for HIGH)
+        # Quality.low (for LOW)
+        
+        try:
+            if hasattr(track, 'audio_quality'):
+                quality_map = {
+                    'HI_RES': (Quality.hi_res_lossless, "HI_RES (MQA)"),
+                    'LOSSLESS': (Quality.lossless, "LOSSLESS (FLAC)"),
+                    'HIGH': (Quality.high, "HIGH (320kbps)"),
+                    'LOW': (Quality.low, "LOW (96kbps)")
+                }
+                result = quality_map.get(track.audio_quality, (Quality.lossless, "LOSSLESS (FLAC)"))
+                log.info(f"Track quality: {track.audio_quality} -> {result[1]}")
+                return result
+        except Exception as e:
+            log.warning(f"Quality detection failed: {e}")
+        
+        # Default to lossless
+        return Quality.lossless, "LOSSLESS (FLAC)"
     
     def _extract_metadata(self, track) -> Dict:
         """Extract track metadata"""
@@ -128,6 +141,7 @@ class TidalPlayer(commands.Cog):
             results = await self.bot.loop.run_in_executor(None, self.session.search, query)
             
             if not results or not results.get('tracks'):
+                log.warning("No tracks found")
                 return await self._fallback(query)
             
             track = results['tracks'][0]
@@ -158,6 +172,7 @@ class TidalPlayer(commands.Cog):
                 }
             
             # Fallback to YouTube
+            log.warning("Stream/download failed, using fallback")
             return await self._fallback(query, metadata)
             
         except Exception as e:
@@ -171,8 +186,10 @@ class TidalPlayer(commands.Cog):
             if url:
                 log.info("Got stream URL")
                 return url
+        except AttributeError:
+            log.warning("track.get_url() not available")
         except Exception as e:
-            log.warning(f"Streaming unavailable: {e}")
+            log.warning(f"Streaming failed: {e}")
         return None
     
     async def _download(self, track, quality, ctx, metadata: Dict) -> Optional[str]:
@@ -180,6 +197,7 @@ class TidalPlayer(commands.Cog):
         try:
             track_id = metadata.get("track_id")
             if not track_id:
+                log.warning("No track ID for download")
                 return None
             
             msg = await ctx.send("⏬ Downloading...")
@@ -200,7 +218,11 @@ class TidalPlayer(commands.Cog):
                 return False
             
             success = await self.bot.loop.run_in_executor(None, download)
-            await msg.delete()
+            
+            try:
+                await msg.delete()
+            except:
+                pass
             
             if success:
                 log.info(f"Downloaded: {metadata['title']}")
@@ -369,3 +391,4 @@ class TidalPlayer(commands.Cog):
         """Cleanup on unload"""
         if self.last_file:
             self._cleanup_file(self.last_file)
+        log.info("TidalPlayer cog unloaded")
