@@ -20,7 +20,6 @@ except ImportError:
 
 try:
     import aiohttp
-    from bs4 import BeautifulSoup
     SCRAPING_AVAILABLE = True
 except ImportError:
     SCRAPING_AVAILABLE = False
@@ -159,10 +158,9 @@ class TidalPlayer(commands.Cog):
         if quiet:
             self._suppress_enqueued(ctx)
         try:
-            # Explicit Spotify check with better detection
             if "open.spotify.com" in q or "spotify:" in q:
                 if not SCRAPING_AVAILABLE:
-                    return await ctx.send("❌ Install beautifulsoup4 and aiohttp: `pip install beautifulsoup4 aiohttp`")
+                    return await ctx.send("❌ Install aiohttp: `pip install aiohttp`")
                 await self._queue_spotify_playlist(ctx, q)
             elif "youtube.com" in q or "youtu.be" in q:
                 if not YOUTUBE_API_AVAILABLE or not self.yt:
@@ -205,57 +203,45 @@ class TidalPlayer(commands.Cog):
         await msg.edit(content=f"✅ Queued {len(items)} tracks from **{name}**")
 
     async def _queue_spotify_playlist(self, ctx, url: str):
-        """Scrape public Spotify playlist and search Tidal for each track."""
+        """Use Lavalink to resolve Spotify playlist, then search each track on Tidal."""
         match = re.search(r"playlist/([A-Za-z0-9]+)", url)
         if not match:
             return await ctx.send("❌ Invalid Spotify playlist URL")
-        pid = match.group(1)
-        embed_url = f"https://open.spotify.com/embed/playlist/{pid}"
         
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get(embed_url) as resp:
-                    if resp.status != 200:
-                        return await ctx.send("❌ Could not fetch playlist (private or unavailable)")
-                    html = await resp.text()
-            except Exception as e:
-                return await ctx.send(f"❌ Error fetching Spotify playlist: {e}")
+        # Delegate to Audio cog's Lavalink to get track list
+        audio_cog = self.bot.get_cog("Audio")
+        if not audio_cog:
+            return await ctx.send("❌ Audio cog not loaded")
         
-        soup = BeautifulSoup(html, "html.parser")
-        script_tag = soup.find("script", {"id": "resource"})
-        if not script_tag:
-            return await ctx.send("❌ Could not parse Spotify playlist data")
-        
-        import json
         try:
-            data = json.loads(script_tag.string)
-            tracks = data.get("tracks", {}).get("items", [])
-        except Exception:
-            return await ctx.send("❌ Could not parse Spotify playlist JSON")
-        
-        if not tracks:
-            return await ctx.send("❌ No tracks found in playlist")
-        
-        await ctx.send(f"⏳ Queuing Spotify playlist ({len(tracks)} tracks) via Tidal search…")
-        queued = 0
-        for item in tracks:
-            tr = item.get("track", {})
-            if not tr:
-                continue
-            artist = tr.get("artists", [{}])[0].get("name", "")
-            title = tr.get("name", "")
-            query = f"{artist} {title}"
+            # Use Audio cog to fetch track info via Lavalink
+            player = audio_cog.lavalink.player_manager.get(ctx.guild.id)
+            if not player:
+                return await ctx.send("❌ Not connected to voice")
             
-            try:
-                res = await self.bot.loop.run_in_executor(None, self.session.search, query)
-                tidal_tracks = res.get("tracks", [])
-                if tidal_tracks:
-                    await self._play(ctx, tidal_tracks[0], show_embed=False)
-                    queued += 1
-            except Exception as e:
-                log.warning(f"Skipped {query}: {e}")
-        
-        await ctx.send(f"✅ Queued {queued}/{len(tracks)} tracks from Spotify")
+            results = await player.node.get_tracks(url)
+            if not results or not results.tracks:
+                return await ctx.send("❌ Could not fetch Spotify playlist")
+            
+            tracks = results.tracks
+            await ctx.send(f"⏳ Queuing Spotify playlist ({len(tracks)} tracks) via Tidal search…")
+            queued = 0
+            
+            for track in tracks:
+                query = f"{track.author} {track.title}"
+                try:
+                    res = await self.bot.loop.run_in_executor(None, self.session.search, query)
+                    tidal_tracks = res.get("tracks", [])
+                    if tidal_tracks:
+                        await self._play(ctx, tidal_tracks[0], show_embed=False)
+                        queued += 1
+                except Exception as e:
+                    log.warning(f"Skipped {query}: {e}")
+            
+            await ctx.send(f"✅ Queued {queued}/{len(tracks)} tracks from Spotify")
+        except Exception as e:
+            log.error(f"Spotify playlist error: {e}")
+            return await ctx.send(f"❌ Error processing Spotify playlist: {e}")
 
     async def _queue_youtube_playlist(self, ctx, url: str):
         match = re.search(r"list=([A-Za-z0-9_-]+)", url)
