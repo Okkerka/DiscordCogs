@@ -235,14 +235,25 @@ class TidalPlayer(commands.Cog):
         if not tracks:
             return await ctx.send("❌ No tracks found in playlist")
         
-        await ctx.send(f"⏳ Queuing Spotify playlist ({len(tracks)} tracks)…")
+        await ctx.send(f"⏳ Queuing Spotify playlist ({len(tracks)} tracks) via Tidal search…")
+        queued = 0
         for item in tracks:
             tr = item.get("track", {})
             artist = tr.get("artists", [{}])[0].get("name", "")
             title = tr.get("name", "")
             query = f"{artist} {title}"
-            await self._search_and_play(ctx, query)
-        await ctx.send("✅ Done queueing Spotify playlist")
+            
+            # Try to find on Tidal
+            async with ctx.typing():
+                res = await self.bot.loop.run_in_executor(None, self.session.search, query)
+            tidal_tracks = res.get("tracks", [])
+            if tidal_tracks:
+                await self._play(ctx, tidal_tracks[0], show_embed=False)
+                queued += 1
+            else:
+                log.warning(f"Skipped (not on Tidal): {query}")
+        
+        await ctx.send(f"✅ Queued {queued}/{len(tracks)} tracks from Spotify (some may not be available on Tidal)")
 
     async def _queue_youtube_playlist(self, ctx, url: str):
         match = re.search(r"list=([A-Za-z0-9_-]+)", url)
@@ -257,7 +268,11 @@ class TidalPlayer(commands.Cog):
             req = self.yt.playlistItems().list_next(req, res)
         await ctx.send(f"⏳ Queuing YouTube playlist ({len(videos)} videos)…")
         for title in videos:
-            await self._search_and_play(ctx, title)
+            async with ctx.typing():
+                res = await self.bot.loop.run_in_executor(None, self.session.search, title)
+            tidal_tracks = res.get("tracks", [])
+            if tidal_tracks:
+                await self._play(ctx, tidal_tracks[0], show_embed=False)
         await ctx.send("✅ Done queueing YouTube playlist")
 
     @commands.Cog.listener()
