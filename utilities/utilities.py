@@ -239,8 +239,8 @@ class Utilities(commands.Cog):
         if message.author.id != user_id:
             return
         content = message.content.lower()
-        yes_words = ["yes", "yea", "ye"]
-        no_words = ["no", "nah", "nuh"]
+        yes_words = ["yes", "yea", "ye", "yuh"]
+        no_words = ["no", "nah", "nuh", "naw"]
         if any(word in content for word in yes_words):
             reply = "I'm a hawk too"
             await message.channel.send(reply)
