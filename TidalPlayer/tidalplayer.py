@@ -1,4 +1,5 @@
 from redbot.core import commands, Config
+from redbot.core.utils.menus import menu, DEFAULT_CONTROLS
 import discord
 import logging
 import asyncio
@@ -12,6 +13,7 @@ except ImportError:
     TIDALAPI_AVAILABLE = False
 
 log = logging.getLogger("red.tidalplayer")
+
 
 class TidalPlayer(commands.Cog):
     """Play music from Tidal in LOSSLESS quality with accurate queue metadata."""
@@ -46,6 +48,18 @@ class TidalPlayer(commands.Cog):
             except Exception as e:
                 log.error(f"Session load failed: {e}")
 
+    async def _check_ready(self, ctx):
+        if not TIDALAPI_AVAILABLE:
+            await ctx.send("❌ Install tidalapi: `[p]pipinstall tidalapi`")
+            return False
+        if not self.session or not self.session.check_login():
+            await ctx.send("❌ Not authenticated. Run `>tidalsetup`")
+            return False
+        if not self.bot.get_cog("Audio"):
+            await ctx.send("❌ Audio cog not loaded")
+            return False
+        return True
+
     def _get_quality_label(self, q):
         return {
             "HI_RES": ("💠", "HI_RES (MQA)"),
@@ -69,14 +83,15 @@ class TidalPlayer(commands.Cog):
 
     async def _pop_meta(self, guild_id):
         async with self.config.guild_from_id(guild_id).track_metadata() as q:
-            if q: q.pop(0)
+            if q:
+                q.pop(0)
 
     def _format_time(self, sec):
         m, s = divmod(sec, 60)
         return f"{m:02d}:{s:02d}"
 
-    def _build_embed(self, title, description, color):
-        return discord.Embed(title=title, description=description, color=color)
+    def _build_embed(self, title, desc, color):
+        return discord.Embed(title=title, description=desc, color=color)
 
     async def _play(self, ctx, track, show_embed=True):
         meta = self._extract_meta(track)
@@ -96,35 +111,29 @@ class TidalPlayer(commands.Cog):
         await self.bot.get_cog("Audio").command_play(ctx, query=url)
         return True
 
-    async def _ready_check(self, ctx):
-        if not TIDALAPI_AVAILABLE:
-            return await ctx.send("❌ Install tidalapi: `[p]pipinstall tidalapi`"), False
-        if not self.session or not self.session.check_login():
-            return await ctx.send("❌ Not authenticated. Run `>tidalsetup`"), False
-        if not self.bot.get_cog("Audio"):
-            return await ctx.send("❌ Audio cog not loaded"), False
-        return True, None
-
     def _suppress_enqueued(self, ctx):
-        if hasattr(ctx, "_orig_send"): return
+        if hasattr(ctx, "_orig_send"):
+            return
         ctx._orig_send = ctx.send
-        async def send_override(*a, **k):
-            e = k.get("embed") or (a[0] if a and isinstance(a[0], discord.Embed) else None)
-            if e and "Track Enqueued" in getattr(e, "title",""):
+        async def send_override(*args, **kwargs):
+            embed = kwargs.get("embed") or (args[0] if args and isinstance(args[0], discord.Embed) else None)
+            if embed and "Track Enqueued" in getattr(embed, "title", ""):
                 return
-            return await ctx._orig_send(*a, **k)
+            return await ctx._orig_send(*args, **kwargs)
         ctx.send = send_override
 
     def _restore_send(self, ctx):
         if hasattr(ctx, "_orig_send"):
-            ctx.send, delattr(ctx, "_orig_send") = ctx._orig_send, None
+            ctx.send = ctx._orig_send
+            delattr(ctx, "_orig_send")
 
     @commands.command(name="tplay")
     async def tplay(self, ctx, *, q: str):
         """Search, play, or queue from Tidal."""
-        ok, err = await self._ready_check(ctx)
-        if not ok: return
-        if await self.config.quiet_mode():
+        if not await self._check_ready(ctx):
+            return
+        quiet = await self.config.quiet_mode()
+        if quiet:
             self._suppress_enqueued(ctx)
         try:
             if re.search(r"(playlist|album|track|mix)/", q):
@@ -132,7 +141,7 @@ class TidalPlayer(commands.Cog):
             else:
                 await self._search_and_play(ctx, q)
         finally:
-            if await self.config.quiet_mode():
+            if quiet:
                 self._restore_send(ctx)
 
     async def _search_and_play(self, ctx, query):
@@ -144,11 +153,16 @@ class TidalPlayer(commands.Cog):
         await self._play(ctx, tracks[0])
 
     async def _handle_url(self, ctx, url):
-        kind = "playlist" if "playlist/" in url else "album" if "album/" in url else "mix" if "mix/" in url else "track"
-        obj = getattr(self.session, kind)(re.search(rf"{kind}/([A-Za-z0-9\-]+)", url).group(1))
-        get_items = getattr(obj, "tracks", None) or getattr(obj, "items", None)
-        items = await self.bot.loop.run_in_executor(None, get_items)
-        name = getattr(obj, "name", obj.title)
+        kind = ("playlist" if "playlist/" in url else
+                "album" if "album/" in url else
+                "mix" if "mix/" in url else
+                "track")
+        match = re.search(rf"{kind}/([A-Za-z0-9\-]+)", url)
+        if not match:
+            return await ctx.send(f"❌ Invalid {kind} URL")
+        obj = await self.bot.loop.run_in_executor(None, getattr(self.session, kind), match.group(1))
+        items = await self.bot.loop.run_in_executor(None, getattr(obj, "tracks", getattr(obj, "items")))
+        name = getattr(obj, "name", getattr(obj, "title", ""))
         msg = await ctx.send(f"⏳ Queueing {kind} '{name}' ({len(items)} tracks)...")
         for t in items:
             await self._play(ctx, t, show_embed=False)
@@ -162,15 +176,19 @@ class TidalPlayer(commands.Cog):
 
     @commands.command(name="tqueue", aliases=["q"])
     async def tqueue(self, ctx):
-        """Show the Tidal queue with correct metadata."""
-        data = await self.config.guild(ctx.guild).track_metadata()
+        """Show the Tidal queue with correct metadata, paginated."""
+        data: List[Dict] = await self.config.guild(ctx.guild).track_metadata()
         if not data:
             return await ctx.send("The queue is empty.")
-        lines = [
-            f"`{i+1}.` **{m['title']}** • {m['artist']} • `{self._format_time(m['duration'])}`"
-            for i, m in enumerate(data)
-        ]
-        await ctx.send("\n".join(lines))
+        embeds = []
+        for i in range(0, len(data), 10):
+            chunk = data[i:i+10]
+            desc = "\n".join(
+                f"`{j+1+i}.` **{m['title']}** • {m['artist']} • `{self._format_time(m['duration'])}`"
+                for j, m in enumerate(chunk)
+            )
+            embeds.append(discord.Embed(title="Tidal Queue", description=desc, color=discord.Color.green()))
+        await menu(ctx, embeds, DEFAULT_CONTROLS)
 
     @commands.is_owner()
     @commands.command()
@@ -198,7 +216,7 @@ class TidalPlayer(commands.Cog):
                 "expiry_time": getattr(self.session, "expiry_time", None)
             }
             for k, v in creds.items():
-                await self.config.__getattribute__(k).set(v)
+                await getattr(self.config, k).set(v)
             await ctx.send("✅ Tidal setup complete!")
         else:
             await ctx.send("❌ Login failed.")
@@ -214,6 +232,7 @@ class TidalPlayer(commands.Cog):
             return await ctx.send(f"Quiet mode is **{status}**.")
         await self.config.quiet_mode.set(mode == "on")
         await ctx.send(f"Quiet mode **{mode}** toggled.")
+
 
 def setup(bot):
     bot.add_cog(TidalPlayer(bot))
