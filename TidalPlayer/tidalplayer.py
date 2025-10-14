@@ -52,7 +52,6 @@ class TidalPlayer(commands.Cog):
     async def _initialize_apis(self):
         await self.bot.wait_until_ready()
         creds = await self.config.all()
-        # Tidal OAuth
         if TIDALAPI_AVAILABLE and all(creds.get(k) for k in ("token_type","access_token","refresh_token")):
             try:
                 self.session.load_oauth_session(
@@ -61,7 +60,6 @@ class TidalPlayer(commands.Cog):
                 )
             except Exception as e:
                 log.error(f"Tidal session load failed: {e}")
-        # YouTube API client
         if YOUTUBE_API_AVAILABLE and creds.get("youtube_api_key"):
             try:
                 self.yt = build("youtube", "v3", developerKey=creds["youtube_api_key"])
@@ -161,12 +159,16 @@ class TidalPlayer(commands.Cog):
         if quiet:
             self._suppress_enqueued(ctx)
         try:
-            # Check Spotify FIRST before generic pattern
-            if SCRAPING_AVAILABLE and "spotify.com" in q:
+            # Explicit Spotify check with better detection
+            if "open.spotify.com" in q or "spotify:" in q:
+                if not SCRAPING_AVAILABLE:
+                    return await ctx.send("❌ Install beautifulsoup4 and aiohttp: `pip install beautifulsoup4 aiohttp`")
                 await self._queue_spotify_playlist(ctx, q)
-            elif YOUTUBE_API_AVAILABLE and ("list=" in q and self.yt):
+            elif "youtube.com" in q or "youtu.be" in q:
+                if not YOUTUBE_API_AVAILABLE or not self.yt:
+                    return await ctx.send("❌ YouTube not configured. Run `>tidalplay youtube <api_key>`")
                 await self._queue_youtube_playlist(ctx, q)
-            elif "tidal.com" in q or re.search(r"(playlist|album|track|mix)/", q):
+            elif "tidal.com" in q:
                 await self._handle_tidal_url(ctx, q)
             else:
                 await self._search_and_play(ctx, q)
@@ -204,8 +206,6 @@ class TidalPlayer(commands.Cog):
 
     async def _queue_spotify_playlist(self, ctx, url: str):
         """Scrape public Spotify playlist and search Tidal for each track."""
-        if not SCRAPING_AVAILABLE:
-            return await ctx.send("❌ Install beautifulsoup4 and aiohttp")
         match = re.search(r"playlist/([A-Za-z0-9]+)", url)
         if not match:
             return await ctx.send("❌ Invalid Spotify playlist URL")
@@ -240,21 +240,22 @@ class TidalPlayer(commands.Cog):
         queued = 0
         for item in tracks:
             tr = item.get("track", {})
+            if not tr:
+                continue
             artist = tr.get("artists", [{}])[0].get("name", "")
             title = tr.get("name", "")
             query = f"{artist} {title}"
             
-            # Try to find on Tidal
-            async with ctx.typing():
+            try:
                 res = await self.bot.loop.run_in_executor(None, self.session.search, query)
-            tidal_tracks = res.get("tracks", [])
-            if tidal_tracks:
-                await self._play(ctx, tidal_tracks[0], show_embed=False)
-                queued += 1
-            else:
-                log.warning(f"Skipped (not on Tidal): {query}")
+                tidal_tracks = res.get("tracks", [])
+                if tidal_tracks:
+                    await self._play(ctx, tidal_tracks[0], show_embed=False)
+                    queued += 1
+            except Exception as e:
+                log.warning(f"Skipped {query}: {e}")
         
-        await ctx.send(f"✅ Queued {queued}/{len(tracks)} tracks from Spotify (some may not be available on Tidal)")
+        await ctx.send(f"✅ Queued {queued}/{len(tracks)} tracks from Spotify")
 
     async def _queue_youtube_playlist(self, ctx, url: str):
         match = re.search(r"list=([A-Za-z0-9_-]+)", url)
@@ -269,11 +270,13 @@ class TidalPlayer(commands.Cog):
             req = self.yt.playlistItems().list_next(req, res)
         await ctx.send(f"⏳ Queuing YouTube playlist ({len(videos)} videos)…")
         for title in videos:
-            async with ctx.typing():
+            try:
                 res = await self.bot.loop.run_in_executor(None, self.session.search, title)
-            tidal_tracks = res.get("tracks", [])
-            if tidal_tracks:
-                await self._play(ctx, tidal_tracks[0], show_embed=False)
+                tidal_tracks = res.get("tracks", [])
+                if tidal_tracks:
+                    await self._play(ctx, tidal_tracks[0], show_embed=False)
+            except Exception as e:
+                log.warning(f"Skipped {title}: {e}")
         await ctx.send("✅ Done queueing YouTube playlist")
 
     @commands.Cog.listener()
