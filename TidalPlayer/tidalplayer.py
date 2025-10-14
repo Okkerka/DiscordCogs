@@ -339,7 +339,21 @@ class TidalPlayer(commands.Cog):
     
     def cog_unload(self):
         log.info("TidalPlayer unloaded")
-
+    @commands.command(name="queue", aliases=["q"])
+    async def tqueue(self, ctx):
+        """Show Tidal queue with correct metadata."""
+        # Fetch our stored metadata
+        metadata_list: List[Dict] = await self.config.guild(ctx.guild).track_metadata()
+        if not metadata_list:
+            return await ctx.send("The queue is empty.")
+        lines = []
+        for i, m in enumerate(metadata_list, 1):
+            title = m["title"]
+            artist = m["artist"]
+            duration = self._format_duration(m["duration"] // 1000)
+            lines.append(f"`{i}.` **{title}** — {artist} • `{duration}`")
+        await ctx.send("\n".join(lines))
+    
 
 async def setup(bot):
     await bot.add_cog(TidalPlayer(bot))
