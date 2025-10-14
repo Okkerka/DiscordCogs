@@ -31,8 +31,6 @@ class Utilities(commands.Cog):
         self.awaiting_hawk_response = {}
         self.last_hawk_user = {}
 
-    # ========== Utility Commands ==========
-
     @commands.command(aliases=["av", "pfp"])
     async def avatar(self, ctx, member: discord.Member = None):
         """Show a user's avatar."""
@@ -70,7 +68,7 @@ class Utilities(commands.Cog):
         embed = discord.Embed(
             title=f"{guild.name}",
             color=PRIMARY,
-            description=f"**ID:** `{guild.id}`\nOwner: {guild.owner.mention}"
+            description=f"**ID:** `{guild.id}`\nOwner: {guild.owner.display_name}"
         )
         embed.add_field(name="Members", value=guild.member_count)
         embed.add_field(name="Channels", value=len(guild.channels))
@@ -152,8 +150,6 @@ class Utilities(commands.Cog):
         )
         await ctx.send(embed=embed)
 
-    # ========== Fun/Silly Commands ==========
-
     @commands.command()
     @commands.guild_only()
     async def hawk(self, ctx, user: Optional[discord.Member] = None):
@@ -219,7 +215,7 @@ class Utilities(commands.Cog):
             pct = random.randint(GAY_PERCENTAGE_MIN_NORMAL, GAY_PERCENTAGE_MAX_NORMAL)
         embed = discord.Embed(
             title="Gay Percentage",
-            description=f"{user.mention} is **{pct}% gay!** 🏳️‍🌈",
+            description=f"{user.display_name} is **{pct}% gay!** 🏳️‍🌈",
             color=PRIMARY
         )
         await ctx.send(embed=embed)
@@ -234,19 +230,29 @@ class Utilities(commands.Cog):
         embed.set_image(url=THANOS_IMG)
         await ctx.send(embed=embed)
 
-    # ========== Hawk List/Config Commands ==========
-
     @commands.command()
     @commands.is_owner()
     @commands.guild_only()
-    async def addhawk(self, ctx, user: discord.Member):
-        """Add a user to the hawk list."""
+    async def addhawk(self, ctx, *users: discord.Member):
+        """Add one or more users to the hawk list."""
+        if not users:
+            await ctx.send("Please specify one or more users.")
+            return
         async with self.config.guild(ctx.guild).hawk_users() as hawk_users:
-            if user.id not in hawk_users:
-                hawk_users.append(user.id)
-                await ctx.send(f"🦅 Added {user.mention} to the hawk list.")
-            else:
-                await ctx.send("Already on the hawk list.")
+            added = []
+            already = []
+            for user in users:
+                if user.id not in hawk_users:
+                    hawk_users.append(user.id)
+                    added.append(user.display_name)
+                else:
+                    already.append(user.display_name)
+        msg = ""
+        if added:
+            msg += f"🦅 Added: {', '.join(f'**{name}**' for name in added)}"
+        if already:
+            msg += f"\nAlready in hawk list: {', '.join(already)}"
+        await ctx.send(msg or "No users added.")
 
     @commands.command()
     @commands.is_owner()
@@ -256,7 +262,7 @@ class Utilities(commands.Cog):
         async with self.config.guild(ctx.guild).hawk_users() as hawk_users:
             if user.id in hawk_users:
                 hawk_users.remove(user.id)
-                await ctx.send(f"🦅 Removed {user.mention} from the hawk list.")
+                await ctx.send(f"🦅 Removed **{user.display_name}** from the hawk list.")
             else:
                 await ctx.send("Not found in the hawk list.")
 
@@ -278,7 +284,7 @@ class Utilities(commands.Cog):
         for uid in hawk_users:
             member = ctx.guild.get_member(uid)
             if member:
-                lines.append(f"{member.mention} (`{uid}`)")
+                lines.append(f"**{member.display_name}** (`{uid}`)")
             else:
                 lines.append(f"`{uid}` (not in server)")
         embed = discord.Embed(
