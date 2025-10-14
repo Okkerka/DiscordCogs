@@ -27,8 +27,6 @@ class Utilities(commands.Cog):
         self.awaiting_hawk_response = {}
         self.last_hawk_user = {}
 
-    # === Info/General Commands ===
-
     @commands.command(aliases=["av", "pfp"])
     async def avatar(self, ctx, member: discord.Member = None):
         """Show a user's avatar."""
@@ -100,8 +98,6 @@ class Utilities(commands.Cog):
             return
         await ctx.send(f"Rolled: {random.randint(1, sides)} (d{sides})")
 
-    # === Funny/Silly Commands ===
-
     @commands.command()
     @commands.guild_only()
     async def hawk(self, ctx, user: Optional[discord.Member] = None):
@@ -162,8 +158,6 @@ class Utilities(commands.Cog):
         embed = discord.Embed(color=0x800080)
         embed.set_image(url=THANOS_IMG)
         await ctx.send(embed=embed)
-
-    # === Owner/Config Only Commands ===
 
     @commands.command()
     @commands.is_owner()
@@ -244,9 +238,15 @@ class Utilities(commands.Cog):
         user_id = self.awaiting_hawk_response[message.guild.id]
         if message.author.id != user_id:
             return
-        content = message.content.lower().strip()
-        if content in ("yes", "no"):
-            reply = "I'm a hawk too" if content == "yes" else "Fuck you then"
+        content = message.content.lower()
+        yes_words = ["yes", "yea", "ye"]
+        no_words = ["no", "nah", "nuh"]
+        if any(word in content for word in yes_words):
+            reply = "I'm a hawk too"
+            await message.channel.send(reply)
+            del self.awaiting_hawk_response[message.guild.id]
+        elif any(word in content for word in no_words):
+            reply = "Fuck you then"
             await message.channel.send(reply)
             del self.awaiting_hawk_response[message.guild.id]
 
