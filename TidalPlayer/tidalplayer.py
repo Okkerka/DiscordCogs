@@ -19,10 +19,11 @@ except ImportError:
     YOUTUBE_API_AVAILABLE = False
 
 try:
-    import aiohttp
-    SCRAPING_AVAILABLE = True
+    import spotipy
+    from spotipy.oauth2 import SpotifyClientCredentials
+    SPOTIFY_AVAILABLE = True
 except ImportError:
-    SCRAPING_AVAILABLE = False
+    SPOTIFY_AVAILABLE = False
 
 log = logging.getLogger("red.tidalplayer")
 
@@ -40,11 +41,14 @@ class TidalPlayer(commands.Cog):
             access_token=None,
             refresh_token=None,
             expiry_time=None,
+            spotify_client_id=None,
+            spotify_client_secret=None,
             youtube_api_key=None,
             quiet_mode=True,
         )
         self.config.register_guild(track_metadata=[])
         self.session = tidalapi.Session() if TIDALAPI_AVAILABLE else None
+        self.sp = None
         self.yt = None
         bot.loop.create_task(self._initialize_apis())
 
@@ -59,6 +63,18 @@ class TidalPlayer(commands.Cog):
                 )
             except Exception as e:
                 log.error(f"Tidal session load failed: {e}")
+        
+        # Initialize Spotify client on startup if credentials exist
+        if SPOTIFY_AVAILABLE and creds.get("spotify_client_id") and creds.get("spotify_client_secret"):
+            try:
+                self.sp = spotipy.Spotify(
+                    client_credentials_manager=SpotifyClientCredentials(
+                        creds["spotify_client_id"], creds["spotify_client_secret"]
+                    )
+                )
+            except Exception as e:
+                log.error(f"Spotify init failed: {e}")
+        
         if YOUTUBE_API_AVAILABLE and creds.get("youtube_api_key"):
             try:
                 self.yt = build("youtube", "v3", developerKey=creds["youtube_api_key"])
@@ -159,8 +175,8 @@ class TidalPlayer(commands.Cog):
             self._suppress_enqueued(ctx)
         try:
             if "open.spotify.com" in q or "spotify:" in q:
-                if not SCRAPING_AVAILABLE:
-                    return await ctx.send("❌ Install aiohttp: `pip install aiohttp`")
+                if not SPOTIFY_AVAILABLE or not self.sp:
+                    return await ctx.send("❌ Spotify not configured. Run `>tidalplay spotify <client_id> <client_secret>`")
                 await self._queue_spotify_playlist(ctx, q)
             elif "youtube.com" in q or "youtu.be" in q:
                 if not YOUTUBE_API_AVAILABLE or not self.yt:
@@ -203,45 +219,45 @@ class TidalPlayer(commands.Cog):
         await msg.edit(content=f"✅ Queued {len(items)} tracks from **{name}**")
 
     async def _queue_spotify_playlist(self, ctx, url: str):
-        """Use Lavalink to resolve Spotify playlist, then search each track on Tidal."""
+        """Use Spotipy to get playlist tracks, search each on Tidal."""
         match = re.search(r"playlist/([A-Za-z0-9]+)", url)
         if not match:
             return await ctx.send("❌ Invalid Spotify playlist URL")
-        
-        # Delegate to Audio cog's Lavalink to get track list
-        audio_cog = self.bot.get_cog("Audio")
-        if not audio_cog:
-            return await ctx.send("❌ Audio cog not loaded")
+        pid = match.group(1)
         
         try:
-            # Use Audio cog to fetch track info via Lavalink
-            player = audio_cog.lavalink.player_manager.get(ctx.guild.id)
-            if not player:
-                return await ctx.send("❌ Not connected to voice")
-            
-            results = await player.node.get_tracks(url)
-            if not results or not results.tracks:
-                return await ctx.send("❌ Could not fetch Spotify playlist")
-            
-            tracks = results.tracks
-            await ctx.send(f"⏳ Queuing Spotify playlist ({len(tracks)} tracks) via Tidal search…")
-            queued = 0
-            
-            for track in tracks:
-                query = f"{track.author} {track.title}"
-                try:
-                    res = await self.bot.loop.run_in_executor(None, self.session.search, query)
-                    tidal_tracks = res.get("tracks", [])
-                    if tidal_tracks:
-                        await self._play(ctx, tidal_tracks[0], show_embed=False)
-                        queued += 1
-                except Exception as e:
-                    log.warning(f"Skipped {query}: {e}")
-            
-            await ctx.send(f"✅ Queued {queued}/{len(tracks)} tracks from Spotify")
+            results = self.sp.playlist_items(pid, fields="items.track(name,artists),next", limit=100)
+            tracks = []
+            while results:
+                tracks.extend(results["items"])
+                results = self.sp.next(results) if results["next"] else None
         except Exception as e:
-            log.error(f"Spotify playlist error: {e}")
-            return await ctx.send(f"❌ Error processing Spotify playlist: {e}")
+            log.error(f"Spotify API error: {e}")
+            return await ctx.send(f"❌ Could not fetch playlist. Make sure it's **public** and credentials are valid.")
+        
+        if not tracks:
+            return await ctx.send("❌ No tracks found in playlist")
+        
+        await ctx.send(f"⏳ Queuing Spotify playlist ({len(tracks)} tracks) via Tidal search…")
+        queued = 0
+        for item in tracks:
+            tr = item.get("track")
+            if not tr:
+                continue
+            artist = tr["artists"][0]["name"] if tr.get("artists") else ""
+            title = tr.get("name", "")
+            query = f"{artist} {title}"
+            
+            try:
+                res = await self.bot.loop.run_in_executor(None, self.session.search, query)
+                tidal_tracks = res.get("tracks", [])
+                if tidal_tracks:
+                    await self._play(ctx, tidal_tracks[0], show_embed=False)
+                    queued += 1
+            except Exception as e:
+                log.warning(f"Skipped {query}: {e}")
+        
+        await ctx.send(f"✅ Queued {queued}/{len(tracks)} tracks from Spotify")
 
     async def _queue_youtube_playlist(self, ctx, url: str):
         match = re.search(r"list=([A-Za-z0-9_-]+)", url)
@@ -324,6 +340,19 @@ class TidalPlayer(commands.Cog):
     async def tidalplay(self, ctx):
         """Setup subcommands."""
         await ctx.send_help()
+
+    @tidalplay.command(name="spotify")
+    @commands.is_owner()
+    async def spotify_setup(self, ctx, client_id: str, client_secret: str):
+        """Store Spotify API credentials."""
+        if not SPOTIFY_AVAILABLE:
+            return await ctx.send("❌ Install spotipy: `pip install spotipy`")
+        await self.config.spotify_client_id.set(client_id)
+        await self.config.spotify_client_secret.set(client_secret)
+        self.sp = spotipy.Spotify(
+            client_credentials_manager=SpotifyClientCredentials(client_id, client_secret)
+        )
+        await ctx.send("✅ Spotify credentials saved and client initialized.")
 
     @tidalplay.command(name="youtube")
     @commands.is_owner()
