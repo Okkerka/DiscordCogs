@@ -1,34 +1,64 @@
 from redbot.core import commands, Config
-import aiohttp
+import discord
 import logging
 import asyncio
+import aiohttp
+from typing import Optional, Dict, Any
+
+try:
+    import tidalapi
+    from tidalapi.media import Quality
+    TIDALAPI_AVAILABLE = True
+except ImportError:
+    TIDALAPI_AVAILABLE = False
 
 log = logging.getLogger("red.tidalplayer")
 
 class TidalPlayer(commands.Cog):
-    """Search Tidal first, play from YouTube with fallback"""
+    """Play music directly from Tidal with Red's Audio cog"""
     
     def __init__(self, bot):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=1234567890)
         default_global = {
-            "bearer_token": None,
+            "token_type": None,
+            "access_token": None,
             "refresh_token": None,
-            "client_id": None,
-            "client_secret": None,
+            "expiry_time": None,
             "country_code": "US",
-            "enabled": True
+            "enabled": True,
+            "quality": "HIGH",  # LOW, HIGH, LOSSLESS, HI_RES
+            "fallback_to_youtube": True,
+            "download_mode": False  # Download tracks before playing
         }
         self.config.register_global(**default_global)
+        self.session = tidalapi.Session() if TIDALAPI_AVAILABLE else None
+        self.download_cache = {}
+        
+        if TIDALAPI_AVAILABLE:
+            bot.loop.create_task(self._load_session())
+    
+    async def _load_session(self):
+        """Load saved session on startup"""
+        token_type = await self.config.token_type()
+        access_token = await self.config.access_token()
+        refresh_token = await self.config.refresh_token()
+        
+        if all([token_type, access_token, refresh_token]):
+            try:
+                self.session.load_oauth_session(token_type, access_token, refresh_token)
+                log.info("Tidal session loaded from config")
+            except Exception as e:
+                log.error(f"Failed to load session: {e}")
     
     @commands.Cog.listener()
     async def on_command(self, ctx):
-        """Intercept play commands and add Tidal search"""
+        """Intercept play commands and use Tidal"""
         if ctx.command.qualified_name != "play":
             return
         
         enabled = await self.config.enabled()
-        if not enabled:
+        if not enabled or not TIDALAPI_AVAILABLE:
             return
         
         # Get the query from command arguments
@@ -36,27 +66,190 @@ class TidalPlayer(commands.Cog):
             return
         
         query = ctx.kwargs.get('query') or (ctx.args[2] if len(ctx.args) > 2 else None)
-        if not query or "http" in query:  # Skip URLs
+        
+        # Skip if already a URL or empty
+        if not query or any(x in str(query).lower() for x in ["http", "www.", ".com"]):
             return
         
-        bearer_token = await self.config.bearer_token()
-        if not bearer_token:
+        if not self.session or not self.session.check_login():
+            log.warning("Tidal session not authenticated")
             return
         
-        # Search Tidal
-        tidal_result = await self.search_tidal(query, bearer_token)
+        # Search Tidal and get playable URL
+        async with ctx.typing():
+            result = await self.get_tidal_playback(query, ctx)
         
-        if tidal_result:
-            # Modify the query to use Tidal metadata
-            new_query = f"{tidal_result['artist']} {tidal_result['title']}"
-            await ctx.send(f"🎵 Found on Tidal: **{tidal_result['title']}** by **{tidal_result['artist']}**")
+        if result:
+            new_query = result["url"]
+            track_info = result.get("info", {})
             
-            # Update the context kwargs/args with new query
+            # Update the context with Tidal URL
             if 'query' in ctx.kwargs:
                 ctx.kwargs['query'] = new_query
             elif len(ctx.args) > 2:
                 ctx.args = list(ctx.args)
                 ctx.args[2] = new_query
+            
+            # Send info message
+            title = track_info.get("title", "Unknown")
+            artist = track_info.get("artist", "Unknown")
+            quality = track_info.get("quality", "Unknown")
+            
+            embed = discord.Embed(
+                title="🎵 Playing from Tidal",
+                description=f"**{title}**\nby {artist}",
+                color=discord.Color.blue()
+            )
+            embed.add_field(name="Quality", value=quality, inline=True)
+            embed.add_field(name="Source", value="Tidal Direct", inline=True)
+            
+            await ctx.send(embed=embed)
+    
+    async def get_tidal_playback(self, query: str, ctx) -> Optional[Dict[str, Any]]:
+        """Get playable URL from Tidal (stream or downloaded file)"""
+        try:
+            # Search Tidal
+            results = await self.bot.loop.run_in_executor(
+                None,
+                self.session.search,
+                query
+            )
+            
+            if not results or not results.get('tracks'):
+                log.warning(f"No Tidal results for: {query}")
+                return await self._fallback_search(query)
+            
+            track = results['tracks'][0]
+            
+            # Get quality setting
+            quality_str = await self.config.quality()
+            quality = self._get_quality_enum(quality_str)
+            
+            # Try to get stream URL
+            download_mode = await self.config.download_mode()
+            
+            if download_mode:
+                # Download the track first
+                url = await self._download_track(track, quality, ctx)
+            else:
+                # Try direct streaming
+                url = await self._get_stream_url(track, quality)
+            
+            if url:
+                return {
+                    "url": url,
+                    "info": {
+                        "title": track.name,
+                        "artist": track.artist.name if track.artist else "Unknown",
+                        "album": track.album.name if track.album else "Unknown",
+                        "quality": quality_str
+                    }
+                }
+            
+            # If we couldn't get URL, try fallback
+            log.warning(f"Could not get Tidal URL for track: {track.name}")
+            return await self._fallback_search(query)
+            
+        except Exception as e:
+            log.error(f"Error getting Tidal playback: {e}", exc_info=True)
+            return await self._fallback_search(query)
+    
+    async def _get_stream_url(self, track, quality) -> Optional[str]:
+        """Attempt to get direct stream URL from Tidal"""
+        try:
+            # Try to get stream URL
+            stream_url = await self.bot.loop.run_in_executor(
+                None,
+                track.get_url
+            )
+            
+            if stream_url:
+                log.info(f"Got Tidal stream URL: {stream_url[:50]}...")
+                return stream_url
+            
+        except AttributeError:
+            log.error("track.get_url() not available - tidalapi version may not support it")
+        except Exception as e:
+            log.error(f"Failed to get stream URL: {e}")
+        
+        return None
+    
+    async def _download_track(self, track, quality, ctx) -> Optional[str]:
+        """Download track and return local file path"""
+        try:
+            import tempfile
+            import os
+            from pathlib import Path
+            
+            # Check cache
+            cache_key = f"{track.id}_{quality}"
+            if cache_key in self.download_cache:
+                if os.path.exists(self.download_cache[cache_key]):
+                    log.info(f"Using cached track: {track.name}")
+                    return self.download_cache[cache_key]
+            
+            await ctx.send("⏬ Downloading from Tidal... (this may take a moment)")
+            
+            # Create temp directory
+            temp_dir = Path(tempfile.gettempdir()) / "tidalplayer"
+            temp_dir.mkdir(exist_ok=True)
+            
+            # Sanitize filename
+            safe_name = "".join(c for c in f"{track.artist.name} - {track.name}" if c.isalnum() or c in (' ', '-', '_')).strip()
+            file_path = temp_dir / f"{safe_name}_{track.id}.m4a"
+            
+            # Try to download using tidalapi
+            # Note: This may not work depending on tidalapi version
+            def download():
+                try:
+                    # Some versions of tidalapi support this
+                    if hasattr(track, 'download'):
+                        track.download(str(file_path), quality=quality)
+                        return True
+                except:
+                    pass
+                return False
+            
+            success = await self.bot.loop.run_in_executor(None, download)
+            
+            if success and file_path.exists():
+                self.download_cache[cache_key] = str(file_path)
+                log.info(f"Successfully downloaded: {track.name}")
+                return str(file_path)
+            else:
+                log.error("Download method not available or failed")
+                
+        except Exception as e:
+            log.error(f"Failed to download track: {e}", exc_info=True)
+        
+        return None
+    
+    async def _fallback_search(self, query: str) -> Optional[Dict[str, Any]]:
+        """Fallback to YouTube search if Tidal fails"""
+        fallback_enabled = await self.config.fallback_to_youtube()
+        
+        if fallback_enabled:
+            log.info(f"Using YouTube fallback for: {query}")
+            return {
+                "url": query,  # Let Audio cog search YouTube
+                "info": {
+                    "title": query,
+                    "artist": "Unknown",
+                    "quality": "YouTube"
+                }
+            }
+        
+        return None
+    
+    def _get_quality_enum(self, quality_str: str):
+        """Convert quality string to tidalapi Quality enum"""
+        quality_map = {
+            "LOW": Quality.low_96k,
+            "HIGH": Quality.high_320k,
+            "LOSSLESS": Quality.lossless,
+            "HI_RES": Quality.hi_res
+        }
+        return quality_map.get(quality_str.upper(), Quality.high_320k)
     
     @commands.group()
     @commands.is_owner()
@@ -65,6 +258,50 @@ class TidalPlayer(commands.Cog):
         if ctx.invoked_subcommand is None:
             await ctx.send_help()
     
+    @tidalplay.command(name="setup")
+    async def tidalsetup(self, ctx):
+        """Set up Tidal OAuth authentication"""
+        if not TIDALAPI_AVAILABLE:
+            return await ctx.send("❌ tidalapi is not installed. Install with: `[p]pipinstall tidalapi`")
+        
+        await ctx.send("Starting OAuth setup...")
+        
+        try:
+            login, future = self.session.login_oauth()
+            
+            embed = discord.Embed(
+                title="Tidal OAuth Setup",
+                description=f"Visit this URL and log in:\n{login.verification_uri_complete}",
+                color=discord.Color.blue()
+            )
+            embed.add_field(name="⏱️ Timeout", value="5 minutes", inline=False)
+            embed.set_footer(text="Make sure you have a Tidal HiFi subscription for best results")
+            await ctx.send(embed=embed)
+            
+            try:
+                await asyncio.wait_for(
+                    self.bot.loop.run_in_executor(None, future.result),
+                    timeout=300
+                )
+            except asyncio.TimeoutError:
+                return await ctx.send("⏱️ OAuth timed out. Please try again.")
+            
+            if self.session.check_login():
+                await self.config.token_type.set(self.session.token_type)
+                await self.config.access_token.set(self.session.access_token)
+                await self.config.refresh_token.set(self.session.refresh_token)
+                
+                if hasattr(self.session, "expiry_time") and self.session.expiry_time:
+                    await self.config.expiry_time.set(self.session.expiry_time.timestamp())
+                
+                await ctx.send("✅ **Setup complete!** Tidal integration is now active.\nUse `>play <song name>` to play from Tidal.")
+                log.info("OAuth setup completed successfully")
+            else:
+                await ctx.send("❌ Login failed. Please try again.")
+        except Exception as e:
+            await ctx.send(f"❌ Error during setup: {e}")
+            log.error(f"OAuth error: {e}", exc_info=True)
+    
     @tidalplay.command(name="toggle")
     async def toggle_integration(self, ctx):
         """Enable/disable Tidal integration with play command"""
@@ -72,228 +309,111 @@ class TidalPlayer(commands.Cog):
         await self.config.enabled.set(not current)
         
         if not current:
-            await ctx.send("✅ Tidal integration **enabled** - >play will search Tidal first")
+            await ctx.send("✅ Tidal integration **enabled** - `>play` will use Tidal")
         else:
-            await ctx.send("❌ Tidal integration **disabled** - >play will work normally")
+            await ctx.send("❌ Tidal integration **disabled** - `>play` will use default sources")
     
-    @tidalplay.command(name="setup")
-    async def setup_oauth(self, ctx):
-        """Interactive OAuth setup guide"""
+    @tidalplay.command(name="quality")
+    async def set_quality(self, ctx, quality: str):
+        """Set playback quality: LOW, HIGH, LOSSLESS, HI_RES"""
+        quality = quality.upper()
+        valid_qualities = ["LOW", "HIGH", "LOSSLESS", "HI_RES"]
         
-        setup_msg = """
-**Tidal OAuth Setup Guide**
-
-**Step 1:** Go to https://developer.tidal.com and sign in
-**Step 2:** Create a new app or select an existing one
-**Step 3:** Copy your **Client ID** and **Client Secret**
-**Step 4:** Add `http://localhost:8080` to your app's redirect URIs
-
-Reply with your **Client ID** (you have 60 seconds):
-        """
+        if quality not in valid_qualities:
+            return await ctx.send(f"❌ Invalid quality. Choose from: {', '.join(valid_qualities)}")
         
-        await ctx.send(setup_msg)
-        
-        # Get Client ID
-        def check(m):
-            return m.author == ctx.author and m.channel == ctx.channel
-        
-        try:
-            client_id_msg = await self.bot.wait_for('message', timeout=60.0, check=check)
-            client_id = client_id_msg.content.strip()
-            await client_id_msg.delete()
-            
-            await ctx.send("✅ Client ID received!\n\nNow reply with your **Client Secret**:")
-            
-            # Get Client Secret
-            client_secret_msg = await self.bot.wait_for('message', timeout=60.0, check=check)
-            client_secret = client_secret_msg.content.strip()
-            await client_secret_msg.delete()
-            
-            # Save credentials
-            await self.config.client_id.set(client_id)
-            await self.config.client_secret.set(client_secret)
-            
-            await ctx.send("✅ Credentials saved!\n\nNow generating authorization URL...")
-            
-            # Generate auth URL
-            auth_url = f"https://login.tidal.com/authorize?response_type=code&client_id={client_id}&redirect_uri=http://localhost:8080&scope=r_usr+w_usr+w_sub"
-            
-            auth_msg = f"""
-**Step 5:** Click this URL and authorize the app:
-{auth_url}
-
-**Step 6:** After authorizing, you'll be redirected to a localhost page. Copy the **code** parameter from the URL.
-Example: `http://localhost:8080?code=ABC123...`
-
-Reply with the **authorization code**:
-            """
-            
-            await ctx.send(auth_msg)
-            
-            # Get auth code
-            auth_code_msg = await self.bot.wait_for('message', timeout=120.0, check=check)
-            auth_code = auth_code_msg.content.strip()
-            await auth_code_msg.delete()
-            
-            await ctx.send("🔄 Exchanging code for tokens...")
-            
-            # Exchange code for tokens
-            success = await self.exchange_code_for_token(client_id, client_secret, auth_code)
-            
-            if success:
-                await ctx.send("✅ **Setup complete!** You can now use `>play` to search Tidal and play from YouTube.")
-            else:
-                await ctx.send("❌ Failed to get tokens. Please try again or set manually with `>tidalplay token`")
-                
-        except asyncio.TimeoutError:
-            await ctx.send("⏱️ Setup timed out. Please try again with `>tidalplay setup`")
-        except Exception as e:
-            await ctx.send(f"❌ Error during setup: {e}")
-            log.error(f"OAuth setup error: {e}")
+        await self.config.quality.set(quality)
+        await ctx.send(f"✅ Playback quality set to: **{quality}**")
     
-    async def exchange_code_for_token(self, client_id: str, client_secret: str, auth_code: str):
-        """Exchange authorization code for access and refresh tokens"""
+    @tidalplay.command(name="downloadmode")
+    async def toggle_download_mode(self, ctx):
+        """Toggle download mode (downloads tracks before playing)"""
+        current = await self.config.download_mode()
+        await self.config.download_mode.set(not current)
         
-        data = {
-            "grant_type": "authorization_code",
-            "code": auth_code,
-            "redirect_uri": "http://localhost:8080",
-            "client_id": client_id,
-            "client_secret": client_secret
-        }
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    "https://auth.tidal.com/v1/oauth2/token",
-                    data=data,
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as resp:
-                    if resp.status == 200:
-                        tokens = await resp.json()
-                        
-                        # Save tokens
-                        await self.config.bearer_token.set(tokens.get("access_token"))
-                        await self.config.refresh_token.set(tokens.get("refresh_token"))
-                        
-                        return True
-                    else:
-                        error_text = await resp.text()
-                        log.error(f"Token exchange failed: {resp.status} - {error_text}")
-                        return False
-        except Exception as e:
-            log.error(f"Error exchanging token: {e}")
-            return False
-    
-    @tidalplay.command(name="refresh")
-    async def refresh_token_cmd(self, ctx):
-        """Refresh your access token using refresh token"""
-        
-        client_id = await self.config.client_id()
-        client_secret = await self.config.client_secret()
-        refresh_token = await self.config.refresh_token()
-        
-        if not all([client_id, client_secret, refresh_token]):
-            await ctx.send("❌ Missing credentials! Run `>tidalplay setup` first.")
-            return
-        
-        success = await self.refresh_access_token()
-        
-        if success:
-            await ctx.send("✅ Access token refreshed successfully!")
+        if not current:
+            await ctx.send("✅ **Download mode enabled** - Tracks will be downloaded before playing")
         else:
-            await ctx.send("❌ Failed to refresh token. You may need to run `>tidalplay setup` again.")
+            await ctx.send("❌ **Download mode disabled** - Will attempt direct streaming")
     
-    async def refresh_access_token(self):
-        """Refresh the access token"""
+    @tidalplay.command(name="fallback")
+    async def toggle_fallback(self, ctx):
+        """Toggle YouTube fallback if Tidal fails"""
+        current = await self.config.fallback_to_youtube()
+        await self.config.fallback_to_youtube.set(not current)
         
-        client_id = await self.config.client_id()
-        client_secret = await self.config.client_secret()
-        refresh_token = await self.config.refresh_token()
-        
-        data = {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": client_id,
-            "client_secret": client_secret
-        }
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    "https://auth.tidal.com/v1/oauth2/token",
-                    data=data,
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as resp:
-                    if resp.status == 200:
-                        tokens = await resp.json()
-                        await self.config.bearer_token.set(tokens.get("access_token"))
-                        return True
-                    else:
-                        log.error(f"Token refresh failed: {resp.status}")
-                        return False
-        except Exception as e:
-            log.error(f"Error refreshing token: {e}")
-            return False
+        if not current:
+            await ctx.send("✅ **YouTube fallback enabled**")
+        else:
+            await ctx.send("❌ **YouTube fallback disabled**")
     
-    async def search_tidal(self, query: str, bearer_token: str):
-        """Search Tidal catalog using OAuth Bearer token"""
-        country_code = await self.config.country_code()
+    @tidalplay.command(name="clearcache")
+    async def clear_cache(self, ctx):
+        """Clear downloaded track cache"""
+        import os
         
-        headers = {
-            "Authorization": f"Bearer {bearer_token}",
-            "Accept": "application/json"
-        }
+        count = 0
+        for cache_key, file_path in list(self.download_cache.items()):
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    count += 1
+                del self.download_cache[cache_key]
+            except Exception as e:
+                log.error(f"Failed to delete cache file: {e}")
         
-        params = {
-            "query": query,
-            "limit": 1,
-            "countryCode": country_code
-        }
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    "https://openapi.tidal.com/search",
-                    headers=headers,
-                    params=params,
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        
-                        # Check if we have track results
-                        if data.get("tracks") and data["tracks"].get("items"):
-                            track = data["tracks"]["items"][0]
-                            return {
-                                "title": track.get("title", "Unknown"),
-                                "artist": track.get("artists", [{}])[0].get("name", "Unknown") if track.get("artists") else "Unknown"
-                            }
-                    elif resp.status == 401:
-                        # Token expired, try to refresh
-                        log.info("Token expired, attempting refresh...")
-                        if await self.refresh_access_token():
-                            # Retry with new token
-                            return await self.search_tidal(query, await self.config.bearer_token())
-                    else:
-                        log.warning(f"Tidal API returned status {resp.status}")
-        except Exception as e:
-            log.error(f"Error searching Tidal: {e}")
-        
-        return None
-    
-    @tidalplay.command(name="token")
-    async def set_token(self, ctx, token: str):
-        """Manually set your Tidal OAuth Bearer token"""
-        await self.config.bearer_token.set(token)
-        await ctx.send("✅ Tidal Bearer token has been set!")
-        try:
-            await ctx.message.delete()
-        except:
-            await ctx.send("⚠️ Please delete your message containing the token!")
+        await ctx.send(f"✅ Cleared {count} cached tracks")
     
     @tidalplay.command(name="country")
     async def set_country(self, ctx, country_code: str):
         """Set Tidal country code (e.g., US, GB, DE)"""
         await self.config.country_code.set(country_code.upper())
-        await ctx.send(f"✅ Tidal country code set to: {country_code.upper()}")
+        await ctx.send(f"✅ Tidal country code set to: **{country_code.upper()}**")
+    
+    @tidalplay.command(name="status")
+    async def check_status(self, ctx):
+        """Check Tidal configuration and authentication status"""
+        if not TIDALAPI_AVAILABLE:
+            return await ctx.send("❌ tidalapi is not installed. Install with: `[p]pipinstall tidalapi`")
+        
+        enabled = await self.config.enabled()
+        quality = await self.config.quality()
+        country = await self.config.country_code()
+        download_mode = await self.config.download_mode()
+        fallback = await self.config.fallback_to_youtube()
+        
+        embed = discord.Embed(
+            title="Tidal Player Status",
+            color=discord.Color.green() if self.session.check_login() else discord.Color.red()
+        )
+        
+        # Authentication status
+        auth_status = "✅ Authenticated" if self.session and self.session.check_login() else "❌ Not authenticated"
+        embed.add_field(name="Authentication", value=auth_status, inline=False)
+        
+        # Integration status
+        integration_status = "✅ Enabled" if enabled else "❌ Disabled"
+        embed.add_field(name="Integration", value=integration_status, inline=True)
+        
+        # Settings
+        embed.add_field(name="Quality", value=quality, inline=True)
+        embed.add_field(name="Country", value=country, inline=True)
+        embed.add_field(name="Download Mode", value="✅ On" if download_mode else "❌ Off", inline=True)
+        embed.add_field(name="YouTube Fallback", value="✅ On" if fallback else "❌ Off", inline=True)
+        embed.add_field(name="Cached Tracks", value=str(len(self.download_cache)), inline=True)
+        
+        if not self.session or not self.session.check_login():
+            embed.set_footer(text="Run >tidalplay setup to authenticate")
+        
+        await ctx.send(embed=embed)
+    
+    def cog_unload(self):
+        """Cleanup when cog is unloaded"""
+        # Clean up cached files
+        import os
+        for file_path in self.download_cache.values():
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except:
+                pass
