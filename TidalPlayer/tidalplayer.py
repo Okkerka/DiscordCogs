@@ -161,7 +161,8 @@ class TidalPlayer(commands.Cog):
         if quiet:
             self._suppress_enqueued(ctx)
         try:
-            if SCRAPING_AVAILABLE and "spotify.com/playlist/" in q:
+            # Check Spotify FIRST before generic pattern
+            if SCRAPING_AVAILABLE and "spotify.com" in q:
                 await self._queue_spotify_playlist(ctx, q)
             elif YOUTUBE_API_AVAILABLE and ("list=" in q and self.yt):
                 await self._queue_youtube_playlist(ctx, q)
