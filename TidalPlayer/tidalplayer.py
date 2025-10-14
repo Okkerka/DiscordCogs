@@ -339,7 +339,7 @@ class TidalPlayer(commands.Cog):
     
     def cog_unload(self):
         log.info("TidalPlayer unloaded")
-    @commands.command(name="queue", aliases=["q"])
+    @commands.command(name="q")
     async def tqueue(self, ctx):
         """Show Tidal queue with correct metadata."""
         # Fetch our stored metadata
