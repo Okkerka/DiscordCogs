@@ -2,7 +2,6 @@ from redbot.core import commands, Config
 import discord
 import logging
 import asyncio
-import aiohttp
 from typing import Optional, Dict, Any
 
 try:
@@ -26,7 +25,6 @@ class TidalPlayer(commands.Cog):
             "refresh_token": None,
             "expiry_time": None,
             "country_code": "US",
-            "enabled": True,
             "quality": "HIGH",  # LOW, HIGH, LOSSLESS, HI_RES
             "fallback_to_youtube": True,
             "download_mode": False  # Download tracks before playing
@@ -51,59 +49,54 @@ class TidalPlayer(commands.Cog):
             except Exception as e:
                 log.error(f"Failed to load session: {e}")
     
-    @commands.Cog.listener()
-    async def on_command(self, ctx):
-        """Intercept play commands and use Tidal"""
-        if ctx.command.qualified_name != "play":
-            return
-        
-        enabled = await self.config.enabled()
-        if not enabled or not TIDALAPI_AVAILABLE:
-            return
-        
-        # Get the query from command arguments
-        if not ctx.args or len(ctx.args) < 3:
-            return
-        
-        query = ctx.kwargs.get('query') or (ctx.args[2] if len(ctx.args) > 2 else None)
-        
-        # Skip if already a URL or empty
-        if not query or any(x in str(query).lower() for x in ["http", "www.", ".com"]):
-            return
+    @commands.command(name="tplay")
+    async def tidal_play(self, ctx, *, query: str):
+        """Play a song from Tidal"""
+        if not TIDALAPI_AVAILABLE:
+            return await ctx.send("❌ tidalapi is not installed. Install with: `[p]pipinstall tidalapi`")
         
         if not self.session or not self.session.check_login():
-            log.warning("Tidal session not authenticated")
-            return
+            return await ctx.send("❌ Not authenticated with Tidal. Run `>tidalplay setup` first.")
+        
+        # Get Audio cog
+        audio = self.bot.get_cog("Audio")
+        if not audio:
+            return await ctx.send("❌ Audio cog is not loaded. Load it with: `[p]load audio`")
         
         # Search Tidal and get playable URL
         async with ctx.typing():
             result = await self.get_tidal_playback(query, ctx)
         
-        if result:
-            new_query = result["url"]
-            track_info = result.get("info", {})
-            
-            # Update the context with Tidal URL
-            if 'query' in ctx.kwargs:
-                ctx.kwargs['query'] = new_query
-            elif len(ctx.args) > 2:
-                ctx.args = list(ctx.args)
-                ctx.args[2] = new_query
-            
-            # Send info message
-            title = track_info.get("title", "Unknown")
-            artist = track_info.get("artist", "Unknown")
-            quality = track_info.get("quality", "Unknown")
-            
-            embed = discord.Embed(
-                title="🎵 Playing from Tidal",
-                description=f"**{title}**\nby {artist}",
-                color=discord.Color.blue()
-            )
-            embed.add_field(name="Quality", value=quality, inline=True)
-            embed.add_field(name="Source", value="Tidal Direct", inline=True)
-            
-            await ctx.send(embed=embed)
+        if not result:
+            return await ctx.send("❌ Could not find or play that track from Tidal.")
+        
+        new_query = result["url"]
+        track_info = result.get("info", {})
+        
+        # Send info message
+        title = track_info.get("title", "Unknown")
+        artist = track_info.get("artist", "Unknown")
+        album = track_info.get("album", "Unknown")
+        quality = track_info.get("quality", "Unknown")
+        source = track_info.get("source", "Tidal")
+        
+        embed = discord.Embed(
+            title="🎵 Playing from Tidal",
+            description=f"**{title}**\nby {artist}",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="Album", value=album, inline=True)
+        embed.add_field(name="Quality", value=quality, inline=True)
+        embed.add_field(name="Source", value=source, inline=True)
+        
+        await ctx.send(embed=embed)
+        
+        # Use Audio cog to play
+        try:
+            await audio.command_play(ctx, query=new_query)
+        except Exception as e:
+            log.error(f"Failed to play via Audio cog: {e}")
+            await ctx.send(f"❌ Failed to play track: {e}")
     
     async def get_tidal_playback(self, query: str, ctx) -> Optional[Dict[str, Any]]:
         """Get playable URL from Tidal (stream or downloaded file)"""
@@ -142,13 +135,14 @@ class TidalPlayer(commands.Cog):
                         "title": track.name,
                         "artist": track.artist.name if track.artist else "Unknown",
                         "album": track.album.name if track.album else "Unknown",
-                        "quality": quality_str
+                        "quality": quality_str,
+                        "source": "Tidal Direct"
                     }
                 }
             
             # If we couldn't get URL, try fallback
             log.warning(f"Could not get Tidal URL for track: {track.name}")
-            return await self._fallback_search(query)
+            return await self._fallback_search(query, track)
             
         except Exception as e:
             log.error(f"Error getting Tidal playback: {e}", exc_info=True)
@@ -224,20 +218,38 @@ class TidalPlayer(commands.Cog):
         
         return None
     
-    async def _fallback_search(self, query: str) -> Optional[Dict[str, Any]]:
+    async def _fallback_search(self, query: str, track=None) -> Optional[Dict[str, Any]]:
         """Fallback to YouTube search if Tidal fails"""
         fallback_enabled = await self.config.fallback_to_youtube()
         
         if fallback_enabled:
-            log.info(f"Using YouTube fallback for: {query}")
-            return {
-                "url": query,  # Let Audio cog search YouTube
-                "info": {
-                    "title": query,
-                    "artist": "Unknown",
-                    "quality": "YouTube"
+            if track:
+                # Use Tidal metadata for better YouTube search
+                search_query = f"{track.artist.name} {track.name}"
+                log.info(f"Using YouTube fallback with Tidal metadata: {search_query}")
+                return {
+                    "url": search_query,
+                    "info": {
+                        "title": track.name,
+                        "artist": track.artist.name if track.artist else "Unknown",
+                        "album": track.album.name if track.album else "Unknown",
+                        "quality": "YouTube",
+                        "source": "YouTube (Tidal metadata)"
+                    }
                 }
-            }
+            else:
+                # Direct search
+                log.info(f"Using YouTube fallback for: {query}")
+                return {
+                    "url": query,
+                    "info": {
+                        "title": query,
+                        "artist": "Unknown",
+                        "album": "Unknown",
+                        "quality": "YouTube",
+                        "source": "YouTube"
+                    }
+                }
         
         return None
     
@@ -294,24 +306,13 @@ class TidalPlayer(commands.Cog):
                 if hasattr(self.session, "expiry_time") and self.session.expiry_time:
                     await self.config.expiry_time.set(self.session.expiry_time.timestamp())
                 
-                await ctx.send("✅ **Setup complete!** Tidal integration is now active.\nUse `>play <song name>` to play from Tidal.")
+                await ctx.send("✅ **Setup complete!** Tidal integration is now active.\nUse `>tplay <song name>` to play from Tidal.")
                 log.info("OAuth setup completed successfully")
             else:
                 await ctx.send("❌ Login failed. Please try again.")
         except Exception as e:
             await ctx.send(f"❌ Error during setup: {e}")
             log.error(f"OAuth error: {e}", exc_info=True)
-    
-    @tidalplay.command(name="toggle")
-    async def toggle_integration(self, ctx):
-        """Enable/disable Tidal integration with play command"""
-        current = await self.config.enabled()
-        await self.config.enabled.set(not current)
-        
-        if not current:
-            await ctx.send("✅ Tidal integration **enabled** - `>play` will use Tidal")
-        else:
-            await ctx.send("❌ Tidal integration **disabled** - `>play` will use default sources")
     
     @tidalplay.command(name="quality")
     async def set_quality(self, ctx, quality: str):
@@ -376,7 +377,6 @@ class TidalPlayer(commands.Cog):
         if not TIDALAPI_AVAILABLE:
             return await ctx.send("❌ tidalapi is not installed. Install with: `[p]pipinstall tidalapi`")
         
-        enabled = await self.config.enabled()
         quality = await self.config.quality()
         country = await self.config.country_code()
         download_mode = await self.config.download_mode()
@@ -391,10 +391,6 @@ class TidalPlayer(commands.Cog):
         auth_status = "✅ Authenticated" if self.session and self.session.check_login() else "❌ Not authenticated"
         embed.add_field(name="Authentication", value=auth_status, inline=False)
         
-        # Integration status
-        integration_status = "✅ Enabled" if enabled else "❌ Disabled"
-        embed.add_field(name="Integration", value=integration_status, inline=True)
-        
         # Settings
         embed.add_field(name="Quality", value=quality, inline=True)
         embed.add_field(name="Country", value=country, inline=True)
@@ -404,6 +400,8 @@ class TidalPlayer(commands.Cog):
         
         if not self.session or not self.session.check_login():
             embed.set_footer(text="Run >tidalplay setup to authenticate")
+        else:
+            embed.set_footer(text="Use >tplay <song name> to play from Tidal")
         
         await ctx.send(embed=embed)
     
