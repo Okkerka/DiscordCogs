@@ -7,16 +7,14 @@ import random
 import asyncio
 import logging
 import re
-import traceback
 from typing import Optional, Union, Dict, List, Tuple
 from datetime import datetime, timedelta
 from functools import lru_cache
-from collections import defaultdict, deque
 
 # Configure logging
 log = logging.getLogger("red.messagedelete")
 
-# Performance and feature constants
+# Constants
 DEFAULT_PING_AMOUNT = 5
 MAX_PING_AMOUNT = 20
 PING_DELAY = 0.5
@@ -25,50 +23,50 @@ GAY_PERCENTAGE_MAX_NORMAL = 100
 GAY_PERCENTAGE_MIN_HAWK = 51
 GAY_PERCENTAGE_MAX_HAWK = 150
 MAX_PURGE_LIMIT = 1000
-CACHE_SIZE = 1000
-SPAM_WINDOW = 10  # seconds
-MAX_SPAM_MESSAGES = 5
+MAX_MASSBAN_USERS = 20
 
 
-class MessageCache:
-    """Efficient message cache with memory management."""
-    
-    def __init__(self, max_size: int = CACHE_SIZE):
-        self.cache: Dict[int, deque] = defaultdict(lambda: deque(maxlen=max_size // 100))
-        self.max_guilds = 100
-    
-    def add_message(self, guild_id: int, user_id: int, timestamp: datetime) -> None:
-        """Add message timestamp to cache."""
-        if len(self.cache) > self.max_guilds:
-            # Remove oldest guild cache
-            oldest_guild = min(self.cache.keys())
-            del self.cache[oldest_guild]
+def mod_or_permissions(**perms):
+    """Custom check: allows custom mods OR users with specific permissions."""
+    async def predicate(ctx: commands.Context):
+        if ctx.guild is None:
+            return False
         
-        self.cache[guild_id].append((user_id, timestamp))
-    
-    def get_user_messages(self, guild_id: int, user_id: int, window: int = SPAM_WINDOW) -> int:
-        """Get message count for user in time window."""
-        if guild_id not in self.cache:
-            return 0
+        # Owner always has access
+        if await ctx.bot.is_owner(ctx.author):
+            return True
         
-        cutoff = datetime.utcnow() - timedelta(seconds=window)
-        count = sum(1 for uid, ts in self.cache[guild_id] if uid == user_id and ts > cutoff)
-        return count
+        # Server owner always has access
+        if ctx.author == ctx.guild.owner:
+            return True
+        
+        # Check if user is in custom moderator list
+        cog = ctx.bot.get_cog("Utilities")
+        if cog:
+            moderators = await cog.config.guild(ctx.guild).moderators()
+            if ctx.author.id in moderators:
+                return True
+        
+        # Fall back to checking Discord permissions
+        return await commands.has_permissions(**perms).predicate(ctx)
+    
+    return commands.check(predicate)
 
 
 class MessageDelete(commands.Cog):
     """High-performance Discord bot with comprehensive moderation and utilities."""
 
     __author__ = ["YourName"]
-    __version__ = "4.0.1"
+    __version__ = "5.2.0"
+    __cog_name__ = "Utilities"
 
     def __init__(self, bot):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=1234567890, force_registration=True)
         
-        # Optimized default configuration
         default_guild = {
             "blocked_users": [],
+            "moderators": [],
             "hawk_users": [
                 786624423721041941, 500641384835842049, 275549294969356288,
                 685961799518257175, 871044256800854078, 332176051914539010
@@ -76,28 +74,60 @@ class MessageDelete(commands.Cog):
             "hawk_enabled": True,
             "gay_enabled": True,
             "warnings": {},
-            "automod_enabled": False,
-            "spam_threshold": MAX_SPAM_MESSAGES,
-            "mass_mention_limit": 5,
-            "filter_invites": False,
-            "filter_links": False
+            "tempbans": {}
         }
         self.config.register_guild(**default_guild)
         
-        # Performance-optimized runtime state
+        # Runtime state
         self.awaiting_hawk_response: Dict[int, int] = {}
         self.last_hawk_user: Dict[int, int] = {}
-        self.message_cache = MessageCache()
         
-        # Precompiled regex patterns for performance
-        self.invite_pattern = re.compile(r'(?:discord\.(?:gg|io|me|li)|discordapp\.com\/invite)\/[a-zA-Z0-9]+', re.IGNORECASE)
-        self.link_pattern = re.compile(r'https?:\/\/[^\s]+', re.IGNORECASE)
+        # Start background task
+        self.tempban_task = self.bot.loop.create_task(self.check_tempbans())
+
+    def cog_unload(self):
+        """Cleanup when cog is unloaded."""
+        if self.tempban_task:
+            self.tempban_task.cancel()
 
     def format_help_for_context(self, ctx: commands.Context) -> str:
         """Show cog version in help."""
         return f"{super().format_help_for_context(ctx)}\n\nVersion: {self.__version__}"
 
-    @lru_cache(maxsize=256)
+    async def check_tempbans(self):
+        """Background task to check and remove expired tempbans."""
+        await self.bot.wait_until_ready()
+        while not self.bot.is_closed():
+            try:
+                for guild in self.bot.guilds:
+                    tempbans = await self.config.guild(guild).tempbans()
+                    now = datetime.utcnow()
+                    
+                    to_unban = []
+                    for user_id_str, ban_info in tempbans.items():
+                        unban_time = datetime.fromisoformat(ban_info["unban_time"])
+                        if now >= unban_time:
+                            to_unban.append(int(user_id_str))
+                    
+                    for user_id in to_unban:
+                        try:
+                            user = await self.bot.fetch_user(user_id)
+                            await guild.unban(user, reason="Temporary ban expired")
+                            log.info(f"Auto-unbanned user {user_id} from guild {guild.id}")
+                            
+                            async with self.config.guild(guild).tempbans() as tempbans_dict:
+                                del tempbans_dict[str(user_id)]
+                        except Exception as e:
+                            log.error(f"Error auto-unbanning user {user_id}: {e}")
+                
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.error(f"Error in tempban checker: {e}")
+                await asyncio.sleep(60)
+
+    @lru_cache(maxsize=128)
     def get_embed_color(self, color_type: str = "default") -> int:
         """Cached embed colors for performance."""
         colors = {
@@ -142,23 +172,16 @@ class MessageDelete(commands.Cog):
             log.error(f"Unexpected error sending message: {e}")
         return None
 
-    def check_spam(self, guild_id: int, user_id: int) -> bool:
-        """Optimized spam detection with caching."""
-        now = datetime.utcnow()
-        self.message_cache.add_message(guild_id, user_id, now)
-        return self.message_cache.get_user_messages(guild_id, user_id) >= MAX_SPAM_MESSAGES
-
     @commands.Cog.listener()
     async def on_command_error(self, ctx: commands.Context, error: Exception):
         """Comprehensive error handling for all commands."""
-        # Ignore handled errors
-        if hasattr(ctx.command, 'on_error') or hasattr(ctx.cog, f'_{ctx.command.name}_error'):
+        if hasattr(ctx.command, 'on_error'):
             return
 
         error_embed = None
         
         if isinstance(error, commands.CommandNotFound):
-            return  # Ignore unknown commands
+            return
         
         elif isinstance(error, commands.MissingRequiredArgument):
             error_embed = self.create_embed(
@@ -204,8 +227,14 @@ class MessageDelete(commands.Cog):
                 "error"
             )
         
+        elif isinstance(error, commands.CheckFailure):
+            error_embed = self.create_embed(
+                "Permission Denied",
+                "You don't have permission to use this command.",
+                "error"
+            )
+        
         else:
-            # Log unexpected errors
             log.error(f"Unhandled error in {ctx.command}: {error}", exc_info=error)
             error_embed = self.create_embed(
                 "Unexpected Error",
@@ -218,14 +247,13 @@ class MessageDelete(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        """Optimized message processing with early returns."""
-        # Early performance optimizations
+        """Handle hawk responses and blocked user messages."""
         if not message.guild or message.author.bot:
             return
         
         guild_id = message.guild.id
         
-        # Hawk response handling (highest priority)
+        # Hawk response handling
         if guild_id in self.awaiting_hawk_response:
             user_id = self.awaiting_hawk_response[guild_id]
             if message.author.id == user_id:
@@ -241,62 +269,195 @@ class MessageDelete(commands.Cog):
             blocked_users = await self.config.guild(message.guild).blocked_users()
             if message.author.id in blocked_users:
                 await message.delete()
-                return
-        except (discord.Forbidden, discord.HTTPException):
-            pass
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.error(f"Error deleting blocked user message: {e}")
 
-        # Automoderation (batch config fetch for performance)
+    # ==================== Utility Functions ====================
+    
+    async def _can_moderate(self, ctx: commands.Context, member: discord.Member) -> bool:
+        """Check if user can moderate target member."""
+        if member.top_role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
+            error_embed = self.create_embed("Insufficient Permissions", "You cannot moderate someone with a role equal to or higher than yours.", "error")
+            await self.safe_send(ctx, embed=error_embed)
+            return False
+        
+        if member.top_role >= ctx.guild.me.top_role:
+            error_embed = self.create_embed("Insufficient Permissions", "I cannot moderate someone with a role equal to or higher than mine.", "error")
+            await self.safe_send(ctx, embed=error_embed)
+            return False
+        
+        if member == ctx.guild.owner:
+            error_embed = self.create_embed("Cannot Moderate Owner", "Cannot moderate the server owner.", "error")
+            await self.safe_send(ctx, embed=error_embed)
+            return False
+        
+        return True
+
+    def _parse_duration(self, duration: str) -> timedelta:
+        """Parse duration string into timedelta object."""
+        time_units = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+        
+        if len(duration) < 2:
+            raise ValueError("Duration must be at least 2 characters (e.g., '5m')")
+        
+        unit = duration[-1].lower()
+        if unit not in time_units:
+            raise ValueError("Invalid time unit. Use: s (seconds), m (minutes), h (hours), d (days), w (weeks)")
+        
         try:
-            guild_config = await self.config.guild(message.guild).all()
-            if not guild_config["automod_enabled"]:
+            amount = int(duration[:-1])
+        except ValueError:
+            raise ValueError("Invalid duration format. Example: 10m, 2h, 1d")
+        
+        if amount <= 0:
+            raise ValueError("Duration must be a positive number")
+        
+        return timedelta(seconds=amount * time_units[unit])
+
+    # ==================== Moderator Management ====================
+
+    @commands.group(name="modset", invoke_without_command=True)
+    @commands.guild_only()
+    @commands.admin_or_permissions(administrator=True)
+    async def modset(self, ctx: commands.Context):
+        """Manage custom moderator permissions for this server.
+        
+        Add users to the moderator list to give them access to all moderation commands
+        without requiring Discord role permissions.
+        """
+        await ctx.send_help(ctx.command)
+
+    @modset.command(name="add")
+    async def modset_add(self, ctx: commands.Context, user: Union[discord.Member, int]):
+        """Add a user to the custom moderator list.
+        
+        Grants full access to all moderation commands in this cog.
+        
+        **Arguments:**
+        - `<user>` - User to add (mention or ID)
+        
+        **Examples:**
+        - `[p]modset add @User`
+        - `[p]modset add 123456789012345678`
+        
+        **Required Permissions:**
+        - You: Administrator
+        """
+        user_id = user.id if isinstance(user, discord.Member) else user
+        
+        async with self.config.guild(ctx.guild).moderators() as moderators:
+            if user_id in moderators:
+                error_embed = self.create_embed("Already a Moderator", f"User ID `{user_id}` is already in the moderator list.", "warning")
+                await self.safe_send(ctx, embed=error_embed)
                 return
+            
+            moderators.append(user_id)
+        
+        user_mention = user.mention if isinstance(user, discord.Member) else f"User ID `{user_id}`"
+        success_embed = self.create_embed(
+            "Moderator Added",
+            f"{user_mention} has been added to the custom moderator list.\n\nThey now have access to all moderation commands.",
+            "success"
+        )
+        await self.safe_send(ctx, embed=success_embed)
 
-            delete_message = False
-            warning_msg = None
+    @modset.command(name="remove")
+    async def modset_remove(self, ctx: commands.Context, user: Union[discord.Member, int]):
+        """Remove a user from the custom moderator list.
+        
+        Revokes access to moderation commands (unless they have Discord permissions).
+        
+        **Arguments:**
+        - `<user>` - User to remove (mention or ID)
+        
+        **Examples:**
+        - `[p]modset remove @User`
+        - `[p]modset remove 123456789012345678`
+        
+        **Required Permissions:**
+        - You: Administrator
+        """
+        user_id = user.id if isinstance(user, discord.Member) else user
+        
+        async with self.config.guild(ctx.guild).moderators() as moderators:
+            if user_id not in moderators:
+                error_embed = self.create_embed("Not a Moderator", f"User ID `{user_id}` is not in the moderator list.", "warning")
+                await self.safe_send(ctx, embed=error_embed)
+                return
+            
+            moderators.remove(user_id)
+        
+        user_mention = user.mention if isinstance(user, discord.Member) else f"User ID `{user_id}`"
+        success_embed = self.create_embed(
+            "Moderator Removed",
+            f"{user_mention} has been removed from the custom moderator list.",
+            "success"
+        )
+        await self.safe_send(ctx, embed=success_embed)
 
-            # Spam detection
-            if self.check_spam(guild_id, message.author.id):
-                delete_message = True
-                warning_msg = f"{message.author.mention}, please slow down your messages!"
-
-            # Mass mentions check
-            elif len(message.mentions) >= guild_config["mass_mention_limit"]:
-                delete_message = True 
-                warning_msg = f"{message.author.mention}, too many mentions in one message!"
-
-            # Invite filter
-            elif guild_config["filter_invites"] and self.invite_pattern.search(message.content):
-                delete_message = True
-                warning_msg = f"{message.author.mention}, invite links are not allowed!"
-
-            # Link filter  
-            elif guild_config["filter_links"] and self.link_pattern.search(message.content):
-                delete_message = True
-                warning_msg = f"{message.author.mention}, external links are not allowed!"
-
-            if delete_message:
-                await message.delete()
-                if warning_msg:
-                    await self.safe_send(message.channel, warning_msg, delete_after=5)
-
-        except Exception as e:
-            log.error(f"Error in automod processing: {e}")
+    @modset.command(name="list")
+    async def modset_list(self, ctx: commands.Context):
+        """Show all users in the custom moderator list.
+        
+        **Examples:**
+        - `[p]modset list`
+        
+        **Required Permissions:**
+        - You: Administrator
+        """
+        moderators = await self.config.guild(ctx.guild).moderators()
+        
+        if not moderators:
+            embed = self.create_embed("No Custom Moderators", "The custom moderator list is empty.", "info")
+            await self.safe_send(ctx, embed=embed)
+            return
+        
+        mod_list = []
+        for user_id in moderators:
+            member = ctx.guild.get_member(user_id)
+            if member:
+                mod_list.append(f"• {member.mention} (`{member}` - `{user_id}`)")
+            else:
+                mod_list.append(f"• `{user_id}` (Not in server)")
+        
+        description = "\n".join(mod_list)
+        if len(description) > 4000:
+            description = description[:4000] + f"\n... and {len(moderators) - description.count('•')} more"
+        
+        embed = self.create_embed("Custom Moderators", description, "info")
+        embed.set_footer(text=f"Total: {len(moderators)} moderator(s)")
+        
+        await self.safe_send(ctx, embed=embed)
 
     # ==================== Core Moderation Commands ====================
     
     @commands.command()
     @commands.guild_only()
-    @commands.has_permissions(kick_members=True)
+    @mod_or_permissions(kick_members=True)
     @commands.bot_has_permissions(kick_members=True)
     async def kick(self, ctx: commands.Context, member: discord.Member, *, reason: Optional[str] = None):
-        """Kick a member from the server."""
+        """Kick a member from the server.
+        
+        Removes a member from the server without banning them. They can rejoin with a new invite.
+        
+        **Arguments:**
+        - `<member>` - The member to kick (mention, ID, or name)
+        - `[reason]` - Optional reason for the kick (shown in audit log and DM)
+        
+        **Examples:**
+        - `[p]kick @BadUser Spamming in chat`
+        - `[p]kick 123456789012345678 Breaking rules`
+        
+        **Required Permissions:**
+        - You: Kick Members OR Custom Moderator
+        - Bot: Kick Members
+        """
         if not await self._can_moderate(ctx, member):
             return
         
         reason = reason or "No reason provided"
         
         try:
-            # Attempt to notify user
             try:
                 embed = self.create_embed(
                     f"Kicked from {ctx.guild.name}",
@@ -325,32 +486,61 @@ class MessageDelete(commands.Cog):
 
     @commands.command()
     @commands.guild_only()
-    @commands.has_permissions(ban_members=True)
+    @mod_or_permissions(ban_members=True)
     @commands.bot_has_permissions(ban_members=True)
-    async def ban(self, ctx: commands.Context, member: Union[discord.Member, discord.User], *, reason: Optional[str] = None):
-        """Ban a user from the server."""
-        if isinstance(member, discord.Member) and not await self._can_moderate(ctx, member):
+    async def ban(self, ctx: commands.Context, user: Union[discord.Member, int], delete_days: int = 1, *, reason: Optional[str] = None):
+        """Ban a user from the server and optionally delete their recent messages.
+        
+        Permanently bans a user from the server. They cannot rejoin unless unbanned.
+        
+        **Arguments:**
+        - `<user>` - The user to ban (mention, ID, or name - works even if not in server)
+        - `[delete_days]` - Days of messages to delete (0-7, default: 1)
+        - `[reason]` - Optional reason for the ban
+        
+        **Examples:**
+        - `[p]ban @Spammer 7 Persistent rule violations`
+        - `[p]ban 123456789012345678 0 Alt account`
+        
+        **Required Permissions:**
+        - You: Ban Members OR Custom Moderator
+        - Bot: Ban Members
+        """
+        # Handle user ID as int
+        if isinstance(user, int):
+            try:
+                user = await self.bot.fetch_user(user)
+            except discord.NotFound:
+                error_embed = self.create_embed("Error", "User not found.", "error")
+                await self.safe_send(ctx, embed=error_embed)
+                return
+        
+        if isinstance(user, discord.Member) and not await self._can_moderate(ctx, user):
+            return
+        
+        if not 0 <= delete_days <= 7:
+            error_embed = self.create_embed("Invalid Days", "Delete days must be between 0 and 7.", "error")
+            await self.safe_send(ctx, embed=error_embed)
             return
         
         reason = reason or "No reason provided"
         
         try:
-            # Attempt to notify user
             try:
                 embed = self.create_embed(
                     f"Banned from {ctx.guild.name}",
                     f"**Reason:** {reason}",
                     "error"
                 )
-                await member.send(embed=embed)
+                await user.send(embed=embed)
             except (discord.Forbidden, discord.HTTPException, AttributeError):
                 pass
 
-            await ctx.guild.ban(member, reason=f"{ctx.author}: {reason}", delete_message_days=1)
+            await ctx.guild.ban(user, reason=f"{ctx.author}: {reason}", delete_message_days=delete_days)
             
             success_embed = self.create_embed(
                 "Member Banned",
-                f"**{member}** has been banned.\n**Reason:** {reason}",
+                f"**{user}** has been banned.\n**Messages deleted:** {delete_days} day(s)\n**Reason:** {reason}",
                 "success"
             )
             await self.safe_send(ctx, embed=success_embed)
@@ -364,15 +554,166 @@ class MessageDelete(commands.Cog):
 
     @commands.command()
     @commands.guild_only()
-    @commands.has_permissions(ban_members=True)
+    @mod_or_permissions(ban_members=True)
+    @commands.bot_has_permissions(ban_members=True)
+    async def softban(self, ctx: commands.Context, member: discord.Member, *, reason: Optional[str] = None):
+        """Kick a user and delete 1 day's worth of their messages.
+        
+        Bans then immediately unbans a user to delete their recent messages while allowing them to rejoin.
+        
+        **Arguments:**
+        - `<member>` - The member to softban
+        - `[reason]` - Optional reason for the softban
+        
+        **Examples:**
+        - `[p]softban @Spammer Posted inappropriate content`
+        
+        **Required Permissions:**
+        - You: Ban Members OR Custom Moderator
+        - Bot: Ban Members
+        """
+        if not await self._can_moderate(ctx, member):
+            return
+        
+        reason = reason or "No reason provided"
+        
+        try:
+            try:
+                embed = self.create_embed(
+                    f"Softbanned from {ctx.guild.name}",
+                    f"You have been removed and your messages deleted.\n**Reason:** {reason}\n\nYou may rejoin the server.",
+                    "warning"
+                )
+                await member.send(embed=embed)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+            await ctx.guild.ban(member, reason=f"Softban by {ctx.author}: {reason}", delete_message_days=1)
+            await ctx.guild.unban(member, reason=f"Softban unban by {ctx.author}")
+            
+            success_embed = self.create_embed(
+                "Member Softbanned",
+                f"**{member}** has been softbanned (kicked with message deletion).\n**Reason:** {reason}",
+                "success"
+            )
+            await self.safe_send(ctx, embed=success_embed)
+            
+        except discord.Forbidden:
+            error_embed = self.create_embed("Error", "I don't have permission to ban/unban that member.", "error")
+            await self.safe_send(ctx, embed=error_embed)
+        except discord.HTTPException as e:
+            error_embed = self.create_embed("Error", f"Failed to softban member: {e}", "error")
+            await self.safe_send(ctx, embed=error_embed)
+
+    @commands.command()
+    @commands.guild_only()
+    @mod_or_permissions(ban_members=True)
+    @commands.bot_has_permissions(ban_members=True)
+    async def tempban(self, ctx: commands.Context, user: Union[discord.Member, int], duration: str, *, reason: Optional[str] = None):
+        """Temporarily ban a user from the server.
+        
+        Bans a user for a specified time period. They will be automatically unbanned when it expires.
+        
+        **Arguments:**
+        - `<user>` - The user to temporarily ban
+        - `<duration>` - Duration of the ban (e.g., 30m, 2h, 1d, 7d)
+        - `[reason]` - Optional reason for the ban
+        
+        **Examples:**
+        - `[p]tempban @BadUser 24h Needs cooldown period`
+        - `[p]tempban 123456789012345678 7d Temporary suspension`
+        
+        **Required Permissions:**
+        - You: Ban Members OR Custom Moderator
+        - Bot: Ban Members
+        """
+        # Handle user ID as int
+        if isinstance(user, int):
+            try:
+                user = await self.bot.fetch_user(user)
+            except discord.NotFound:
+                error_embed = self.create_embed("Error", "User not found.", "error")
+                await self.safe_send(ctx, embed=error_embed)
+                return
+        
+        if isinstance(user, discord.Member) and not await self._can_moderate(ctx, user):
+            return
+        
+        try:
+            delta = self._parse_duration(duration)
+        except ValueError as e:
+            error_embed = self.create_embed("Invalid Duration", str(e), "error")
+            await self.safe_send(ctx, embed=error_embed)
+            return
+        
+        reason = reason or "No reason provided"
+        unban_time = datetime.utcnow() + delta
+        
+        try:
+            try:
+                embed = self.create_embed(
+                    f"Temporarily Banned from {ctx.guild.name}",
+                    f"**Duration:** {duration}\n**Unbanned:** <t:{int(unban_time.timestamp())}:R>\n**Reason:** {reason}",
+                    "warning"
+                )
+                await user.send(embed=embed)
+            except (discord.Forbidden, discord.HTTPException, AttributeError):
+                pass
+
+            await ctx.guild.ban(user, reason=f"Tempban by {ctx.author}: {reason}", delete_message_days=1)
+            
+            async with self.config.guild(ctx.guild).tempbans() as tempbans:
+                tempbans[str(user.id)] = {
+                    "unban_time": unban_time.isoformat(),
+                    "reason": reason,
+                    "moderator": ctx.author.id
+                }
+            
+            success_embed = self.create_embed(
+                "Member Temporarily Banned",
+                f"**{user}** has been banned for {duration}.\n**Unbanned:** <t:{int(unban_time.timestamp())}:R>\n**Reason:** {reason}",
+                "success"
+            )
+            await self.safe_send(ctx, embed=success_embed)
+            
+        except discord.Forbidden:
+            error_embed = self.create_embed("Error", "I don't have permission to ban that user.", "error")
+            await self.safe_send(ctx, embed=error_embed)
+        except discord.HTTPException as e:
+            error_embed = self.create_embed("Error", f"Failed to tempban user: {e}", "error")
+            await self.safe_send(ctx, embed=error_embed)
+
+    @commands.command()
+    @commands.guild_only()
+    @mod_or_permissions(ban_members=True)
     @commands.bot_has_permissions(ban_members=True)
     async def unban(self, ctx: commands.Context, user_id: int, *, reason: Optional[str] = None):
-        """Unban a user from the server."""
+        """Unban a user from the server.
+        
+        Removes a ban, allowing the user to rejoin the server.
+        
+        **Arguments:**
+        - `<user_id>` - The ID of the user to unban
+        - `[reason]` - Optional reason for the unban
+        
+        **Examples:**
+        - `[p]unban 123456789012345678 Appeal accepted`
+        - `[p]unban 987654321098765432 Ban was a mistake`
+        
+        **Required Permissions:**
+        - You: Ban Members OR Custom Moderator
+        - Bot: Ban Members
+        """
         reason = reason or "No reason provided"
         
         try:
             user = await self.bot.fetch_user(user_id)
             await ctx.guild.unban(user, reason=f"{ctx.author}: {reason}")
+            
+            # Remove from tempbans if present
+            async with self.config.guild(ctx.guild).tempbans() as tempbans:
+                if str(user_id) in tempbans:
+                    del tempbans[str(user_id)]
             
             success_embed = self.create_embed(
                 "Member Unbanned",
@@ -391,20 +732,113 @@ class MessageDelete(commands.Cog):
             error_embed = self.create_embed("Error", f"Failed to unban user: {e}", "error")
             await self.safe_send(ctx, embed=error_embed)
 
+    @commands.command()
+    @commands.guild_only()
+    @mod_or_permissions(ban_members=True)
+    @commands.bot_has_permissions(ban_members=True)
+    async def massban(self, ctx: commands.Context, *user_ids: int, reason: str = None):
+        """Mass ban multiple users from the server.
+        
+        Bans multiple users at once. Useful for handling raids or multiple rule breakers.
+        
+        **Arguments:**
+        - `<user_ids>` - Space-separated list of user IDs to ban (max 20)
+        - `[reason]` - Optional reason for the bans
+        
+        **Examples:**
+        - `[p]massban 123456789 987654321 555555555 Raid participants`
+        
+        **Required Permissions:**
+        - You: Ban Members OR Custom Moderator
+        - Bot: Ban Members
+        """
+        if len(user_ids) == 0:
+            error_embed = self.create_embed("No Users Provided", "Please provide at least one user ID.", "error")
+            await self.safe_send(ctx, embed=error_embed)
+            return
+        
+        if len(user_ids) > MAX_MASSBAN_USERS:
+            error_embed = self.create_embed("Too Many Users", f"Maximum {MAX_MASSBAN_USERS} users can be banned at once.", "error")
+            await self.safe_send(ctx, embed=error_embed)
+            return
+        
+        reason = reason or "Mass ban - No reason provided"
+        
+        banned = []
+        failed = []
+        
+        status_msg = await self.safe_send(ctx, f"Banning {len(user_ids)} users...")
+        
+        for user_id in user_ids:
+            try:
+                user = await self.bot.fetch_user(user_id)
+                await ctx.guild.ban(user, reason=f"Massban by {ctx.author}: {reason}", delete_message_days=1)
+                banned.append(f"{user} ({user_id})")
+            except discord.NotFound:
+                failed.append(f"{user_id} (Not found)")
+            except discord.Forbidden:
+                failed.append(f"{user_id} (Permission denied)")
+            except discord.HTTPException as e:
+                failed.append(f"{user_id} (Error: {e})")
+        
+        if status_msg:
+            await status_msg.delete()
+        
+        fields = []
+        if banned:
+            banned_text = "\n".join(banned[:10])
+            if len(banned) > 10:
+                banned_text += f"\n... and {len(banned) - 10} more"
+            fields.append(("Successfully Banned", banned_text, False))
+        
+        if failed:
+            failed_text = "\n".join(failed[:10])
+            if len(failed) > 10:
+                failed_text += f"\n... and {len(failed) - 10} more"
+            fields.append(("Failed", failed_text, False))
+        
+        result_embed = self.create_embed(
+            "Mass Ban Complete",
+            f"**Total:** {len(user_ids)} | **Banned:** {len(banned)} | **Failed:** {len(failed)}\n**Reason:** {reason}",
+            "success" if len(banned) > 0 else "warning",
+            fields=fields
+        )
+        await self.safe_send(ctx, embed=result_embed)
+
     @commands.command(aliases=["mute"])
     @commands.guild_only()
-    @commands.has_permissions(moderate_members=True)
+    @mod_or_permissions(moderate_members=True)
     @commands.bot_has_permissions(moderate_members=True)
     async def timeout(self, ctx: commands.Context, member: discord.Member, duration: str, *, reason: Optional[str] = None):
-        """Timeout a member for a specified duration."""
+        """Timeout a member for a specified duration.
+        
+        Prevents a member from sending messages, reacting, or speaking in voice channels.
+        
+        **Arguments:**
+        - `<member>` - The member to timeout
+        - `<duration>` - Duration (e.g., 10m, 2h, 1d - max 28 days)
+        - `[reason]` - Optional reason
+        
+        **Examples:**
+        - `[p]timeout @User 10m Spamming`
+        - `[p]mute @User 1h Inappropriate behavior`
+        
+        **Required Permissions:**
+        - You: Moderate Members OR Custom Moderator
+        - Bot: Moderate Members
+        """
         if not await self._can_moderate(ctx, member):
             return
         
-        # Parse duration with better error handling
         try:
             delta = self._parse_duration(duration)
         except ValueError as e:
             error_embed = self.create_embed("Invalid Duration", str(e), "error")
+            await self.safe_send(ctx, embed=error_embed)
+            return
+        
+        if delta.total_seconds() > 2419200:  # 28 days
+            error_embed = self.create_embed("Duration Too Long", "Maximum timeout duration is 28 days.", "error")
             await self.safe_send(ctx, embed=error_embed)
             return
         
@@ -429,10 +863,25 @@ class MessageDelete(commands.Cog):
 
     @commands.command(aliases=["unmute"])
     @commands.guild_only()
-    @commands.has_permissions(moderate_members=True)
+    @mod_or_permissions(moderate_members=True)
     @commands.bot_has_permissions(moderate_members=True)
     async def untimeout(self, ctx: commands.Context, member: discord.Member, *, reason: Optional[str] = None):
-        """Remove a timeout from a member."""
+        """Remove a timeout from a member.
+        
+        Restores a member's ability to send messages and participate normally.
+        
+        **Arguments:**
+        - `<member>` - The member to remove timeout from
+        - `[reason]` - Optional reason
+        
+        **Examples:**
+        - `[p]untimeout @User Apologized`
+        - `[p]unmute @User`
+        
+        **Required Permissions:**
+        - You: Moderate Members OR Custom Moderator
+        - Bot: Moderate Members
+        """
         reason = reason or "No reason provided"
         
         try:
@@ -454,10 +903,25 @@ class MessageDelete(commands.Cog):
 
     @commands.command(aliases=["clear", "clean"])
     @commands.guild_only()
-    @commands.has_permissions(manage_messages=True)
+    @mod_or_permissions(manage_messages=True)
     @commands.bot_has_permissions(manage_messages=True, read_message_history=True)
     async def purge(self, ctx: commands.Context, amount: int, member: Optional[discord.Member] = None):
-        """Delete messages. Can target specific user or purge all messages."""
+        """Delete multiple messages at once.
+        
+        Can delete all messages or only messages from a specific user.
+        
+        **Arguments:**
+        - `<amount>` - Number of messages to delete (1-1000)
+        - `[member]` - Optional: Only delete messages from this member
+        
+        **Examples:**
+        - `[p]purge 50` - Delete last 50 messages
+        - `[p]purge 100 @Spammer` - Delete last 100 messages from a specific user
+        
+        **Required Permissions:**
+        - You: Manage Messages OR Custom Moderator
+        - Bot: Manage Messages, Read Message History
+        """
         if amount < 1:
             error_embed = self.create_embed("Invalid Amount", "Amount must be at least 1.", "error")
             await self.safe_send(ctx, embed=error_embed)
@@ -473,7 +937,7 @@ class MessageDelete(commands.Cog):
                 return m.author == member if member else True
             
             deleted = await ctx.channel.purge(limit=amount + 1, check=check)
-            count = len(deleted) - 1  # Subtract command message
+            count = len(deleted) - 1
             
             target_text = f" from **{member}**" if member else ""
             success_embed = self.create_embed(
@@ -483,7 +947,6 @@ class MessageDelete(commands.Cog):
             )
             msg = await self.safe_send(ctx, embed=success_embed)
             
-            # Auto-delete confirmation after 5 seconds
             if msg:
                 await msg.delete(delay=5)
             
@@ -494,14 +957,207 @@ class MessageDelete(commands.Cog):
             error_embed = self.create_embed("Error", f"Failed to purge messages: {e}", "error")
             await self.safe_send(ctx, embed=error_embed)
 
+    @commands.command()
+    @commands.guild_only()
+    @mod_or_permissions(manage_nicknames=True)
+    @commands.bot_has_permissions(manage_nicknames=True)
+    async def rename(self, ctx: commands.Context, member: discord.Member, *, nickname: str = None):
+        """Change a member's server nickname.
+        
+        Sets or removes a member's nickname on the server.
+        
+        **Arguments:**
+        - `<member>` - The member to rename
+        - `[nickname]` - New nickname (leave empty to remove nickname)
+        
+        **Examples:**
+        - `[p]rename @User NewNickname`
+        - `[p]rename @User` - Remove nickname
+        
+        **Required Permissions:**
+        - You: Manage Nicknames OR Custom Moderator
+        - Bot: Manage Nicknames
+        """
+        if not await self._can_moderate(ctx, member):
+            return
+        
+        old_nick = member.nick or member.name
+        
+        try:
+            await member.edit(nick=nickname, reason=f"Nickname changed by {ctx.author}")
+            
+            if nickname:
+                success_embed = self.create_embed(
+                    "Nickname Changed",
+                    f"**{member}**'s nickname has been changed.\n**Old:** {old_nick}\n**New:** {nickname}",
+                    "success"
+                )
+            else:
+                success_embed = self.create_embed(
+                    "Nickname Removed",
+                    f"**{member}**'s nickname has been removed.\n**Old nickname:** {old_nick}",
+                    "success"
+                )
+            
+            await self.safe_send(ctx, embed=success_embed)
+            
+        except discord.Forbidden:
+            error_embed = self.create_embed("Error", "I don't have permission to change that member's nickname.", "error")
+            await self.safe_send(ctx, embed=error_embed)
+        except discord.HTTPException as e:
+            error_embed = self.create_embed("Error", f"Failed to change nickname: {e}", "error")
+            await self.safe_send(ctx, embed=error_embed)
+
+    @commands.command()
+    @commands.guild_only()
+    @mod_or_permissions(move_members=True)
+    @commands.bot_has_permissions(move_members=True)
+    async def voicekick(self, ctx: commands.Context, member: discord.Member, *, reason: Optional[str] = None):
+        """Kick a member from their current voice channel.
+        
+        Disconnects a member from the voice channel they're currently in.
+        
+        **Arguments:**
+        - `<member>` - The member to kick from voice
+        - `[reason]` - Optional reason
+        
+        **Examples:**
+        - `[p]voicekick @User Disrupting voice chat`
+        
+        **Required Permissions:**
+        - You: Move Members OR Custom Moderator
+        - Bot: Move Members
+        """
+        if not await self._can_moderate(ctx, member):
+            return
+        
+        if not member.voice:
+            error_embed = self.create_embed("Error", f"**{member}** is not in a voice channel.", "error")
+            await self.safe_send(ctx, embed=error_embed)
+            return
+        
+        reason = reason or "No reason provided"
+        
+        try:
+            await member.move_to(None, reason=f"Voice kicked by {ctx.author}: {reason}")
+            
+            success_embed = self.create_embed(
+                "Member Voice Kicked",
+                f"**{member}** has been kicked from voice.\n**Reason:** {reason}",
+                "success"
+            )
+            await self.safe_send(ctx, embed=success_embed)
+            
+        except discord.Forbidden:
+            error_embed = self.create_embed("Error", "I don't have permission to move that member.", "error")
+            await self.safe_send(ctx, embed=error_embed)
+        except discord.HTTPException as e:
+            error_embed = self.create_embed("Error", f"Failed to voice kick member: {e}", "error")
+            await self.safe_send(ctx, embed=error_embed)
+
+    @commands.command()
+    @commands.guild_only()
+    @mod_or_permissions(mute_members=True, deafen_members=True)
+    @commands.bot_has_permissions(mute_members=True, deafen_members=True)
+    async def voiceban(self, ctx: commands.Context, member: discord.Member, *, reason: Optional[str] = None):
+        """Ban a user from speaking and listening in voice channels.
+        
+        Server mutes and deafens a member, preventing them from using voice chat.
+        
+        **Arguments:**
+        - `<member>` - The member to voice ban
+        - `[reason]` - Optional reason
+        
+        **Examples:**
+        - `[p]voiceban @User Abusing voice chat`
+        
+        **Required Permissions:**
+        - You: Mute Members, Deafen Members OR Custom Moderator
+        - Bot: Mute Members, Deafen Members
+        """
+        if not await self._can_moderate(ctx, member):
+            return
+        
+        reason = reason or "No reason provided"
+        
+        try:
+            await member.edit(mute=True, deafen=True, reason=f"Voice banned by {ctx.author}: {reason}")
+            
+            success_embed = self.create_embed(
+                "Member Voice Banned",
+                f"**{member}** has been voice banned (muted and deafened).\n**Reason:** {reason}",
+                "success"
+            )
+            await self.safe_send(ctx, embed=success_embed)
+            
+        except discord.Forbidden:
+            error_embed = self.create_embed("Error", "I don't have permission to mute/deafen that member.", "error")
+            await self.safe_send(ctx, embed=error_embed)
+        except discord.HTTPException as e:
+            error_embed = self.create_embed("Error", f"Failed to voice ban member: {e}", "error")
+            await self.safe_send(ctx, embed=error_embed)
+
+    @commands.command()
+    @commands.guild_only()
+    @mod_or_permissions(mute_members=True, deafen_members=True)
+    @commands.bot_has_permissions(mute_members=True, deafen_members=True)
+    async def voiceunban(self, ctx: commands.Context, member: discord.Member, *, reason: Optional[str] = None):
+        """Unban a user from speaking and listening in voice channels.
+        
+        Removes server mute and deafen, restoring voice chat access.
+        
+        **Arguments:**
+        - `<member>` - The member to voice unban
+        - `[reason]` - Optional reason
+        
+        **Examples:**
+        - `[p]voiceunban @User`
+        
+        **Required Permissions:**
+        - You: Mute Members, Deafen Members OR Custom Moderator
+        - Bot: Mute Members, Deafen Members
+        """
+        reason = reason or "No reason provided"
+        
+        try:
+            await member.edit(mute=False, deafen=False, reason=f"Voice unbanned by {ctx.author}: {reason}")
+            
+            success_embed = self.create_embed(
+                "Member Voice Unbanned",
+                f"**{member}** has been voice unbanned (unmuted and undeafened).",
+                "success"
+            )
+            await self.safe_send(ctx, embed=success_embed)
+            
+        except discord.Forbidden:
+            error_embed = self.create_embed("Error", "I don't have permission to unmute/undeafen that member.", "error")
+            await self.safe_send(ctx, embed=error_embed)
+        except discord.HTTPException as e:
+            error_embed = self.create_embed("Error", f"Failed to voice unban member: {e}", "error")
+            await self.safe_send(ctx, embed=error_embed)
+
     # ==================== Channel Management ====================
     
     @commands.command()
     @commands.guild_only()
-    @commands.has_permissions(manage_channels=True)
+    @mod_or_permissions(manage_channels=True)
     @commands.bot_has_permissions(manage_channels=True)
     async def lock(self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None):
-        """Lock a channel so members cannot send messages."""
+        """Lock a channel so members cannot send messages.
+        
+        Prevents @everyone from sending messages in the channel.
+        
+        **Arguments:**
+        - `[channel]` - Channel to lock (defaults to current channel)
+        
+        **Examples:**
+        - `[p]lock`
+        - `[p]lock #general`
+        
+        **Required Permissions:**
+        - You: Manage Channels OR Custom Moderator
+        - Bot: Manage Channels
+        """
         channel = channel or ctx.channel
         overwrite = channel.overwrites_for(ctx.guild.default_role)
         
@@ -526,10 +1182,24 @@ class MessageDelete(commands.Cog):
 
     @commands.command()
     @commands.guild_only()
-    @commands.has_permissions(manage_channels=True)
+    @mod_or_permissions(manage_channels=True)
     @commands.bot_has_permissions(manage_channels=True)
     async def unlock(self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None):
-        """Unlock a channel so members can send messages."""
+        """Unlock a channel so members can send messages.
+        
+        Allows @everyone to send messages in the channel again.
+        
+        **Arguments:**
+        - `[channel]` - Channel to unlock (defaults to current channel)
+        
+        **Examples:**
+        - `[p]unlock`
+        - `[p]unlock #general`
+        
+        **Required Permissions:**
+        - You: Manage Channels OR Custom Moderator
+        - Bot: Manage Channels
+        """
         channel = channel or ctx.channel
         overwrite = channel.overwrites_for(ctx.guild.default_role)
         
@@ -554,13 +1224,29 @@ class MessageDelete(commands.Cog):
 
     @commands.command()
     @commands.guild_only()
-    @commands.has_permissions(manage_channels=True)
+    @mod_or_permissions(manage_channels=True)
     @commands.bot_has_permissions(manage_channels=True)
     async def slowmode(self, ctx: commands.Context, seconds: int, channel: Optional[discord.TextChannel] = None):
-        """Set slowmode for a channel."""
+        """Set slowmode for a channel.
+        
+        Adds a delay between messages that users can send.
+        
+        **Arguments:**
+        - `<seconds>` - Slowmode delay in seconds (0-21600, 0 to disable)
+        - `[channel]` - Channel to apply slowmode (defaults to current channel)
+        
+        **Examples:**
+        - `[p]slowmode 5` - 5 second slowmode
+        - `[p]slowmode 0` - Disable slowmode
+        - `[p]slowmode 30 #general`
+        
+        **Required Permissions:**
+        - You: Manage Channels OR Custom Moderator
+        - Bot: Manage Channels
+        """
         channel = channel or ctx.channel
         
-        if seconds < 0 or seconds > 21600:
+        if not 0 <= seconds <= 21600:
             error_embed = self.create_embed("Invalid Duration", "Slowmode must be between 0 and 21600 seconds (6 hours).", "error")
             await self.safe_send(ctx, embed=error_embed)
             return
@@ -585,62 +1271,154 @@ class MessageDelete(commands.Cog):
             error_embed = self.create_embed("Error", f"Failed to set slowmode: {e}", "error")
             await self.safe_send(ctx, embed=error_embed)
 
-    # ==================== Utility Functions ====================
-    
-    async def _can_moderate(self, ctx: commands.Context, member: discord.Member) -> bool:
-        """Check if user can moderate target member."""
-        if member.top_role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
-            error_embed = self.create_embed("Insufficient Permissions", "You cannot moderate someone with a role equal to or higher than yours.", "error")
-            await self.safe_send(ctx, embed=error_embed)
-            return False
-        
-        if member.top_role >= ctx.guild.me.top_role:
-            error_embed = self.create_embed("Insufficient Permissions", "I cannot moderate someone with a role equal to or higher than mine.", "error")
-            await self.safe_send(ctx, embed=error_embed)
-            return False
-        
-        if member == ctx.guild.owner:
-            error_embed = self.create_embed("Cannot Moderate Owner", "Cannot moderate the server owner.", "error")
-            await self.safe_send(ctx, embed=error_embed)
-            return False
-        
-        return True
+    # ==================== Warning System ====================
 
-    def _parse_duration(self, duration: str) -> timedelta:
-        """Parse duration string into timedelta object."""
-        time_units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    @commands.command()
+    @commands.guild_only()
+    @mod_or_permissions(moderate_members=True)
+    async def warn(self, ctx: commands.Context, member: discord.Member, *, reason: str):
+        """Issue a warning to a member.
         
-        if len(duration) < 2:
-            raise ValueError("Duration must be at least 2 characters (e.g., '5m')")
+        Adds a warning to a member's record that can be viewed later.
         
-        unit = duration[-1].lower()
-        if unit not in time_units:
-            raise ValueError("Invalid time unit. Use: s (seconds), m (minutes), h (hours), d (days)")
+        **Arguments:**
+        - `<member>` - The member to warn
+        - `<reason>` - Reason for the warning
+        
+        **Examples:**
+        - `[p]warn @User Breaking rule #3`
+        - `[p]warn @User Inappropriate language`
+        
+        **Required Permissions:**
+        - You: Moderate Members OR Custom Moderator
+        """
+        if not await self._can_moderate(ctx, member):
+            return
+        
+        async with self.config.guild(ctx.guild).warnings() as warnings:
+            if str(member.id) not in warnings:
+                warnings[str(member.id)] = []
+            
+            warning = {
+                "reason": reason,
+                "moderator": ctx.author.id,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            warnings[str(member.id)].append(warning)
+            warn_count = len(warnings[str(member.id)])
         
         try:
-            amount = int(duration[:-1])
-        except ValueError:
-            raise ValueError("Invalid duration format. Example: 10m, 2h, 1d")
+            user_embed = self.create_embed(
+                f"Warning in {ctx.guild.name}",
+                f"**Reason:** {reason}\n**Total Warnings:** {warn_count}",
+                "warning"
+            )
+            await member.send(embed=user_embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
         
-        if amount <= 0:
-            raise ValueError("Duration must be a positive number")
+        success_embed = self.create_embed(
+            "Member Warned",
+            f"**{member}** has been warned. This is warning #{warn_count}.\n**Reason:** {reason}",
+            "success"
+        )
+        await self.safe_send(ctx, embed=success_embed)
+
+    @commands.command()
+    @commands.guild_only()
+    @mod_or_permissions(moderate_members=True)
+    async def warnings(self, ctx: commands.Context, member: discord.Member):
+        """View all warnings for a member.
         
-        seconds = amount * time_units[unit]
-        if seconds > 2419200:  # 28 days
-            raise ValueError("Maximum timeout duration is 28 days")
+        Displays a member's warning history.
         
-        return timedelta(seconds=seconds)
+        **Arguments:**
+        - `<member>` - The member to check warnings for
+        
+        **Examples:**
+        - `[p]warnings @User`
+        
+        **Required Permissions:**
+        - You: Moderate Members OR Custom Moderator
+        """
+        all_warnings = await self.config.guild(ctx.guild).warnings()
+        user_warnings = all_warnings.get(str(member.id), [])
+        
+        if not user_warnings:
+            embed = self.create_embed("No Warnings", f"**{member}** has no warnings.", "success")
+            await self.safe_send(ctx, embed=embed)
+            return
+        
+        fields = []
+        for i, warning in enumerate(user_warnings[-10:], 1):  # Show last 10
+            mod = ctx.guild.get_member(warning["moderator"])
+            mod_name = mod.mention if mod else f"Unknown (ID: {warning['moderator']})"
+            timestamp = datetime.fromisoformat(warning["timestamp"])
+            
+            fields.append((
+                f"Warning #{len(user_warnings) - 10 + i if len(user_warnings) > 10 else i}",
+                f"**Reason:** {warning['reason']}\n**Moderator:** {mod_name}\n**Date:** <t:{int(timestamp.timestamp())}:R>",
+                False
+            ))
+        
+        embed = self.create_embed(f"Warnings for {member}", fields=fields, color="warning")
+        embed.set_footer(text=f"Total warnings: {len(user_warnings)} | Showing last 10")
+        
+        await self.safe_send(ctx, embed=embed)
+
+    @commands.command()
+    @commands.guild_only()
+    @commands.admin_or_permissions(administrator=True)
+    async def clearwarnings(self, ctx: commands.Context, member: discord.Member):
+        """Clear all warnings for a member.
+        
+        Removes all warnings from a member's record.
+        
+        **Arguments:**
+        - `<member>` - The member to clear warnings for
+        
+        **Examples:**
+        - `[p]clearwarnings @User`
+        
+        **Required Permissions:**
+        - You: Administrator
+        """
+        async with self.config.guild(ctx.guild).warnings() as warnings:
+            if str(member.id) in warnings:
+                count = len(warnings[str(member.id)])
+                del warnings[str(member.id)]
+                
+                success_embed = self.create_embed(
+                    "Warnings Cleared",
+                    f"Cleared {count} warning(s) for **{member}**.",
+                    "success"
+                )
+                await self.safe_send(ctx, embed=success_embed)
+            else:
+                error_embed = self.create_embed("No Warnings", f"**{member}** has no warnings to clear.", "warning")
+                await self.safe_send(ctx, embed=error_embed)
 
     # ==================== Information Commands ====================
 
     @commands.command(aliases=["ui", "whois"])
     @commands.guild_only()
     async def userinfo(self, ctx: commands.Context, member: Optional[discord.Member] = None):
-        """Show detailed information about a user."""
+        """Show detailed information about a member.
+        
+        Displays account creation date, join date, roles, and other member information.
+        
+        **Arguments:**
+        - `[member]` - Member to get info about (defaults to yourself)
+        
+        **Examples:**
+        - `[p]userinfo`
+        - `[p]userinfo @User`
+        - `[p]whois @User`
+        """
         member = member or ctx.author
         
         roles = [role.mention for role in member.roles if role != ctx.guild.default_role]
-        roles_display = ", ".join(roles[:10])  # Limit to prevent embed overflow
+        roles_display = ", ".join(roles[:10])
         if len(roles) > 10:
             roles_display += f" ... and {len(roles) - 10} more"
         
@@ -668,10 +1446,16 @@ class MessageDelete(commands.Cog):
     @commands.command(aliases=["si", "guildinfo"])
     @commands.guild_only()
     async def serverinfo(self, ctx: commands.Context):
-        """Show information about the server."""
+        """Show information about the server.
+        
+        Displays server stats including member count, roles, channels, and more.
+        
+        **Examples:**
+        - `[p]serverinfo`
+        - `[p]si`
+        """
         guild = ctx.guild
         
-        # Calculate member stats
         online_members = sum(1 for m in guild.members if m.status != discord.Status.offline)
         bot_count = sum(1 for m in guild.members if m.bot)
         
@@ -698,7 +1482,18 @@ class MessageDelete(commands.Cog):
     @commands.command(aliases=["av", "pfp"])
     @commands.guild_only()
     async def avatar(self, ctx: commands.Context, member: Optional[discord.Member] = None):
-        """Show a user's avatar."""
+        """Show a user's avatar in high quality.
+        
+        Displays the full-size avatar with a download link.
+        
+        **Arguments:**
+        - `[member]` - Member to get avatar from (defaults to yourself)
+        
+        **Examples:**
+        - `[p]avatar`
+        - `[p]avatar @User`
+        - `[p]av @User`
+        """
         member = member or ctx.author
         
         embed = self.create_embed(
@@ -709,25 +1504,32 @@ class MessageDelete(commands.Cog):
         
         await self.safe_send(ctx, embed=embed)
 
-    @commands.command()
+    @commands.command(aliases=["latency", "botping"])
     @commands.guild_only()
-    async def ping(self, ctx: commands.Context):
-        """Check the bot's latency."""
+    async def status(self, ctx: commands.Context):
+        """Check the bot's latency and status.
+        
+        Shows websocket latency and bot performance metrics.
+        
+        **Examples:**
+        - `[p]status`
+        - `[p]latency`
+        """
         latency_ms = round(self.bot.latency * 1000)
         
         if latency_ms < 100:
             color = "success"
-            status = "Excellent"
+            status_text = "Excellent"
         elif latency_ms < 300:
             color = "warning"
-            status = "Good"
+            status_text = "Good"
         else:
             color = "error"
-            status = "Poor"
+            status_text = "Poor"
         
         embed = self.create_embed(
-            "Bot Latency",
-            f"**{latency_ms}ms** ({status})",
+            "Bot Status",
+            f"**Latency:** {latency_ms}ms ({status_text})",
             color
         )
         
@@ -737,7 +1539,17 @@ class MessageDelete(commands.Cog):
 
     @commands.command(aliases=["8ball"])
     async def eightball(self, ctx: commands.Context, *, question: str):
-        """Ask the magic 8-ball a question."""
+        """Ask the magic 8-ball a question.
+        
+        Get mystical answers to your yes/no questions.
+        
+        **Arguments:**
+        - `<question>` - Your question
+        
+        **Examples:**
+        - `[p]8ball Will I win the lottery?`
+        - `[p]eightball Should I study today?`
+        """
         responses = [
             "It is certain", "Without a doubt", "Yes definitely", "You may rely on it",
             "As I see it, yes", "Most likely", "Outlook good", "Yes", "Signs point to yes",
@@ -757,7 +1569,16 @@ class MessageDelete(commands.Cog):
     @commands.command()
     @commands.guild_only()
     async def poll(self, ctx: commands.Context, *, question: str):
-        """Create a simple yes/no poll."""
+        """Create a simple yes/no poll.
+        
+        Creates a poll message with yes/no reaction buttons.
+        
+        **Arguments:**
+        - `<question>` - The poll question
+        
+        **Examples:**
+        - `[p]poll Should we add a new channel?`
+        """
         embed = self.create_embed(
             "Poll",
             question,
@@ -773,7 +1594,17 @@ class MessageDelete(commands.Cog):
     @commands.command()
     @commands.guild_only()
     async def choose(self, ctx: commands.Context, *choices):
-        """Let the bot choose between multiple options."""
+        """Let the bot randomly choose between options.
+        
+        Provide multiple options and the bot will pick one randomly.
+        
+        **Arguments:**
+        - `<choices>` - Space-separated list of options (minimum 2)
+        
+        **Examples:**
+        - `[p]choose pizza burger tacos`
+        - `[p]choose yes no maybe`
+        """
         if len(choices) < 2:
             error_embed = self.create_embed("Not Enough Options", "Please provide at least 2 choices separated by spaces.", "error")
             await self.safe_send(ctx, embed=error_embed)
@@ -792,7 +1623,13 @@ class MessageDelete(commands.Cog):
     @commands.command()
     @commands.guild_only()
     async def coinflip(self, ctx: commands.Context):
-        """Flip a coin."""
+        """Flip a coin.
+        
+        Simple coin flip - heads or tails.
+        
+        **Examples:**
+        - `[p]coinflip`
+        """
         result = random.choice(["Heads", "Tails"])
         
         embed = self.create_embed(
@@ -806,7 +1643,15 @@ class MessageDelete(commands.Cog):
     @commands.command()
     @commands.guild_only()
     async def dice(self, ctx: commands.Context, sides: int = 6):
-        """Roll a dice with specified number of sides."""
+        """Roll a dice with a specified number of sides.
+        
+        **Arguments:**
+        - `[sides]` - Number of sides on the dice (2-100, default: 6)
+        
+        **Examples:**
+        - `[p]dice` - Roll a standard 6-sided dice
+        - `[p]dice 20` - Roll a 20-sided dice
+        """
         if sides < 2:
             error_embed = self.create_embed("Invalid Dice", "Dice must have at least 2 sides.", "error")
             await self.safe_send(ctx, embed=error_embed)
@@ -827,188 +1672,28 @@ class MessageDelete(commands.Cog):
         
         await self.safe_send(ctx, embed=embed)
 
-    # ==================== Warning System ====================
-
-    @commands.command()
-    @commands.guild_only()
-    @commands.has_permissions(moderate_members=True)
-    async def warn(self, ctx: commands.Context, member: discord.Member, *, reason: str):
-        """Warn a member."""
-        if not await self._can_moderate(ctx, member):
-            return
-        
-        async with self.config.guild(ctx.guild).warnings() as warnings:
-            if str(member.id) not in warnings:
-                warnings[str(member.id)] = []
-            
-            warning = {
-                "reason": reason,
-                "moderator": ctx.author.id,
-                "timestamp": datetime.utcnow().isoformat()
-            }
-            warnings[str(member.id)].append(warning)
-            warn_count = len(warnings[str(member.id)])
-        
-        # Notify user
-        try:
-            user_embed = self.create_embed(
-                f"Warning in {ctx.guild.name}",
-                f"**Reason:** {reason}\n**Total Warnings:** {warn_count}",
-                "warning"
-            )
-            await member.send(embed=user_embed)
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-        
-        success_embed = self.create_embed(
-            "Member Warned",
-            f"**{member}** has been warned. This is warning #{warn_count}.\n**Reason:** {reason}",
-            "success"
-        )
-        await self.safe_send(ctx, embed=success_embed)
-
-    @commands.command()
-    @commands.guild_only()
-    @commands.has_permissions(moderate_members=True)
-    async def warnings(self, ctx: commands.Context, member: discord.Member):
-        """View all warnings for a member."""
-        all_warnings = await self.config.guild(ctx.guild).warnings()
-        user_warnings = all_warnings.get(str(member.id), [])
-        
-        if not user_warnings:
-            embed = self.create_embed("No Warnings", f"**{member}** has no warnings.", "success")
-            await self.safe_send(ctx, embed=embed)
-            return
-        
-        fields = []
-        for i, warning in enumerate(user_warnings, 1):
-            mod = ctx.guild.get_member(warning["moderator"])
-            mod_name = mod.mention if mod else f"Unknown (ID: {warning['moderator']})"
-            timestamp = datetime.fromisoformat(warning["timestamp"])
-            
-            fields.append((
-                f"Warning #{i}",
-                f"**Reason:** {warning['reason']}\n**Moderator:** {mod_name}\n**Date:** <t:{int(timestamp.timestamp())}:R>",
-                False
-            ))
-        
-        embed = self.create_embed(f"Warnings for {member}", fields=fields, color="warning")
-        embed.set_footer(text=f"Total warnings: {len(user_warnings)}")
-        
-        await self.safe_send(ctx, embed=embed)
-
-    @commands.command()
-    @commands.guild_only()
-    @commands.has_permissions(administrator=True)
-    async def clearwarnings(self, ctx: commands.Context, member: discord.Member):
-        """Clear all warnings for a member."""
-        async with self.config.guild(ctx.guild).warnings() as warnings:
-            if str(member.id) in warnings:
-                count = len(warnings[str(member.id)])
-                del warnings[str(member.id)]
-                
-                success_embed = self.create_embed(
-                    "Warnings Cleared",
-                    f"Cleared {count} warning(s) for **{member}**.",
-                    "success"
-                )
-                await self.safe_send(ctx, embed=success_embed)
-            else:
-                error_embed = self.create_embed("No Warnings", f"**{member}** has no warnings to clear.", "warning")
-                await self.safe_send(ctx, embed=error_embed)
-
-    # ==================== AutoMod Configuration ====================
-
-    @commands.group(name="automod", invoke_without_command=True)
-    @commands.has_permissions(administrator=True)
-    @commands.guild_only()
-    async def automod(self, ctx: commands.Context):
-        """Configure automatic moderation settings."""
-        await ctx.send_help(ctx.command)
-
-    @automod.command(name="toggle")
-    async def automod_toggle(self, ctx: commands.Context):
-        """Toggle automod on/off."""
-        current = await self.config.guild(ctx.guild).automod_enabled()
-        new_status = not current
-        await self.config.guild(ctx.guild).automod_enabled.set(new_status)
-        
-        status = "enabled" if new_status else "disabled"
-        color = "success" if new_status else "warning"
-        
-        embed = self.create_embed("AutoMod Updated", f"AutoMod has been **{status}**.", color)
-        await self.safe_send(ctx, embed=embed)
-
-    @automod.command(name="invites")
-    async def automod_invites(self, ctx: commands.Context):
-        """Toggle invite link filtering."""
-        current = await self.config.guild(ctx.guild).filter_invites()
-        new_status = not current
-        await self.config.guild(ctx.guild).filter_invites.set(new_status)
-        
-        status = "enabled" if new_status else "disabled"
-        color = "success" if new_status else "warning"
-        
-        embed = self.create_embed("Invite Filter Updated", f"Invite filtering has been **{status}**.", color)
-        await self.safe_send(ctx, embed=embed)
-
-    @automod.command(name="links")
-    async def automod_links(self, ctx: commands.Context):
-        """Toggle external link filtering."""
-        current = await self.config.guild(ctx.guild).filter_links()
-        new_status = not current
-        await self.config.guild(ctx.guild).filter_links.set(new_status)
-        
-        status = "enabled" if new_status else "disabled"
-        color = "success" if new_status else "warning"
-        
-        embed = self.create_embed("Link Filter Updated", f"Link filtering has been **{status}**.", color)
-        await self.safe_send(ctx, embed=embed)
-
-    @automod.command(name="mentions")
-    async def automod_mentions(self, ctx: commands.Context, limit: int):
-        """Set the mass mention limit (1-10)."""
-        if limit < 1 or limit > 10:
-            error_embed = self.create_embed("Invalid Limit", "Mention limit must be between 1 and 10.", "error")
-            await self.safe_send(ctx, embed=error_embed)
-            return
-        
-        await self.config.guild(ctx.guild).mass_mention_limit.set(limit)
-        
-        success_embed = self.create_embed("Mention Limit Updated", f"Mass mention limit set to **{limit}**.", "success")
-        await self.safe_send(ctx, embed=success_embed)
-
-    @automod.command(name="settings")
-    async def automod_settings(self, ctx: commands.Context):
-        """View current automod settings."""
-        config = await self.config.guild(ctx.guild).all()
-        
-        def format_status(enabled: bool) -> str:
-            return "Enabled" if enabled else "Disabled"
-        
-        fields = [
-            ("AutoMod Status", format_status(config["automod_enabled"]), True),
-            ("Filter Invites", format_status(config["filter_invites"]), True),
-            ("Filter Links", format_status(config["filter_links"]), True),
-            ("Spam Threshold", f"{config['spam_threshold']} msgs/10s", True),
-            ("Mass Mention Limit", str(config["mass_mention_limit"]), True),
-        ]
-        
-        embed = self.create_embed("AutoMod Settings", fields=fields, color="info")
-        await self.safe_send(ctx, embed=embed)
-
     # ==================== Message Block Commands ====================
     
     @commands.group(name="msgblock", invoke_without_command=True)
     @commands.is_owner()
     @commands.guild_only()
     async def msgblock(self, ctx: commands.Context):
-        """Manage users whose messages are automatically deleted."""
+        """Manage users whose messages are automatically deleted.
+        
+        Use subcommands to add, remove, or list blocked users.
+        """
         await ctx.send_help(ctx.command)
 
     @msgblock.command(name="add")
     async def msgblock_add(self, ctx: commands.Context, user_id: int):
-        """Add a user to the message deletion list."""
+        """Add a user to the message deletion list.
+        
+        **Arguments:**
+        - `<user_id>` - Discord user ID to block
+        
+        **Examples:**
+        - `[p]msgblock add 123456789012345678`
+        """
         if user_id <= 0:
             error_embed = self.create_embed("Invalid User ID", "User ID must be a positive number.", "error")
             await self.safe_send(ctx, embed=error_embed)
@@ -1027,7 +1712,14 @@ class MessageDelete(commands.Cog):
 
     @msgblock.command(name="remove")
     async def msgblock_remove(self, ctx: commands.Context, user_id: int):
-        """Remove a user from the message deletion list."""
+        """Remove a user from the message deletion list.
+        
+        **Arguments:**
+        - `<user_id>` - Discord user ID to unblock
+        
+        **Examples:**
+        - `[p]msgblock remove 123456789012345678`
+        """
         async with self.config.guild(ctx.guild).blocked_users() as blocked_users:
             if user_id not in blocked_users:
                 error_embed = self.create_embed("Not Blocked", f"User ID `{user_id}` is not blocked.", "warning")
@@ -1041,7 +1733,11 @@ class MessageDelete(commands.Cog):
 
     @msgblock.command(name="list")
     async def msgblock_list(self, ctx: commands.Context):
-        """Show all blocked users."""
+        """Show all blocked users.
+        
+        **Examples:**
+        - `[p]msgblock list`
+        """
         blocked_users = await self.config.guild(ctx.guild).blocked_users()
         
         if not blocked_users:
@@ -1057,7 +1753,6 @@ class MessageDelete(commands.Cog):
             else:
                 user_list.append(f"• `{user_id}` (Not in server)")
         
-        # Split into chunks if too long
         description = "\n".join(user_list)
         if len(description) > 4000:
             description = description[:4000] + f"\n... and {len(blocked_users) - description.count('•')} more"
@@ -1083,7 +1778,7 @@ class MessageDelete(commands.Cog):
         hawk_enabled = await self.config.guild(ctx.guild).hawk_enabled()
         if not hawk_enabled:
             embed = discord.Embed(color=0xED4245)
-            embed.set_image(url="https://cdn.discordapp.com/attachments/1069748983293022249/1425831928644501624/4rMETw3.gif?ex=68ef9c76&is=68ee4af6&hm=39b6924ec16d99466f581f6f85427430d72d646729aa82566aa87e2b4ad24b3f&")
+            embed.set_image(url="https://cdn.discordapp.com/attachments/1069748983293022249/1425831928644501624/4rMETw3.gif")
             embed.description = "The hawk command is currently disabled."
             await self.safe_send(ctx, embed=embed)
             return
@@ -1123,7 +1818,7 @@ class MessageDelete(commands.Cog):
         gay_enabled = await self.config.guild(ctx.guild).gay_enabled()
         if not gay_enabled:
             embed = discord.Embed(color=0xED4245)
-            embed.set_image(url="https://cdn.discordapp.com/attachments/1069748983293022249/1425831928644501624/4rMETw3.gif?ex=68ef9c76&is=68ee4af6&hm=39b6924ec16d99466f581f6f85427430d72d646729aa82566aa87e2b4ad24b3f&")
+            embed.set_image(url="https://cdn.discordapp.com/attachments/1069748983293022249/1425831928644501624/4rMETw3.gif")
             embed.description = "The gay command is currently disabled."
             await self.safe_send(ctx, embed=embed)
             return
@@ -1259,12 +1954,10 @@ class MessageDelete(commands.Cog):
         status_text = "enabled" if new_status else "disabled"
         
         if new_status:
-            # Show the green "enabled" image
             embed = discord.Embed(color=0x57F287)
-            embed.set_image(url="https://cdn.discordapp.com/attachments/1069748983293022249/1425831721160540281/NzusuSn.png?ex=68ef9c44&is=68ee4ac4&hm=e97e9983b9d353846965007409b69c50f696589f21fe423e257d6e43e61972cb&")
+            embed.set_image(url="https://cdn.discordapp.com/attachments/1069748983293022249/1425831721160540281/NzusuSn.png")
             embed.description = f"Hawk command is now **{status_text}**."
         else:
-            # Just show text for disabled
             embed = self.create_embed("Hawk Command Updated", f"Hawk command is now **{status_text}**.", "warning")
         
         await self.safe_send(ctx, embed=embed)
@@ -1281,12 +1974,10 @@ class MessageDelete(commands.Cog):
         status_text = "enabled" if new_status else "disabled"
         
         if new_status:
-            # Show the green "enabled" image
             embed = discord.Embed(color=0x57F287)
-            embed.set_image(url="https://cdn.discordapp.com/attachments/1069748983293022249/1425831721160540281/NzusuSn.png?ex=68ef9c44&is=68ee4ac4&hm=e97e9983b9d353846965007409b69c50f696589f21fe423e257d6e43e61972cb&")
+            embed.set_image(url="https://cdn.discordapp.com/attachments/1069748983293022249/1425831721160540281/NzusuSn.png")
             embed.description = f"Gay command is now **{status_text}**."
         else:
-            # Just show text for disabled
             embed = self.create_embed("Gay Command Updated", f"Gay command is now **{status_text}**.", "warning")
         
         await self.safe_send(ctx, embed=embed)
