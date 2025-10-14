@@ -12,8 +12,8 @@ THANOS_IMG = "https://cdn.discordapp.com/attachments/1069748983293022249/1425583
 HAWK_ENABLED_GIF = "https://cdn.discordapp.com/attachments/1069748983293022249/1425831721160540281/NzusuSn.png?ex=68ef9c44&is=68ee4ac4&hm=e97e9983b9d353846965007409b69c50f696589f21fe423e257d6e43e61972cb&"
 HAWK_DISABLED_GIF = "https://cdn.discordapp.com/attachments/1069748983293022249/1425831928644501624/4rMETw3.gif?ex=68ef9c76&is=68ee4af6&hm=39b6924ec16d99466f581f6f85427430d72d646729aa82566aa87e2b4ad24b3f&"
 
-PRIMARY = discord.Color.purple()
-SUCCESS = discord.Color.green()
+BASE = discord.Color.purple()
+SUCCESS = discord.Color.purple()
 ERROR = discord.Color.red()
 
 class Utilities(commands.Cog):
@@ -37,7 +37,7 @@ class Utilities(commands.Cog):
         member = member or ctx.author
         embed = discord.Embed(
             title=f"{member.display_name}'s Avatar",
-            color=PRIMARY
+            color=BASE
         )
         embed.set_image(url=member.display_avatar.url)
         embed.set_footer(text=f"ID: {member.id}")
@@ -50,7 +50,7 @@ class Utilities(commands.Cog):
         roles = [r.mention for r in member.roles if r != ctx.guild.default_role]
         embed = discord.Embed(
             title=f"{member}",
-            color=member.color
+            color=BASE
         )
         embed.set_thumbnail(url=member.display_avatar.url)
         embed.add_field(name="ID", value=member.id)
@@ -67,7 +67,7 @@ class Utilities(commands.Cog):
         guild = ctx.guild
         embed = discord.Embed(
             title=f"{guild.name}",
-            color=PRIMARY,
+            color=BASE,
             description=f"**ID:** `{guild.id}`\nOwner: {guild.owner.display_name}"
         )
         embed.add_field(name="Members", value=guild.member_count)
@@ -83,7 +83,7 @@ class Utilities(commands.Cog):
         embed = discord.Embed(
             title="Bot Latency",
             description=f"{round(ctx.bot.latency * 1000)} ms",
-            color=PRIMARY
+            color=BASE
         )
         await ctx.send(embed=embed)
 
@@ -97,7 +97,7 @@ class Utilities(commands.Cog):
         embed = discord.Embed(
             title="Magic 8-ball",
             description=f"**Question:** {question}\n**Answer:** {random.choice(responses)}",
-            color=PRIMARY
+            color=BASE
         )
         await ctx.send(embed=embed)
 
@@ -107,7 +107,7 @@ class Utilities(commands.Cog):
         embed = discord.Embed(
             title="Poll",
             description=f"**{question}**\n👍 = Yes\n👎 = No",
-            color=PRIMARY
+            color=BASE
         )
         msg = await ctx.send(embed=embed)
         await msg.add_reaction("👍")
@@ -123,7 +123,7 @@ class Utilities(commands.Cog):
         embed = discord.Embed(
             title="Choose",
             description=f"I choose: **{choice}**",
-            color=PRIMARY
+            color=BASE
         )
         await ctx.send(embed=embed)
 
@@ -133,7 +133,7 @@ class Utilities(commands.Cog):
         embed = discord.Embed(
             title="Coin Flip",
             description=f"Result: **{random.choice(['Heads', 'Tails'])}**",
-            color=PRIMARY
+            color=BASE
         )
         await ctx.send(embed=embed)
 
@@ -146,7 +146,7 @@ class Utilities(commands.Cog):
         embed = discord.Embed(
             title="Dice Roll",
             description=f"Rolled: **{random.randint(1, sides)}** (d{sides})",
-            color=PRIMARY
+            color=BASE
         )
         await ctx.send(embed=embed)
 
@@ -185,7 +185,7 @@ class Utilities(commands.Cog):
         embed = discord.Embed(
             title="🦅 Hawk Check!",
             description=f"{user.mention} Are you a hawk?",
-            color=discord.Color.blurple()
+            color=BASE
         )
         await ctx.send(
             embed=embed,
@@ -216,7 +216,7 @@ class Utilities(commands.Cog):
         embed = discord.Embed(
             title="Gay Percentage",
             description=f"{user.display_name} is **{pct}% gay!** 🏳️‍🌈",
-            color=PRIMARY
+            color=BASE
         )
         await ctx.send(embed=embed)
 
@@ -225,7 +225,7 @@ class Utilities(commands.Cog):
         """Show Thanos meme."""
         embed = discord.Embed(
             title="Thanos Meme",
-            color=PRIMARY
+            color=BASE
         )
         embed.set_image(url=THANOS_IMG)
         await ctx.send(embed=embed)
@@ -270,14 +270,16 @@ class Utilities(commands.Cog):
     @commands.is_owner()
     @commands.guild_only()
     async def listhawk(self, ctx):
-        """List all hawk users."""
+        """List all hawk users and show how many are in the list."""
         hawk_users = await self.config.guild(ctx.guild).hawk_users()
+        total = len(hawk_users)
         if not hawk_users:
             embed = discord.Embed(
                 title="🦅 Hawk List",
                 description="The hawk list is empty.",
                 color=ERROR
             )
+            embed.set_footer(text="Total: 0")
             await ctx.send(embed=embed)
             return
         lines = []
@@ -290,8 +292,9 @@ class Utilities(commands.Cog):
         embed = discord.Embed(
             title="🦅 Hawk List",
             description="\n".join(lines),
-            color=SUCCESS
+            color=BASE
         )
+        embed.set_footer(text=f"Total: {total}")
         await ctx.send(embed=embed)
 
     @commands.command()
@@ -304,7 +307,7 @@ class Utilities(commands.Cog):
         embed = discord.Embed(
             title="🦅 Hawk Command Toggled",
             description=f"Hawk command is now **{'enabled' if not enabled else 'disabled'}**.",
-            color=SUCCESS if not enabled else ERROR
+            color=BASE
         )
         gif = HAWK_ENABLED_GIF if not enabled else HAWK_DISABLED_GIF
         embed.set_image(url=gif)
@@ -320,7 +323,7 @@ class Utilities(commands.Cog):
         embed = discord.Embed(
             title="Gay Command Toggled",
             description=f"Gay command is now **{'enabled' if not enabled else 'disabled'}**.",
-            color=SUCCESS if not enabled else ERROR
+            color=BASE
         )
         gif = HAWK_ENABLED_GIF if not enabled else HAWK_DISABLED_GIF
         embed.set_image(url=gif)
