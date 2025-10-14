@@ -16,9 +16,47 @@ class TidalPlayer(commands.Cog):
             "refresh_token": None,
             "client_id": None,
             "client_secret": None,
-            "country_code": "US"
+            "country_code": "US",
+            "enabled": True
         }
         self.config.register_global(**default_global)
+    
+    @commands.Cog.listener()
+    async def on_command(self, ctx):
+        """Intercept play commands and add Tidal search"""
+        if ctx.command.qualified_name != "play":
+            return
+        
+        enabled = await self.config.enabled()
+        if not enabled:
+            return
+        
+        # Get the query from command arguments
+        if not ctx.args or len(ctx.args) < 3:
+            return
+        
+        query = ctx.kwargs.get('query') or (ctx.args[2] if len(ctx.args) > 2 else None)
+        if not query or "http" in query:  # Skip URLs
+            return
+        
+        bearer_token = await self.config.bearer_token()
+        if not bearer_token:
+            return
+        
+        # Search Tidal
+        tidal_result = await self.search_tidal(query, bearer_token)
+        
+        if tidal_result:
+            # Modify the query to use Tidal metadata
+            new_query = f"{tidal_result['artist']} {tidal_result['title']}"
+            await ctx.send(f"🎵 Found on Tidal: **{tidal_result['title']}** by **{tidal_result['artist']}**")
+            
+            # Update the context kwargs/args with new query
+            if 'query' in ctx.kwargs:
+                ctx.kwargs['query'] = new_query
+            elif len(ctx.args) > 2:
+                ctx.args = list(ctx.args)
+                ctx.args[2] = new_query
     
     @commands.group()
     @commands.is_owner()
@@ -26,6 +64,17 @@ class TidalPlayer(commands.Cog):
         """TidalPlayer commands"""
         if ctx.invoked_subcommand is None:
             await ctx.send_help()
+    
+    @tidalplay.command(name="toggle")
+    async def toggle_integration(self, ctx):
+        """Enable/disable Tidal integration with play command"""
+        current = await self.config.enabled()
+        await self.config.enabled.set(not current)
+        
+        if not current:
+            await ctx.send("✅ Tidal integration **enabled** - >play will search Tidal first")
+        else:
+            await ctx.send("❌ Tidal integration **disabled** - >play will work normally")
     
     @tidalplay.command(name="setup")
     async def setup_oauth(self, ctx):
@@ -186,38 +235,6 @@ Reply with the **authorization code**:
         except Exception as e:
             log.error(f"Error refreshing token: {e}")
             return False
-    
-    @commands.command()
-    async def play(self, ctx, *, query: str):
-        """Play from Tidal first, YouTube as fallback"""
-        
-        bearer_token = await self.config.bearer_token()
-        
-        if not bearer_token:
-            await ctx.send("⚠️ No Tidal token set! Run `>tidalplay setup` first, or searching YouTube directly...")
-            search_query = query
-        else:
-            # Try Tidal first
-            async with ctx.typing():
-                tidal_result = await self.search_tidal(query, bearer_token)
-            
-            if tidal_result:
-                # Found on Tidal - use metadata for YouTube search
-                search_query = f"{tidal_result['artist']} {tidal_result['title']}"
-                await ctx.send(f"🎵 Found on Tidal: **{tidal_result['title']}** by **{tidal_result['artist']}**\nSearching YouTube...")
-            else:
-                # Not found on Tidal - fallback to direct search
-                search_query = query
-                await ctx.send("🔍 Not found on Tidal, searching YouTube directly...")
-        
-        # Use Audio cog to play from YouTube
-        audio = self.bot.get_cog("Audio")
-        if not audio:
-            await ctx.send("❌ Audio cog is not loaded!")
-            return
-        
-        # Call Audio's play command
-        await audio.command_play(ctx, query=search_query)
     
     async def search_tidal(self, query: str, bearer_token: str):
         """Search Tidal catalog using OAuth Bearer token"""
