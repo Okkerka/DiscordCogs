@@ -12,9 +12,9 @@ def mod_or_permissions(**perms):
         cog = ctx.bot.get_cog("Moderation")
         moderators = await cog.config.guild(ctx.guild).moderators() if (ctx.guild and cog) else []
         if ctx.guild and ctx.author.id in moderators:
-            # Modset: Must also have permissions
+            # mods: Must also have permissions
             return await commands.has_permissions(**perms).predicate(ctx)
-        # Anyone not in modset: denied
+        # Anyone not in mods: denied
         return False
     return commands.check(predicate)
 
@@ -65,15 +65,15 @@ class Moderation(commands.Cog):
             except Exception:
                 await asyncio.sleep(60)
 
-    # ================= Modset Management =================
+    # ================= mods Management =================
     @commands.group(invoke_without_command=True)
     @commands.guild_only()
     @commands.admin_or_permissions(administrator=True)
-    async def modset(self, ctx: commands.Context):
+    async def mods(self, ctx: commands.Context):
         """Manage custom moderators for this server."""
         await ctx.send_help(ctx.command)
 
-    @modset.command()
+    @mods.command()
     async def add(self, ctx, user: Union[discord.Member, int]):
         """Add a user to the custom moderator list."""
         user_id = user.id if isinstance(user, discord.Member) else user
@@ -84,7 +84,7 @@ class Moderation(commands.Cog):
             else:
                 await ctx.send(f"User ID `{user_id}` is already a moderator.")
 
-    @modset.command()
+    @mods.command()
     async def remove(self, ctx, user: Union[discord.Member, int]):
         """Remove a user from the custom moderator list."""
         user_id = user.id if isinstance(user, discord.Member) else user
@@ -95,7 +95,7 @@ class Moderation(commands.Cog):
             else:
                 await ctx.send(f"User ID `{user_id}` is not in the moderator list.")
 
-    @modset.command(name="list")
+    @mods.command(name="list")
     async def list_(self, ctx):
         """Show all custom moderators."""
         moderators = await self.config.guild(ctx.guild).moderators()
