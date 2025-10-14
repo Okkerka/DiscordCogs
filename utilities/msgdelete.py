@@ -14,7 +14,7 @@ log = logging.getLogger("red.messagedelete")
 # Constants
 DEFAULT_PING_AMOUNT = 5
 MAX_PING_AMOUNT = 20
-PING_DELAY = 0.5  # seconds between pings to avoid rate limits
+PING_DELAY = 0.15  # seconds between pings to avoid rate limits
 GAY_PERCENTAGE_MIN_NORMAL = 0
 GAY_PERCENTAGE_MAX_NORMAL = 100
 GAY_PERCENTAGE_MIN_HAWK = 51
