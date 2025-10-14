@@ -55,7 +55,8 @@ class TidalPlayer(commands.Cog):
     async def _initialize_apis(self):
         await self.bot.wait_until_ready()
         creds = await self.config.all()
-        if TIDALAPI_AVAILABLE and all(creds.get(k) for k in ("token_type","access_token","refresh_token")):
+        # Tidal OAuth session
+        if TIDALAPI_AVAILABLE and all(creds.get(k) for k in ("token_type", "access_token", "refresh_token")):
             try:
                 self.session.load_oauth_session(
                     creds["token_type"], creds["access_token"],
@@ -64,6 +65,7 @@ class TidalPlayer(commands.Cog):
                 log.info("Tidal session loaded")
             except Exception as e:
                 log.error(f"Tidal session load failed: {e}")
+        # Spotify client
         if SPOTIFY_AVAILABLE and creds.get("spotify_client_id") and creds.get("spotify_client_secret"):
             try:
                 self.sp = spotipy.Spotify(
@@ -74,6 +76,7 @@ class TidalPlayer(commands.Cog):
                 log.info("Spotify client initialized")
             except Exception as e:
                 log.error(f"Spotify init failed: {e}")
+        # YouTube client
         if YOUTUBE_API_AVAILABLE and creds.get("youtube_api_key"):
             try:
                 self.yt = build("youtube", "v3", developerKey=creds["youtube_api_key"])
@@ -149,11 +152,13 @@ class TidalPlayer(commands.Cog):
         if hasattr(ctx, "_orig_send"):
             return
         ctx._orig_send = ctx.send
+
         async def send_override(*a, **k):
             e = k.get("embed") or (a[0] if a and isinstance(a[0], discord.Embed) else None)
             if e and "Track Enqueued" in getattr(e, "title", ""):
                 return
             return await ctx._orig_send(*a, **k)
+
         ctx.send = send_override
 
     def _restore_send(self, ctx):
@@ -264,8 +269,8 @@ class TidalPlayer(commands.Cog):
             ))
         await menu(ctx, embeds, DEFAULT_CONTROLS)
 
-    @commands.is_owner()
     @commands.command(name="tidalsetup")
+    @commands.is_owner()
     async def tidalsetup(self, ctx):
         """Setup Tidal OAuth."""
         if not TIDALAPI_AVAILABLE:
@@ -292,27 +297,33 @@ class TidalPlayer(commands.Cog):
         else:
             await ctx.send("❌ Login failed.")
 
+    @commands.group(name="tidalplay", invoke_without_command=True)
     @commands.is_owner()
-    @commands.command(name="tidalplay spotify")
-    async def spotifysetup(self, ctx, client_id: str, client_secret: str):
-        """Setup Spotify API credentials."""
+    async def tidalplay(self, ctx):
+        """Group for playlist-source setup (Spotify/YouTube)."""
+        await ctx.send_help()
+
+    @tidalplay.command(name="spotify")
+    @commands.is_owner()
+    async def spotify_setup(self, ctx, client_id: str, client_secret: str):
+        """Store Spotify API credentials."""
         if not SPOTIFY_AVAILABLE:
             return await ctx.send("❌ Install spotipy: `[p]pipinstall spotipy`")
         await self.config.spotify_client_id.set(client_id)
         await self.config.spotify_client_secret.set(client_secret)
         await ctx.send("✅ Spotify credentials saved.")
 
+    @tidalplay.command(name="youtube")
     @commands.is_owner()
-    @commands.command(name="tidalplay youtube")
-    async def youtubesetup(self, ctx, api_key: str):
-        """Setup YouTube Data API key."""
+    async def youtube_setup(self, ctx, api_key: str):
+        """Store YouTube Data API key."""
         if not YOUTUBE_API_AVAILABLE:
             return await ctx.send("❌ Install google-api-python-client")
         await self.config.youtube_api_key.set(api_key)
         await ctx.send("✅ YouTube API key saved.")
 
+    @commands.command(name="tidalquiet")
     @commands.is_owner()
-    @commands.command()
     async def tidalquiet(self, ctx, mode: str = None):
         """Toggle quiet mode for enqueue suppression."""
         if mode not in (None, "on", "off"):
