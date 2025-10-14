@@ -1,0 +1,9 @@
+{
+    "author": ["Okkerka"],
+    "description": "Play Tidal playlists, albums, and tracks via Audio cog",
+    "install_msg": "Thanks for installing TidalPlaylist! Use [p]tidalsetup to authenticate with Tidal.",
+    "short": "Play Tidal links",
+    "tags": ["audio", "music", "tidal"],
+    "type": "COG",
+    "end_user_data_statement": "This cog does not store user data."
+}

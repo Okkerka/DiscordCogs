@@ -1,0 +1,10 @@
+{
+    "author": ["Okkerka"],
+    "description": "Automatically deletes messages from specific users across all servers.",
+    "install_msg": "Thank you for installing MessageDelete! Use `[p]msgblock add <user_id>` to start blocking users.",
+    "short": "Auto-delete messages from specific users",
+    "name": "MessageDelete",
+    "tags": ["moderation", "utility", "admin"],
+    "type": "COG",
+    "end_user_data_statement": "This cog stores user IDs of blocked users."
+}

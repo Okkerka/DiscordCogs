@@ -1,0 +1,16 @@
+{
+    "author": ["Okkerka"],
+    "description": "Integrates Tidal with Red's Audio cog. Searches Tidal first, then falls back to YouTube for playback.",
+    "install_msg": "Thanks for installing TidalPlayer!",
+    "short": "Tidal integration with YouTube fallback",
+    "name": "TidalPlayer",
+    "tags": ["audio", "music", "tidal", "youtube"],
+    "type": "COG",
+    "end_user_data_statement": "This cog does not store any user data.",
+    "min_bot_version": "3.4.0",
+    "hidden": false,
+    "disabled": false,
+    "required_cogs": {},
+    "requirements": ["aiohttp"],
+    "permissions": ["embed_links", "add_reactions"]
+}
