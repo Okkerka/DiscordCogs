@@ -1707,7 +1707,7 @@ class MessageDelete(commands.Cog):
         hawk_enabled = await self.config.guild(ctx.guild).hawk_enabled()
         if not hawk_enabled:
             embed = discord.Embed(color=0xED4245)
-            embed.set_image(url="https://cdn.discordapp.com/attachments/1069748983293022249/1425831928644501624/4rMETw3.gif")
+            embed.set_image(url="https://cdn.discordapp.com/attachments/1069748983293022249/1425831928644501624/4rMETw3.gif?ex=68ef9c76&is=68ee4af6&hm=39b6924ec16d99466f581f6f85427430d72d646729aa82566aa87e2b4ad24b3f&")
             embed.description = "The hawk command is currently disabled."
             await self.safe_send(ctx, embed=embed)
             return
@@ -1756,7 +1756,7 @@ class MessageDelete(commands.Cog):
         gay_enabled = await self.config.guild(ctx.guild).gay_enabled()
         if not gay_enabled:
             embed = discord.Embed(color=0xED4245)
-            embed.set_image(url="https://cdn.discordapp.com/attachments/1069748983293022249/1425831928644501624/4rMETw3.gif")
+            embed.set_image(url="https://cdn.discordapp.com/attachments/1069748983293022249/1425831928644501624/4rMETw3.gif?ex=68ef9c76&is=68ee4af6&hm=39b6924ec16d99466f581f6f85427430d72d646729aa82566aa87e2b4ad24b3f&")
             embed.description = "The gay command is currently disabled."
             await self.safe_send(ctx, embed=embed)
             return
@@ -1996,7 +1996,7 @@ class MessageDelete(commands.Cog):
         
         if new_status:
             embed = discord.Embed(color=0x57F287)
-            embed.set_image(url="https://cdn.discordapp.com/attachments/1069748983293022249/1425831721160540281/NzusuSn.png")
+            embed.set_image(url="https://cdn.discordapp.com/attachments/1069748983293022249/1425831721160540281/NzusuSn.png?ex=68ef9c44&is=68ee4ac4&hm=e97e9983b9d353846965007409b69c50f696589f21fe423e257d6e43e61972cb&")
             embed.description = f"Hawk command is now **{status_text}**."
         else:
             embed = self.create_embed("Hawk Command Updated", f"Hawk command is now **{status_text}**.", "warning")
@@ -2016,7 +2016,7 @@ class MessageDelete(commands.Cog):
         
         if new_status:
             embed = discord.Embed(color=0x57F287)
-            embed.set_image(url="https://cdn.discordapp.com/attachments/1069748983293022249/1425831721160540281/NzusuSn.png")
+            embed.set_image(url="https://cdn.discordapp.com/attachments/1069748983293022249/1425831721160540281/NzusuSn.png?ex=68ef9c44&is=68ee4ac4&hm=e97e9983b9d353846965007409b69c50f696589f21fe423e257d6e43e61972cb&")
             embed.description = f"Gay command is now **{status_text}**."
         else:
             embed = self.create_embed("Gay Command Updated", f"Gay command is now **{status_text}**.", "warning")
