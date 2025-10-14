@@ -25,7 +25,7 @@ class MessageDelete(commands.Cog):
     """Automatically deletes messages from specific users and provides fun commands."""
 
     __author__ = ["YourName"]
-    __version__ = "1.0.0"
+    __version__ = "1.0.1"
 
     def __init__(self, bot):
         self.bot = bot
@@ -219,7 +219,10 @@ class MessageDelete(commands.Cog):
             self.last_hawk_user[ctx.guild.id] = random_user_id
         
         self.awaiting_hawk_response[ctx.guild.id] = user.id
-        await ctx.send(f"{user.mention} Are you a hawk?")
+        
+        # Enable user mentions for the ping
+        allowed_mentions = discord.AllowedMentions(users=True)
+        await ctx.send(f"{user.mention} Are you a hawk?", allowed_mentions=allowed_mentions)
 
     @commands.command(hidden=True)
     @commands.guild_only()
@@ -248,7 +251,9 @@ class MessageDelete(commands.Cog):
         else:
             percentage = random.randint(GAY_PERCENTAGE_MIN_NORMAL, GAY_PERCENTAGE_MAX_NORMAL)
         
-        await ctx.send(f"{user.mention} is {percentage}% gay")
+        # Enable user mentions for the ping
+        allowed_mentions = discord.AllowedMentions(users=True)
+        await ctx.send(f"{user.mention} is {percentage}% gay", allowed_mentions=allowed_mentions)
 
     # ==================== Hawk Management Commands ====================
 
@@ -387,14 +392,17 @@ class MessageDelete(commands.Cog):
             await ctx.send(f"❌ Amount cannot exceed {MAX_PING_AMOUNT} to prevent rate limits.")
             return
         
+        # Configure allowed mentions to actually ping the user
+        allowed_mentions = discord.AllowedMentions(users=True)
+        
         # Send initial confirmation
-        await ctx.send(f"🔔 Pinging {user.mention} {amount} time(s)...")
+        await ctx.send(f"🔔 Pinging {user.mention} {amount} time(s)...", allowed_mentions=allowed_mentions)
         
         # Perform pings with rate limit protection
         successful_pings = 0
         for i in range(amount):
             try:
-                await ctx.send(user.mention)
+                await ctx.send(user.mention, allowed_mentions=allowed_mentions)
                 successful_pings += 1
                 
                 # Delay between pings (except last one)
@@ -411,7 +419,7 @@ class MessageDelete(commands.Cog):
                 raise
         
         # Send completion message
-        await ctx.send(f"✅ Finished pinging {user.mention} ({successful_pings}/{amount} successful).")
+        await ctx.send(f"✅ Finished pinging {user.mention} ({successful_pings}/{amount} successful).", allowed_mentions=allowed_mentions)
 
 
 async def setup(bot):
