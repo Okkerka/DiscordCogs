@@ -2,7 +2,7 @@ from redbot.core import commands, Config
 import discord
 import logging
 import asyncio
-from typing import Optional, Dict
+import re
 
 try:
     import tidalapi
@@ -13,282 +13,293 @@ except ImportError:
 log = logging.getLogger("red.tidalplayer")
 
 class TidalPlayer(commands.Cog):
-    """Play music from Tidal in highest quality available"""
+    """Play music from Tidal in LOSSLESS quality"""
     
     def __init__(self, bot):
         self.bot = bot
-        self.config = Config.get_conf(self, identifier=1234567890)
+        self.config = Config.get_conf(self, identifier=1234567890, force_registration=True)
         default_global = {
             "token_type": None,
             "access_token": None,
             "refresh_token": None,
             "expiry_time": None,
-            "country_code": "US",
-            "fallback_to_youtube": True,
-            "debug_mode": False
+            "quiet_mode": True
         }
         self.config.register_global(**default_global)
         self.session = tidalapi.Session() if TIDALAPI_AVAILABLE else None
-        self.debug_enabled = False
         
         if TIDALAPI_AVAILABLE:
             bot.loop.create_task(self._load_session())
     
-    def _debug(self, message: str):
-        """Log debug messages if debug mode is enabled"""
-        if self.debug_enabled:
-            log.info(f"[DEBUG] {message}")
-    
     async def _load_session(self):
         """Load saved Tidal session"""
+        await self.bot.wait_until_ready()
         try:
-            self.debug_enabled = await self.config.debug_mode()
-            self._debug("Loading Tidal session...")
-            
-            token_type = await self.config.token_type()
-            access_token = await self.config.access_token()
-            refresh_token = await self.config.refresh_token()
-            
-            if all([token_type, access_token, refresh_token]):
-                self.session.load_oauth_session(token_type, access_token, refresh_token)
-                log.info("Tidal session loaded")
-                self._debug(f"Session loaded")
-            else:
-                self._debug("No saved session found")
+            creds = await self.config.all()
+            if all(creds.get(f) for f in ("token_type", "access_token", "refresh_token")):
+                self.session.load_oauth_session(
+                    token_type=creds["token_type"],
+                    access_token=creds["access_token"],
+                    refresh_token=creds["refresh_token"],
+                    expiry_time=creds.get("expiry_time")
+                )
+                log.info("Tidal session loaded" if self.session.check_login() else "Tidal session expired")
         except Exception as e:
             log.error(f"Session load failed: {e}")
-            self._debug(f"Session load exception: {e}")
+    
+    def _patch_ctx_send(self, ctx):
+        """Suppress 'Track Enqueued' messages"""
+        if not hasattr(ctx, "_original_send"):
+            ctx._original_send = ctx.send
+            async def send_override(*args, **kwargs):
+                embed = kwargs.get("embed") or (args[0] if args and isinstance(args[0], discord.Embed) else None)
+                if embed and hasattr(embed, "title") and embed.title:
+                    if "Track Enqueued" in embed.title or "Tracks Enqueued" in embed.title:
+                        return
+                return await ctx._original_send(*args, **kwargs)
+            ctx.send = send_override
+    
+    def _restore_ctx_send(self, ctx):
+        """Restore ctx.send"""
+        if hasattr(ctx, "_original_send"):
+            ctx.send = ctx._original_send
+            delattr(ctx, "_original_send")
+    
+    async def _check_ready(self, ctx):
+        """Check if ready"""
+        if not TIDALAPI_AVAILABLE:
+            await ctx.send("❌ Install: `[p]pipinstall tidalapi`")
+            return False
+        if not self.session or not self.session.check_login():
+            await ctx.send("❌ Not authenticated. Run `>tidalsetup`")
+            return False
+        if not self.bot.get_cog("Audio"):
+            await ctx.send("❌ Audio cog not loaded")
+            return False
+        return True
     
     def _get_quality(self, track) -> str:
-        """Get quality label for track"""
-        try:
-            if hasattr(track, 'audio_quality'):
-                quality_labels = {
-                    'HI_RES': "HI_RES (MQA)",
-                    'LOSSLESS': "LOSSLESS (FLAC)",
-                    'HIGH': "HIGH (320kbps)",
-                    'LOW': "LOW (96kbps)"
-                }
-                return quality_labels.get(track.audio_quality, "LOSSLESS (FLAC)")
-        except Exception as e:
-            log.warning(f"Quality detection error: {e}")
+        """Get quality label"""
+        if hasattr(track, 'audio_quality'):
+            return {
+                'HI_RES': "HI_RES (MQA)",
+                'LOSSLESS': "LOSSLESS (FLAC)",
+                'HIGH': "HIGH (320kbps)",
+                'LOW': "LOW (96kbps)"
+            }.get(track.audio_quality, "LOSSLESS")
+        return "LOSSLESS"
+    
+    def _create_embed(self, title_text, description, quality=None, color=discord.Color.blue()) -> discord.Embed:
+        """Create embed"""
+        if quality:
+            if "HI_RES" in quality or "MQA" in quality:
+                color = discord.Color.gold()
+            elif "LOSSLESS" in quality:
+                color = discord.Color.blue()
         
-        return "LOSSLESS (FLAC)"
+        embed = discord.Embed(title=title_text, description=description, color=color)
+        if quality:
+            embed.add_field(name="Quality", value=quality, inline=True)
+        return embed
     
-    def _extract_metadata(self, track) -> Dict:
-        """Extract track metadata"""
-        return {
-            "title": getattr(track, 'name', "Unknown"),
-            "artist": getattr(track.artist, 'name', "Unknown") if hasattr(track, 'artist') and track.artist else "Unknown",
-            "album": getattr(track.album, 'name', "Unknown") if hasattr(track, 'album') and track.album else "Unknown",
-            "duration": getattr(track, 'duration', 0) * 1000  # Convert to milliseconds
-        }
-    
-    async def _inject_metadata(self, ctx, metadata: Dict):
-        """Try to inject metadata into Lavalink player"""
+    async def _play_track(self, ctx, track):
+        """Play single track"""
         try:
-            await asyncio.sleep(1.5)  # Wait for track to load
+            quality = self._get_quality(track)
+            stream_url = await self.bot.loop.run_in_executor(None, track.get_url)
             
-            audio_cog = self.bot.get_cog("Audio")
-            if not audio_cog:
-                self._debug("Audio cog not found")
-                return
+            if not stream_url:
+                return False
             
-            # Try to access the lavalink player
-            try:
-                if hasattr(audio_cog, 'lavalink'):
-                    player = audio_cog.lavalink.player_manager.get(ctx.guild.id)
-                    if player and player.current:
-                        self._debug(f"Current track title: {player.current.title}")
-                        
-                        # Inject metadata if title is unknown
-                        if "Unknown" in player.current.title or not player.current.title:
-                            player.current.title = metadata['title']
-                            player.current.author = metadata['artist']
-                            player.current.length = metadata['duration']
-                            self._debug(f"✅ Injected metadata: {metadata['title']} by {metadata['artist']}")
-                        else:
-                            self._debug(f"Track already has metadata: {player.current.title}")
-                else:
-                    self._debug("lavalink not found in Audio cog")
-                    
-            except AttributeError as e:
-                self._debug(f"Could not access player: {e}")
-                
+            audio = self.bot.get_cog("Audio")
+            await audio.command_play(ctx, query=stream_url)
+            return True
         except Exception as e:
-            self._debug(f"Metadata injection failed: {e}")
-    
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
-        """Suppress Audio cog 'Track Enqueued' messages when using tplay"""
-        if message.author == self.bot.user and message.embeds:
-            for embed in message.embeds:
-                if embed.title and ("Track Enqueued" in embed.title or "Tracks Enqueued" in embed.title):
-                    async for msg in message.channel.history(limit=10, before=message):
-                        if ">tplay" in msg.content or "!tplay" in msg.content:
-                            self._debug("Suppressing Audio cog enqueue message")
-                            try:
-                                await message.delete()
-                            except:
-                                pass
-                            return
-                    break
+            log.error(f"Play track error: {e}")
+            return False
     
     @commands.command(name="tplay")
     async def tidal_play(self, ctx, *, query: str):
-        """Play a song from Tidal in highest quality"""
-        self.debug_enabled = await self.config.debug_mode()
-        self._debug(f"Command: >tplay {query}")
+        """
+        Play from Tidal - supports search, playlists, albums, tracks, mixes
         
-        if not TIDALAPI_AVAILABLE:
-            return await ctx.send("❌ Install tidalapi: `[p]pipinstall tidalapi`")
+        Examples:
+        >tplay Lovejoy Baptism
+        >tplay https://tidal.com/browse/playlist/xxxxx
+        >tplay https://tidal.com/browse/album/xxxxx
+        >tplay https://tidal.com/browse/track/xxxxx
+        >tplay https://tidal.com/browse/mix/xxxxx
+        """
+        if not await self._check_ready(ctx):
+            return
         
-        if not self.session or not self.session.check_login():
-            return await ctx.send("❌ Not authenticated. Run `>tidalplay setup`")
+        quiet = await self.config.quiet_mode()
+        if quiet:
+            self._patch_ctx_send(ctx)
         
-        if not self.bot.get_cog("Audio"):
-            return await ctx.send("❌ Audio cog not loaded")
-        
-        async with ctx.typing():
-            result = await self._get_track(query)
-        
-        if not result:
-            return await ctx.send("❌ Track not found")
-        
-        self._debug(f"Playing: {result['info']['title']} by {result['info']['artist']}")
-        
-        # Send embed only if from Tidal
-        if not result.get("is_fallback"):
-            await ctx.send(embed=self._create_embed(result["info"]))
-        
-        # Play via Audio cog
         try:
-            audio = self.bot.get_cog("Audio")
-            await audio.command_play(ctx, query=result["url"])
-            
-            # Inject metadata after playing
-            if not result.get("is_fallback"):
-                self._debug("Scheduling metadata injection...")
-                self.bot.loop.create_task(self._inject_metadata(ctx, result["info"]))
-                
-        except Exception as e:
-            log.error(f"Play failed: {e}")
-            await ctx.send(f"❌ Playback failed")
+            # Check if it's a URL
+            if "tidal.com" in query or "tidal.link" in query:
+                await self._handle_url(ctx, query)
+            else:
+                # Search query
+                await self._handle_search(ctx, query)
+        finally:
+            if quiet:
+                self._restore_ctx_send(ctx)
     
-    async def _get_track(self, query: str) -> Optional[Dict]:
-        """Search and get track from Tidal"""
+    async def _handle_search(self, ctx, query):
+        """Handle search query"""
         try:
-            self._debug(f"Searching Tidal: {query}")
-            
-            results = await self.bot.loop.run_in_executor(None, self.session.search, query)
+            async with ctx.typing():
+                results = await self.bot.loop.run_in_executor(None, self.session.search, query)
             
             if not results or not results.get('tracks'):
-                self._debug("No tracks found")
-                return await self._fallback(query)
+                await ctx.send("❌ No tracks found")
+                return
             
-            self._debug(f"Found {len(results['tracks'])} tracks")
             track = results['tracks'][0]
+            quality = self._get_quality(track)
             
-            metadata = self._extract_metadata(track)
-            quality_str = self._get_quality(track)
+            title = getattr(track, 'name', "Unknown")
+            artist = getattr(track.artist, 'name', "Unknown") if hasattr(track, 'artist') and track.artist else "Unknown"
+            album = getattr(track.album, 'name', "") if hasattr(track, 'album') and track.album else ""
             
-            self._debug(f"Track: {metadata['title']} by {metadata['artist']} ({quality_str})")
+            desc = f"**{title}**\nby {artist}"
+            if album:
+                desc += f"\n*{album}*"
             
-            # Get stream URL
-            stream_url = await self._stream(track)
-            if stream_url:
-                return {
-                    "url": stream_url,
-                    "info": {**metadata, "quality": quality_str},
-                    "is_fallback": False
-                }
-            
-            self._debug("Stream failed, using fallback")
-            return await self._fallback(query, metadata)
+            await ctx.send(embed=self._create_embed("💎 Playing from Tidal", desc, quality))
+            await self._play_track(ctx, track)
             
         except Exception as e:
-            log.error(f"Track retrieval failed: {e}")
-            self._debug(f"Exception: {e}")
-            return await self._fallback(query)
+            await ctx.send(f"❌ Error: {e}")
+            log.error(f"Search error: {e}")
     
-    async def _stream(self, track) -> Optional[str]:
-        """Get stream URL"""
-        try:
-            self._debug("Getting stream URL...")
-            url = await self.bot.loop.run_in_executor(None, track.get_url)
-            if url:
-                self._debug(f"Stream URL obtained: {url[:50]}...")
-                return url
-            self._debug("track.get_url() returned None")
-        except Exception as e:
-            self._debug(f"Stream failed: {e}")
-        return None
-    
-    async def _fallback(self, query: str, metadata: Dict = None) -> Optional[Dict]:
-        """YouTube fallback"""
-        if not await self.config.fallback_to_youtube():
-            return None
-        
-        if metadata:
-            search = f"{metadata['artist']} {metadata['title']}"
-            self._debug(f"YouTube fallback: {search}")
-            return {
-                "url": search,
-                "info": {**metadata, "quality": "YouTube"},
-                "is_fallback": True
-            }
-        
-        self._debug(f"YouTube fallback: {query}")
-        return {
-            "url": query,
-            "info": {"title": query, "artist": "Unknown", "album": "Unknown", "quality": "YouTube", "duration": 0},
-            "is_fallback": True
-        }
-    
-    def _create_embed(self, info: Dict) -> discord.Embed:
-        """Create track info embed"""
-        quality = info.get("quality", "Unknown")
-        
-        if "HI_RES" in quality or "MQA" in quality:
-            color, emoji = discord.Color.gold(), "💎"
-        elif "LOSSLESS" in quality:
-            color, emoji = discord.Color.blue(), "🎵"
+    async def _handle_url(self, ctx, url):
+        """Handle Tidal URL"""
+        if "mix/" in url:
+            await self._queue_mix(ctx, url)
+        elif "playlist/" in url:
+            await self._queue_playlist(ctx, url)
+        elif "album/" in url:
+            await self._queue_album(ctx, url)
+        elif "track/" in url:
+            await self._queue_single_track(ctx, url)
         else:
-            color, emoji = discord.Color.green(), "🎶"
-        
-        embed = discord.Embed(
-            title=f"{emoji} Playing from Tidal",
-            description=f"**{info['title']}**\nby {info['artist']}",
-            color=color
-        )
-        
-        if info.get("album") and info["album"] != "Unknown":
-            embed.add_field(name="Album", value=info["album"], inline=True)
-        embed.add_field(name="Quality", value=quality, inline=True)
-        
-        return embed
+            await ctx.send("❌ Invalid Tidal URL")
     
-    @commands.group()
+    async def _queue_playlist(self, ctx, url):
+        """Queue entire playlist"""
+        match = re.search(r"playlist/([A-Za-z0-9\-]+)", url)
+        if not match:
+            await ctx.send("❌ Invalid playlist URL")
+            return
+        
+        try:
+            loading = await ctx.send("⏳ Loading playlist...")
+            playlist = await self.bot.loop.run_in_executor(None, self.session.playlist, match.group(1))
+            tracks = await self.bot.loop.run_in_executor(None, playlist.tracks)
+            
+            total = len(tracks)
+            await loading.edit(content=f"⏳ Queueing **{playlist.name}** ({total} tracks)...")
+            
+            queued = 0
+            for track in tracks:
+                if await self._play_track(ctx, track):
+                    queued += 1
+            
+            await loading.edit(content=f"✅ Queued **{queued}/{total}** tracks from **{playlist.name}**")
+        except Exception as e:
+            await ctx.send(f"❌ Error: {e}")
+            log.error(f"Playlist error: {e}")
+    
+    async def _queue_album(self, ctx, url):
+        """Queue entire album"""
+        match = re.search(r"album/([0-9]+)", url)
+        if not match:
+            await ctx.send("❌ Invalid album URL")
+            return
+        
+        try:
+            loading = await ctx.send("⏳ Loading album...")
+            album = await self.bot.loop.run_in_executor(None, self.session.album, match.group(1))
+            tracks = await self.bot.loop.run_in_executor(None, album.tracks)
+            
+            total = len(tracks)
+            await loading.edit(content=f"⏳ Queueing **{album.name}** by {album.artist.name} ({total} tracks)...")
+            
+            queued = 0
+            for track in tracks:
+                if await self._play_track(ctx, track):
+                    queued += 1
+            
+            await loading.edit(content=f"✅ Queued **{queued}/{total}** tracks from **{album.name}**")
+        except Exception as e:
+            await ctx.send(f"❌ Error: {e}")
+            log.error(f"Album error: {e}")
+    
+    async def _queue_single_track(self, ctx, url):
+        """Queue single track from URL"""
+        match = re.search(r"track/([0-9]+)", url)
+        if not match:
+            await ctx.send("❌ Invalid track URL")
+            return
+        
+        try:
+            track = await self.bot.loop.run_in_executor(None, self.session.track, match.group(1))
+            quality = self._get_quality(track)
+            
+            title = getattr(track, 'name', "Unknown")
+            artist = getattr(track.artist, 'name', "Unknown") if hasattr(track, 'artist') and track.artist else "Unknown"
+            
+            await ctx.send(embed=self._create_embed("💎 Playing from Tidal", f"**{title}**\nby {artist}", quality))
+            await self._play_track(ctx, track)
+        except Exception as e:
+            await ctx.send(f"❌ Error: {e}")
+            log.error(f"Track error: {e}")
+    
+    async def _queue_mix(self, ctx, url):
+        """Queue Tidal mix"""
+        match = re.search(r"mix/([A-Za-z0-9]+)", url)
+        if not match:
+            await ctx.send("❌ Invalid mix URL")
+            return
+        
+        try:
+            loading = await ctx.send("⏳ Loading mix...")
+            mix = await self.bot.loop.run_in_executor(None, self.session.mix, match.group(1))
+            items = await self.bot.loop.run_in_executor(None, mix.items)
+            
+            total = len(items)
+            await loading.edit(content=f"⏳ Queueing **{mix.title}** ({total} tracks)...")
+            
+            queued = 0
+            for item in items:
+                if await self._play_track(ctx, item):
+                    queued += 1
+            
+            await loading.edit(content=f"✅ Queued **{queued}/{total}** tracks from **{mix.title}**")
+        except Exception as e:
+            await ctx.send(f"❌ Error: {e}")
+            log.error(f"Mix error: {e}")
+    
     @commands.is_owner()
-    async def tidalplay(self, ctx):
-        """Tidal configuration"""
-        pass
-    
-    @tidalplay.command(name="setup", hidden=True)
-    async def setup(self, ctx):
-        """Authenticate with Tidal"""
+    @commands.command()
+    async def tidalsetup(self, ctx):
+        """Setup Tidal OAuth"""
         if not TIDALAPI_AVAILABLE:
-            return await ctx.send("❌ Install tidalapi first")
+            return await ctx.send("❌ Install: `[p]pipinstall tidalapi`")
         
+        await ctx.send("Starting OAuth...")
         try:
             login, future = self.session.login_oauth()
-            
             embed = discord.Embed(
-                title="Tidal Authentication",
+                title="Tidal OAuth",
                 description=f"Visit:\n{login.verification_uri_complete}",
                 color=discord.Color.blue()
             )
-            embed.set_footer(text="5 minute timeout | Requires Tidal HiFi subscription")
+            embed.set_footer(text="5 minute timeout")
             await ctx.send(embed=embed)
             
             await asyncio.wait_for(
@@ -300,71 +311,35 @@ class TidalPlayer(commands.Cog):
                 await self.config.token_type.set(self.session.token_type)
                 await self.config.access_token.set(self.session.access_token)
                 await self.config.refresh_token.set(self.session.refresh_token)
-                
                 if hasattr(self.session, "expiry_time") and self.session.expiry_time:
                     await self.config.expiry_time.set(self.session.expiry_time.timestamp())
-                
-                await ctx.send("✅ Authenticated! Use `>tplay <song>` to play")
+                await ctx.send("✅ Setup complete! Use `>tplay <song/url>`")
             else:
-                await ctx.send("❌ Authentication failed")
+                await ctx.send("❌ Login failed")
         except asyncio.TimeoutError:
             await ctx.send("⏱️ Timeout")
         except Exception as e:
             await ctx.send(f"❌ Error: {e}")
     
-    @tidalplay.command(name="debug")
-    async def debug(self, ctx):
-        """Toggle debug mode"""
-        current = await self.config.debug_mode()
-        await self.config.debug_mode.set(not current)
-        self.debug_enabled = not current
+    @commands.is_owner()
+    @commands.command()
+    async def tidalquiet(self, ctx, mode: str = None):
+        """Toggle quiet mode (suppresses 'Track Enqueued')"""
+        if mode is None:
+            status = "enabled" if await self.config.quiet_mode() else "disabled"
+            await ctx.send(f"Quiet mode: **{status}**\nUsage: `>tidalquiet on/off`")
+            return
         
-        status = "enabled" if not current else "disabled"
-        await ctx.send(f"🐛 Debug mode **{status}**")
-    
-    @tidalplay.command(name="fallback")
-    async def fallback(self, ctx):
-        """Toggle YouTube fallback"""
-        current = await self.config.fallback_to_youtube()
-        await self.config.fallback_to_youtube.set(not current)
+        if mode.lower() not in ("on", "off"):
+            await ctx.send("Usage: `>tidalquiet on/off`")
+            return
         
-        status = "enabled" if not current else "disabled"
-        await ctx.send(f"✅ YouTube fallback **{status}**")
-    
-    @tidalplay.command(name="country")
-    async def country(self, ctx, code: str):
-        """Set country code (US, GB, DE, etc.)"""
-        await self.config.country_code.set(code.upper())
-        await ctx.send(f"✅ Country: **{code.upper()}**")
-    
-    @tidalplay.command(name="status")
-    async def status(self, ctx):
-        """Show configuration"""
-        if not TIDALAPI_AVAILABLE:
-            return await ctx.send("❌ tidalapi not installed")
-        
-        authenticated = self.session and self.session.check_login()
-        fallback = await self.config.fallback_to_youtube()
-        country = await self.config.country_code()
-        debug_mode = await self.config.debug_mode()
-        
-        embed = discord.Embed(
-            title="Tidal Player Status",
-            color=discord.Color.green() if authenticated else discord.Color.red()
-        )
-        
-        embed.add_field(name="Authentication", value="✅" if authenticated else "❌", inline=True)
-        embed.add_field(name="YouTube Fallback", value="✅" if fallback else "❌", inline=True)
-        embed.add_field(name="Country", value=country, inline=True)
-        embed.add_field(name="Debug Mode", value="🐛" if debug_mode else "❌", inline=True)
-        
-        if not authenticated:
-            embed.set_footer(text="Run >tidalplay setup")
-        else:
-            embed.set_footer(text="Streams highest quality | Metadata injection enabled")
-        
-        await ctx.send(embed=embed)
+        await self.config.quiet_mode.set(mode.lower() == "on")
+        await ctx.send(f"✅ Quiet mode **{mode.lower()}**")
     
     def cog_unload(self):
-        """Cleanup on unload"""
-        log.info("TidalPlayer cog unloaded")
+        log.info("TidalPlayer unloaded")
+
+
+async def setup(bot):
+    await bot.add_cog(TidalPlayer(bot))
