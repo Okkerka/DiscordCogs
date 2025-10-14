@@ -9,7 +9,6 @@ import tempfile
 
 try:
     import tidalapi
-    from tidalapi.media import Quality
     TIDALAPI_AVAILABLE = True
 except ImportError:
     TIDALAPI_AVAILABLE = False
@@ -29,7 +28,8 @@ class TidalPlayer(commands.Cog):
             "expiry_time": None,
             "country_code": "US",
             "fallback_to_youtube": True,
-            "download_mode": False
+            "download_mode": False,
+            "debug_mode": False
         }
         self.config.register_global(**default_global)
         self.session = tidalapi.Session() if TIDALAPI_AVAILABLE else None
@@ -38,9 +38,15 @@ class TidalPlayer(commands.Cog):
         if TIDALAPI_AVAILABLE:
             bot.loop.create_task(self._load_session())
     
+    async def _debug(self, message: str):
+        """Log debug messages if debug mode is enabled"""
+        if await self.config.debug_mode():
+            log.info(f"[DEBUG] {message}")
+    
     async def _load_session(self):
         """Load saved Tidal session"""
         try:
+            await self._debug("Loading Tidal session...")
             token_type = await self.config.token_type()
             access_token = await self.config.access_token()
             refresh_token = await self.config.refresh_token()
@@ -48,8 +54,12 @@ class TidalPlayer(commands.Cog):
             if all([token_type, access_token, refresh_token]):
                 self.session.load_oauth_session(token_type, access_token, refresh_token)
                 log.info("Tidal session loaded")
+                await self._debug(f"Session loaded: token_type={token_type}")
+            else:
+                await self._debug("No saved session found")
         except Exception as e:
             log.error(f"Session load failed: {e}")
+            await self._debug(f"Session load exception: {type(e).__name__}: {e}")
     
     def _cleanup_file(self, file_path: str):
         """Delete a file if it exists"""
@@ -60,30 +70,21 @@ class TidalPlayer(commands.Cog):
             except Exception as e:
                 log.error(f"Delete failed: {e}")
     
-    def _get_quality(self, track) -> tuple:
-        """Get highest quality available"""
-        # Available Quality values in tidalapi:
-        # Quality.hi_res_lossless (for HI_RES/MQA)
-        # Quality.lossless (for LOSSLESS)
-        # Quality.high (for HIGH)
-        # Quality.low (for LOW)
-        
+    def _get_quality(self, track) -> str:
+        """Get quality label for track"""
         try:
             if hasattr(track, 'audio_quality'):
-                quality_map = {
-                    'HI_RES': (Quality.hi_res_lossless, "HI_RES (MQA)"),
-                    'LOSSLESS': (Quality.lossless, "LOSSLESS (FLAC)"),
-                    'HIGH': (Quality.high, "HIGH (320kbps)"),
-                    'LOW': (Quality.low, "LOW (96kbps)")
+                quality_labels = {
+                    'HI_RES': "HI_RES (MQA)",
+                    'LOSSLESS': "LOSSLESS (FLAC)",
+                    'HIGH': "HIGH (320kbps)",
+                    'LOW': "LOW (96kbps)"
                 }
-                result = quality_map.get(track.audio_quality, (Quality.lossless, "LOSSLESS (FLAC)"))
-                log.info(f"Track quality: {track.audio_quality} -> {result[1]}")
-                return result
+                return quality_labels.get(track.audio_quality, "LOSSLESS (FLAC)")
         except Exception as e:
-            log.warning(f"Quality detection failed: {e}")
+            log.warning(f"Quality detection error: {e}")
         
-        # Default to lossless
-        return Quality.lossless, "LOSSLESS (FLAC)"
+        return "LOSSLESS (FLAC)"
     
     def _extract_metadata(self, track) -> Dict:
         """Extract track metadata"""
@@ -97,73 +98,104 @@ class TidalPlayer(commands.Cog):
     @commands.command(name="tplay")
     async def tidal_play(self, ctx, *, query: str):
         """Play a song from Tidal"""
+        await self._debug(f"Command received: query='{query}', user={ctx.author}, guild={ctx.guild.name if ctx.guild else 'DM'}")
+        
         if not TIDALAPI_AVAILABLE:
+            await self._debug("tidalapi not available")
             return await ctx.send("❌ Install tidalapi: `[p]pipinstall tidalapi`")
         
         if not self.session or not self.session.check_login():
+            await self._debug("Session not authenticated")
             return await ctx.send("❌ Not authenticated. Run `>tidalplay setup`")
         
         if not self.bot.get_cog("Audio"):
+            await self._debug("Audio cog not loaded")
             return await ctx.send("❌ Audio cog not loaded")
         
         # Clean up previous file
         if self.last_file:
+            await self._debug(f"Cleaning up previous file: {self.last_file}")
             self._cleanup_file(self.last_file)
             self.last_file = None
         
         # Get track
+        await self._debug("Starting track search...")
         async with ctx.typing():
             result = await self._get_track(query, ctx)
         
         if not result:
+            await self._debug("No result returned from track search")
             return await ctx.send("❌ Track not found")
+        
+        await self._debug(f"Track result: url={result['url'][:50]}..., is_fallback={result.get('is_fallback')}")
         
         # Send embed only if playing from Tidal
         if not result.get("is_fallback"):
+            await self._debug("Sending Tidal embed")
             await ctx.send(embed=self._create_embed(result["info"]))
+        else:
+            await self._debug("Using YouTube fallback, no embed")
         
         # Save file for cleanup
         if result.get("file_path"):
             self.last_file = result["file_path"]
+            await self._debug(f"Saved file path for cleanup: {self.last_file}")
         
         # Play via Audio cog
         try:
+            await self._debug("Invoking Audio cog play command")
             audio = self.bot.get_cog("Audio")
             await audio.command_play(ctx, query=result["url"])
+            await self._debug("Audio cog play command completed")
         except Exception as e:
             log.error(f"Play failed: {e}")
+            await self._debug(f"Play exception: {type(e).__name__}: {e}")
             await ctx.send(f"❌ Playback failed")
     
     async def _get_track(self, query: str, ctx) -> Optional[Dict]:
         """Search and get track from Tidal"""
         try:
+            await self._debug(f"Searching Tidal for: {query}")
+            
             # Search
             results = await self.bot.loop.run_in_executor(None, self.session.search, query)
+            await self._debug(f"Search completed, results type: {type(results)}")
             
             if not results or not results.get('tracks'):
-                log.warning("No tracks found")
+                await self._debug("No tracks in search results")
                 return await self._fallback(query)
             
+            await self._debug(f"Found {len(results['tracks'])} tracks")
             track = results['tracks'][0]
+            
             metadata = self._extract_metadata(track)
-            quality, quality_str = self._get_quality(track)
+            await self._debug(f"Metadata: {metadata}")
             
-            log.info(f"Found: {metadata['title']} by {metadata['artist']} ({quality_str})")
+            quality_str = self._get_quality(track)
+            await self._debug(f"Quality: {quality_str}")
             
-            # Try download mode first, then streaming
-            if await self.config.download_mode():
-                result = await self._download(track, quality, ctx, metadata)
+            # Try download mode first
+            download_mode = await self.config.download_mode()
+            await self._debug(f"Download mode: {download_mode}")
+            
+            if download_mode:
+                await self._debug("Attempting download...")
+                result = await self._download(track, ctx, metadata)
                 if result:
+                    await self._debug(f"Download successful: {result}")
                     return {
                         "url": result,
                         "file_path": result,
                         "info": {**metadata, "quality": quality_str},
                         "is_fallback": False
                     }
+                await self._debug("Download failed")
             
             # Try streaming
-            stream_url = await self._stream(track, quality)
+            await self._debug("Attempting stream...")
+            stream_url = await self._stream(track)
             if stream_url:
+                await self._debug(f"Stream URL obtained: {stream_url[:50]}...")
                 return {
                     "url": stream_url,
                     "file_path": None,
@@ -171,53 +203,65 @@ class TidalPlayer(commands.Cog):
                     "is_fallback": False
                 }
             
-            # Fallback to YouTube
-            log.warning("Stream/download failed, using fallback")
+            await self._debug("Stream failed, using fallback")
             return await self._fallback(query, metadata)
             
         except Exception as e:
             log.error(f"Track retrieval failed: {e}")
+            await self._debug(f"Track retrieval exception: {type(e).__name__}: {e}")
+            import traceback
+            if await self.config.debug_mode():
+                log.error(traceback.format_exc())
             return await self._fallback(query)
     
-    async def _stream(self, track, quality) -> Optional[str]:
+    async def _stream(self, track) -> Optional[str]:
         """Get stream URL"""
         try:
+            await self._debug(f"Calling track.get_url() on track ID {getattr(track, 'id', 'unknown')}")
             url = await self.bot.loop.run_in_executor(None, track.get_url)
             if url:
-                log.info("Got stream URL")
+                await self._debug(f"Stream URL type: {type(url)}, length: {len(str(url))}")
                 return url
-        except AttributeError:
-            log.warning("track.get_url() not available")
+            await self._debug("track.get_url() returned None")
+        except AttributeError as e:
+            await self._debug(f"track.get_url() not available: {e}")
         except Exception as e:
-            log.warning(f"Streaming failed: {e}")
+            await self._debug(f"Stream exception: {type(e).__name__}: {e}")
         return None
     
-    async def _download(self, track, quality, ctx, metadata: Dict) -> Optional[str]:
+    async def _download(self, track, ctx, metadata: Dict) -> Optional[str]:
         """Download track"""
         try:
             track_id = metadata.get("track_id")
             if not track_id:
-                log.warning("No track ID for download")
+                await self._debug("No track ID available")
                 return None
             
+            await self._debug(f"Creating download message...")
             msg = await ctx.send("⏬ Downloading...")
             
             temp_dir = Path(tempfile.gettempdir()) / "tidalplayer"
             temp_dir.mkdir(exist_ok=True)
+            await self._debug(f"Temp dir: {temp_dir}")
             
             # Sanitize filename
             safe_name = "".join(c for c in f"{metadata['artist']}-{metadata['title']}" 
                               if c.isalnum() or c in (' ', '-', '_'))[:100]
             file_path = temp_dir / f"{safe_name}_{track_id}.m4a"
+            await self._debug(f"Target file: {file_path}")
             
             # Download
             def download():
                 if hasattr(track, 'download'):
-                    track.download(str(file_path), quality=quality)
+                    await self._debug("track.download() method exists")
+                    track.download(str(file_path))
                     return file_path.exists()
+                await self._debug("track.download() method not available")
                 return False
             
+            await self._debug("Starting download executor...")
             success = await self.bot.loop.run_in_executor(None, download)
+            await self._debug(f"Download result: {success}")
             
             try:
                 await msg.delete()
@@ -225,23 +269,30 @@ class TidalPlayer(commands.Cog):
                 pass
             
             if success:
-                log.info(f"Downloaded: {metadata['title']}")
+                file_size = os.path.getsize(file_path)
+                await self._debug(f"Download successful, file size: {file_size} bytes")
                 return str(file_path)
             
-            log.warning("Download method unavailable")
+            await self._debug("Download unsuccessful")
         except Exception as e:
-            log.error(f"Download failed: {e}")
+            await self._debug(f"Download exception: {type(e).__name__}: {e}")
+            import traceback
+            if await self.config.debug_mode():
+                log.error(traceback.format_exc())
         
         return None
     
     async def _fallback(self, query: str, metadata: Dict = None) -> Optional[Dict]:
         """YouTube fallback"""
-        if not await self.config.fallback_to_youtube():
+        fallback_enabled = await self.config.fallback_to_youtube()
+        await self._debug(f"Fallback enabled: {fallback_enabled}")
+        
+        if not fallback_enabled:
             return None
         
         if metadata:
             search = f"{metadata['artist']} {metadata['title']}"
-            log.info(f"YouTube fallback: {search}")
+            await self._debug(f"YouTube fallback search: {search}")
             return {
                 "url": search,
                 "file_path": None,
@@ -249,6 +300,7 @@ class TidalPlayer(commands.Cog):
                 "is_fallback": True
             }
         
+        await self._debug(f"YouTube fallback direct: {query}")
         return {
             "url": query,
             "file_path": None,
@@ -260,7 +312,6 @@ class TidalPlayer(commands.Cog):
         """Create track info embed"""
         quality = info.get("quality", "Unknown")
         
-        # Color based on quality
         if "HI_RES" in quality or "MQA" in quality:
             color, emoji = discord.Color.gold(), "💎"
         elif "LOSSLESS" in quality:
@@ -324,6 +375,15 @@ class TidalPlayer(commands.Cog):
         except Exception as e:
             await ctx.send(f"❌ Error: {e}")
     
+    @tidalplay.command(name="debug")
+    async def debug(self, ctx):
+        """Toggle debug mode for detailed console logging"""
+        current = await self.config.debug_mode()
+        await self.config.debug_mode.set(not current)
+        
+        status = "enabled" if not current else "disabled"
+        await ctx.send(f"🐛 Debug mode **{status}**\nCheck your console for detailed logs")
+    
     @tidalplay.command(name="downloadmode")
     async def downloadmode(self, ctx):
         """Toggle download mode"""
@@ -358,6 +418,7 @@ class TidalPlayer(commands.Cog):
         download_mode = await self.config.download_mode()
         fallback = await self.config.fallback_to_youtube()
         country = await self.config.country_code()
+        debug_mode = await self.config.debug_mode()
         
         embed = discord.Embed(
             title="Tidal Player Status",
@@ -368,6 +429,7 @@ class TidalPlayer(commands.Cog):
         embed.add_field(name="Download Mode", value="✅" if download_mode else "❌", inline=True)
         embed.add_field(name="YouTube Fallback", value="✅" if fallback else "❌", inline=True)
         embed.add_field(name="Country", value=country, inline=True)
+        embed.add_field(name="Debug Mode", value="🐛" if debug_mode else "❌", inline=True)
         embed.add_field(name="Cached File", value="Yes" if self.last_file else "No", inline=True)
         
         if not authenticated:
