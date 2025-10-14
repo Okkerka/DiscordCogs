@@ -22,12 +22,12 @@ class TidalPlayer(commands.Cog):
     
     @commands.group()
     @commands.is_owner()
-    async def tidalsetup(self, ctx):
-        """Setup Tidal OAuth authentication"""
+    async def tidalplay(self, ctx):
+        """TidalPlayer commands"""
         if ctx.invoked_subcommand is None:
             await ctx.send_help()
     
-    @tidalsetup.command(name="oauth")
+    @tidalplay.command(name="setup")
     async def setup_oauth(self, ctx):
         """Interactive OAuth setup guide"""
         
@@ -94,10 +94,10 @@ Reply with the **authorization code**:
             if success:
                 await ctx.send("✅ **Setup complete!** You can now use `>play` to search Tidal and play from YouTube.")
             else:
-                await ctx.send("❌ Failed to get tokens. Please try again or set manually with `>tidaltoken`")
+                await ctx.send("❌ Failed to get tokens. Please try again or set manually with `>tidalplay token`")
                 
         except asyncio.TimeoutError:
-            await ctx.send("⏱️ Setup timed out. Please try again with `>tidalsetup oauth`")
+            await ctx.send("⏱️ Setup timed out. Please try again with `>tidalplay setup`")
         except Exception as e:
             await ctx.send(f"❌ Error during setup: {e}")
             log.error(f"OAuth setup error: {e}")
@@ -136,7 +136,7 @@ Reply with the **authorization code**:
             log.error(f"Error exchanging token: {e}")
             return False
     
-    @tidalsetup.command(name="refresh")
+    @tidalplay.command(name="refresh")
     async def refresh_token_cmd(self, ctx):
         """Refresh your access token using refresh token"""
         
@@ -145,7 +145,7 @@ Reply with the **authorization code**:
         refresh_token = await self.config.refresh_token()
         
         if not all([client_id, client_secret, refresh_token]):
-            await ctx.send("❌ Missing credentials! Run `>tidalsetup oauth` first.")
+            await ctx.send("❌ Missing credentials! Run `>tidalplay setup` first.")
             return
         
         success = await self.refresh_access_token()
@@ -153,7 +153,7 @@ Reply with the **authorization code**:
         if success:
             await ctx.send("✅ Access token refreshed successfully!")
         else:
-            await ctx.send("❌ Failed to refresh token. You may need to run `>tidalsetup oauth` again.")
+            await ctx.send("❌ Failed to refresh token. You may need to run `>tidalplay setup` again.")
     
     async def refresh_access_token(self):
         """Refresh the access token"""
@@ -194,7 +194,7 @@ Reply with the **authorization code**:
         bearer_token = await self.config.bearer_token()
         
         if not bearer_token:
-            await ctx.send("⚠️ No Tidal token set! Run `>tidalsetup oauth` first, or searching YouTube directly...")
+            await ctx.send("⚠️ No Tidal token set! Run `>tidalplay setup` first, or searching YouTube directly...")
             search_query = query
         else:
             # Try Tidal first
@@ -265,9 +265,8 @@ Reply with the **authorization code**:
         
         return None
     
-    @commands.command()
-    @commands.is_owner()
-    async def tidaltoken(self, ctx, token: str):
+    @tidalplay.command(name="token")
+    async def set_token(self, ctx, token: str):
         """Manually set your Tidal OAuth Bearer token"""
         await self.config.bearer_token.set(token)
         await ctx.send("✅ Tidal Bearer token has been set!")
@@ -276,9 +275,8 @@ Reply with the **authorization code**:
         except:
             await ctx.send("⚠️ Please delete your message containing the token!")
     
-    @commands.command()
-    @commands.is_owner()
-    async def tidalcountry(self, ctx, country_code: str):
+    @tidalplay.command(name="country")
+    async def set_country(self, ctx, country_code: str):
         """Set Tidal country code (e.g., US, GB, DE)"""
         await self.config.country_code.set(country_code.upper())
         await ctx.send(f"✅ Tidal country code set to: {country_code.upper()}")
