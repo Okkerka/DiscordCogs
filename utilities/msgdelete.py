@@ -27,28 +27,35 @@ MAX_MASSBAN_USERS = 20
 
 
 def mod_or_permissions(**perms):
-    """Custom check: allows custom mods OR users with specific permissions."""
+    """Custom check: requires BOTH custom mod status AND Discord permissions."""
     async def predicate(ctx: commands.Context):
         if ctx.guild is None:
             return False
         
-        # Owner always has access
+        # Owner always has access (bypass all checks)
         if await ctx.bot.is_owner(ctx.author):
             return True
         
-        # Server owner always has access
+        # Server owner always has access (bypass all checks)
         if ctx.author == ctx.guild.owner:
             return True
         
         # Check if user is in custom moderator list
         cog = ctx.bot.get_cog("Utilities")
+        is_custom_mod = False
         if cog:
             moderators = await cog.config.guild(ctx.guild).moderators()
-            if ctx.author.id in moderators:
-                return True
+            is_custom_mod = ctx.author.id in moderators
         
-        # Fall back to checking Discord permissions
-        return await commands.has_permissions(**perms).predicate(ctx)
+        # Check Discord permissions
+        has_perms = await commands.has_permissions(**perms).predicate(ctx)
+        
+        # Custom moderators need BOTH to be on the list AND have Discord permissions
+        if is_custom_mod and has_perms:
+            return True
+        
+        # Regular users just need Discord permissions
+        return has_perms
     
     return commands.check(predicate)
 
@@ -57,7 +64,7 @@ class MessageDelete(commands.Cog):
     """High-performance Discord bot with comprehensive moderation and utilities."""
 
     __author__ = ["YourName"]
-    __version__ = "5.2.0"
+    __version__ = "5.3.0"
     __cog_name__ = "Utilities"
 
     def __init__(self, bot):
@@ -322,8 +329,8 @@ class MessageDelete(commands.Cog):
     async def modset(self, ctx: commands.Context):
         """Manage custom moderator permissions for this server.
         
-        Add users to the moderator list to give them access to all moderation commands
-        without requiring Discord role permissions.
+        Users added to the moderator list must still have the required Discord permissions
+        to use moderation commands. This provides an additional layer of verification.
         """
         await ctx.send_help(ctx.command)
 
@@ -331,7 +338,7 @@ class MessageDelete(commands.Cog):
     async def modset_add(self, ctx: commands.Context, user: Union[discord.Member, int]):
         """Add a user to the custom moderator list.
         
-        Grants full access to all moderation commands in this cog.
+        Note: Users still need the appropriate Discord permissions to use mod commands.
         
         **Arguments:**
         - `<user>` - User to add (mention or ID)
@@ -356,7 +363,7 @@ class MessageDelete(commands.Cog):
         user_mention = user.mention if isinstance(user, discord.Member) else f"User ID `{user_id}`"
         success_embed = self.create_embed(
             "Moderator Added",
-            f"{user_mention} has been added to the custom moderator list.\n\nThey now have access to all moderation commands.",
+            f"{user_mention} has been added to the custom moderator list.\n\nNote: They still need appropriate Discord permissions to use mod commands.",
             "success"
         )
         await self.safe_send(ctx, embed=success_embed)
@@ -364,8 +371,6 @@ class MessageDelete(commands.Cog):
     @modset.command(name="remove")
     async def modset_remove(self, ctx: commands.Context, user: Union[discord.Member, int]):
         """Remove a user from the custom moderator list.
-        
-        Revokes access to moderation commands (unless they have Discord permissions).
         
         **Arguments:**
         - `<user>` - User to remove (mention or ID)
@@ -449,7 +454,7 @@ class MessageDelete(commands.Cog):
         - `[p]kick 123456789012345678 Breaking rules`
         
         **Required Permissions:**
-        - You: Kick Members OR Custom Moderator
+        - You: Kick Members (+ Custom Moderator if applicable)
         - Bot: Kick Members
         """
         if not await self._can_moderate(ctx, member):
@@ -503,7 +508,7 @@ class MessageDelete(commands.Cog):
         - `[p]ban 123456789012345678 0 Alt account`
         
         **Required Permissions:**
-        - You: Ban Members OR Custom Moderator
+        - You: Ban Members (+ Custom Moderator if applicable)
         - Bot: Ban Members
         """
         # Handle user ID as int
@@ -569,7 +574,7 @@ class MessageDelete(commands.Cog):
         - `[p]softban @Spammer Posted inappropriate content`
         
         **Required Permissions:**
-        - You: Ban Members OR Custom Moderator
+        - You: Ban Members (+ Custom Moderator if applicable)
         - Bot: Ban Members
         """
         if not await self._can_moderate(ctx, member):
@@ -624,7 +629,7 @@ class MessageDelete(commands.Cog):
         - `[p]tempban 123456789012345678 7d Temporary suspension`
         
         **Required Permissions:**
-        - You: Ban Members OR Custom Moderator
+        - You: Ban Members (+ Custom Moderator if applicable)
         - Bot: Ban Members
         """
         # Handle user ID as int
@@ -701,7 +706,7 @@ class MessageDelete(commands.Cog):
         - `[p]unban 987654321098765432 Ban was a mistake`
         
         **Required Permissions:**
-        - You: Ban Members OR Custom Moderator
+        - You: Ban Members (+ Custom Moderator if applicable)
         - Bot: Ban Members
         """
         reason = reason or "No reason provided"
@@ -749,7 +754,7 @@ class MessageDelete(commands.Cog):
         - `[p]massban 123456789 987654321 555555555 Raid participants`
         
         **Required Permissions:**
-        - You: Ban Members OR Custom Moderator
+        - You: Ban Members (+ Custom Moderator if applicable)
         - Bot: Ban Members
         """
         if len(user_ids) == 0:
@@ -824,7 +829,7 @@ class MessageDelete(commands.Cog):
         - `[p]mute @User 1h Inappropriate behavior`
         
         **Required Permissions:**
-        - You: Moderate Members OR Custom Moderator
+        - You: Moderate Members (+ Custom Moderator if applicable)
         - Bot: Moderate Members
         """
         if not await self._can_moderate(ctx, member):
@@ -879,7 +884,7 @@ class MessageDelete(commands.Cog):
         - `[p]unmute @User`
         
         **Required Permissions:**
-        - You: Moderate Members OR Custom Moderator
+        - You: Moderate Members (+ Custom Moderator if applicable)
         - Bot: Moderate Members
         """
         reason = reason or "No reason provided"
@@ -919,7 +924,7 @@ class MessageDelete(commands.Cog):
         - `[p]purge 100 @Spammer` - Delete last 100 messages from a specific user
         
         **Required Permissions:**
-        - You: Manage Messages OR Custom Moderator
+        - You: Manage Messages (+ Custom Moderator if applicable)
         - Bot: Manage Messages, Read Message History
         """
         if amount < 1:
@@ -975,7 +980,7 @@ class MessageDelete(commands.Cog):
         - `[p]rename @User` - Remove nickname
         
         **Required Permissions:**
-        - You: Manage Nicknames OR Custom Moderator
+        - You: Manage Nicknames (+ Custom Moderator if applicable)
         - Bot: Manage Nicknames
         """
         if not await self._can_moderate(ctx, member):
@@ -1025,7 +1030,7 @@ class MessageDelete(commands.Cog):
         - `[p]voicekick @User Disrupting voice chat`
         
         **Required Permissions:**
-        - You: Move Members OR Custom Moderator
+        - You: Move Members (+ Custom Moderator if applicable)
         - Bot: Move Members
         """
         if not await self._can_moderate(ctx, member):
@@ -1072,7 +1077,7 @@ class MessageDelete(commands.Cog):
         - `[p]voiceban @User Abusing voice chat`
         
         **Required Permissions:**
-        - You: Mute Members, Deafen Members OR Custom Moderator
+        - You: Mute Members, Deafen Members (+ Custom Moderator if applicable)
         - Bot: Mute Members, Deafen Members
         """
         if not await self._can_moderate(ctx, member):
@@ -1114,7 +1119,7 @@ class MessageDelete(commands.Cog):
         - `[p]voiceunban @User`
         
         **Required Permissions:**
-        - You: Mute Members, Deafen Members OR Custom Moderator
+        - You: Mute Members, Deafen Members (+ Custom Moderator if applicable)
         - Bot: Mute Members, Deafen Members
         """
         reason = reason or "No reason provided"
@@ -1155,7 +1160,7 @@ class MessageDelete(commands.Cog):
         - `[p]lock #general`
         
         **Required Permissions:**
-        - You: Manage Channels OR Custom Moderator
+        - You: Manage Channels (+ Custom Moderator if applicable)
         - Bot: Manage Channels
         """
         channel = channel or ctx.channel
@@ -1197,7 +1202,7 @@ class MessageDelete(commands.Cog):
         - `[p]unlock #general`
         
         **Required Permissions:**
-        - You: Manage Channels OR Custom Moderator
+        - You: Manage Channels (+ Custom Moderator if applicable)
         - Bot: Manage Channels
         """
         channel = channel or ctx.channel
@@ -1241,7 +1246,7 @@ class MessageDelete(commands.Cog):
         - `[p]slowmode 30 #general`
         
         **Required Permissions:**
-        - You: Manage Channels OR Custom Moderator
+        - You: Manage Channels (+ Custom Moderator if applicable)
         - Bot: Manage Channels
         """
         channel = channel or ctx.channel
@@ -1290,7 +1295,7 @@ class MessageDelete(commands.Cog):
         - `[p]warn @User Inappropriate language`
         
         **Required Permissions:**
-        - You: Moderate Members OR Custom Moderator
+        - You: Moderate Members (+ Custom Moderator if applicable)
         """
         if not await self._can_moderate(ctx, member):
             return
@@ -1339,7 +1344,7 @@ class MessageDelete(commands.Cog):
         - `[p]warnings @User`
         
         **Required Permissions:**
-        - You: Moderate Members OR Custom Moderator
+        - You: Moderate Members (+ Custom Moderator if applicable)
         """
         all_warnings = await self.config.guild(ctx.guild).warnings()
         user_warnings = all_warnings.get(str(member.id), [])
@@ -1672,6 +1677,156 @@ class MessageDelete(commands.Cog):
         
         await self.safe_send(ctx, embed=embed)
 
+    # ==================== Fun Commands (Extras) ====================
+
+    @commands.command()
+    async def thanos(self, ctx: commands.Context):
+        """Display Thanos image.
+        
+        **Examples:**
+        - `[p]thanos`
+        """
+        embed = discord.Embed(color=0x800080)
+        embed.set_image(url="https://cdn.discordapp.com/attachments/1069748983293022249/1425583704532848721/6LpanIV.png")
+        await self.safe_send(ctx, embed=embed)
+
+    @commands.command()
+    @commands.guild_only()
+    async def hawk(self, ctx: commands.Context, user: Optional[discord.Member] = None):
+        """Ask a user if they're a hawk.
+        
+        Randomly selects a user from the hawk list if no user is specified.
+        
+        **Arguments:**
+        - `[user]` - Optional: Specific user to ask
+        
+        **Examples:**
+        - `[p]hawk` - Ask random hawk user
+        - `[p]hawk @User` - Ask specific user
+        """
+        hawk_enabled = await self.config.guild(ctx.guild).hawk_enabled()
+        if not hawk_enabled:
+            embed = discord.Embed(color=0xED4245)
+            embed.set_image(url="https://cdn.discordapp.com/attachments/1069748983293022249/1425831928644501624/4rMETw3.gif")
+            embed.description = "The hawk command is currently disabled."
+            await self.safe_send(ctx, embed=embed)
+            return
+        
+        hawk_users = await self.config.guild(ctx.guild).hawk_users()
+        
+        if user is None:
+            if not hawk_users:
+                error_embed = self.create_embed("No Hawk Users", "No users in the hawk list!", "error")
+                await self.safe_send(ctx, embed=error_embed)
+                return
+            
+            available_users = hawk_users.copy()
+            if len(hawk_users) > 1 and ctx.guild.id in self.last_hawk_user:
+                last_user = self.last_hawk_user[ctx.guild.id]
+                if last_user in available_users:
+                    available_users.remove(last_user)
+            
+            random_user_id = random.choice(available_users)
+            user = ctx.guild.get_member(random_user_id)
+            
+            if not user:
+                error_embed = self.create_embed("User Not Found", f"User ID `{random_user_id}` is not in this server.", "error")
+                await self.safe_send(ctx, embed=error_embed)
+                return
+            
+            self.last_hawk_user[ctx.guild.id] = random_user_id
+        
+        self.awaiting_hawk_response[ctx.guild.id] = user.id
+        allowed_mentions = discord.AllowedMentions(users=True)
+        await self.safe_send(ctx, f"{user.mention} Are you a hawk?", allowed_mentions=allowed_mentions)
+
+    @commands.command()
+    @commands.guild_only()
+    async def gay(self, ctx: commands.Context, user: Optional[discord.Member] = None):
+        """Check how gay someone is.
+        
+        Generates a random percentage for the specified user.
+        
+        **Arguments:**
+        - `<user>` - User to check
+        
+        **Examples:**
+        - `[p]gay @User`
+        """
+        gay_enabled = await self.config.guild(ctx.guild).gay_enabled()
+        if not gay_enabled:
+            embed = discord.Embed(color=0xED4245)
+            embed.set_image(url="https://cdn.discordapp.com/attachments/1069748983293022249/1425831928644501624/4rMETw3.gif")
+            embed.description = "The gay command is currently disabled."
+            await self.safe_send(ctx, embed=embed)
+            return
+        
+        if user is None:
+            error_embed = self.create_embed("Missing User", "Please mention a user!", "error")
+            await self.safe_send(ctx, embed=error_embed)
+            return
+        
+        hawk_users = await self.config.guild(ctx.guild).hawk_users()
+        
+        if user.id in hawk_users:
+            percentage = random.randint(GAY_PERCENTAGE_MIN_HAWK, GAY_PERCENTAGE_MAX_HAWK)
+        else:
+            percentage = random.randint(GAY_PERCENTAGE_MIN_NORMAL, GAY_PERCENTAGE_MAX_NORMAL)
+        
+        allowed_mentions = discord.AllowedMentions(users=True)
+        await self.safe_send(ctx, f"{user.mention} is {percentage}% gay", allowed_mentions=allowed_mentions)
+
+    @commands.command()
+    @commands.is_owner()
+    @commands.guild_only()
+    async def spamping(self, ctx: commands.Context, user: discord.Member, amount: Optional[int] = DEFAULT_PING_AMOUNT):
+        """Ping a user multiple times.
+        
+        Sends multiple ping messages to annoy a user (owner only).
+        
+        **Arguments:**
+        - `<user>` - User to spam ping
+        - `[amount]` - Number of pings (default: 5, max: 20)
+        
+        **Examples:**
+        - `[p]spamping @User 10`
+        
+        **Required Permissions:**
+        - You: Bot Owner
+        """
+        if amount < 1:
+            error_embed = self.create_embed("Invalid Amount", "Amount must be at least 1.", "error")
+            await self.safe_send(ctx, embed=error_embed)
+            return
+        
+        if amount > MAX_PING_AMOUNT:
+            error_embed = self.create_embed("Amount Too High", f"Amount cannot exceed {MAX_PING_AMOUNT}.", "error")
+            await self.safe_send(ctx, embed=error_embed)
+            return
+        
+        allowed_mentions = discord.AllowedMentions(users=True)
+        
+        start_embed = self.create_embed("Spam Ping Started", f"Pinging {user.mention} {amount} time(s)...", "info")
+        await self.safe_send(ctx, embed=start_embed, allowed_mentions=allowed_mentions)
+        
+        successful_pings = 0
+        for i in range(amount):
+            try:
+                await self.safe_send(ctx, user.mention, allowed_mentions=allowed_mentions)
+                successful_pings += 1
+                if i < amount - 1:
+                    await asyncio.sleep(PING_DELAY)
+            except Exception as e:
+                log.error(f"Error during spamping: {e}")
+                break
+        
+        end_embed = self.create_embed(
+            "Spam Ping Complete",
+            f"Finished pinging {user.mention} ({successful_pings}/{amount} successful).",
+            "success"
+        )
+        await self.safe_send(ctx, embed=end_embed, allowed_mentions=allowed_mentions)
+
     # ==================== Message Block Commands ====================
     
     @commands.group(name="msgblock", invoke_without_command=True)
@@ -1762,121 +1917,7 @@ class MessageDelete(commands.Cog):
         
         await self.safe_send(ctx, embed=embed)
 
-    # ==================== Hidden Fun Commands ====================
-
-    @commands.command(hidden=True)
-    async def thanos(self, ctx: commands.Context):
-        """Display Thanos image."""
-        embed = discord.Embed(color=0x800080)
-        embed.set_image(url="https://cdn.discordapp.com/attachments/1069748983293022249/1425583704532848721/6LpanIV.png")
-        await self.safe_send(ctx, embed=embed)
-
-    @commands.command(hidden=True)
-    @commands.guild_only()
-    async def hawk(self, ctx: commands.Context, user: Optional[discord.Member] = None):
-        """Ask a user if they're a hawk."""
-        hawk_enabled = await self.config.guild(ctx.guild).hawk_enabled()
-        if not hawk_enabled:
-            embed = discord.Embed(color=0xED4245)
-            embed.set_image(url="https://cdn.discordapp.com/attachments/1069748983293022249/1425831928644501624/4rMETw3.gif")
-            embed.description = "The hawk command is currently disabled."
-            await self.safe_send(ctx, embed=embed)
-            return
-        
-        hawk_users = await self.config.guild(ctx.guild).hawk_users()
-        
-        if user is None:
-            if not hawk_users:
-                error_embed = self.create_embed("No Hawk Users", "No users in the hawk list!", "error")
-                await self.safe_send(ctx, embed=error_embed)
-                return
-            
-            available_users = hawk_users.copy()
-            if len(hawk_users) > 1 and ctx.guild.id in self.last_hawk_user:
-                last_user = self.last_hawk_user[ctx.guild.id]
-                if last_user in available_users:
-                    available_users.remove(last_user)
-            
-            random_user_id = random.choice(available_users)
-            user = ctx.guild.get_member(random_user_id)
-            
-            if not user:
-                error_embed = self.create_embed("User Not Found", f"User ID `{random_user_id}` is not in this server.", "error")
-                await self.safe_send(ctx, embed=error_embed)
-                return
-            
-            self.last_hawk_user[ctx.guild.id] = random_user_id
-        
-        self.awaiting_hawk_response[ctx.guild.id] = user.id
-        allowed_mentions = discord.AllowedMentions(users=True)
-        await self.safe_send(ctx, f"{user.mention} Are you a hawk?", allowed_mentions=allowed_mentions)
-
-    @commands.command(hidden=True)
-    @commands.guild_only()
-    async def gay(self, ctx: commands.Context, user: Optional[discord.Member] = None):
-        """Check how gay someone is."""
-        gay_enabled = await self.config.guild(ctx.guild).gay_enabled()
-        if not gay_enabled:
-            embed = discord.Embed(color=0xED4245)
-            embed.set_image(url="https://cdn.discordapp.com/attachments/1069748983293022249/1425831928644501624/4rMETw3.gif")
-            embed.description = "The gay command is currently disabled."
-            await self.safe_send(ctx, embed=embed)
-            return
-        
-        if user is None:
-            error_embed = self.create_embed("Missing User", "Please mention a user!", "error")
-            await self.safe_send(ctx, embed=error_embed)
-            return
-        
-        hawk_users = await self.config.guild(ctx.guild).hawk_users()
-        
-        if user.id in hawk_users:
-            percentage = random.randint(GAY_PERCENTAGE_MIN_HAWK, GAY_PERCENTAGE_MAX_HAWK)
-        else:
-            percentage = random.randint(GAY_PERCENTAGE_MIN_NORMAL, GAY_PERCENTAGE_MAX_NORMAL)
-        
-        allowed_mentions = discord.AllowedMentions(users=True)
-        await self.safe_send(ctx, f"{user.mention} is {percentage}% gay", allowed_mentions=allowed_mentions)
-
-    @commands.command(hidden=True)
-    @commands.is_owner()
-    @commands.guild_only()
-    async def spamping(self, ctx: commands.Context, user: discord.Member, amount: Optional[int] = DEFAULT_PING_AMOUNT):
-        """Ping a user multiple times."""
-        if amount < 1:
-            error_embed = self.create_embed("Invalid Amount", "Amount must be at least 1.", "error")
-            await self.safe_send(ctx, embed=error_embed)
-            return
-        
-        if amount > MAX_PING_AMOUNT:
-            error_embed = self.create_embed("Amount Too High", f"Amount cannot exceed {MAX_PING_AMOUNT}.", "error")
-            await self.safe_send(ctx, embed=error_embed)
-            return
-        
-        allowed_mentions = discord.AllowedMentions(users=True)
-        
-        start_embed = self.create_embed("Spam Ping Started", f"Pinging {user.mention} {amount} time(s)...", "info")
-        await self.safe_send(ctx, embed=start_embed, allowed_mentions=allowed_mentions)
-        
-        successful_pings = 0
-        for i in range(amount):
-            try:
-                await self.safe_send(ctx, user.mention, allowed_mentions=allowed_mentions)
-                successful_pings += 1
-                if i < amount - 1:
-                    await asyncio.sleep(PING_DELAY)
-            except Exception as e:
-                log.error(f"Error during spamping: {e}")
-                break
-        
-        end_embed = self.create_embed(
-            "Spam Ping Complete",
-            f"Finished pinging {user.mention} ({successful_pings}/{amount} successful).",
-            "success"
-        )
-        await self.safe_send(ctx, embed=end_embed, allowed_mentions=allowed_mentions)
-
-    # ==================== Hawk Management ====================
+    # ==================== Hawk Management (Hidden) ====================
 
     @commands.command(hidden=True)
     @commands.is_owner()
