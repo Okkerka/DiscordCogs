@@ -258,7 +258,7 @@ class TidalPlayer(commands.Cog):
         if ctx.invoked_subcommand is None:
             await ctx.send_help()
     
-    @tidalplay.command(name="setup")
+    @tidalplay.command(name="setup", hidden=True)
     async def tidalsetup(self, ctx):
         """Set up Tidal OAuth authentication"""
         if not TIDALAPI_AVAILABLE:
