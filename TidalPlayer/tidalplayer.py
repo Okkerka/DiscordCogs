@@ -63,7 +63,7 @@ class TidalPlayer(commands.Cog):
             finally:
                 self.last_played_file = None
     
-    @commands.command(name="tplay", aliases=["tidalplay"])
+    @commands.command(name="tplay", aliases=["tidalplayer"])
     async def tidal_play(self, ctx, *, query: str):
         """Play a song from Tidal"""
         if not TIDALAPI_AVAILABLE:
