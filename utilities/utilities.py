@@ -13,7 +13,6 @@ HAWK_ENABLED_GIF = "https://cdn.discordapp.com/attachments/1069748983293022249/1
 HAWK_DISABLED_GIF = "https://cdn.discordapp.com/attachments/1069748983293022249/1425831928644501624/4rMETw3.gif?ex=68ef9c76&is=68ee4af6&hm=39b6924ec16d99466f581f6f85427430d72d646729aa82566aa87e2b4ad24b3f&"
 
 BASE = discord.Color.purple()
-SUCCESS = discord.Color.purple()
 ERROR = discord.Color.red()
 
 class Utilities(commands.Cog):
@@ -234,7 +233,7 @@ class Utilities(commands.Cog):
     @commands.is_owner()
     @commands.guild_only()
     async def addhawk(self, ctx, *users: discord.Member):
-        """Add one or more users to the hawk list."""
+        """Add one or more users to the hawk list (does NOT ping)."""
         if not users:
             await ctx.send("Please specify one or more users.")
             return
@@ -295,6 +294,33 @@ class Utilities(commands.Cog):
             color=BASE
         )
         embed.set_footer(text=f"Total: {total}")
+        await ctx.send(embed=embed)
+
+    @commands.command()
+    @commands.is_owner()
+    @commands.guild_only()
+    async def clearhawks(self, ctx):
+        """Remove users from the hawk list who are no longer in the server."""
+        hawk_users = await self.config.guild(ctx.guild).hawk_users()
+        removed = []
+        current = []
+        for uid in list(hawk_users):
+            member = ctx.guild.get_member(uid)
+            if not member:
+                hawk_users.remove(uid)
+                removed.append(uid)
+            else:
+                current.append(uid)
+        await self.config.guild(ctx.guild).hawk_users.set(current)
+        embed = discord.Embed(
+            title="🦅 Hawk List Cleanup",
+            description=f"Removed {len(removed)} users who left the server.",
+            color=BASE
+        )
+        if removed:
+            embed.add_field(name="Removed User IDs", value=", ".join(str(u) for u in removed), inline=False)
+        else:
+            embed.add_field(name="Removed User IDs", value="None", inline=False)
         await ctx.send(embed=embed)
 
     @commands.command()
