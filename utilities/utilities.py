@@ -32,127 +32,75 @@ class Utilities(commands.Cog):
 
     @commands.command(aliases=["av", "pfp"])
     async def avatar(self, ctx, member: discord.Member = None):
-        """Show a user's avatar."""
         member = member or ctx.author
-        embed = discord.Embed(
-            title=f"{member.display_name}'s Avatar",
-            color=BASE
-        )
-        embed.set_image(url=member.display_avatar.url)
-        embed.set_footer(text=f"ID: {member.id}")
-        await ctx.send(embed=embed)
+        await ctx.send(member.display_avatar.url)
 
     @commands.command(aliases=["ui", "whois"])
     async def userinfo(self, ctx, member: discord.Member = None):
-        """Show info about a user."""
         member = member or ctx.author
+        lines = [
+            f"__{member}__",
+            f"ID: `{member.id}`",
+            f"Account Created: {discord.utils.format_dt(member.created_at, 'f')}",
+            f"Joined Server: {discord.utils.format_dt(member.joined_at, 'f')}",
+            f"Top Role: {member.top_role.mention}",
+        ]
         roles = [r.mention for r in member.roles if r != ctx.guild.default_role]
-        embed = discord.Embed(
-            title=f"{member}",
-            color=BASE
-        )
-        embed.set_thumbnail(url=member.display_avatar.url)
-        embed.add_field(name="ID", value=member.id)
-        embed.add_field(name="Account Creation", value=f"{discord.utils.format_dt(member.created_at, 'f')}")
-        embed.add_field(name="Joined Server", value=f"{discord.utils.format_dt(member.joined_at, 'f')}")
-        embed.add_field(name="Top Role", value=member.top_role.mention)
-        embed.add_field(name="Roles", value=", ".join(roles) if roles else "None", inline=False)
-        embed.set_footer(text=f"Requested by {ctx.author}", icon_url=ctx.author.display_avatar.url)
-        await ctx.send(embed=embed)
+        if roles:
+            lines.append(f"Roles: {', '.join(roles)}")
+        await ctx.send("\n".join(lines))
 
     @commands.command(aliases=["si", "guildinfo"])
     async def serverinfo(self, ctx):
-        """Show info about the server."""
         guild = ctx.guild
-        embed = discord.Embed(
-            title=f"{guild.name}",
-            color=BASE,
-            description=f"**ID:** `{guild.id}`\nOwner: {guild.owner.display_name}"
-        )
-        embed.add_field(name="Members", value=guild.member_count)
-        embed.add_field(name="Channels", value=len(guild.channels))
-        if guild.icon:
-            embed.set_thumbnail(url=guild.icon.url)
-        embed.set_footer(text="Created at " + guild.created_at.strftime("%Y-%m-%d %H:%M"))
-        await ctx.send(embed=embed)
+        lines = [
+            f"**{guild.name}** (ID: `{guild.id}`)",
+            f"Owner: {guild.owner.display_name}",
+            f"Created: {guild.created_at.strftime('%Y-%m-%d %H:%M')}",
+            f"Members: {guild.member_count}",
+            f"Channels: {len(guild.channels)}",
+        ]
+        await ctx.send("\n".join(lines))
 
     @commands.command(aliases=["latency", "botping"])
     async def status(self, ctx):
-        """Show the bot's latency."""
-        embed = discord.Embed(
-            title="Bot Latency",
-            description=f"{round(ctx.bot.latency * 1000)} ms",
-            color=BASE
-        )
-        await ctx.send(embed=embed)
+        await ctx.send(f"Bot latency: `{round(ctx.bot.latency * 1000)} ms`")
 
     @commands.command(aliases=["8ball"])
     async def eightball(self, ctx, *, question: str):
-        """Ask the Magic 8-ball a question."""
         responses = [
             "It is certain", "Without a doubt", "Yes", "No", "Maybe", "Ask again later",
             "My reply is no", "My sources say no", "Outlook good", "Very doubtful"
         ]
-        embed = discord.Embed(
-            title="Magic 8-ball",
-            description=f"**Question:** {question}\n**Answer:** {random.choice(responses)}",
-            color=BASE
-        )
-        await ctx.send(embed=embed)
+        await ctx.send(f"🎱 {random.choice(responses)}")
 
     @commands.command()
     async def poll(self, ctx, *, question: str):
-        """Create a yes/no poll."""
-        embed = discord.Embed(
-            title="Poll",
-            description=f"**{question}**\n👍 = Yes\n👎 = No",
-            color=BASE
-        )
-        msg = await ctx.send(embed=embed)
+        msg = await ctx.send(f"**{question}**\n👍 = Yes\n👎 = No")
         await msg.add_reaction("👍")
         await msg.add_reaction("👎")
 
     @commands.command()
     async def choose(self, ctx, *choices):
-        """Randomly choose from options."""
         if not choices or len(choices) < 2:
             await ctx.send("You must provide at least 2 options")
             return
-        choice = random.choice(choices)
-        embed = discord.Embed(
-            title="Choose",
-            description=f"I choose: **{choice}**",
-            color=BASE
-        )
-        await ctx.send(embed=embed)
+        await ctx.send(f"I choose: **{random.choice(choices)}**")
 
     @commands.command()
     async def coinflip(self, ctx):
-        """Flip a coin!"""
-        embed = discord.Embed(
-            title="Coin Flip",
-            description=f"Result: **{random.choice(['Heads', 'Tails'])}**",
-            color=BASE
-        )
-        await ctx.send(embed=embed)
+        await ctx.send(f"Result: **{random.choice(['Heads', 'Tails'])}**")
 
     @commands.command()
     async def dice(self, ctx, sides: int = 6):
-        """Roll a dice!"""
         if not 2 <= sides <= 100:
             await ctx.send("Number of sides must be between 2 and 100.")
             return
-        embed = discord.Embed(
-            title="Dice Roll",
-            description=f"Rolled: **{random.randint(1, sides)}** (d{sides})",
-            color=BASE
-        )
-        await ctx.send(embed=embed)
+        await ctx.send(f"Rolled: **{random.randint(1, sides)}** (d{sides})")
 
     @commands.command()
     @commands.guild_only()
     async def hawk(self, ctx, user: Optional[discord.Member] = None):
-        """Ask a user if they're a hawk."""
         if not await self.config.guild(ctx.guild).hawk_enabled():
             embed = discord.Embed(
                 title="🦅 Hawk",
@@ -165,75 +113,58 @@ class Utilities(commands.Cog):
 
         hawk_users = await self.config.guild(ctx.guild).hawk_users()
         if user is None:
-            if not hawk_users:
+            still_here = [uid for uid in hawk_users if ctx.guild.get_member(uid)]
+            if not still_here:
                 await ctx.send("There are no hawk users set!")
                 return
-            available = hawk_users.copy()
+            available = still_here.copy()
             if len(available) > 1 and ctx.guild.id in self.last_hawk_user:
                 last_id = self.last_hawk_user[ctx.guild.id]
                 if last_id in available:
                     available.remove(last_id)
             random_user_id = random.choice(available)
             user = ctx.guild.get_member(random_user_id)
-            if not user:
-                await ctx.send(f"User ID `{random_user_id}` is not in this server!")
-                return
             self.last_hawk_user[ctx.guild.id] = random_user_id
 
+        if not user:
+            await ctx.send("Target user not found in server.")
+            return
+
         self.awaiting_hawk_response[ctx.guild.id] = user.id
-        embed = discord.Embed(
-            title="🦅 Hawk Check!",
-            description=f"{user.mention} Are you a hawk?",
-            color=BASE
-        )
         await ctx.send(
-            embed=embed,
+            f"{user.mention} Are you a hawk?",
             allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False)
         )
 
     @commands.command()
     @commands.guild_only()
     async def gay(self, ctx, user: Optional[discord.Member] = None):
-        """How gay is this user?"""
+        """How gay is this user? Now with 1% chance of 9999% for hawk list members."""
         if not await self.config.guild(ctx.guild).gay_enabled():
-            embed = discord.Embed(
-                title="Gay Percentage",
-                description="The gay command is currently **disabled**.",
-                color=ERROR
-            )
-            embed.set_image(url=HAWK_DISABLED_GIF)
-            await ctx.send(embed=embed)
+            await ctx.send("❌ The gay command is currently disabled.")
             return
         if user is None:
             await ctx.send("Please mention a user.")
             return
         hawk_users = await self.config.guild(ctx.guild).hawk_users()
+        pct = None
         if user.id in hawk_users:
-            pct = random.randint(GAY_PERCENTAGE_MIN_HAWK, GAY_PERCENTAGE_MAX_HAWK)
+            if random.randrange(100) == 0:
+                pct = 9999
+            else:
+                pct = random.randint(GAY_PERCENTAGE_MIN_HAWK, GAY_PERCENTAGE_MAX_HAWK)
         else:
             pct = random.randint(GAY_PERCENTAGE_MIN_NORMAL, GAY_PERCENTAGE_MAX_NORMAL)
-        embed = discord.Embed(
-            title="Gay Percentage",
-            description=f"{user.display_name} is **{pct}% gay!** 🏳️‍🌈",
-            color=BASE
-        )
-        await ctx.send(embed=embed)
+        await ctx.send(f"{user.display_name} is **{pct}% gay!** 🏳️‍🌈")
 
     @commands.command()
     async def thanos(self, ctx):
-        """Show Thanos meme."""
-        embed = discord.Embed(
-            title="Thanos Meme",
-            color=BASE
-        )
-        embed.set_image(url=THANOS_IMG)
-        await ctx.send(embed=embed)
+        await ctx.send(THANOS_IMG)
 
     @commands.command()
     @commands.is_owner()
     @commands.guild_only()
     async def addhawk(self, ctx, *users: discord.Member):
-        """Add one or more users to the hawk list (does NOT ping)."""
         if not users:
             await ctx.send("Please specify one or more users.")
             return
@@ -257,7 +188,6 @@ class Utilities(commands.Cog):
     @commands.is_owner()
     @commands.guild_only()
     async def removehawk(self, ctx, user: discord.Member):
-        """Remove a user from the hawk list."""
         async with self.config.guild(ctx.guild).hawk_users() as hawk_users:
             if user.id in hawk_users:
                 hawk_users.remove(user.id)
@@ -269,17 +199,10 @@ class Utilities(commands.Cog):
     @commands.is_owner()
     @commands.guild_only()
     async def listhawk(self, ctx):
-        """List all hawk users and show how many are in the list."""
         hawk_users = await self.config.guild(ctx.guild).hawk_users()
         total = len(hawk_users)
         if not hawk_users:
-            embed = discord.Embed(
-                title="🦅 Hawk List",
-                description="The hawk list is empty.",
-                color=ERROR
-            )
-            embed.set_footer(text="Total: 0")
-            await ctx.send(embed=embed)
+            await ctx.send("🦅 The hawk list is empty.\nTotal: 0")
             return
         lines = []
         for uid in hawk_users:
@@ -288,72 +211,40 @@ class Utilities(commands.Cog):
                 lines.append(f"**{member.display_name}** (`{uid}`)")
             else:
                 lines.append(f"`{uid}` (not in server)")
-        embed = discord.Embed(
-            title="🦅 Hawk List",
-            description="\n".join(lines),
-            color=BASE
-        )
-        embed.set_footer(text=f"Total: {total}")
-        await ctx.send(embed=embed)
+        lines.append(f"Total: {total}")
+        await ctx.send("\n".join(lines))
 
     @commands.command()
     @commands.is_owner()
     @commands.guild_only()
     async def clearhawks(self, ctx):
-        """Remove users from the hawk list who are no longer in the server."""
         hawk_users = await self.config.guild(ctx.guild).hawk_users()
-        removed = []
-        current = []
-        for uid in list(hawk_users):
-            member = ctx.guild.get_member(uid)
-            if not member:
-                hawk_users.remove(uid)
-                removed.append(uid)
-            else:
-                current.append(uid)
-        await self.config.guild(ctx.guild).hawk_users.set(current)
-        embed = discord.Embed(
-            title="🦅 Hawk List Cleanup",
-            description=f"Removed {len(removed)} users who left the server.",
-            color=BASE
+        removed = [uid for uid in hawk_users if not ctx.guild.get_member(uid)]
+        kept = [uid for uid in hawk_users if ctx.guild.get_member(uid)]
+        await self.config.guild(ctx.guild).hawk_users.set(kept)
+        msg = (
+            f"🦅 Removed {len(removed)} users who left the server.\n"
+            f"Removed: {', '.join(str(u) for u in removed) if removed else 'None'}"
         )
-        if removed:
-            embed.add_field(name="Removed User IDs", value=", ".join(str(u) for u in removed), inline=False)
-        else:
-            embed.add_field(name="Removed User IDs", value="None", inline=False)
-        await ctx.send(embed=embed)
+        await ctx.send(msg)
 
     @commands.command()
     @commands.is_owner()
     @commands.guild_only()
     async def disablehawk(self, ctx):
-        """Toggle the hawk command on/off."""
         enabled = await self.config.guild(ctx.guild).hawk_enabled()
         await self.config.guild(ctx.guild).hawk_enabled.set(not enabled)
-        embed = discord.Embed(
-            title="🦅 Hawk Command Toggled",
-            description=f"Hawk command is now **{'enabled' if not enabled else 'disabled'}**.",
-            color=BASE
-        )
-        gif = HAWK_ENABLED_GIF if not enabled else HAWK_DISABLED_GIF
-        embed.set_image(url=gif)
-        await ctx.send(embed=embed)
+        state = "enabled" if not enabled else "disabled"
+        await ctx.send(f"🦅 Hawk command is now **{state}**.")
 
     @commands.command()
     @commands.is_owner()
     @commands.guild_only()
     async def disablegay(self, ctx):
-        """Toggle the gay command on/off."""
         enabled = await self.config.guild(ctx.guild).gay_enabled()
         await self.config.guild(ctx.guild).gay_enabled.set(not enabled)
-        embed = discord.Embed(
-            title="Gay Command Toggled",
-            description=f"Gay command is now **{'enabled' if not enabled else 'disabled'}**.",
-            color=BASE
-        )
-        gif = HAWK_ENABLED_GIF if not enabled else HAWK_DISABLED_GIF
-        embed.set_image(url=gif)
-        await ctx.send(embed=embed)
+        state = "enabled" if not enabled else "disabled"
+        await ctx.send(f"Gay command is now **{state}**.")
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -370,12 +261,10 @@ class Utilities(commands.Cog):
         yes_words = ["yes", "yea", "ye", "yuh"]
         no_words = ["no", "nah", "nuh", "naw"]
         if any(word in content for word in yes_words):
-            reply = "I'm a hawk too"
-            await message.channel.send(reply)
+            await message.channel.send("I'm a hawk too")
             del self.awaiting_hawk_response[message.guild.id]
         elif any(word in content for word in no_words):
-            reply = "Fuck you then"
-            await message.channel.send(reply)
+            await message.channel.send("Fuck you then")
             del self.awaiting_hawk_response[message.guild.id]
 
 async def setup(bot):
