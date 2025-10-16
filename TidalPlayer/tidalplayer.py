@@ -524,6 +524,17 @@ class TidalPlayer(commands.Cog):
         await self._clear_meta(ctx.guild.id)
         await ctx.send("✅ Tidal queue metadata cleared.")
 
+    @commands.command(name="tidalreset")
+    @commands.is_owner()
+    async def tidalreset(self, ctx):
+        """Clear all stored Tidal OAuth tokens and reset authentication."""
+        await self.config.token_type.set(None)
+        await self.config.access_token.set(None)
+        await self.config.refresh_token.set(None)
+        await self.config.expiry_time.set(None)
+        self.session = tidalapi.Session() if TIDALAPI_AVAILABLE else None
+        await ctx.send("✅ Tidal authentication data cleared. Now run:\n1. `[p]pipinstall --force-reinstall tidalapi`\n2. Restart your bot\n3. `>tidalsetup`")
+
     @commands.command(name="tidalsetup")
     @commands.is_owner()
     async def tidalsetup(self, ctx):
@@ -546,7 +557,7 @@ class TidalPlayer(commands.Cog):
         
         if isinstance(result, Exception):
             log.error(f"OAuth failed: {result}")
-            await ctx.send(f"❌ Tidal OAuth failed: {result}\n\n**Troubleshooting:**\n1. Make sure you're on tidalapi 0.8.8: `[p]pipinstall --upgrade tidalapi`\n2. Check your bot's console/terminal for the login link\n3. If still failing, Tidal may be blocking third-party apps temporarily")
+            await ctx.send(f"❌ Tidal OAuth failed: {result}\n\n**Troubleshooting:**\n1. Run `>tidalreset` to clear old tokens\n2. Make sure you're on tidalapi 0.8.8: `[p]pipinstall --force-reinstall tidalapi`\n3. **Restart your bot** after reinstalling\n4. Check your bot's console/terminal for the login link")
             return
         
         # Check if login succeeded
