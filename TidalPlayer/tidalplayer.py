@@ -1168,37 +1168,34 @@ class TidalPlayer(commands.Cog):
                 None,
                 self.session.login_oauth
             )
-
             await ctx.send(Messages.PROGRESS_OAUTH)
-                print(f"\n[TIDAL] Visit: {login.verification_uri_complete}")
-                print(f"\n[TIDAL] Visit: {login.verification_uri_complete}")
-                print(f"[TIDAL] Or enter code: {login.user_code} at {login.verification_uri}\n")
-
-                try:
-                    await asyncio.wait_for(future, timeout=300)
-                except asyncio.TimeoutError:
-                    await ctx.send("OAuth timeout. Please try again.")
-                    return
-
-                if self.session.check_login():
-                    await self.config.token_type.set(self.session.token_type)
-                    await self.config.access_token.set(self.session.access_token)
-                    await self.config.refresh_token.set(self.session.refresh_token)
-
-                    expiry = None
-                    if self.session.expiry_time:
-                        expiry = int(self.session.expiry_time.timestamp())
-                    await self.config.expiry_time.set(expiry)
-
-                    await ctx.send(Messages.SUCCESS_TIDAL_SETUP)
-                else:
-                    await ctx.send("Login failed. Please try again.")
+            print(f"\n[TIDAL] Visit: {login.verification_uri_complete}")
+            print(f"[TIDAL] Or enter code: {login.user_code} at {login.verification_uri}\n")
+            
+            try:
+                await asyncio.wait_for(future, timeout=300)
+            except asyncio.TimeoutError:
+                await ctx.send("OAuth timeout. Please try again.")
+                return
+            
+            if self.session.check_login():
+                await self.config.token_type.set(self.session.token_type)
+                await self.config.access_token.set(self.session.access_token)
+                await self.config.refresh_token.set(self.session.refresh_token)
+                
+                expiry = None
+                if self.session.expiry_time:
+                    expiry = int(self.session.expiry_time.timestamp())
+                await self.config.expiry_time.set(expiry)
+                
+                await ctx.send(Messages.SUCCESS_TIDAL_SETUP)
             else:
-                await ctx.send(Messages.PROGRESS_OAUTH_PENDING)
-
+                await ctx.send("Login failed. Please try again.")
+        
         except Exception as e:
             log.error(f"OAuth setup error: {e}", exc_info=True)
             await ctx.send(f"Setup failed: {str(e)}")
+            
 
     @commands.group(name="tidalplay")
     @commands.is_owner()
