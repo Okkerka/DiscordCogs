@@ -339,7 +339,6 @@ class TidalPlayer(commands.Cog):
             return False
 
         return True
-
     async def _interactive_select(self, ctx: commands.Context, tracks: List[Any]) -> Optional[Any]:
         if not tracks:
             return None
@@ -384,6 +383,7 @@ class TidalPlayer(commands.Cog):
         except asyncio.TimeoutError:
             await ctx.send(Messages.ERROR_TIMEOUT)
             return None
+
 
     def _suppress_enqueued(self, ctx: commands.Context) -> None:
         if hasattr(ctx, "_orig_send"):
@@ -436,12 +436,16 @@ class TidalPlayer(commands.Cog):
                 log.error(f"Failed to get URL for track: {meta['title']}")
                 return False
 
-            audio_cog = self.bot.get_cog("Audio")
-            if audio_cog:
-                await audio_cog.command_play(ctx, query=url)
-                return True
+            self._suppress_enqueued(ctx)
 
-            return False
+            try:
+                audio_cog = self.bot.get_cog("Audio")
+                if audio_cog:
+                    await audio_cog.command_play(ctx, query=url)
+                    return True
+                return False
+            finally:
+                self._restore_send(ctx)
         except Exception as e:
             log.error(f"Play error: {e}", exc_info=True)
             return False
@@ -818,14 +822,7 @@ class TidalPlayer(commands.Cog):
                     await ctx.send(Messages.ERROR_NO_TRACKS_FOUND)
                     return
 
-                interactive = await self.config.guild(ctx.guild).interactive_search()
-
-                if interactive:
-                    selected = await self._interactive_select(ctx, tracks)
-                    if selected:
-                        await self._play(ctx, selected)
-                else:
-                    await self._play(ctx, tracks[0])
+                await self._play(ctx, tracks[0])
 
             except APIError as e:
                 await ctx.send(f"{Messages.ERROR_NO_TRACKS_FOUND} ({str(e)})")
@@ -886,28 +883,6 @@ class TidalPlayer(commands.Cog):
     async def tclear(self, ctx: commands.Context) -> None:
         await self._clear_meta(ctx.guild.id)
         await ctx.send(Messages.SUCCESS_QUEUE_CLEARED)
-
-    @commands.command(name="tidalfilter")
-    async def tidalfilter(self, ctx: commands.Context) -> None:
-        current = await self.config.guild(ctx.guild).filter_remixes()
-        new_value = not current
-        await self.config.guild(ctx.guild).filter_remixes.set(new_value)
-
-        if new_value:
-            await ctx.send(Messages.SUCCESS_FILTER_ENABLED)
-        else:
-            await ctx.send(Messages.SUCCESS_FILTER_DISABLED)
-
-    @commands.command(name="tidaloptions")
-    async def tidaloptions(self, ctx: commands.Context) -> None:
-        current = await self.config.guild(ctx.guild).interactive_search()
-        new_value = not current
-        await self.config.guild(ctx.guild).interactive_search.set(new_value)
-
-        if new_value:
-            await ctx.send(Messages.SUCCESS_INTERACTIVE_ENABLED)
-        else:
-            await ctx.send(Messages.SUCCESS_INTERACTIVE_DISABLED)
 
     @commands.is_owner()
     @commands.command(name="tidalsetup")
