@@ -527,86 +527,38 @@ class TidalPlayer(commands.Cog):
     @commands.command(name="tidalsetup")
     @commands.is_owner()
     async def tidalsetup(self, ctx):
-        """Setup Tidal OAuth authentication."""
+        """Setup Tidal OAuth authentication (requires tidalapi 0.8.8+)."""
         if not TIDALAPI_AVAILABLE:
             return await ctx.send("❌ Error: Install tidalapi with `[p]pipinstall tidalapi`")
         
-        # Try login_oauth_simple first (more reliable)
-        if hasattr(self.session, 'login_oauth_simple'):
-            await ctx.send("🔐 Starting Tidal OAuth (simplified method)...")
-            
-            def _run_oauth_simple():
-                """Run OAuth with custom printer to capture link."""
-                link_data = {'lines': []}
-                
-                def custom_printer(text):
-                    link_data['lines'].append(text)
-                
-                try:
-                    self.session.login_oauth_simple(fn_print=custom_printer)
-                    return link_data
-                except Exception as e:
-                    return e
-            
-            result = await self.bot.loop.run_in_executor(None, _run_oauth_simple)
-            
-            if isinstance(result, Exception):
-                log.error(f"OAuth simple failed: {result}")
-                await ctx.send(f"❌ Tidal OAuth failed: {result}\n\n**Troubleshooting:**\n1. Update tidalapi: `[p]pipinstall --upgrade tidalapi`\n2. Tidal may have blocked third-party logins\n3. Try a different Tidal account")
-                return
-            
-            # Show the login instructions that were captured
-            if result.get('lines'):
-                await ctx.send('\n'.join(result['lines']))
-            
-            if self.session.check_login():
-                await self.config.token_type.set(self.session.token_type)
-                await self.config.access_token.set(self.session.access_token)
-                await self.config.refresh_token.set(self.session.refresh_token)
-                if hasattr(self.session, "expiry_time"):
-                    await self.config.expiry_time.set(self.session.expiry_time.timestamp())
-                await ctx.send("✅ Tidal setup complete!")
-            else:
-                await ctx.send("❌ Login failed. You may not have completed the authorization.")
-        else:
-            # Fall back to standard login_oauth
-            def _run_oauth():
-                try:
-                    return self.session.login_oauth()
-                except Exception as e:
-                    return e
-
-            result = await self.bot.loop.run_in_executor(None, _run_oauth)
-            if isinstance(result, Exception):
-                await ctx.send(f"❌ Tidal OAuth device login failed: {result}")
-                await ctx.send("**Troubleshooting:**\n1. Update tidalapi: `[p]pipinstall --upgrade tidalapi`\n2. This error often means Tidal restricted third-party app logins\n3. Check if your Tidal subscription is active")
-                return
-
-            login, fut = result
-            embed = discord.Embed(
-                title="🎵 Tidal OAuth Setup",
-                description=f"Visit:\n{login.verification_uri_complete}",
-                color=discord.Color.blue()
-            )
-            embed.set_footer(text="Expires in 5 minutes")
-            await ctx.send(embed=embed)
-            
+        await ctx.send("🔐 Starting Tidal OAuth login...\n**⚠️ CHECK YOUR BOT CONSOLE/TERMINAL FOR THE LOGIN LINK!**")
+        
+        def _run_oauth_simple():
+            """Run OAuth - output goes to console."""
             try:
-                await asyncio.wait_for(self.bot.loop.run_in_executor(None, fut.result), timeout=OAUTH_TIMEOUT)
-            except asyncio.TimeoutError:
-                return await ctx.send("⏱️ OAuth timed out. Please try again.")
+                # Updated client credentials in 0.8.8 should fix 401 errors
+                self.session.login_oauth_simple()
+                return True
             except Exception as e:
-                return await ctx.send(f"❌ OAuth login error: {e}")
-
-            if self.session.check_login():
-                await self.config.token_type.set(self.session.token_type)
-                await self.config.access_token.set(self.session.access_token)
-                await self.config.refresh_token.set(self.session.refresh_token)
-                if hasattr(self.session, "expiry_time"):
-                    await self.config.expiry_time.set(self.session.expiry_time.timestamp())
-                await ctx.send("✅ Tidal setup complete!")
-            else:
-                await ctx.send("❌ Login failed. Try again or check if Tidal restricted third-party access.")
+                return e
+        
+        result = await self.bot.loop.run_in_executor(None, _run_oauth_simple)
+        
+        if isinstance(result, Exception):
+            log.error(f"OAuth failed: {result}")
+            await ctx.send(f"❌ Tidal OAuth failed: {result}\n\n**Troubleshooting:**\n1. Make sure you're on tidalapi 0.8.8: `[p]pipinstall --upgrade tidalapi`\n2. Check your bot's console/terminal for the login link\n3. If still failing, Tidal may be blocking third-party apps temporarily")
+            return
+        
+        # Check if login succeeded
+        if self.session.check_login():
+            await self.config.token_type.set(self.session.token_type)
+            await self.config.access_token.set(self.session.access_token)
+            await self.config.refresh_token.set(self.session.refresh_token)
+            if hasattr(self.session, "expiry_time"):
+                await self.config.expiry_time.set(self.session.expiry_time.timestamp())
+            await ctx.send("✅ Tidal setup complete!")
+        else:
+            await ctx.send("❌ Login failed. The link was printed to your console - follow it, authorize, then run this command again.")
 
     @commands.group(name="tidalplay", invoke_without_command=True)
     @commands.is_owner()
