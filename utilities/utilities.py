@@ -11,8 +11,8 @@ GAY_PERCENTAGE_MAX_HAWK = 150
 skibiditoilet = "\u200b"
 
 THANOS_IMG = "https://cdn.discordapp.com/attachments/1069748983293022249/1425583704532848721/6LpanIV.png"
-HAWK_ENABLED_GIF = "https://cdn.discordapp.com/attachments/1069748983293022249/1425831721160540281/NzusuSn.png"
-HAWK_DISABLED_GIF = "https://cdn.discordapp.com/attachments/1069748983293022249/1425831928644501624/4rMETw3.gif"
+HAWK_ENABLED_GIF = "https://cdn.discordapp.com/attachments/1069748983293022249/1425831721160540281/NzusuSn.png?ex=68ef9c44&is=68ee4ac4&hm=e97e9983b9d353846965007409b69c50f696589f21fe423e257d6e43e61972cb&"
+HAWK_DISABLED_GIF = "https://cdn.discordapp.com/attachments/1069748983293022249/1425831928644501624/4rMETw3.gif?ex=68ef9c76&is=68ee4af6&hm=39b6924ec16d99466f581f6f85427430d72d646729aa82566aa87e2b4ad24b3f&"
 
 BASE = discord.Color.purple()
 ERROR = discord.Color.red()
@@ -139,7 +139,13 @@ class Utilities(commands.Cog):
     @commands.guild_only()
     async def gay(self, ctx, user: Optional[discord.Member] = None):
         if not await self.config.guild(ctx.guild).gay_enabled():
-            await ctx.send("❌ The gay command is currently disabled.")
+            embed = discord.Embed(
+                title="Gay Percentage",
+                description="The gay command is currently **disabled**.",
+                color=ERROR
+            )
+            embed.set_image(url=HAWK_DISABLED_GIF)
+            await ctx.send(embed=embed)
             return
         if user is None:
             await ctx.send("Please mention a user.")
@@ -153,11 +159,21 @@ class Utilities(commands.Cog):
             pct = 9999 if random.randrange(100) == 0 else random.randint(GAY_PERCENTAGE_MIN_HAWK, GAY_PERCENTAGE_MAX_HAWK)
         else:
             pct = random.randint(GAY_PERCENTAGE_MIN_NORMAL, GAY_PERCENTAGE_MAX_NORMAL)
-        await ctx.send(f"{user.display_name} is **{pct}% gay!** 🏳️‍🌈")
+        embed = discord.Embed(
+            title="Gay Percentage",
+            description=f"{user.display_name} is **{pct}% gay!** 🏳️‍🌈",
+            color=BASE
+        )
+        await ctx.send(embed=embed)
 
     @commands.command()
     async def thanos(self, ctx):
-        await ctx.send(THANOS_IMG)
+        embed = discord.Embed(
+            title="Thanos Meme",
+            color=BASE
+        )
+        embed.set_image(url=THANOS_IMG)
+        await ctx.send(embed=embed)
 
     @commands.command()
     @commands.is_owner()
@@ -204,7 +220,13 @@ class Utilities(commands.Cog):
         hawk_users = set(await self.config.guild(ctx.guild).hawk_users())
         total = len(hawk_users)
         if not hawk_users:
-            await ctx.send("🦅 The hawk list is empty.\nTotal: 0")
+            embed = discord.Embed(
+                title="🦅 Hawk List",
+                description="The hawk list is empty.",
+                color=ERROR
+            )
+            embed.set_footer(text="Total: 0")
+            await ctx.send(embed=embed)
             return
         lines = []
         for uid in hawk_users:
@@ -213,8 +235,13 @@ class Utilities(commands.Cog):
                 lines.append(f"**{member.display_name}** (`{uid}`)")
             else:
                 lines.append(f"`{uid}` (not in server)")
-        lines.append(f"Total: {total}")
-        await ctx.send("\n".join(lines))
+        embed = discord.Embed(
+            title="🦅 Hawk List",
+            description="\n".join(lines),
+            color=BASE
+        )
+        embed.set_footer(text=f"Total: {total}")
+        await ctx.send(embed=embed)
 
     @commands.command()
     @commands.is_owner()
@@ -225,11 +252,13 @@ class Utilities(commands.Cog):
         removed = [uid for uid in hawk_users if not ctx.guild.get_member(uid)]
         kept = [uid for uid in hawk_users if ctx.guild.get_member(uid)]
         await config.hawk_users.set(kept)
-        msg = (
-            f"🦅 Removed {len(removed)} users who left the server.\n"
-            f"Removed: {', '.join(str(u) for u in removed) if removed else 'None'}"
+        embed = discord.Embed(
+            title="🦅 Hawk List Cleanup",
+            description=f"Removed {len(removed)} users who left the server.",
+            color=BASE
         )
-        await ctx.send(msg)
+        embed.add_field(name="Removed User IDs", value=", ".join(str(u) for u in removed) if removed else "None", inline=False)
+        await ctx.send(embed=embed)
 
     @commands.command()
     @commands.is_owner()
@@ -239,7 +268,14 @@ class Utilities(commands.Cog):
         enabled = await config.hawk_enabled()
         await config.hawk_enabled.set(not enabled)
         state = "enabled" if not enabled else "disabled"
-        await ctx.send(f"🦅 Hawk command is now **{state}**.")
+        embed = discord.Embed(
+            title="🦅 Hawk Command Toggled",
+            description=f"Hawk command is now **{state}**.",
+            color=BASE
+        )
+        gif = HAWK_ENABLED_GIF if not enabled else HAWK_DISABLED_GIF
+        embed.set_image(url=gif)
+        await ctx.send(embed=embed)
 
     @commands.command()
     @commands.is_owner()
@@ -249,7 +285,14 @@ class Utilities(commands.Cog):
         enabled = await config.gay_enabled()
         await config.gay_enabled.set(not enabled)
         state = "enabled" if not enabled else "disabled"
-        await ctx.send(f"Gay command is now **{state}**.")
+        embed = discord.Embed(
+            title="Gay Command Toggled",
+            description=f"Gay command is now **{state}**.",
+            color=BASE
+        )
+        gif = HAWK_ENABLED_GIF if not enabled else HAWK_DISABLED_GIF
+        embed.set_image(url=gif)
+        await ctx.send(embed=embed)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
