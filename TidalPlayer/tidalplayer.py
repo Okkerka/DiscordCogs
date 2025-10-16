@@ -542,69 +542,70 @@ class TidalPlayer(commands.Cog):
         if not TIDALAPI_AVAILABLE:
             return await ctx.send("❌ Error: Install tidalapi with `[p]pipinstall tidalapi`")
         
-        await ctx.send("🔐 Starting Tidal OAuth login... Check your DMs!")
+        await ctx.send("🔐 Starting Tidal OAuth login...")
+        log.info("tidalsetup command started")
         
         def _run_oauth_simple():
-            """Run OAuth with custom print function."""
+            """Run OAuth - check multiple methods."""
+            log.info("Running OAuth in executor")
             output_lines = []
             
             def custom_print(msg):
-                """Custom print function to capture output."""
+                log.info(f"OAuth output: {msg}")
                 output_lines.append(str(msg))
             
             try:
-                # Pass custom print function to fn_print parameter
+                # Try with fn_print first
+                log.info("Attempting login_oauth_simple with fn_print parameter")
                 self.session.login_oauth_simple(fn_print=custom_print)
+                log.info(f"OAuth completed. Captured {len(output_lines)} lines")
                 return ("success", "\n".join(output_lines))
+            except TypeError as te:
+                # fn_print not supported, try without it
+                log.warning(f"fn_print parameter not supported: {te}")
+                try:
+                    log.info("Attempting login_oauth_simple without parameters")
+                    self.session.login_oauth_simple()
+                    return ("success", "")
+                except Exception as e2:
+                    log.error(f"OAuth without params failed: {e2}")
+                    return ("error", e2, "")
             except Exception as e:
+                log.error(f"OAuth failed: {e}", exc_info=True)
                 return ("error", e, "\n".join(output_lines))
         
-        result = await self.bot.loop.run_in_executor(None, _run_oauth_simple)
-        
-        # Send to DMs
         try:
-            if result[0] == "error":
-                error = result[1]
-                output = result[2] if len(result) > 2 else ""
-                log.error(f"OAuth failed: {error}")
-                
-                dm_msg = f"❌ **Tidal OAuth Failed**\n``````"
-                if output:
-                    dm_msg += f"\n**Output:**\n``````"
-                dm_msg += "\n**Troubleshooting:**\n1. Run `>tidalreset`\n2. `[p]pipinstall --force-reinstall tidalapi`\n3. Restart bot\n4. Try again"
-                
-                await ctx.author.send(dm_msg[:2000])
-                await ctx.send("❌ OAuth failed. Check your DMs for details.")
-                return
-            else:
-                output = result[1]
-                
-                if output and len(output.strip()) > 0:
-                    # Send captured output to DMs
-                    chunks = [output[i:i+1900] for i in range(0, len(output), 1900)]
-                    for chunk in chunks:
-                        await ctx.author.send(f"🔐 **Tidal OAuth Login**\n``````")
-                    await ctx.send("✅ Login instructions sent to your DMs!")
-                else:
-                    # No output captured - print to console as fallback
-                    await ctx.send("⚠️ No output captured. **Check your bot console/logs** for the login link.")
-                    log.warning("Tidal OAuth: No output captured, check console for login link")
-                    return
-            
-        except discord.Forbidden:
-            await ctx.send("❌ I can't DM you! Please enable DMs from server members.\n**Check your bot console/logs for the login link.**")
-            if result[0] == "success" and result[1]:
-                log.info(f"Tidal OAuth output (user DMs disabled):\n{result[1]}")
-            return
+            result = await self.bot.loop.run_in_executor(None, _run_oauth_simple)
+            log.info(f"OAuth result: {result[0]}")
         except Exception as e:
-            log.error(f"Error sending DM: {e}")
-            await ctx.send(f"❌ Error sending DM: {e}\n**Check your bot console/logs for the login link.**")
+            log.error(f"Executor error: {e}", exc_info=True)
+            await ctx.send(f"❌ Executor error: {e}")
             return
         
-        # Wait for user to complete auth
-        await asyncio.sleep(5)
+        # Handle result
+        if result[0] == "error":
+            error = result[1]
+            log.error(f"OAuth failed: {error}")
+            await ctx.send(f"❌ OAuth failed: {error}\n\n**Check your console for more details or the login link!**")
+            return
         
-        # Check if login succeeded
+        output = result[1] if len(result) > 1 else ""
+        
+        # Try to send to DMs if we have output
+        if output and len(output.strip()) > 0:
+            try:
+                await ctx.author.send(f"🔐 **Tidal OAuth Login**\n``````")
+                await ctx.send("✅ Login link sent to your DMs!")
+            except discord.Forbidden:
+                await ctx.send("❌ Can't DM you. **The login link should be in your console logs!**")
+                log.info(f"OAuth output (DMs blocked): {output}")
+        else:
+            await ctx.send("⚠️ **Check your bot console NOW** - the Tidal login link should be printed there!")
+            log.warning("No OAuth output captured - link should be in console")
+        
+        # Check if already logged in
+        await asyncio.sleep(3)
+        
         if self.session.check_login():
             await self.config.token_type.set(self.session.token_type)
             await self.config.access_token.set(self.session.access_token)
@@ -612,12 +613,14 @@ class TidalPlayer(commands.Cog):
             if hasattr(self.session, "expiry_time"):
                 await self.config.expiry_time.set(self.session.expiry_time.timestamp())
             await ctx.send("✅ Tidal setup complete!")
+            log.info("Tidal authentication successful")
             try:
                 await ctx.author.send("✅ Tidal authentication successful!")
             except:
                 pass
         else:
-            await ctx.send("⏳ Waiting for authentication... Run this command again once you've completed the login.")
+            await ctx.send("⏳ **Check your console for the login link!** Complete it, then run `>tidalsetup` again.")
+            log.warning("Login not completed yet")
 
     @commands.group(name="tidalplay", invoke_without_command=True)
     @commands.is_owner()
