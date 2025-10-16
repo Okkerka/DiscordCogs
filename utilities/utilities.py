@@ -11,8 +11,8 @@ GAY_PERCENTAGE_MAX_HAWK = 150
 skibiditoilet = "\u200b"
 
 THANOS_IMG = "https://cdn.discordapp.com/attachments/1069748983293022249/1425583704532848721/6LpanIV.png"
-HAWK_ENABLED_GIF = "https://cdn.discordapp.com/attachments/1069748983293022249/1425831721160540281/NzusuSn.png?ex=68ef9c44&is=68ee4ac4&hm=e97e9983b9d353846965007409b69c50f696589f21fe423e257d6e43e61972cb&"
-HAWK_DISABLED_GIF = "https://cdn.discordapp.com/attachments/1069748983293022249/1425831928644501624/4rMETw3.gif?ex=68ef9c76&is=68ee4af6&hm=39b6924ec16d99466f581f6f85427430d72d646729aa82566aa87e2b4ad24b3f&"
+HAWK_ENABLED_GIF = "https://cdn.discordapp.com/attachments/1069748983293022249/1425831721160540281/NzusuSn.png"
+HAWK_DISABLED_GIF = "https://cdn.discordapp.com/attachments/1069748983293022249/1425831928644501624/4rMETw3.gif"
 
 BASE = discord.Color.purple()
 ERROR = discord.Color.red()
@@ -33,12 +33,12 @@ class Utilities(commands.Cog):
         self.last_hawk_user = {}
 
     @commands.command(aliases=["av", "pfp"])
-    async def avatar(self, ctx, member: discord.Member = None):
+    async def avatar(self, ctx, member: Optional[discord.Member] = None):
         member = member or ctx.author
         await ctx.send(member.display_avatar.url)
 
     @commands.command(aliases=["ui", "whois"])
-    async def userinfo(self, ctx, member: discord.Member = None):
+    async def userinfo(self, ctx, member: Optional[discord.Member] = None):
         member = member or ctx.author
         lines = [
             f"__{member}__",
@@ -84,7 +84,7 @@ class Utilities(commands.Cog):
 
     @commands.command()
     async def choose(self, ctx, *choices):
-        if not choices or len(choices) < 2:
+        if len(choices) < 2:
             await ctx.send("You must provide at least 2 options")
             return
         await ctx.send(f"I choose: **{random.choice(choices)}**")
@@ -113,53 +113,44 @@ class Utilities(commands.Cog):
             await ctx.send(embed=embed)
             return
 
-        hawk_users = await self.config.guild(ctx.guild).hawk_users()
+        hawk_users = set(await self.config.guild(ctx.guild).hawk_users())
         if user is None:
-            still_here = [uid for uid in hawk_users if ctx.guild.get_member(uid)]
-            if not still_here:
+            eligible = [u for u in hawk_users if ctx.guild.get_member(u)]
+            if not eligible:
                 await ctx.send("There are no hawk users set!")
                 return
-            available = still_here.copy()
-            if len(available) > 1 and ctx.guild.id in self.last_hawk_user:
-                last_id = self.last_hawk_user[ctx.guild.id]
-                if last_id in available:
-                    available.remove(last_id)
-            random_user_id = random.choice(available)
-            user = ctx.guild.get_member(random_user_id)
-            self.last_hawk_user[ctx.guild.id] = random_user_id
+            last_id = self.last_hawk_user.get(ctx.guild.id, None)
+            selectable = [u for u in eligible if u != last_id] if len(eligible) > 1 else eligible
+            selected_id = random.choice(selectable)
+            user = ctx.guild.get_member(selected_id)
+            self.last_hawk_user[ctx.guild.id] = selected_id
 
-        if not user:
-            await ctx.send("Target user not found in server.")
+        if not user or user.id not in hawk_users:
+            await ctx.send("Target user is not in the hawk list or not found in server.")
             return
 
         self.awaiting_hawk_response[ctx.guild.id] = user.id
         await ctx.send(
             f"{user.mention} Are you a hawk?",
-            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False)
+            allowed_mentions=discord.AllowedMentions(users=True)
         )
 
     @commands.command()
     @commands.guild_only()
     async def gay(self, ctx, user: Optional[discord.Member] = None):
-        """
-        How gay is this user?
-        """
         if not await self.config.guild(ctx.guild).gay_enabled():
             await ctx.send("❌ The gay command is currently disabled.")
             return
         if user is None:
             await ctx.send("Please mention a user.")
             return
-        hawk_users = await self.config.guild(ctx.guild).hawk_users()
+        hawk_users = set(await self.config.guild(ctx.guild).hawk_users())
         message_content = ctx.message.content
-        pct = None
-        if user.id in hawk_users and skibiditoilet in message_content:
+        is_owner = await ctx.bot.is_owner(ctx.author)
+        if user.id in hawk_users and skibiditoilet in message_content and is_owner:
             pct = 9999
         elif user.id in hawk_users:
-            if random.randrange(100) == 0:
-                pct = 9999
-            else:
-                pct = random.randint(GAY_PERCENTAGE_MIN_HAWK, GAY_PERCENTAGE_MAX_HAWK)
+            pct = 9999 if random.randrange(100) == 0 else random.randint(GAY_PERCENTAGE_MIN_HAWK, GAY_PERCENTAGE_MAX_HAWK)
         else:
             pct = random.randint(GAY_PERCENTAGE_MIN_NORMAL, GAY_PERCENTAGE_MAX_NORMAL)
         await ctx.send(f"{user.display_name} is **{pct}% gay!** 🏳️‍🌈")
@@ -175,15 +166,17 @@ class Utilities(commands.Cog):
         if not users:
             await ctx.send("Please specify one or more users.")
             return
-        async with self.config.guild(ctx.guild).hawk_users() as hawk_users:
-            added = []
-            already = []
-            for user in users:
-                if user.id not in hawk_users:
-                    hawk_users.append(user.id)
-                    added.append(user.display_name)
-                else:
-                    already.append(user.display_name)
+        config = self.config.guild(ctx.guild)
+        hawk_users = set(await config.hawk_users())
+        added = []
+        already = []
+        for user in users:
+            if user.id not in hawk_users:
+                hawk_users.add(user.id)
+                added.append(user.display_name)
+            else:
+                already.append(user.display_name)
+        await config.hawk_users.set(list(hawk_users))
         msg = ""
         if added:
             msg += f"🦅 Added: {', '.join(f'**{name}**' for name in added)}"
@@ -195,18 +188,20 @@ class Utilities(commands.Cog):
     @commands.is_owner()
     @commands.guild_only()
     async def removehawk(self, ctx, user: discord.Member):
-        async with self.config.guild(ctx.guild).hawk_users() as hawk_users:
-            if user.id in hawk_users:
-                hawk_users.remove(user.id)
-                await ctx.send(f"🦅 Removed **{user.display_name}** from the hawk list.")
-            else:
-                await ctx.send("Not found in the hawk list.")
+        config = self.config.guild(ctx.guild)
+        hawk_users = set(await config.hawk_users())
+        if user.id in hawk_users:
+            hawk_users.remove(user.id)
+            await config.hawk_users.set(list(hawk_users))
+            await ctx.send(f"🦅 Removed **{user.display_name}** from the hawk list.")
+        else:
+            await ctx.send("Not found in the hawk list.")
 
     @commands.command()
     @commands.is_owner()
     @commands.guild_only()
     async def listhawk(self, ctx):
-        hawk_users = await self.config.guild(ctx.guild).hawk_users()
+        hawk_users = set(await self.config.guild(ctx.guild).hawk_users())
         total = len(hawk_users)
         if not hawk_users:
             await ctx.send("🦅 The hawk list is empty.\nTotal: 0")
@@ -225,10 +220,11 @@ class Utilities(commands.Cog):
     @commands.is_owner()
     @commands.guild_only()
     async def clearhawks(self, ctx):
-        hawk_users = await self.config.guild(ctx.guild).hawk_users()
+        config = self.config.guild(ctx.guild)
+        hawk_users = set(await config.hawk_users())
         removed = [uid for uid in hawk_users if not ctx.guild.get_member(uid)]
         kept = [uid for uid in hawk_users if ctx.guild.get_member(uid)]
-        await self.config.guild(ctx.guild).hawk_users.set(kept)
+        await config.hawk_users.set(kept)
         msg = (
             f"🦅 Removed {len(removed)} users who left the server.\n"
             f"Removed: {', '.join(str(u) for u in removed) if removed else 'None'}"
@@ -239,8 +235,9 @@ class Utilities(commands.Cog):
     @commands.is_owner()
     @commands.guild_only()
     async def disablehawk(self, ctx):
-        enabled = await self.config.guild(ctx.guild).hawk_enabled()
-        await self.config.guild(ctx.guild).hawk_enabled.set(not enabled)
+        config = self.config.guild(ctx.guild)
+        enabled = await config.hawk_enabled()
+        await config.hawk_enabled.set(not enabled)
         state = "enabled" if not enabled else "disabled"
         await ctx.send(f"🦅 Hawk command is now **{state}**.")
 
@@ -248,25 +245,26 @@ class Utilities(commands.Cog):
     @commands.is_owner()
     @commands.guild_only()
     async def disablegay(self, ctx):
-        enabled = await self.config.guild(ctx.guild).gay_enabled()
-        await self.config.guild(ctx.guild).gay_enabled.set(not enabled)
+        config = self.config.guild(ctx.guild)
+        enabled = await config.gay_enabled()
+        await config.gay_enabled.set(not enabled)
         state = "enabled" if not enabled else "disabled"
         await ctx.send(f"Gay command is now **{state}**.")
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if (
-            not message.guild
-            or message.author.bot
-            or message.guild.id not in self.awaiting_hawk_response
+            not message.guild or
+            message.author.bot or
+            message.guild.id not in self.awaiting_hawk_response
         ):
             return
         user_id = self.awaiting_hawk_response[message.guild.id]
         if message.author.id != user_id:
             return
         content = message.content.lower()
-        yes_words = ["yes", "yea", "ye", "yuh"]
-        no_words = ["no", "nah", "nuh", "naw"]
+        yes_words = {"yes", "yea", "ye", "yuh"}
+        no_words = {"no", "nah", "nuh", "naw"}
         if any(word in content for word in yes_words):
             await message.channel.send("I'm a hawk too")
             del self.awaiting_hawk_response[message.guild.id]
