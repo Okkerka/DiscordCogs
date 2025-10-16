@@ -34,6 +34,7 @@ BATCH_UPDATE_INTERVAL = 5
 API_SEMAPHORE_LIMIT = 3
 SEARCH_RETRY_ATTEMPTS = 2
 COG_IDENTIFIER = 160819386
+INTERACTIVE_TIMEOUT = 30
 
 
 class Messages:
@@ -57,6 +58,15 @@ class Messages:
     SUCCESS_TIDAL_SETUP = "Tidal setup complete!"
     SUCCESS_SPOTIFY_CONFIGURED = "Spotify configured."
     SUCCESS_YOUTUBE_CONFIGURED = "YouTube configured."
+    SUCCESS_FILTER_ENABLED = "Remix/TikTok filter enabled."
+    SUCCESS_FILTER_DISABLED = "Remix/TikTok filter disabled."
+    SUCCESS_INTERACTIVE_ENABLED = "Interactive search enabled. You'll choose from multiple results."
+    SUCCESS_INTERACTIVE_DISABLED = "Interactive search disabled. First result will auto-play."
+
+    ERROR_TIMEOUT = "Selection timed out."
+    ERROR_INVALID_CHOICE = "Invalid choice. Please enter a number between 1 and {max}."
+
+    STATUS_CHOOSE_TRACK = "Choose a track (1-{max}) or cancel:"
 
     PROGRESS_QUEUEING = "Queueing {name} ({count} tracks)..."
     PROGRESS_FETCHING_SPOTIFY = "Fetching Spotify playlist..."
@@ -79,6 +89,11 @@ QUALITY_LABELS = {
     "HIGH": "HIGH (320kbps)",
     "LOW": "LOW (96kbps)"
 }
+
+FILTER_KEYWORDS = [
+    'sped up', 'slowed', 'tiktok', 'nightcore', 
+    'reverb', '8d audio', 'bass boosted'
+]
 
 
 class TidalPlayerError(Exception):
@@ -128,7 +143,9 @@ class TidalPlayer(commands.Cog):
 
         self.config.register_guild(
             track_metadata=[],
-            cancel_queue=False
+            cancel_queue=False,
+            filter_remixes=True,
+            interactive_search=False
         )
 
         self.session: Optional[tidalapi.Session] = (
@@ -245,6 +262,14 @@ class TidalPlayer(commands.Cog):
         minutes, secs = divmod(seconds, 60)
         return f"{minutes:02d}:{secs:02d}"
 
+    def _filter_tracks(self, tracks: List[Any]) -> List[Any]:
+        filtered = []
+        for track in tracks:
+            title_lower = getattr(track, "name", "").lower()
+            if not any(keyword in title_lower for keyword in FILTER_KEYWORDS):
+                filtered.append(track)
+        return filtered if filtered else tracks
+
     async def _add_meta(self, guild_id: int, meta: Dict[str, Any]) -> bool:
         try:
             async with self.config.guild_from_id(guild_id).track_metadata() as queue:
@@ -285,11 +310,17 @@ class TidalPlayer(commands.Cog):
             log.error(f"Set cancel error for guild {guild_id}: {e}", exc_info=True)
 
     @async_retry(max_attempts=SEARCH_RETRY_ATTEMPTS)
-    async def _search_tidal(self, query: str) -> List[Any]:
+    async def _search_tidal(self, query: str, guild_id: int) -> List[Any]:
         async with self.api_semaphore:
             try:
                 result = await self.bot.loop.run_in_executor(None, self.session.search, query)
-                return result.get("tracks", [])
+                tracks = result.get("tracks", [])
+
+                filter_enabled = await self.config.guild_from_id(guild_id).filter_remixes()
+                if filter_enabled and tracks:
+                    tracks = self._filter_tracks(tracks)
+
+                return tracks
             except Exception as e:
                 log.error(f"Tidal search failed for query '{query}': {e}")
                 raise APIError(f"Tidal search failed: {e}")
@@ -308,6 +339,51 @@ class TidalPlayer(commands.Cog):
             return False
 
         return True
+
+    async def _interactive_select(self, ctx: commands.Context, tracks: List[Any]) -> Optional[Any]:
+        if not tracks:
+            return None
+
+        results_to_show = min(5, len(tracks))
+        description = ""
+
+        for i, track in enumerate(tracks[:results_to_show], 1):
+            meta = self._extract_meta(track)
+            duration = self._format_time(meta["duration"])
+            description += f"**{i}.** {meta['title']} - {meta['artist']} ({duration})\n"
+
+        embed = discord.Embed(
+            title="Search Results",
+            description=description,
+            color=discord.Color.blue()
+        )
+        embed.set_footer(text=Messages.STATUS_CHOOSE_TRACK.format(max=results_to_show))
+
+        await ctx.send(embed=embed)
+
+        def check(m):
+            return m.author == ctx.author and m.channel == ctx.channel
+
+        try:
+            msg = await self.bot.wait_for('message', check=check, timeout=INTERACTIVE_TIMEOUT)
+
+            try:
+                choice = int(msg.content)
+                if 1 <= choice <= results_to_show:
+                    return tracks[choice - 1]
+                else:
+                    await ctx.send(Messages.ERROR_INVALID_CHOICE.format(max=results_to_show))
+                    return None
+            except ValueError:
+                if msg.content.lower() in ['cancel', 'c', 'stop']:
+                    await ctx.send("Cancelled.")
+                    return None
+                await ctx.send(Messages.ERROR_INVALID_CHOICE.format(max=results_to_show))
+                return None
+
+        except asyncio.TimeoutError:
+            await ctx.send(Messages.ERROR_TIMEOUT)
+            return None
 
     def _suppress_enqueued(self, ctx: commands.Context) -> None:
         if hasattr(ctx, "_orig_send"):
@@ -372,7 +448,7 @@ class TidalPlayer(commands.Cog):
 
     async def _search_and_queue(self, ctx: commands.Context, query: str, track_name: str) -> bool:
         try:
-            tracks = await self._search_tidal(query)
+            tracks = await self._search_tidal(query, ctx.guild.id)
             if not tracks:
                 log.info(f"No Tidal match for: {track_name}")
                 return False
@@ -736,13 +812,20 @@ class TidalPlayer(commands.Cog):
             await self._queue_youtube_playlist(ctx, playlist_id)
         else:
             try:
-                tracks = await self._search_tidal(query)
+                tracks = await self._search_tidal(query, ctx.guild.id)
 
                 if not tracks:
                     await ctx.send(Messages.ERROR_NO_TRACKS_FOUND)
                     return
 
-                await self._play(ctx, tracks[0])
+                interactive = await self.config.guild(ctx.guild).interactive_search()
+
+                if interactive:
+                    selected = await self._interactive_select(ctx, tracks)
+                    if selected:
+                        await self._play(ctx, selected)
+                else:
+                    await self._play(ctx, tracks[0])
 
             except APIError as e:
                 await ctx.send(f"{Messages.ERROR_NO_TRACKS_FOUND} ({str(e)})")
@@ -803,6 +886,28 @@ class TidalPlayer(commands.Cog):
     async def tclear(self, ctx: commands.Context) -> None:
         await self._clear_meta(ctx.guild.id)
         await ctx.send(Messages.SUCCESS_QUEUE_CLEARED)
+
+    @commands.command(name="tidalfilter")
+    async def tidalfilter(self, ctx: commands.Context) -> None:
+        current = await self.config.guild(ctx.guild).filter_remixes()
+        new_value = not current
+        await self.config.guild(ctx.guild).filter_remixes.set(new_value)
+
+        if new_value:
+            await ctx.send(Messages.SUCCESS_FILTER_ENABLED)
+        else:
+            await ctx.send(Messages.SUCCESS_FILTER_DISABLED)
+
+    @commands.command(name="tidaloptions")
+    async def tidaloptions(self, ctx: commands.Context) -> None:
+        current = await self.config.guild(ctx.guild).interactive_search()
+        new_value = not current
+        await self.config.guild(ctx.guild).interactive_search.set(new_value)
+
+        if new_value:
+            await ctx.send(Messages.SUCCESS_INTERACTIVE_ENABLED)
+        else:
+            await ctx.send(Messages.SUCCESS_INTERACTIVE_DISABLED)
 
     @commands.is_owner()
     @commands.command(name="tidalsetup")
