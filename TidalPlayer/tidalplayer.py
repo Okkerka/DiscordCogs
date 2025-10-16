@@ -542,23 +542,61 @@ class TidalPlayer(commands.Cog):
         if not TIDALAPI_AVAILABLE:
             return await ctx.send("❌ Error: Install tidalapi with `[p]pipinstall tidalapi`")
         
-        await ctx.send("🔐 Starting Tidal OAuth login...\n**⚠️ CHECK YOUR BOT CONSOLE/TERMINAL FOR THE LOGIN LINK!**")
+        await ctx.send("🔐 Starting Tidal OAuth login... Check your DMs!")
         
         def _run_oauth_simple():
-            """Run OAuth - output goes to console."""
+            """Run OAuth and capture output."""
+            import sys
+            from io import StringIO
+            
+            # Capture stdout
+            old_stdout = sys.stdout
+            sys.stdout = captured_output = StringIO()
+            
             try:
-                # Updated client credentials in 0.8.8 should fix 401 errors
                 self.session.login_oauth_simple()
-                return True
+                output = captured_output.getvalue()
+                return ("success", output)
             except Exception as e:
-                return e
+                output = captured_output.getvalue()
+                return ("error", e, output)
+            finally:
+                sys.stdout = old_stdout
         
         result = await self.bot.loop.run_in_executor(None, _run_oauth_simple)
         
-        if isinstance(result, Exception):
-            log.error(f"OAuth failed: {result}")
-            await ctx.send(f"❌ Tidal OAuth failed: {result}\n\n**Troubleshooting:**\n1. Run `>tidalreset` to clear old tokens\n2. Make sure you're on tidalapi 0.8.8: `[p]pipinstall --force-reinstall tidalapi`\n3. **Restart your bot** after reinstalling\n4. Check your bot's console/terminal for the login link")
+        # Send to DMs
+        try:
+            if result[0] == "error":
+                error, output = result[1], result[2]
+                log.error(f"OAuth failed: {error}")
+                
+                dm_msg = f"❌ **Tidal OAuth Failed**\n``````"
+                if output:
+                    dm_msg += f"\n**Console Output:**\n``````"
+                dm_msg += f"\n**Troubleshooting:**\n1. Run `>tidalreset`\n2. Update: `[p]pipinstall --force-reinstall tidalapi`\n3. Restart bot\n4. Try again"
+                
+                await ctx.author.send(dm_msg[:2000])  # Discord 2000 char limit
+                await ctx.send("❌ OAuth failed. Check your DMs for details.")
+                return
+            else:
+                output = result[1]
+                
+                if output:
+                    # Send captured output to DMs
+                    await ctx.author.send(f"🔐 **Tidal OAuth Login**\n``````")
+                    await ctx.send("✅ Login link sent to your DMs! Follow the instructions there.")
+                else:
+                    await ctx.send("⚠️ No output captured. Check your bot console for the login link.")
+            
+        except discord.Forbidden:
+            await ctx.send("❌ I can't DM you! Enable DMs from server members or check your console.")
+            if result[0] == "success" and result[1]:
+                log.info(f"Tidal OAuth output: {result[1]}")
             return
+        
+        # Wait a bit for user to complete auth
+        await asyncio.sleep(5)
         
         # Check if login succeeded
         if self.session.check_login():
@@ -568,8 +606,12 @@ class TidalPlayer(commands.Cog):
             if hasattr(self.session, "expiry_time"):
                 await self.config.expiry_time.set(self.session.expiry_time.timestamp())
             await ctx.send("✅ Tidal setup complete!")
+            try:
+                await ctx.author.send("✅ Tidal authentication successful!")
+            except:
+                pass
         else:
-            await ctx.send("❌ Login failed. The link was printed to your console - follow it, authorize, then run this command again.")
+            await ctx.send("⏳ Waiting for authentication... Run this command again once you've completed the login.")
 
     @commands.group(name="tidalplay", invoke_without_command=True)
     @commands.is_owner()
