@@ -1169,8 +1169,8 @@ class TidalPlayer(commands.Cog):
                 self.session.login_oauth
             )
 
-            if login.verify_link_expired:
-                await ctx.send(Messages.PROGRESS_OAUTH)
+            await ctx.send(Messages.PROGRESS_OAUTH)
+                print(f"\n[TIDAL] Visit: {login.verification_uri_complete}")
                 print(f"\n[TIDAL] Visit: {login.verification_uri_complete}")
                 print(f"[TIDAL] Or enter code: {login.user_code} at {login.verification_uri}\n")
 
