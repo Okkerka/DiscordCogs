@@ -1,11 +1,3 @@
-"""
-TidalPlayer - A Red-DiscordBot cog for playing music from Tidal.
-
-This cog allows users to play music from Tidal with lossless quality,
-and supports importing playlists from Spotify and YouTube by searching
-equivalent tracks on Tidal.
-"""
-
 from redbot.core import commands, Config
 from redbot.core.utils.menus import menu, DEFAULT_CONTROLS
 import discord
@@ -37,7 +29,6 @@ except ImportError:
 
 log = logging.getLogger("red.tidalplayer")
 
-# Configuration Constants
 MAX_QUEUE_SIZE = 1000
 BATCH_UPDATE_INTERVAL = 5
 API_SEMAPHORE_LIMIT = 3
@@ -46,8 +37,6 @@ COG_IDENTIFIER = 160819386
 
 
 class Messages:
-    """Centralized message templates for user feedback."""
-
     ERROR_NO_TIDALAPI = "tidalapi not installed. Run: `[p]pipinstall tidalapi`"
     ERROR_NOT_AUTHENTICATED = "Not authenticated. Run: `>tidalsetup`"
     ERROR_NO_AUDIO_COG = "Audio cog not loaded. Run: `[p]load audio`"
@@ -75,11 +64,9 @@ class Messages:
     PROGRESS_QUEUEING_SPOTIFY = "Queueing {count} tracks from Spotify..."
     PROGRESS_QUEUEING_YOUTUBE = "Queueing {count} videos from YouTube..."
     PROGRESS_UPDATE = "{queued} queued, {skipped} skipped ({current}/{total})"
-    PROGRESS_OAUTH = "Starting OAuth... Check your console for the login link!"
-    PROGRESS_OAUTH_PENDING = "Complete login in console, then run `>tidalsetup` again."
+    PROGRESS_OAUTH = "Starting OAuth..."
 
     STATUS_STOPPING = "Stopping playlist queueing..."
-    STATUS_CANCELLED = "Cancelled. Queued {queued}/{total}."
     STATUS_CANCELLED_WITH_SKIPPED = "Cancelled. {queued} queued, {skipped} skipped."
     STATUS_EMPTY_QUEUE = "Queue is empty."
     STATUS_PLAYING = "Playing from Tidal"
@@ -95,31 +82,18 @@ QUALITY_LABELS = {
 
 
 class TidalPlayerError(Exception):
-    """Base exception for TidalPlayer errors."""
     pass
 
 
 class AuthenticationError(TidalPlayerError):
-    """Raised when authentication fails."""
     pass
 
 
 class APIError(TidalPlayerError):
-    """Raised when API calls fail."""
     pass
 
 
 def async_retry(max_attempts: int = SEARCH_RETRY_ATTEMPTS, delay: float = 0.5):
-    """
-    Decorator for retrying async functions on failure.
-
-    Parameters:
-        max_attempts (int): Maximum number of retry attempts.
-        delay (float): Delay between retries in seconds.
-
-    Returns:
-        Callable: Decorated function with retry logic.
-    """
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         async def wrapper(*args, **kwargs):
@@ -137,27 +111,10 @@ def async_retry(max_attempts: int = SEARCH_RETRY_ATTEMPTS, delay: float = 0.5):
 
 
 class TidalPlayer(commands.Cog):
-    """
-    Play music from Tidal, Spotify, or YouTube via Tidal search (LOSSLESS).
-
-    This cog integrates with Tidal's API to provide lossless music playback
-    through Discord. It supports searching and playing individual tracks,
-    as well as importing entire playlists from Tidal, Spotify, and YouTube.
-    """
 
     def __init__(self, bot: commands.Bot):
-        """
-        Initialize the TidalPlayer cog.
-
-        Parameters:
-            bot (commands.Bot): The Red-DiscordBot instance.
-        """
         self.bot = bot
-        self.config = Config.get_conf(
-            self, 
-            identifier=COG_IDENTIFIER, 
-            force_registration=True
-        )
+        self.config = Config.get_conf(self, identifier=COG_IDENTIFIER, force_registration=True)
 
         self.config.register_global(
             token_type=None,
@@ -184,16 +141,9 @@ class TidalPlayer(commands.Cog):
         bot.loop.create_task(self._initialize_apis())
 
     def cog_unload(self) -> None:
-        """Clean up resources when the cog is unloaded."""
         log.info("TidalPlayer cog unloaded")
 
     async def _initialize_apis(self) -> None:
-        """
-        Initialize API clients on bot startup.
-
-        Loads stored credentials and attempts to establish sessions
-        with Tidal, Spotify, and YouTube APIs.
-        """
         await self.bot.wait_until_ready()
         creds = await self.config.all()
 
@@ -202,12 +152,6 @@ class TidalPlayer(commands.Cog):
         await self._initialize_youtube(creds)
 
     async def _initialize_tidal(self, creds: Dict[str, Any]) -> None:
-        """
-        Initialize Tidal session with stored credentials.
-
-        Parameters:
-            creds (Dict[str, Any]): Dictionary containing stored credentials.
-        """
         if not TIDALAPI_AVAILABLE:
             return
 
@@ -233,12 +177,6 @@ class TidalPlayer(commands.Cog):
             log.error(f"Tidal session load failed: {e}", exc_info=True)
 
     async def _initialize_spotify(self, creds: Dict[str, Any]) -> None:
-        """
-        Initialize Spotify client with stored credentials.
-
-        Parameters:
-            creds (Dict[str, Any]): Dictionary containing stored credentials.
-        """
         if not SPOTIFY_AVAILABLE:
             return
 
@@ -250,27 +188,15 @@ class TidalPlayer(commands.Cog):
 
         try:
             self.sp = spotipy.Spotify(
-                client_credentials_manager=SpotifyClientCredentials(
-                    client_id,
-                    client_secret
-                )
+                client_credentials_manager=SpotifyClientCredentials(client_id, client_secret)
             )
-            await self.bot.loop.run_in_executor(
-                None,
-                lambda: self.sp.search("test", limit=1)
-            )
+            await self.bot.loop.run_in_executor(None, lambda: self.sp.search("test", limit=1))
             log.info("Spotify client initialized successfully")
         except Exception as e:
             log.error(f"Spotify initialization failed: {e}", exc_info=True)
             self.sp = None
 
     async def _initialize_youtube(self, creds: Dict[str, Any]) -> None:
-        """
-        Initialize YouTube client with stored credentials.
-
-        Parameters:
-            creds (Dict[str, Any]): Dictionary containing stored credentials.
-        """
         if not YOUTUBE_API_AVAILABLE:
             return
 
@@ -286,27 +212,9 @@ class TidalPlayer(commands.Cog):
             self.yt = None
 
     def _get_quality_label(self, quality: str) -> str:
-        """
-        Convert quality code to human-readable format.
-
-        Parameters:
-            quality (str): Quality code from Tidal API.
-
-        Returns:
-            str: Human-readable quality label.
-        """
         return QUALITY_LABELS.get(quality, "LOSSLESS (FLAC)")
 
     def _extract_meta(self, track: Any) -> Dict[str, Any]:
-        """
-        Extract metadata from a Tidal track object.
-
-        Parameters:
-            track (Any): Tidal track object.
-
-        Returns:
-            Dict[str, Any]: Dictionary containing track metadata.
-        """
         try:
             return {
                 "title": getattr(track, "name", None) or "Unknown",
@@ -334,29 +242,10 @@ class TidalPlayer(commands.Cog):
             }
 
     def _format_time(self, seconds: int) -> str:
-        """
-        Format seconds as MM:SS.
-
-        Parameters:
-            seconds (int): Duration in seconds.
-
-        Returns:
-            str: Formatted time string.
-        """
         minutes, secs = divmod(seconds, 60)
         return f"{minutes:02d}:{secs:02d}"
 
     async def _add_meta(self, guild_id: int, meta: Dict[str, Any]) -> bool:
-        """
-        Add track metadata to the guild queue.
-
-        Parameters:
-            guild_id (int): Discord guild ID.
-            meta (Dict[str, Any]): Track metadata dictionary.
-
-        Returns:
-            bool: True if metadata was added.
-        """
         try:
             async with self.config.guild_from_id(guild_id).track_metadata() as queue:
                 if len(queue) >= MAX_QUEUE_SIZE:
@@ -369,12 +258,6 @@ class TidalPlayer(commands.Cog):
             return False
 
     async def _pop_meta(self, guild_id: int) -> None:
-        """
-        Remove the first track metadata from the guild queue.
-
-        Parameters:
-            guild_id (int): Discord guild ID.
-        """
         try:
             async with self.config.guild_from_id(guild_id).track_metadata() as queue:
                 if queue:
@@ -383,27 +266,12 @@ class TidalPlayer(commands.Cog):
             log.error(f"Pop metadata error for guild {guild_id}: {e}", exc_info=True)
 
     async def _clear_meta(self, guild_id: int) -> None:
-        """
-        Clear all track metadata from the guild queue.
-
-        Parameters:
-            guild_id (int): Discord guild ID.
-        """
         try:
             await self.config.guild_from_id(guild_id).track_metadata.set([])
         except Exception as e:
             log.error(f"Clear metadata error for guild {guild_id}: {e}", exc_info=True)
 
     async def _should_cancel(self, guild_id: int) -> bool:
-        """
-        Check if playlist queueing should be cancelled.
-
-        Parameters:
-            guild_id (int): Discord guild ID.
-
-        Returns:
-            bool: True if queueing should be cancelled.
-        """
         try:
             return await self.config.guild_from_id(guild_id).cancel_queue()
         except Exception as e:
@@ -411,13 +279,6 @@ class TidalPlayer(commands.Cog):
             return False
 
     async def _set_cancel(self, guild_id: int, value: bool) -> None:
-        """
-        Set the cancel flag for playlist queueing.
-
-        Parameters:
-            guild_id (int): Discord guild ID.
-            value (bool): Cancel flag value.
-        """
         try:
             await self.config.guild_from_id(guild_id).cancel_queue.set(value)
         except Exception as e:
@@ -425,37 +286,15 @@ class TidalPlayer(commands.Cog):
 
     @async_retry(max_attempts=SEARCH_RETRY_ATTEMPTS)
     async def _search_tidal(self, query: str) -> List[Any]:
-        """
-        Search Tidal with rate limiting and automatic retry.
-
-        Parameters:
-            query (str): Search query string.
-
-        Returns:
-            List[Any]: List of track objects from Tidal API.
-        """
         async with self.api_semaphore:
             try:
-                result = await self.bot.loop.run_in_executor(
-                    None,
-                    self.session.search,
-                    query
-                )
+                result = await self.bot.loop.run_in_executor(None, self.session.search, query)
                 return result.get("tracks", [])
             except Exception as e:
                 log.error(f"Tidal search failed for query '{query}': {e}")
                 raise APIError(f"Tidal search failed: {e}")
 
     async def _check_ready(self, ctx: commands.Context) -> bool:
-        """
-        Verify that all required components are ready for playback.
-
-        Parameters:
-            ctx (commands.Context): Discord context.
-
-        Returns:
-            bool: True if ready, False otherwise.
-        """
         if not TIDALAPI_AVAILABLE:
             await ctx.send(Messages.ERROR_NO_TIDALAPI)
             return False
@@ -471,12 +310,6 @@ class TidalPlayer(commands.Cog):
         return True
 
     def _suppress_enqueued(self, ctx: commands.Context) -> None:
-        """
-        Suppress Track Enqueued messages from the Audio cog.
-
-        Parameters:
-            ctx (commands.Context): Discord context to modify.
-        """
         if hasattr(ctx, "_orig_send"):
             return
 
@@ -493,33 +326,11 @@ class TidalPlayer(commands.Cog):
         ctx.send = send_override
 
     def _restore_send(self, ctx: commands.Context) -> None:
-        """
-        Restore the original send method to the context.
-
-        Parameters:
-            ctx (commands.Context): Discord context to restore.
-        """
         if hasattr(ctx, "_orig_send"):
             ctx.send = ctx._orig_send
             delattr(ctx, "_orig_send")
 
-    async def _play(
-        self,
-        ctx: commands.Context,
-        track: Any,
-        show_embed: bool = True
-    ) -> bool:
-        """
-        Queue a track via the Audio cog.
-
-        Parameters:
-            ctx (commands.Context): Discord context.
-            track (Any): Tidal track object.
-            show_embed (bool): Whether to display track information embed.
-
-        Returns:
-            bool: True if track was queued successfully.
-        """
+    async def _play(self, ctx: commands.Context, track: Any, show_embed: bool = True) -> bool:
         try:
             meta = self._extract_meta(track)
 
@@ -559,23 +370,7 @@ class TidalPlayer(commands.Cog):
             log.error(f"Play error: {e}", exc_info=True)
             return False
 
-    async def _search_and_queue(
-        self,
-        ctx: commands.Context,
-        query: str,
-        track_name: str
-    ) -> bool:
-        """
-        Search Tidal for a track and queue the best match.
-
-        Parameters:
-            ctx (commands.Context): Discord context.
-            query (str): Search query string.
-            track_name (str): Original track name for logging.
-
-        Returns:
-            bool: True if track was found and queued successfully.
-        """
+    async def _search_and_queue(self, ctx: commands.Context, query: str, track_name: str) -> bool:
         try:
             tracks = await self._search_tidal(query)
             if not tracks:
@@ -595,18 +390,6 @@ class TidalPlayer(commands.Cog):
         playlist_name: str,
         progress_msg: Optional[discord.Message] = None
     ) -> Dict[str, int]:
-        """
-        Queue multiple tracks from a playlist with progress updates.
-
-        Parameters:
-            ctx (commands.Context): Discord context.
-            tracks (List[Any]): List of track objects.
-            playlist_name (str): Name of the playlist for status messages.
-            progress_msg (Optional[discord.Message]): Message to update with progress.
-
-        Returns:
-            Dict[str, int]: Dictionary with queued and skipped counts.
-        """
         self._suppress_enqueued(ctx)
         queued = 0
         skipped = 0
@@ -627,10 +410,7 @@ class TidalPlayer(commands.Cog):
                     if progress_msg and (i - last_update >= BATCH_UPDATE_INTERVAL or i == total):
                         try:
                             embed = discord.Embed(
-                                title=Messages.PROGRESS_QUEUEING.format(
-                                    name=playlist_name,
-                                    count=total
-                                ),
+                                title=Messages.PROGRESS_QUEUEING.format(name=playlist_name, count=total),
                                 description=Messages.PROGRESS_UPDATE.format(
                                     queued=queued,
                                     skipped=skipped,
@@ -656,18 +436,7 @@ class TidalPlayer(commands.Cog):
             self._restore_send(ctx)
             await self._set_cancel(ctx.guild.id, False)
 
-    async def _queue_spotify_playlist(
-        self,
-        ctx: commands.Context,
-        playlist_id: str
-    ) -> None:
-        """
-        Queue tracks from a Spotify playlist by searching on Tidal.
-
-        Parameters:
-            ctx (commands.Context): Discord context.
-            playlist_id (str): Spotify playlist ID.
-        """
+    async def _queue_spotify_playlist(self, ctx: commands.Context, playlist_id: str) -> None:
         if not SPOTIFY_AVAILABLE:
             await ctx.send(Messages.ERROR_INSTALL_SPOTIFY)
             return
@@ -679,11 +448,7 @@ class TidalPlayer(commands.Cog):
         progress_msg = await ctx.send(Messages.PROGRESS_FETCHING_SPOTIFY)
 
         try:
-            playlist = await self.bot.loop.run_in_executor(
-                None,
-                self.sp.playlist,
-                playlist_id
-            )
+            playlist = await self.bot.loop.run_in_executor(None, self.sp.playlist, playlist_id)
 
             if not playlist or "tracks" not in playlist:
                 await progress_msg.edit(content=Messages.ERROR_FETCH_FAILED)
@@ -691,9 +456,7 @@ class TidalPlayer(commands.Cog):
 
             tracks = playlist["tracks"]["items"]
             if not tracks:
-                await progress_msg.edit(
-                    content=Messages.ERROR_NO_TRACKS_IN_CONTENT.format(content_type="playlist")
-                )
+                await progress_msg.edit(content=Messages.ERROR_NO_TRACKS_IN_CONTENT.format(content_type="playlist"))
                 return
 
             playlist_name = playlist.get("name", "Spotify Playlist")
@@ -713,10 +476,7 @@ class TidalPlayer(commands.Cog):
                 if await self._should_cancel(ctx.guild.id):
                     embed = discord.Embed(
                         title=Messages.STATUS_STOPPING,
-                        description=Messages.STATUS_CANCELLED_WITH_SKIPPED.format(
-                            queued=queued,
-                            skipped=skipped
-                        ),
+                        description=Messages.STATUS_CANCELLED_WITH_SKIPPED.format(queued=queued, skipped=skipped),
                         color=discord.Color.orange()
                     )
                     await progress_msg.edit(embed=embed)
@@ -775,18 +535,7 @@ class TidalPlayer(commands.Cog):
         finally:
             await self._set_cancel(ctx.guild.id, False)
 
-    async def _queue_youtube_playlist(
-        self,
-        ctx: commands.Context,
-        playlist_id: str
-    ) -> None:
-        """
-        Queue tracks from a YouTube playlist by searching on Tidal.
-
-        Parameters:
-            ctx (commands.Context): Discord context.
-            playlist_id (str): YouTube playlist ID.
-        """
+    async def _queue_youtube_playlist(self, ctx: commands.Context, playlist_id: str) -> None:
         if not YOUTUBE_API_AVAILABLE:
             await ctx.send(Messages.ERROR_INSTALL_YOUTUBE)
             return
@@ -812,9 +561,7 @@ class TidalPlayer(commands.Cog):
 
             items = response["items"]
             if not items:
-                await progress_msg.edit(
-                    content=Messages.ERROR_NO_TRACKS_IN_CONTENT.format(content_type="playlist")
-                )
+                await progress_msg.edit(content=Messages.ERROR_NO_TRACKS_IN_CONTENT.format(content_type="playlist"))
                 return
 
             playlist_title = items[0]["snippet"].get("playlistTitle", "YouTube Playlist")
@@ -834,10 +581,7 @@ class TidalPlayer(commands.Cog):
                 if await self._should_cancel(ctx.guild.id):
                     embed = discord.Embed(
                         title=Messages.STATUS_STOPPING,
-                        description=Messages.STATUS_CANCELLED_WITH_SKIPPED.format(
-                            queued=queued,
-                            skipped=skipped
-                        ),
+                        description=Messages.STATUS_CANCELLED_WITH_SKIPPED.format(queued=queued, skipped=skipped),
                         color=discord.Color.orange()
                     )
                     await progress_msg.edit(embed=embed)
@@ -890,13 +634,6 @@ class TidalPlayer(commands.Cog):
             await self._set_cancel(ctx.guild.id, False)
 
     async def _handle_tidal_url(self, ctx: commands.Context, url: str) -> None:
-        """
-        Handle Tidal URLs for tracks, albums, or playlists.
-
-        Parameters:
-            ctx (commands.Context): Discord context.
-            url (str): Tidal URL to process.
-        """
         track_match = re.search(r"tidal\.com/(?:browse/)?track/(\d+)", url)
         album_match = re.search(r"tidal\.com/(?:browse/)?album/(\d+)", url)
         playlist_match = re.search(r"tidal\.com/(?:browse/)?playlist/([a-f0-9-]+)", url)
@@ -904,11 +641,7 @@ class TidalPlayer(commands.Cog):
         try:
             if track_match:
                 track_id = track_match.group(1)
-                track = await self.bot.loop.run_in_executor(
-                    None,
-                    self.session.track,
-                    track_id
-                )
+                track = await self.bot.loop.run_in_executor(None, self.session.track, track_id)
                 if track:
                     await self._play(ctx, track)
                 else:
@@ -916,11 +649,7 @@ class TidalPlayer(commands.Cog):
 
             elif album_match:
                 album_id = album_match.group(1)
-                album = await self.bot.loop.run_in_executor(
-                    None,
-                    self.session.album,
-                    album_id
-                )
+                album = await self.bot.loop.run_in_executor(None, self.session.album, album_id)
 
                 if not album:
                     await ctx.send(Messages.ERROR_CONTENT_UNAVAILABLE)
@@ -932,18 +661,10 @@ class TidalPlayer(commands.Cog):
                     return
 
                 progress_msg = await ctx.send(
-                    Messages.PROGRESS_QUEUEING.format(
-                        name=album.name,
-                        count=len(tracks)
-                    )
+                    Messages.PROGRESS_QUEUEING.format(name=album.name, count=len(tracks))
                 )
 
-                result = await self._queue_playlist_batch(
-                    ctx,
-                    tracks,
-                    album.name,
-                    progress_msg
-                )
+                result = await self._queue_playlist_batch(ctx, tracks, album.name, progress_msg)
 
                 embed = discord.Embed(
                     title=Messages.SUCCESS_PARTIAL_QUEUE.format(
@@ -958,11 +679,7 @@ class TidalPlayer(commands.Cog):
 
             elif playlist_match:
                 playlist_id = playlist_match.group(1)
-                playlist = await self.bot.loop.run_in_executor(
-                    None,
-                    self.session.playlist,
-                    playlist_id
-                )
+                playlist = await self.bot.loop.run_in_executor(None, self.session.playlist, playlist_id)
 
                 if not playlist:
                     await ctx.send(Messages.ERROR_CONTENT_UNAVAILABLE)
@@ -974,18 +691,10 @@ class TidalPlayer(commands.Cog):
                     return
 
                 progress_msg = await ctx.send(
-                    Messages.PROGRESS_QUEUEING.format(
-                        name=playlist.name,
-                        count=len(tracks)
-                    )
+                    Messages.PROGRESS_QUEUEING.format(name=playlist.name, count=len(tracks))
                 )
 
-                result = await self._queue_playlist_batch(
-                    ctx,
-                    tracks,
-                    playlist.name,
-                    progress_msg
-                )
+                result = await self._queue_playlist_batch(ctx, tracks, playlist.name, progress_msg)
 
                 embed = discord.Embed(
                     title=Messages.SUCCESS_PARTIAL_QUEUE.format(
@@ -1010,43 +719,21 @@ class TidalPlayer(commands.Cog):
 
     @commands.command(name="tplay")
     async def tplay(self, ctx: commands.Context, *, query: str) -> None:
-        """
-        Play a track or queue a playlist from Tidal, Spotify, or YouTube.
-
-        Parameters:
-            ctx (commands.Context): Discord context.
-            query (str): Search query or URL.
-
-        Usage:
-            >tplay <search query>
-            >tplay <Tidal URL>
-            >tplay <Spotify playlist URL>
-            >tplay <YouTube playlist URL>
-        """
         if not await self._check_ready(ctx):
             return
 
         tidal_url = re.search(r"tidal\.com/(?:browse/)?(track|album|playlist)", query)
-        spotify_playlist = re.search(
-            r"open\.spotify\.com/playlist/([a-zA-Z0-9]+)",
-            query
-        )
-        youtube_playlist = re.search(
-            r"youtube\.com/.*[?&]list=([a-zA-Z0-9_-]+)",
-            query
-        )
+        spotify_playlist = re.search(r"open\.spotify\.com/playlist/([a-zA-Z0-9]+)", query)
+        youtube_playlist = re.search(r"youtube\.com/.*[?&]list=([a-zA-Z0-9_-]+)", query)
 
         if tidal_url:
             await self._handle_tidal_url(ctx, query)
-
         elif spotify_playlist:
             playlist_id = spotify_playlist.group(1)
             await self._queue_spotify_playlist(ctx, playlist_id)
-
         elif youtube_playlist:
             playlist_id = youtube_playlist.group(1)
             await self._queue_youtube_playlist(ctx, playlist_id)
-
         else:
             try:
                 tracks = await self._search_tidal(query)
@@ -1065,29 +752,11 @@ class TidalPlayer(commands.Cog):
 
     @commands.command(name="tstop")
     async def tstop(self, ctx: commands.Context) -> None:
-        """
-        Stop queueing a playlist.
-
-        Parameters:
-            ctx (commands.Context): Discord context.
-
-        Usage:
-            >tstop
-        """
         await self._set_cancel(ctx.guild.id, True)
         await ctx.send(Messages.STATUS_STOPPING)
 
     @commands.command(name="tqueue")
     async def tqueue(self, ctx: commands.Context) -> None:
-        """
-        Display the current queue with track metadata.
-
-        Parameters:
-            ctx (commands.Context): Discord context.
-
-        Usage:
-            >tqueue
-        """
         try:
             queue = await self.config.guild(ctx.guild).track_metadata()
 
@@ -1132,105 +801,76 @@ class TidalPlayer(commands.Cog):
 
     @commands.command(name="tclear")
     async def tclear(self, ctx: commands.Context) -> None:
-        """
-        Clear the queue metadata.
-
-        Parameters:
-            ctx (commands.Context): Discord context.
-
-        Usage:
-            >tclear
-        """
         await self._clear_meta(ctx.guild.id)
         await ctx.send(Messages.SUCCESS_QUEUE_CLEARED)
 
+    @commands.is_owner()
     @commands.command(name="tidalsetup")
     async def tidalsetup(self, ctx: commands.Context) -> None:
-        """
-        Set up Tidal OAuth authentication.
-
-        Parameters:
-            ctx (commands.Context): Discord context.
-
-        Usage:
-            >tidalsetup
-
-        Notes:
-            This command initiates the OAuth flow. Follow the console
-            instructions to complete authentication.
-        """
         if not TIDALAPI_AVAILABLE:
             await ctx.send(Messages.ERROR_NO_TIDALAPI)
             return
 
         try:
-            login, future = await self.bot.loop.run_in_executor(
-                None,
-                self.session.login_oauth
+            login, future = await self.bot.loop.run_in_executor(None, self.session.login_oauth)
+
+            oauth_embed = discord.Embed(
+                title="Tidal OAuth Setup",
+                description="Click the link below to authenticate your Tidal account:",
+                color=discord.Color.blue()
             )
-            await ctx.send(Messages.PROGRESS_OAUTH)
-            print(f"\n[TIDAL] Visit: {login.verification_uri_complete}")
-            print(f"[TIDAL] Or enter code: {login.user_code} at {login.verification_uri}\n")
-            
+            oauth_embed.add_field(
+                name="Login URL",
+                value=f"[Click here to login]({login.verification_uri_complete})",
+                inline=False
+            )
+            oauth_embed.add_field(
+                name="Or enter code manually",
+                value=f"Code: `{login.user_code}`\nURL: {login.verification_uri}",
+                inline=False
+            )
+            oauth_embed.set_footer(text="You have 5 minutes to complete login")
+
             try:
-                await self.bot.loop.run_in_executor(None, future.result, 300)
-            except asyncio.TimeoutError:
-                await ctx.send("OAuth timeout. Please try again.")
-                return
-            
+                await ctx.author.send(embed=oauth_embed)
+                await ctx.send("OAuth link sent to your DMs.")
+            except Exception:
+                await ctx.send(embed=oauth_embed)
+                await ctx.send("Couldn't DM you; sent the OAuth link in this channel instead.")
+
+            log.info(f"[TIDAL OAuth] Visit: {login.verification_uri_complete}")
+            log.info(f"[TIDAL OAuth] Code: {login.user_code} at {login.verification_uri}")
+
+            await self.bot.loop.run_in_executor(None, future.result, 300)
+
             if self.session.check_login():
                 await self.config.token_type.set(self.session.token_type)
                 await self.config.access_token.set(self.session.access_token)
                 await self.config.refresh_token.set(self.session.refresh_token)
-                
+
                 expiry = None
                 if self.session.expiry_time:
                     expiry = int(self.session.expiry_time.timestamp())
                 await self.config.expiry_time.set(expiry)
-                
+
                 await ctx.send(Messages.SUCCESS_TIDAL_SETUP)
+                log.info("Tidal OAuth authentication successful")
             else:
                 await ctx.send("Login failed. Please try again.")
-        
+                log.warning("Tidal OAuth authentication failed")
+
         except Exception as e:
             log.error(f"OAuth setup error: {e}", exc_info=True)
             await ctx.send(f"Setup failed: {str(e)}")
-            
 
-    @commands.group(name="tidalplay")
     @commands.is_owner()
+    @commands.group(name="tidalplay")
     async def tidalplay(self, ctx: commands.Context) -> None:
-        """
-        Configure Spotify and YouTube API credentials.
-
-        Parameters:
-            ctx (commands.Context): Discord context.
-
-        Usage:
-            >tidalplay spotify <client_id> <client_secret>
-            >tidalplay youtube <api_key>
-        """
         if ctx.invoked_subcommand is None:
             await ctx.send_help(ctx.command)
 
     @tidalplay.command(name="spotify")
-    async def tidalplay_spotify(
-        self,
-        ctx: commands.Context,
-        client_id: str,
-        client_secret: str
-    ) -> None:
-        """
-        Configure Spotify API credentials.
-
-        Parameters:
-            ctx (commands.Context): Discord context.
-            client_id (str): Spotify client ID.
-            client_secret (str): Spotify client secret.
-
-        Usage:
-            >tidalplay spotify <client_id> <client_secret>
-        """
+    async def tidalplay_spotify(self, ctx: commands.Context, client_id: str, client_secret: str) -> None:
         if not SPOTIFY_AVAILABLE:
             await ctx.send(Messages.ERROR_INSTALL_SPOTIFY)
             return
@@ -1240,16 +880,10 @@ class TidalPlayer(commands.Cog):
             await self.config.spotify_client_secret.set(client_secret)
 
             self.sp = spotipy.Spotify(
-                client_credentials_manager=SpotifyClientCredentials(
-                    client_id,
-                    client_secret
-                )
+                client_credentials_manager=SpotifyClientCredentials(client_id, client_secret)
             )
 
-            await self.bot.loop.run_in_executor(
-                None,
-                lambda: self.sp.search("test", limit=1)
-            )
+            await self.bot.loop.run_in_executor(None, lambda: self.sp.search("test", limit=1))
 
             await ctx.send(Messages.SUCCESS_SPOTIFY_CONFIGURED)
 
@@ -1260,16 +894,6 @@ class TidalPlayer(commands.Cog):
 
     @tidalplay.command(name="youtube")
     async def tidalplay_youtube(self, ctx: commands.Context, api_key: str) -> None:
-        """
-        Configure YouTube API credentials.
-
-        Parameters:
-            ctx (commands.Context): Discord context.
-            api_key (str): YouTube Data API key.
-
-        Usage:
-            >tidalplay youtube <api_key>
-        """
         if not YOUTUBE_API_AVAILABLE:
             await ctx.send(Messages.ERROR_INSTALL_YOUTUBE)
             return
@@ -1288,18 +912,6 @@ class TidalPlayer(commands.Cog):
 
     @tidalplay.command(name="cleartokens")
     async def tidalplay_cleartokens(self, ctx: commands.Context) -> None:
-        """
-        Clear stored Tidal OAuth tokens.
-
-        Parameters:
-            ctx (commands.Context): Discord context.
-
-        Usage:
-            >tidalplay cleartokens
-
-        Notes:
-            Use this if you encounter authentication issues.
-        """
         await self.config.token_type.set(None)
         await self.config.access_token.set(None)
         await self.config.refresh_token.set(None)
@@ -1307,40 +919,14 @@ class TidalPlayer(commands.Cog):
         await ctx.send(Messages.SUCCESS_TOKENS_CLEARED)
 
     @commands.Cog.listener()
-    async def on_red_audio_track_start(
-        self,
-        guild: discord.Guild,
-        track: Any,
-        requester: discord.Member
-    ) -> None:
-        """
-        Handle track start events from the Audio cog.
-
-        Parameters:
-            guild (discord.Guild): Guild where track started.
-            track (Any): Track object from Audio cog.
-            requester (discord.Member): Member who requested the track.
-        """
+    async def on_red_audio_track_start(self, guild: discord.Guild, track: Any, requester: discord.Member) -> None:
         try:
             await self._pop_meta(guild.id)
         except Exception as e:
             log.error(f"Track start event error for guild {guild.id}: {e}", exc_info=True)
 
     @commands.Cog.listener()
-    async def on_red_audio_queue_end(
-        self,
-        guild: discord.Guild,
-        track_count: int,
-        total_duration: int
-    ) -> None:
-        """
-        Handle queue end events from the Audio cog.
-
-        Parameters:
-            guild (discord.Guild): Guild where queue ended.
-            track_count (int): Number of tracks that were played.
-            total_duration (int): Total duration of all tracks.
-        """
+    async def on_red_audio_queue_end(self, guild: discord.Guild, track_count: int, total_duration: int) -> None:
         try:
             await self._clear_meta(guild.id)
         except Exception as e:
@@ -1348,10 +934,4 @@ class TidalPlayer(commands.Cog):
 
 
 async def setup(bot: commands.Bot) -> None:
-    """
-    Register the TidalPlayer cog with the bot.
-
-    Parameters:
-        bot (commands.Bot): The Red-DiscordBot instance.
-    """
     await bot.add_cog(TidalPlayer(bot))
