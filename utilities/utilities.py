@@ -1,6 +1,7 @@
 from redbot.core import commands, Config
 import discord
 import random
+import asyncio
 from typing import Optional
 
 GAY_PERCENTAGE_MIN_NORMAL = 0
@@ -293,6 +294,29 @@ class Utilities(commands.Cog):
         gif = HAWK_ENABLED_GIF if not enabled else HAWK_DISABLED_GIF
         embed.set_image(url=gif)
         await ctx.send(embed=embed)
+
+    @commands.command()
+    @commands.is_owner()
+    @commands.guild_only()
+    async def timedping(self, ctx, user: discord.Member, seconds: int = 0, minutes: int = 0):
+        """
+        Set a timed ping for a user.
+        Usage: !timedping @user [seconds] [minutes]
+        Example: !timedping @user 30 5  --> pings in 5 mins 30 seconds
+        """
+        total_seconds = seconds + minutes * 60
+        if total_seconds < 1 or total_seconds > 21600:
+            await ctx.send("Please specify a total wait time between 1 second and 6 hours (21600 seconds).")
+            return
+        await ctx.send(f"Timer set! Will ping {user.mention} in {total_seconds} seconds "
+                       f"({total_seconds // 60} min {total_seconds % 60} sec).")
+        try:
+            await asyncio.sleep(total_seconds)
+        except asyncio.CancelledError:
+            await ctx.send("Timer canceled.")
+            return
+        await ctx.send(f"{user.mention} 👈 Timed ping after {total_seconds} seconds!",
+                       allowed_mentions=discord.AllowedMentions(users=True))
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
