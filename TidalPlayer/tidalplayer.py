@@ -545,57 +545,63 @@ class TidalPlayer(commands.Cog):
         await ctx.send("🔐 Starting Tidal OAuth login... Check your DMs!")
         
         def _run_oauth_simple():
-            """Run OAuth and capture output."""
-            import sys
-            from io import StringIO
+            """Run OAuth with custom print function."""
+            output_lines = []
             
-            # Capture stdout
-            old_stdout = sys.stdout
-            sys.stdout = captured_output = StringIO()
+            def custom_print(msg):
+                """Custom print function to capture output."""
+                output_lines.append(str(msg))
             
             try:
-                self.session.login_oauth_simple()
-                output = captured_output.getvalue()
-                return ("success", output)
+                # Pass custom print function to fn_print parameter
+                self.session.login_oauth_simple(fn_print=custom_print)
+                return ("success", "\n".join(output_lines))
             except Exception as e:
-                output = captured_output.getvalue()
-                return ("error", e, output)
-            finally:
-                sys.stdout = old_stdout
+                return ("error", e, "\n".join(output_lines))
         
         result = await self.bot.loop.run_in_executor(None, _run_oauth_simple)
         
         # Send to DMs
         try:
             if result[0] == "error":
-                error, output = result[1], result[2]
+                error = result[1]
+                output = result[2] if len(result) > 2 else ""
                 log.error(f"OAuth failed: {error}")
                 
                 dm_msg = f"❌ **Tidal OAuth Failed**\n``````"
                 if output:
-                    dm_msg += f"\n**Console Output:**\n``````"
-                dm_msg += f"\n**Troubleshooting:**\n1. Run `>tidalreset`\n2. Update: `[p]pipinstall --force-reinstall tidalapi`\n3. Restart bot\n4. Try again"
+                    dm_msg += f"\n**Output:**\n``````"
+                dm_msg += "\n**Troubleshooting:**\n1. Run `>tidalreset`\n2. `[p]pipinstall --force-reinstall tidalapi`\n3. Restart bot\n4. Try again"
                 
-                await ctx.author.send(dm_msg[:2000])  # Discord 2000 char limit
+                await ctx.author.send(dm_msg[:2000])
                 await ctx.send("❌ OAuth failed. Check your DMs for details.")
                 return
             else:
                 output = result[1]
                 
-                if output:
+                if output and len(output.strip()) > 0:
                     # Send captured output to DMs
-                    await ctx.author.send(f"🔐 **Tidal OAuth Login**\n``````")
-                    await ctx.send("✅ Login link sent to your DMs! Follow the instructions there.")
+                    chunks = [output[i:i+1900] for i in range(0, len(output), 1900)]
+                    for chunk in chunks:
+                        await ctx.author.send(f"🔐 **Tidal OAuth Login**\n``````")
+                    await ctx.send("✅ Login instructions sent to your DMs!")
                 else:
-                    await ctx.send("⚠️ No output captured. Check your bot console for the login link.")
+                    # No output captured - print to console as fallback
+                    await ctx.send("⚠️ No output captured. **Check your bot console/logs** for the login link.")
+                    log.warning("Tidal OAuth: No output captured, check console for login link")
+                    return
             
         except discord.Forbidden:
-            await ctx.send("❌ I can't DM you! Enable DMs from server members or check your console.")
+            await ctx.send("❌ I can't DM you! Please enable DMs from server members.\n**Check your bot console/logs for the login link.**")
             if result[0] == "success" and result[1]:
-                log.info(f"Tidal OAuth output: {result[1]}")
+                log.info(f"Tidal OAuth output (user DMs disabled):\n{result[1]}")
+            return
+        except Exception as e:
+            log.error(f"Error sending DM: {e}")
+            await ctx.send(f"❌ Error sending DM: {e}\n**Check your bot console/logs for the login link.**")
             return
         
-        # Wait a bit for user to complete auth
+        # Wait for user to complete auth
         await asyncio.sleep(5)
         
         # Check if login succeeded
