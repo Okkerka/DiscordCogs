@@ -537,13 +537,13 @@ class TidalPlayer(commands.Cog):
             
             def _run_oauth_simple():
                 """Run OAuth with custom printer to capture link."""
-                link_data = {}
+                link_data = {'lines': []}
                 
                 def custom_printer(text):
-                    link_data['text'] = text
+                    link_data['lines'].append(text)
                 
                 try:
-                    self.session.login_oauth_simple(function=custom_printer)
+                    self.session.login_oauth_simple(fn_print=custom_printer)
                     return link_data
                 except Exception as e:
                     return e
@@ -554,6 +554,10 @@ class TidalPlayer(commands.Cog):
                 log.error(f"OAuth simple failed: {result}")
                 await ctx.send(f"❌ Tidal OAuth failed: {result}\n\n**Troubleshooting:**\n1. Update tidalapi: `[p]pipinstall --upgrade tidalapi`\n2. Tidal may have blocked third-party logins\n3. Try a different Tidal account")
                 return
+            
+            # Show the login instructions that were captured
+            if result.get('lines'):
+                await ctx.send('\n'.join(result['lines']))
             
             if self.session.check_login():
                 await self.config.token_type.set(self.session.token_type)
