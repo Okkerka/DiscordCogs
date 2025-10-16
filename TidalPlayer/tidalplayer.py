@@ -5,6 +5,7 @@ import logging
 import asyncio
 import re
 from typing import Dict, List, Optional, Tuple
+from datetime import datetime
 
 try:
     import tidalapi
@@ -32,6 +33,7 @@ MAX_QUEUE_SIZE = 1000
 BATCH_UPDATE_INTERVAL = 5
 API_SEMAPHORE_LIMIT = 3
 OAUTH_TIMEOUT = 300
+SEARCH_RETRY_ATTEMPTS = 2
 
 
 class TidalPlayer(commands.Cog):
@@ -65,27 +67,34 @@ class TidalPlayer(commands.Cog):
         log.info("TidalPlayer cog unloaded and tasks cleaned up")
 
     async def _initialize_apis(self):
-        """Initialize Tidal, Spotify, and YouTube API clients."""
+        """Initialize Tidal, Spotify, and YouTube API clients with proper error handling."""
         try:
             await self.bot.wait_until_ready()
             creds = await self.config.all()
             
-            # Tidal OAuth
+            # Tidal OAuth with retry and refresh logic
             if TIDALAPI_AVAILABLE and all(creds.get(k) for k in ("token_type", "access_token", "refresh_token")):
                 try:
-                    await self.bot.loop.run_in_executor(
-                        None,
-                        self.session.load_oauth_session,
-                        creds["token_type"],
-                        creds["access_token"],
-                        creds["refresh_token"],
-                        creds.get("expiry_time")
-                    )
-                    log.info("Tidal session loaded successfully")
+                    expiry = creds.get("expiry_time")
+                    if expiry and datetime.fromtimestamp(expiry) < datetime.now():
+                        log.info("Tidal token expired, will need re-authentication")
+                    else:
+                        await self.bot.loop.run_in_executor(
+                            None,
+                            self.session.load_oauth_session,
+                            creds["token_type"],
+                            creds["access_token"],
+                            creds["refresh_token"],
+                            expiry
+                        )
+                        if self.session.check_login():
+                            log.info("Tidal session loaded successfully")
+                        else:
+                            log.warning("Tidal session loaded but login check failed")
                 except Exception as e:
                     log.error(f"Tidal session load failed: {e}")
             
-            # Spotify client
+            # Spotify client with validation
             if SPOTIFY_AVAILABLE and creds.get("spotify_client_id") and creds.get("spotify_client_secret"):
                 try:
                     self.sp = spotipy.Spotify(
@@ -94,17 +103,21 @@ class TidalPlayer(commands.Cog):
                             creds["spotify_client_secret"]
                         )
                     )
-                    log.info("Spotify client initialized")
+                    # Test the connection
+                    await self.bot.loop.run_in_executor(None, lambda: self.sp.search("test", limit=1))
+                    log.info("Spotify client initialized and validated")
                 except Exception as e:
                     log.error(f"Spotify init failed: {e}")
+                    self.sp = None
             
-            # YouTube API
+            # YouTube API with validation
             if YOUTUBE_API_AVAILABLE and creds.get("youtube_api_key"):
                 try:
                     self.yt = build("youtube", "v3", developerKey=creds["youtube_api_key"])
                     log.info("YouTube API initialized")
                 except Exception as e:
                     log.error(f"YouTube init failed: {e}")
+                    self.yt = None
         except Exception as e:
             log.error(f"API initialization failed: {e}")
 
@@ -112,6 +125,7 @@ class TidalPlayer(commands.Cog):
         """Convert Tidal quality code to readable format."""
         labels = {
             "HI_RES": "HI-RES (MQA)",
+            "HI_RES_LOSSLESS": "HI-RES LOSSLESS",
             "LOSSLESS": "LOSSLESS (FLAC)",
             "HIGH": "HIGH (320kbps)",
             "LOW": "LOW (96kbps)"
@@ -119,59 +133,89 @@ class TidalPlayer(commands.Cog):
         return labels.get(quality, "LOSSLESS (FLAC)")
 
     def _extract_meta(self, track) -> Dict:
-        """Extract metadata from Tidal track object."""
-        return {
-            "title": track.name or "Unknown",
-            "artist": track.artist.name if getattr(track, "artist", None) else "Unknown",
-            "album": track.album.name if getattr(track, "album", None) else None,
-            "duration": int(getattr(track, "duration", 0) or 0),
-            "quality": getattr(track, "audio_quality", "LOSSLESS")
-        }
+        """Extract metadata from Tidal track object with fallbacks."""
+        try:
+            return {
+                "title": getattr(track, "name", None) or "Unknown",
+                "artist": getattr(track.artist, "name", "Unknown") if hasattr(track, "artist") and track.artist else "Unknown",
+                "album": getattr(track.album, "name", None) if hasattr(track, "album") and track.album else None,
+                "duration": int(getattr(track, "duration", 0) or 0),
+                "quality": getattr(track, "audio_quality", "LOSSLESS")
+            }
+        except Exception as e:
+            log.error(f"Error extracting metadata: {e}")
+            return {
+                "title": "Unknown",
+                "artist": "Unknown",
+                "album": None,
+                "duration": 0,
+                "quality": "LOSSLESS"
+            }
 
     async def _add_meta(self, guild_id: int, meta: Dict) -> bool:
         """Add track metadata to guild queue with size limit."""
-        async with self.config.guild_from_id(guild_id).track_metadata() as q:
-            if len(q) >= MAX_QUEUE_SIZE:
-                log.warning(f"Queue size limit reached for guild {guild_id}")
-                return False
-            q.append(meta)
-            return True
+        try:
+            async with self.config.guild_from_id(guild_id).track_metadata() as q:
+                if len(q) >= MAX_QUEUE_SIZE:
+                    log.warning(f"Queue size limit reached for guild {guild_id}")
+                    return False
+                q.append(meta)
+                return True
+        except Exception as e:
+            log.error(f"Error adding metadata: {e}")
+            return False
 
     async def _pop_meta(self, guild_id: int):
         """Remove first track metadata from guild queue."""
-        async with self.config.guild_from_id(guild_id).track_metadata() as q:
-            if q:
-                q.pop(0)
+        try:
+            async with self.config.guild_from_id(guild_id).track_metadata() as q:
+                if q:
+                    q.pop(0)
+        except Exception as e:
+            log.error(f"Error popping metadata: {e}")
 
     async def _clear_meta(self, guild_id: int):
         """Clear all track metadata for guild."""
-        await self.config.guild_from_id(guild_id).track_metadata.set([])
+        try:
+            await self.config.guild_from_id(guild_id).track_metadata.set([])
+        except Exception as e:
+            log.error(f"Error clearing metadata: {e}")
 
     async def _should_cancel(self, guild_id: int) -> bool:
         """Check if queueing should be cancelled."""
-        return await self.config.guild_from_id(guild_id).cancel_queue()
+        try:
+            return await self.config.guild_from_id(guild_id).cancel_queue()
+        except:
+            return False
 
     async def _set_cancel(self, guild_id: int, value: bool):
         """Set cancel flag for guild."""
-        await self.config.guild_from_id(guild_id).cancel_queue.set(value)
+        try:
+            await self.config.guild_from_id(guild_id).cancel_queue.set(value)
+        except Exception as e:
+            log.error(f"Error setting cancel flag: {e}")
 
     def _format_time(self, seconds: int) -> str:
         """Format seconds to MM:SS."""
         m, s = divmod(seconds, 60)
         return f"{m:02d}:{s:02d}"
 
-    async def _search_tidal(self, query: str) -> List:
-        """Search Tidal with semaphore rate limiting."""
+    async def _search_tidal(self, query: str, retry: int = 0) -> List:
+        """Search Tidal with semaphore rate limiting and retry logic."""
         async with self.api_semaphore:
             try:
                 res = await self.bot.loop.run_in_executor(None, self.session.search, query)
                 return res.get("tracks", [])
             except Exception as e:
-                log.error(f"Tidal search failed for '{query}': {e}")
+                if retry < SEARCH_RETRY_ATTEMPTS:
+                    log.warning(f"Tidal search failed for '{query}' (attempt {retry + 1}), retrying: {e}")
+                    await asyncio.sleep(0.5)
+                    return await self._search_tidal(query, retry + 1)
+                log.error(f"Tidal search failed for '{query}' after {SEARCH_RETRY_ATTEMPTS} attempts: {e}")
                 return []
 
     async def _play(self, ctx, track, show_embed: bool = True) -> bool:
-        """Queue a Tidal track via Audio cog."""
+        """Queue a Tidal track via Audio cog with comprehensive error handling."""
         try:
             meta = self._extract_meta(track)
             added = await self._add_meta(ctx.guild.id, meta)
@@ -185,7 +229,7 @@ class TidalPlayer(commands.Cog):
                 if meta["album"]:
                     desc += f"\n_{meta['album']}_"
                 embed = discord.Embed(
-                    title="Playing from Tidal",
+                    title="🎵 Playing from Tidal",
                     description=desc,
                     color=discord.Color.blue()
                 )
@@ -210,13 +254,13 @@ class TidalPlayer(commands.Cog):
     async def _check_ready(self, ctx) -> bool:
         """Verify Tidal session and Audio cog are available."""
         if not TIDALAPI_AVAILABLE:
-            await ctx.send("Error: tidalapi not installed. Run: `[p]pipinstall tidalapi`")
+            await ctx.send("❌ Error: tidalapi not installed. Run: `[p]pipinstall tidalapi`")
             return False
         if not self.session or not self.session.check_login():
-            await ctx.send("Error: Not authenticated. Run: `>tidalsetup`")
+            await ctx.send("❌ Error: Not authenticated. Run: `>tidalsetup`")
             return False
         if not self.bot.get_cog("Audio"):
-            await ctx.send("Error: Audio cog not loaded")
+            await ctx.send("❌ Error: Audio cog not loaded. Load it with `[p]load audio`")
             return False
         return True
 
@@ -252,16 +296,19 @@ class TidalPlayer(commands.Cog):
         try:
             if "open.spotify.com" in query or "spotify:" in query:
                 if not SPOTIFY_AVAILABLE or not self.sp:
-                    return await ctx.send("Error: Spotify not configured. Run: `>tidalplay spotify <client_id> <client_secret>`")
+                    return await ctx.send("❌ Spotify not configured. Run: `>tidalplay spotify <client_id> <client_secret>`")
                 await self._queue_spotify_playlist(ctx, query)
             elif "youtube.com" in query or "youtu.be" in query:
                 if not YOUTUBE_API_AVAILABLE or not self.yt:
-                    return await ctx.send("Error: YouTube not configured. Run: `>tidalplay youtube <api_key>`")
+                    return await ctx.send("❌ YouTube not configured. Run: `>tidalplay youtube <api_key>`")
                 await self._queue_youtube_playlist(ctx, query)
             elif "tidal.com" in query:
                 await self._handle_tidal_url(ctx, query)
             else:
                 await self._search_and_play(ctx, query)
+        except Exception as e:
+            log.error(f"Error in tplay command: {e}")
+            await ctx.send(f"❌ An error occurred: {str(e)}")
         finally:
             self._restore_send(ctx)
 
@@ -280,7 +327,7 @@ class TidalPlayer(commands.Cog):
         await self._play(ctx, tracks[0])
 
     async def _handle_tidal_url(self, ctx, url: str):
-        """Queue Tidal playlist, album, or track."""
+        """Queue Tidal playlist, album, or track with robust error handling."""
         kind = ("playlist" if "playlist/" in url else
                 "album" if "album/" in url else
                 "mix" if "mix/" in url else
@@ -290,7 +337,10 @@ class TidalPlayer(commands.Cog):
         if not match:
             return await ctx.send(f"❌ Invalid Tidal {kind} URL")
         
-        loader = getattr(self.session, kind)
+        loader = getattr(self.session, kind, None)
+        if not loader:
+            return await ctx.send(f"❌ Unsupported Tidal content type: {kind}")
+        
         try:
             obj = await self.bot.loop.run_in_executor(None, loader, match.group(1))
         except Exception as e:
@@ -301,6 +351,10 @@ class TidalPlayer(commands.Cog):
             None,
             lambda: getattr(obj, "tracks", lambda: getattr(obj, "items", lambda: [])())()
         )
+        
+        if not items:
+            return await ctx.send(f"❌ No tracks found in this {kind}")
+        
         name = getattr(obj, "name", getattr(obj, "title", "Unknown"))
         msg = await ctx.send(f"🎵 Queueing Tidal {kind} **{name}** ({len(items)} tracks)...")
         
@@ -449,7 +503,7 @@ class TidalPlayer(commands.Cog):
         """Display the Tidal queue with metadata."""
         data: List[Dict] = await self.config.guild(ctx.guild).track_metadata()
         if not data:
-            return await ctx.send("The queue is empty.")
+            return await ctx.send("📭 The queue is empty.")
         
         embeds = []
         for i in range(0, len(data), 10):
@@ -458,7 +512,9 @@ class TidalPlayer(commands.Cog):
                 f"`{i+j+1}.` **{m['title']}** • {m['artist']} • `{self._format_time(m['duration'])}`"
                 for j, m in enumerate(chunk)
             )
-            embeds.append(discord.Embed(title="Tidal Queue", description=desc, color=discord.Color.blue()))
+            embed = discord.Embed(title="🎵 Tidal Queue", description=desc, color=discord.Color.blue())
+            embed.set_footer(text=f"Page {i//10 + 1} of {(len(data)-1)//10 + 1} • Total: {len(data)} tracks")
+            embeds.append(embed)
         
         await menu(ctx, embeds, DEFAULT_CONTROLS)
 
@@ -473,45 +529,80 @@ class TidalPlayer(commands.Cog):
     async def tidalsetup(self, ctx):
         """Setup Tidal OAuth authentication."""
         if not TIDALAPI_AVAILABLE:
-            return await ctx.send("Error: Install tidalapi with `[p]pipinstall tidalapi`")
+            return await ctx.send("❌ Error: Install tidalapi with `[p]pipinstall tidalapi`")
         
-        def _run_oauth():
-            try:
-                return self.session.login_oauth()
-            except Exception as e:
-                return e
-
-        result = await self.bot.loop.run_in_executor(None, _run_oauth)
-        if isinstance(result, Exception):
-            await ctx.send(f"❌ Tidal OAuth device login failed: {result}")
-            await ctx.send("This may be a temporary Tidal outage, a restriction on 3rd party logins, or a bug in the `tidalapi` library.\nIf this persists, check for tidalapi package updates or try a different account.")
-            return
-
-        login, fut = result
-        embed = discord.Embed(
-            title="🎵 Tidal OAuth Setup",
-            description=f"Visit:\n{login.verification_uri_complete}",
-            color=discord.Color.blue()
-        )
-        embed.set_footer(text="Expires in 5 minutes")
-        await ctx.send(embed=embed)
-        
-        try:
-            await asyncio.wait_for(self.bot.loop.run_in_executor(None, fut.result), timeout=OAUTH_TIMEOUT)
-        except asyncio.TimeoutError:
-            return await ctx.send("⏱️ OAuth timed out.")
-        except Exception as e:
-            return await ctx.send(f"❌ OAuth login error: {e}")
-
-        if self.session.check_login():
-            await self.config.token_type.set(self.session.token_type)
-            await self.config.access_token.set(self.session.access_token)
-            await self.config.refresh_token.set(self.session.refresh_token)
-            if hasattr(self.session, "expiry_time"):
-                await self.config.expiry_time.set(self.session.expiry_time.timestamp())
-            await ctx.send("✅ Tidal setup complete!")
+        # Try login_oauth_simple first (more reliable)
+        if hasattr(self.session, 'login_oauth_simple'):
+            await ctx.send("🔐 Starting Tidal OAuth (simplified method)...")
+            
+            def _run_oauth_simple():
+                """Run OAuth with custom printer to capture link."""
+                link_data = {}
+                
+                def custom_printer(text):
+                    link_data['text'] = text
+                
+                try:
+                    self.session.login_oauth_simple(function=custom_printer)
+                    return link_data
+                except Exception as e:
+                    return e
+            
+            result = await self.bot.loop.run_in_executor(None, _run_oauth_simple)
+            
+            if isinstance(result, Exception):
+                log.error(f"OAuth simple failed: {result}")
+                await ctx.send(f"❌ Tidal OAuth failed: {result}\n\n**Troubleshooting:**\n1. Update tidalapi: `[p]pipinstall --upgrade tidalapi`\n2. Tidal may have blocked third-party logins\n3. Try a different Tidal account")
+                return
+            
+            if self.session.check_login():
+                await self.config.token_type.set(self.session.token_type)
+                await self.config.access_token.set(self.session.access_token)
+                await self.config.refresh_token.set(self.session.refresh_token)
+                if hasattr(self.session, "expiry_time"):
+                    await self.config.expiry_time.set(self.session.expiry_time.timestamp())
+                await ctx.send("✅ Tidal setup complete!")
+            else:
+                await ctx.send("❌ Login failed. You may not have completed the authorization.")
         else:
-            await ctx.send("❌ Login failed. Try again or check if Tidal restricted third-party access.")
+            # Fall back to standard login_oauth
+            def _run_oauth():
+                try:
+                    return self.session.login_oauth()
+                except Exception as e:
+                    return e
+
+            result = await self.bot.loop.run_in_executor(None, _run_oauth)
+            if isinstance(result, Exception):
+                await ctx.send(f"❌ Tidal OAuth device login failed: {result}")
+                await ctx.send("**Troubleshooting:**\n1. Update tidalapi: `[p]pipinstall --upgrade tidalapi`\n2. This error often means Tidal restricted third-party app logins\n3. Check if your Tidal subscription is active")
+                return
+
+            login, fut = result
+            embed = discord.Embed(
+                title="🎵 Tidal OAuth Setup",
+                description=f"Visit:\n{login.verification_uri_complete}",
+                color=discord.Color.blue()
+            )
+            embed.set_footer(text="Expires in 5 minutes")
+            await ctx.send(embed=embed)
+            
+            try:
+                await asyncio.wait_for(self.bot.loop.run_in_executor(None, fut.result), timeout=OAUTH_TIMEOUT)
+            except asyncio.TimeoutError:
+                return await ctx.send("⏱️ OAuth timed out. Please try again.")
+            except Exception as e:
+                return await ctx.send(f"❌ OAuth login error: {e}")
+
+            if self.session.check_login():
+                await self.config.token_type.set(self.session.token_type)
+                await self.config.access_token.set(self.session.access_token)
+                await self.config.refresh_token.set(self.session.refresh_token)
+                if hasattr(self.session, "expiry_time"):
+                    await self.config.expiry_time.set(self.session.expiry_time.timestamp())
+                await ctx.send("✅ Tidal setup complete!")
+            else:
+                await ctx.send("❌ Login failed. Try again or check if Tidal restricted third-party access.")
 
     @commands.group(name="tidalplay", invoke_without_command=True)
     @commands.is_owner()
@@ -524,7 +615,7 @@ class TidalPlayer(commands.Cog):
     async def spotify_setup(self, ctx, client_id: str, client_secret: str):
         """Configure Spotify API credentials."""
         if not SPOTIFY_AVAILABLE:
-            return await ctx.send("Error: Install spotipy with: `pip install spotipy`")
+            return await ctx.send("❌ Error: Install spotipy with: `pip install spotipy`")
         
         await self.config.spotify_client_id.set(client_id)
         await self.config.spotify_client_secret.set(client_secret)
@@ -532,6 +623,8 @@ class TidalPlayer(commands.Cog):
             self.sp = spotipy.Spotify(
                 client_credentials_manager=SpotifyClientCredentials(client_id, client_secret)
             )
+            # Validate
+            await self.bot.loop.run_in_executor(None, lambda: self.sp.search("test", limit=1))
             await ctx.send("✅ Spotify credentials saved and validated.")
         except Exception as e:
             await ctx.send(f"❌ Failed to initialize Spotify client: {e}")
@@ -541,7 +634,7 @@ class TidalPlayer(commands.Cog):
     async def youtube_setup(self, ctx, api_key: str):
         """Configure YouTube Data API key."""
         if not YOUTUBE_API_AVAILABLE:
-            return await ctx.send("Error: Install google-api-python-client with: `pip install google-api-python-client`")
+            return await ctx.send("❌ Error: Install google-api-python-client with: `pip install google-api-python-client`")
         
         await self.config.youtube_api_key.set(api_key)
         try:
