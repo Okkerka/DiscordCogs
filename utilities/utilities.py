@@ -32,6 +32,7 @@ class Utilities(commands.Cog):
         self.config.register_guild(**default_guild)
         self.awaiting_hawk_response = {}
         self.last_hawk_user = {}
+        self.timed_pings = {}
 
     @commands.command(aliases=["av", "pfp"])
     async def avatar(self, ctx, member: Optional[discord.Member] = None):
@@ -300,23 +301,73 @@ class Utilities(commands.Cog):
     @commands.guild_only()
     async def timedping(self, ctx, user: discord.Member, seconds: int = 0, minutes: int = 0):
         """
-        Set a timed ping for a user.
+        Set a repeating timed ping for a user.
         Usage: !timedping @user [seconds] [minutes]
-        Example: !timedping @user 30 5  --> pings in 5 mins 30 seconds
+        Example: !timedping @user 30 5  --> pings every 5 mins 30 seconds
         """
         total_seconds = seconds + minutes * 60
         if total_seconds < 1 or total_seconds > 21600:
             await ctx.send("Please specify a total wait time between 1 second and 6 hours (21600 seconds).")
             return
-        await ctx.send(f"Timer set! Will ping {user.mention} in {total_seconds} seconds "
-                       f"({total_seconds // 60} min {total_seconds % 60} sec).")
-        try:
-            await asyncio.sleep(total_seconds)
-        except asyncio.CancelledError:
-            await ctx.send("Timer canceled.")
+        
+        key = (ctx.guild.id, user.id)
+        if key in self.timed_pings:
+            await ctx.send(f"{user.mention} already has an active timed ping. Use `!stoptimedping @user` first.")
             return
-        await ctx.send(f"{user.mention} 👈 Timed ping after {total_seconds} seconds!",
-                       allowed_mentions=discord.AllowedMentions(users=True))
+        
+        task = asyncio.create_task(self._repeating_ping(ctx.channel, user, total_seconds))
+        self.timed_pings[key] = task
+        
+        await ctx.send(f"⏰ Repeating timer set! Will ping {user.mention} every {total_seconds} seconds "
+                       f"({total_seconds // 60} min {total_seconds % 60} sec).")
+
+    async def _repeating_ping(self, channel, user, interval):
+        """Internal method to handle repeating pings."""
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                await channel.send(f"{user.mention} 👈 Repeating ping!",
+                                 allowed_mentions=discord.AllowedMentions(users=True))
+        except asyncio.CancelledError:
+            pass
+
+    @commands.command()
+    @commands.is_owner()
+    @commands.guild_only()
+    async def stoptimedping(self, ctx, user: discord.Member):
+        """
+        Stop a repeating timed ping for a user.
+        Usage: !stoptimedping @user
+        """
+        key = (ctx.guild.id, user.id)
+        if key not in self.timed_pings:
+            await ctx.send(f"No active timed ping found for {user.mention}.")
+            return
+        
+        task = self.timed_pings[key]
+        task.cancel()
+        del self.timed_pings[key]
+        await ctx.send(f"⏰ Stopped repeating ping for {user.mention}.")
+
+    @commands.command()
+    @commands.is_owner()
+    @commands.guild_only()
+    async def listtimedpings(self, ctx):
+        """List all active repeating timed pings in this server."""
+        active = [(uid, task) for (gid, uid), task in self.timed_pings.items() if gid == ctx.guild.id]
+        if not active:
+            await ctx.send("No active timed pings in this server.")
+            return
+        
+        lines = []
+        for uid, _ in active:
+            member = ctx.guild.get_member(uid)
+            if member:
+                lines.append(f"• {member.mention} (`{uid}`)")
+            else:
+                lines.append(f"• Unknown user (`{uid}`)")
+        
+        await ctx.send("⏰ **Active Timed Pings:**\n" + "\n".join(lines))
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
