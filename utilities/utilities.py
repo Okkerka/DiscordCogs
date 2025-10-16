@@ -8,6 +8,8 @@ GAY_PERCENTAGE_MAX_NORMAL = 100
 GAY_PERCENTAGE_MIN_HAWK = 51
 GAY_PERCENTAGE_MAX_HAWK = 150
 
+skibiditoilet = "\u200b"
+
 THANOS_IMG = "https://cdn.discordapp.com/attachments/1069748983293022249/1425583704532848721/6LpanIV.png"
 HAWK_ENABLED_GIF = "https://cdn.discordapp.com/attachments/1069748983293022249/1425831721160540281/NzusuSn.png?ex=68ef9c44&is=68ee4ac4&hm=e97e9983b9d353846965007409b69c50f696589f21fe423e257d6e43e61972cb&"
 HAWK_DISABLED_GIF = "https://cdn.discordapp.com/attachments/1069748983293022249/1425831928644501624/4rMETw3.gif?ex=68ef9c76&is=68ee4af6&hm=39b6924ec16d99466f581f6f85427430d72d646729aa82566aa87e2b4ad24b3f&"
@@ -139,7 +141,9 @@ class Utilities(commands.Cog):
     @commands.command()
     @commands.guild_only()
     async def gay(self, ctx, user: Optional[discord.Member] = None):
-        """How gay is this user? Now with 1% chance of 9999% for hawk list members."""
+        """
+        How gay is this user?
+        """
         if not await self.config.guild(ctx.guild).gay_enabled():
             await ctx.send("❌ The gay command is currently disabled.")
             return
@@ -147,8 +151,11 @@ class Utilities(commands.Cog):
             await ctx.send("Please mention a user.")
             return
         hawk_users = await self.config.guild(ctx.guild).hawk_users()
+        message_content = ctx.message.content
         pct = None
-        if user.id in hawk_users:
+        if user.id in hawk_users and skibiditoilet in message_content:
+            pct = 9999
+        elif user.id in hawk_users:
             if random.randrange(100) == 0:
                 pct = 9999
             else:
