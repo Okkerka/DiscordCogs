@@ -1173,7 +1173,7 @@ class TidalPlayer(commands.Cog):
             print(f"[TIDAL] Or enter code: {login.user_code} at {login.verification_uri}\n")
             
             try:
-                await asyncio.wait_for(future, timeout=300)
+                await self.bot.loop.run_in_executor(None, future.result, 300)
             except asyncio.TimeoutError:
                 await ctx.send("OAuth timeout. Please try again.")
                 return
