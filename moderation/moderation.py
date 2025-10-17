@@ -642,7 +642,69 @@ class Moderation(commands.Cog):
             await ctx.send("❌ I don't have permission to move that member.")
         except Exception as e:
             await ctx.send(f"❌ Could not voice kick member: {e}")
+        @commands.command()
+        @commands.guild_only()
+        @mod_or_permissions(mute_members=True)
+        @commands.bot_has_permissions(mute_members=True)
+        async def voicemute(self, ctx, member: discord.Member, *, reason: Optional[str] = None):
+         """Server mute a member in voice channels."""
+            if member.top_role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
+                await ctx.send("❌ Cannot voice mute someone with equal or higher role.")
+                return
+    
+            if not member.voice:
+                await ctx.send("❌ Member is not in a voice channel.")
+                return
+    
+            if member.voice.mute:
+                await ctx.send("❌ Member is already voice muted.")
+                return
+    
+            try:
+                await member.edit(mute=True, reason=f"Voice muted by {ctx.author}: {reason or 'No reason provided'}")
+        
+                success_embed = discord.Embed(
+                    title="Member Voice Muted",
+                    description=f"**{member}** has been voice muted.\n**Reason:** {reason or 'No reason provided'}",
+                    color=0x57F287
+                )
+                await ctx.send(embed=success_embed)
+        
+            except discord.Forbidden:
+                await ctx.send("❌ I don't have permission to mute that member.")
+            except Exception as e:
+                await ctx.send(f"❌ Could not voice mute member: {e}")
 
+
+        @commands.command()
+        @commands.guild_only()
+        @mod_or_permissions(mute_members=True)
+        @commands.bot_has_permissions(mute_members=True)
+        async def voiceunmute(self, ctx, member: discord.Member, *, reason: Optional[str] = None):
+            """Server unmute a member in voice channels."""
+            if not member.voice:
+                await ctx.send("❌ Member is not in a voice channel.")
+                return
+    
+            if not member.voice.mute:
+                await ctx.send("❌ Member is not voice muted.")
+                return
+    
+            try:
+                await member.edit(mute=False, reason=f"Voice unmuted by {ctx.author}: {reason or 'No reason provided'}")
+        
+                success_embed = discord.Embed(
+                    title="Member Voice Unmuted",
+                    description=f"**{member}** has been voice unmuted.",
+                    color=0x57F287
+                )
+                await ctx.send(embed=success_embed)
+        
+            except discord.Forbidden:
+                await ctx.send("❌ I don't have permission to unmute that member.")
+            except Exception as e:
+                await ctx.send(f"❌ Could not voice unmute member: {e}")
+ 
     @commands.command()
     @commands.guild_only()
     @mod_or_permissions(mute_members=True, deafen_members=True)
