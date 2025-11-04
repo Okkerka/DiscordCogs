@@ -91,7 +91,7 @@ QUALITY_LABELS = {
 }
 
 FILTER_KEYWORDS = [
-    'sped up', 'slowed', 'tiktok', 'nightcore', 
+    'sped up', 'slowed', 'tiktok',
     'reverb', '8d audio', 'bass boosted'
 ]
 
