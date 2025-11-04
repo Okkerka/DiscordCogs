@@ -38,6 +38,10 @@ INTERACTIVE_TIMEOUT = 30
 RETRY_BASE_DELAY = 0.5
 RETRY_MAX_DELAY = 5.0
 
+# Reaction numbers for interactive selection
+REACTION_NUMBERS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+CANCEL_EMOJI = "❌"
+
 class Messages:
     ERROR_NO_TIDALAPI = "tidalapi not installed. Run: `[p]pipinstall tidalapi`"
     ERROR_NOT_AUTHENTICATED = "Not authenticated. Run: `>tidalsetup`"
@@ -67,7 +71,7 @@ class Messages:
     ERROR_TIMEOUT = "Selection timed out."
     ERROR_INVALID_CHOICE = "Invalid choice. Please enter a number between 1 and {max}."
 
-    STATUS_CHOOSE_TRACK = "Choose a track (1-{max}) or cancel:"
+    STATUS_CHOOSE_TRACK = "React with a number to select a track, or {cancel} to cancel"
 
     PROGRESS_QUEUEING = "Queueing {name} ({count} tracks)..."
     PROGRESS_FETCHING_SPOTIFY = "Fetching Spotify playlist..."
@@ -90,6 +94,7 @@ QUALITY_LABELS = {
     "LOW": "LOW (96kbps)"
 }
 
+# Removed 'nightcore' from filter
 FILTER_KEYWORDS = [
     'sped up', 'slowed', 'tiktok',
     'reverb', '8d audio', 'bass boosted'
@@ -350,6 +355,7 @@ class TidalPlayer(commands.Cog):
         return True
 
     async def _interactive_select(self, ctx: commands.Context, tracks: List[Any]) -> Optional[Any]:
+        """Reaction-based track selection."""
         if not tracks:
             return None
 
@@ -359,40 +365,43 @@ class TidalPlayer(commands.Cog):
         for i, track in enumerate(tracks[:results_to_show], 1):
             meta = self._extract_meta(track)
             duration = self._format_time(meta["duration"])
-            description += f"**{i}.** {meta['title']} - {meta['artist']} ({duration})\n"
+            description += f"{REACTION_NUMBERS[i-1]} **{meta['title']}** - {meta['artist']} ({duration})\n"
 
         embed = discord.Embed(
             title="Search Results",
             description=description,
             color=discord.Color.blue()
         )
-        embed.set_footer(text=Messages.STATUS_CHOOSE_TRACK.format(max=results_to_show))
+        embed.set_footer(text=Messages.STATUS_CHOOSE_TRACK.format(cancel=CANCEL_EMOJI))
 
-        await ctx.send(embed=embed)
+        msg = await ctx.send(embed=embed)
 
-        def check(m):
-            return m.author == ctx.author and m.channel == ctx.channel
+        # Add reactions
+        for i in range(results_to_show):
+            await msg.add_reaction(REACTION_NUMBERS[i])
+        await msg.add_reaction(CANCEL_EMOJI)
+
+        def check(reaction, user):
+            return (
+                user == ctx.author
+                and reaction.message.id == msg.id
+                and (str(reaction.emoji) in REACTION_NUMBERS[:results_to_show] or str(reaction.emoji) == CANCEL_EMOJI)
+            )
 
         try:
-            msg = await self.bot.wait_for('message', check=check, timeout=INTERACTIVE_TIMEOUT)
+            reaction, user = await self.bot.wait_for('reaction_add', check=check, timeout=INTERACTIVE_TIMEOUT)
 
-            content = msg.content.strip().lower()
-            if content in ['cancel', 'c', 'stop']:
+            if str(reaction.emoji) == CANCEL_EMOJI:
+                await msg.delete()
                 await ctx.send("Cancelled.")
                 return None
 
-            try:
-                choice = int(msg.content)
-                if 1 <= choice <= results_to_show:
-                    return tracks[choice - 1]
-                else:
-                    await ctx.send(Messages.ERROR_INVALID_CHOICE.format(max=results_to_show))
-                    return None
-            except ValueError:
-                await ctx.send(Messages.ERROR_INVALID_CHOICE.format(max=results_to_show))
-                return None
+            choice = REACTION_NUMBERS.index(str(reaction.emoji))
+            await msg.delete()
+            return tracks[choice]
 
         except asyncio.TimeoutError:
+            await msg.delete()
             await ctx.send(Messages.ERROR_TIMEOUT)
             return None
 
