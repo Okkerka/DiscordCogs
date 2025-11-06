@@ -1,10 +1,12 @@
 import asyncio
+import json
 import logging
 from typing import Optional, Dict
 from datetime import datetime, timedelta
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 import discord
-import httpx
 from redbot.core import commands, Config, checks
 from redbot.core.utils.chat_formatting import pagify
 
@@ -32,21 +34,12 @@ class GrokCog(commands.Cog):
         self.config.register_user(request_count=0, last_request_time=None, rate_limited_until=None)
 
         self._active_requests: Dict[int, asyncio.Task] = {}
-        self._client: Optional[httpx.AsyncClient] = None
-
-    async def cog_load(self):
-        self._client = httpx.AsyncClient(
-            timeout=30.0,
-            limits=httpx.Limits(max_connections=5, max_keepalive_connections=2),
-        )
 
     async def cog_unload(self):
         for task in self._active_requests.values():
             if not task.done():
                 task.cancel()
         self._active_requests.clear()
-        if self._client:
-            await self._client.aclose()
 
     async def _check_rate_limit(self, user_id: int) -> Optional[str]:
         user_cfg = await self.config.user_from_id(user_id).all()
@@ -76,41 +69,47 @@ class GrokCog(commands.Cog):
             "temperature": 0.7,
         }
 
-        for attempt in range(await self.config.max_retries()):
+        max_retries = await self.config.max_retries()
+        
+        for attempt in range(max_retries):
             try:
-                resp = await self._client.post(
+                req = Request(
                     "https://api.x.ai/v1/chat/completions",
-                    json=payload,
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    timeout=await self.config.timeout(),
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
                 )
-
-                if resp.status_code == 429:
-                    await self._apply_penalty(user_id)
-                    raise commands.UserFeedbackCheckFailure("❌ Rate limited (10 min)")
-
-                if resp.status_code >= 500 and attempt < await self.config.max_retries() - 1:
-                    await asyncio.sleep(2 ** attempt)
-                    continue
-
-                if resp.status_code >= 400:
-                    msg = resp.json().get("error", {}).get("message", "Unknown")
-                    raise commands.UserFeedbackCheckFailure(f"❌ {msg}")
-
-                content = resp.json()["choices"][0]["message"]["content"].strip()
+                
+                resp = urlopen(req, timeout=await self.config.timeout())
+                result = json.loads(resp.read().decode("utf-8"))
+                content = result["choices"][0]["message"]["content"].strip()
+                
                 async with self.config.user_from_id(user_id).all() as cfg:
                     cfg["request_count"] += 1
                     cfg["last_request_time"] = datetime.now().isoformat()
                 return content
 
-            except httpx.TimeoutException:
-                if attempt < await self.config.max_retries() - 1:
+            except HTTPError as e:
+                if e.code == 429:
+                    await self._apply_penalty(user_id)
+                    raise commands.UserFeedbackCheckFailure("❌ Rate limited (10 min)")
+                
+                if e.code >= 500 and attempt < max_retries - 1:
                     await asyncio.sleep(2 ** attempt)
                     continue
-                raise commands.UserFeedbackCheckFailure("⏱️ Timeout")
+                
+                if e.code >= 400:
+                    try:
+                        err = json.loads(e.read().decode("utf-8"))
+                        msg = err.get("error", {}).get("message", "Unknown")
+                    except:
+                        msg = "Unknown error"
+                    raise commands.UserFeedbackCheckFailure(f"❌ {msg}")
 
-            except httpx.HTTPError:
-                if attempt < await self.config.max_retries() - 1:
+            except URLError:
+                if attempt < max_retries - 1:
                     await asyncio.sleep(2 ** attempt)
                     continue
                 raise commands.UserFeedbackCheckFailure("❌ Network error")
@@ -143,7 +142,7 @@ class GrokCog(commands.Cog):
         self._active_requests[user_id] = asyncio.current_task()
 
         try:
-            response = await self._call_grok(question, user_id)
+            response = await asyncio.to_thread(self._call_grok_sync, question, user_id)
             for page in pagify(response, page_length=2000):
                 await ctx.send(page)
         except commands.UserFeedbackCheckFailure as e:
@@ -153,6 +152,34 @@ class GrokCog(commands.Cog):
             await ctx.send("❌ Error. Check logs.")
         finally:
             self._active_requests.pop(user_id, None)
+
+    def _call_grok_sync(self, prompt: str, user_id: int) -> str:
+        api_key = asyncio.get_event_loop().run_until_complete(self.config.api_key())
+        if not api_key:
+            raise RuntimeError("API key not set")
+
+        payload = {
+            "model": asyncio.get_event_loop().run_until_complete(self.config.model()),
+            "messages": [
+                {"role": "system", "content": asyncio.get_event_loop().run_until_complete(self.config.system_prompt())},
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": asyncio.get_event_loop().run_until_complete(self.config.max_tokens()),
+            "temperature": 0.7,
+        }
+
+        req = Request(
+            "https://api.x.ai/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+        
+        resp = urlopen(req, timeout=30)
+        result = json.loads(resp.read().decode("utf-8"))
+        return result["choices"][0]["message"]["content"].strip()
 
     @commands.Cog.listener()
     async def on_message(self, msg: discord.Message):
