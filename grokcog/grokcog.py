@@ -4,7 +4,7 @@ import logging
 from typing import Optional, Dict
 from datetime import datetime, timedelta
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 import discord
 from redbot.core import commands, Config, checks
@@ -68,6 +68,7 @@ class GrokCog(commands.Cog):
 
         for attempt in range(max_retries):
             try:
+                log.debug(f"Attempt {attempt + 1}/{max_retries} to call Grok API")
                 req = Request(
                     "https://api.x.ai/v1/chat/completions",
                     data=json.dumps(payload).encode("utf-8"),
@@ -75,33 +76,50 @@ class GrokCog(commands.Cog):
                         "Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json",
                     },
+                    method="POST",
                 )
                 
                 resp = urlopen(req, timeout=timeout)
                 result = json.loads(resp.read().decode("utf-8"))
-                return result["choices"][0]["message"]["content"].strip()
+                content = result["choices"][0]["message"]["content"].strip()
+                log.debug(f"Grok API success: {len(content)} chars")
+                return content
 
             except HTTPError as e:
+                log.warning(f"HTTP {e.code}: {e.reason}")
+                
                 if e.code == 429:
+                    log.error("Rate limited by API")
                     raise commands.UserFeedbackCheckFailure("❌ Rate limited (10 min)")
                 
                 if e.code >= 500 and attempt < max_retries - 1:
+                    log.warning(f"Server error, retrying...")
                     continue
                 
                 if e.code >= 400:
                     try:
-                        err = json.loads(e.read().decode("utf-8"))
-                        msg = err.get("error", {}).get("message", "Unknown")
+                        err_data = e.read().decode("utf-8")
+                        err = json.loads(err_data)
+                        msg = err.get("error", {}).get("message", err_data[:100])
                     except:
-                        msg = "Unknown error"
+                        msg = f"HTTP {e.code}"
+                    log.error(f"API error: {msg}")
                     raise commands.UserFeedbackCheckFailure(f"❌ {msg}")
 
-            except commands.UserFeedbackCheckFailure:
-                raise
-            except Exception as e:
+            except URLError as e:
+                log.warning(f"URLError: {e.reason}")
                 if attempt < max_retries - 1:
                     continue
                 raise commands.UserFeedbackCheckFailure("❌ Network error")
+
+            except commands.UserFeedbackCheckFailure:
+                raise
+            
+            except Exception as e:
+                log.error(f"Unexpected error (attempt {attempt + 1}): {type(e).__name__}: {e}")
+                if attempt < max_retries - 1:
+                    continue
+                raise commands.UserFeedbackCheckFailure(f"❌ {type(e).__name__}: {str(e)[:100]}")
 
         raise commands.UserFeedbackCheckFailure("❌ Max retries exceeded")
 
@@ -129,6 +147,7 @@ class GrokCog(commands.Cog):
         self._active_requests[user_id] = asyncio.current_task()
 
         try:
+            log.debug(f"Processing request from user {user_id}: {question[:50]}")
             response = await asyncio.to_thread(
                 self._call_grok_sync,
                 api_key,
@@ -150,8 +169,8 @@ class GrokCog(commands.Cog):
         except commands.UserFeedbackCheckFailure as e:
             await ctx.send(str(e))
         except Exception as e:
-            log.error(f"Error: {e}", exc_info=True)
-            await ctx.send("❌ Error. Check logs.")
+            log.error(f"Error: {type(e).__name__}: {e}", exc_info=True)
+            await ctx.send(f"❌ {type(e).__name__}: {str(e)[:200]}")
         finally:
             self._active_requests.pop(user_id, None)
 
