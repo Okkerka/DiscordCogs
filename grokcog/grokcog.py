@@ -14,7 +14,7 @@ log = logging.getLogger("red.grokcog")
 
 
 class GrokCog(commands.Cog):
-    """Grok AI integration for Red-DiscordBot."""
+    """Groq AI with fact-checking via web search."""
 
     __version__ = "1.0.0"
 
@@ -24,11 +24,10 @@ class GrokCog(commands.Cog):
 
         self.config.register_global(
             api_key=None,
-            model="grok-beta",
+            model="llama-3.3-70b-versatile",
             max_tokens=500,
             timeout=30,
             max_retries=3,
-            system_prompt="You are Grok, a helpful and witty AI assistant.",
         )
         self.config.register_guild(enabled=True, cooldown_seconds=30, max_input_length=2000)
         self.config.register_user(request_count=0, last_request_time=None, rate_limited_until=None)
@@ -55,22 +54,44 @@ class GrokCog(commands.Cog):
         await self.config.user_from_id(user_id).rate_limited_until.set(until)
 
     @staticmethod
-    def _call_grok_sync(api_key: str, model: str, system_prompt: str, prompt: str, max_tokens: int, timeout: int, max_retries: int) -> str:
+    def _web_search(query: str) -> str:
+        try:
+            from duckduckgo_search import DDGS
+            results = DDGS().text(query, max_results=5)
+            if not results:
+                return "No search results found."
+            
+            formatted = "SEARCH RESULTS:\n"
+            for i, r in enumerate(results, 1):
+                formatted += f"\n{i}. {r['title']}\n   {r['body'][:300]}\n"
+            return formatted
+        except ImportError:
+            return "[Install: pip install duckduckgo-search]"
+        except Exception as e:
+            return f"[Search error: {str(e)[:50]}]"
+
+    @staticmethod
+    def _fact_check_sync(api_key: str, model: str, claim: str, search_data: str, timeout: int, max_retries: int) -> str:
+        system_prompt = """You are a fact-checker. Based on the search results provided, determine if the claim is TRUE, FALSE, or UNCLEAR.
+        
+Format your response as:
+VERDICT: [TRUE/FALSE/UNCLEAR]
+REASON: [Brief explanation citing the search results]"""
+
         payload = {
             "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
+                {"role": "user", "content": f"CLAIM: {claim}\n\n{search_data}"},
             ],
-            "max_tokens": max_tokens,
-            "temperature": 0.7,
+            "max_tokens": 300,
+            "temperature": 0.3,
         }
 
         for attempt in range(max_retries):
             try:
-                log.debug(f"Attempt {attempt + 1}/{max_retries} to call Grok API")
                 req = Request(
-                    "https://api.x.ai/v1/chat/completions",
+                    "https://api.groq.com/openai/v1/chat/completions",
                     data=json.dumps(payload).encode("utf-8"),
                     headers={
                         "Authorization": f"Bearer {api_key}",
@@ -81,47 +102,25 @@ class GrokCog(commands.Cog):
                 
                 resp = urlopen(req, timeout=timeout)
                 result = json.loads(resp.read().decode("utf-8"))
-                content = result["choices"][0]["message"]["content"].strip()
-                log.debug(f"Grok API success: {len(content)} chars")
-                return content
+                return result["choices"][0]["message"]["content"].strip()
 
             except HTTPError as e:
-                log.warning(f"HTTP {e.code}: {e.reason}")
-                
                 if e.code == 429:
-                    log.error("Rate limited by API")
-                    raise commands.UserFeedbackCheckFailure("❌ Rate limited (10 min)")
-                
+                    raise commands.UserFeedbackCheckFailure("❌ Rate limited")
                 if e.code >= 500 and attempt < max_retries - 1:
-                    log.warning(f"Server error, retrying...")
                     continue
-                
                 if e.code >= 400:
-                    try:
-                        err_data = e.read().decode("utf-8")
-                        err = json.loads(err_data)
-                        msg = err.get("error", {}).get("message", err_data[:100])
-                    except:
-                        msg = f"HTTP {e.code}"
-                    log.error(f"API error: {msg}")
-                    raise commands.UserFeedbackCheckFailure(f"❌ {msg}")
+                    raise commands.UserFeedbackCheckFailure(f"❌ API error {e.code}")
 
-            except URLError as e:
-                log.warning(f"URLError: {e.reason}")
+            except URLError:
                 if attempt < max_retries - 1:
                     continue
                 raise commands.UserFeedbackCheckFailure("❌ Network error")
 
             except commands.UserFeedbackCheckFailure:
                 raise
-            
-            except Exception as e:
-                log.error(f"Unexpected error (attempt {attempt + 1}): {type(e).__name__}: {e}")
-                if attempt < max_retries - 1:
-                    continue
-                raise commands.UserFeedbackCheckFailure(f"❌ {type(e).__name__}: {str(e)[:100]}")
 
-        raise commands.UserFeedbackCheckFailure("❌ Max retries exceeded")
+        raise commands.UserFeedbackCheckFailure("❌ Max retries")
 
     async def _process(self, user_id: int, guild_id: int, question: str, ctx):
         guild_cfg = await self.config.guild_from_id(guild_id).all()
@@ -145,32 +144,39 @@ class GrokCog(commands.Cog):
             return await ctx.send("❌ No API key")
 
         self._active_requests[user_id] = asyncio.current_task()
+        search_msg = None
 
         try:
-            log.debug(f"Processing request from user {user_id}: {question[:50]}")
+            search_msg = await ctx.send("🔍 Searching for data...")
+            search_data = await asyncio.to_thread(self._web_search, question)
+            await search_msg.edit(content="📊 Fact-checking...")
+
             response = await asyncio.to_thread(
-                self._call_grok_sync,
+                self._fact_check_sync,
                 api_key,
                 await self.config.model(),
-                await self.config.system_prompt(),
                 question,
-                await self.config.max_tokens(),
+                search_data,
                 await self.config.timeout(),
                 await self.config.max_retries(),
             )
             
-            for page in pagify(response, page_length=2000):
-                await ctx.send(page)
+            await search_msg.delete()
+            await ctx.send(response)
             
             async with self.config.user_from_id(user_id).all() as cfg:
                 cfg["request_count"] += 1
                 cfg["last_request_time"] = datetime.now().isoformat()
 
         except commands.UserFeedbackCheckFailure as e:
+            if search_msg:
+                await search_msg.delete()
             await ctx.send(str(e))
         except Exception as e:
-            log.error(f"Error: {type(e).__name__}: {e}", exc_info=True)
-            await ctx.send(f"❌ {type(e).__name__}: {str(e)[:200]}")
+            if search_msg:
+                await search_msg.delete()
+            log.error(f"Error: {e}", exc_info=True)
+            await ctx.send("❌ Error")
         finally:
             self._active_requests.pop(user_id, None)
 
@@ -188,22 +194,15 @@ class GrokCog(commands.Cog):
     @commands.guild_only()
     @commands.cooldown(1, 30, commands.BucketType.user)
     async def grok(self, ctx: commands.Context, *, question: str):
-        """Ask Grok."""
+        """Fact-check a claim."""
         await self._process(ctx.author.id, ctx.guild.id, question, ctx)
 
     @grok.command(name="stats")
     async def stats(self, ctx: commands.Context):
-        """Stats."""
+        """Your stats."""
         cfg = await self.config.user(ctx.author).all()
         embed = discord.Embed(title="Stats", color=discord.Color.blue())
-        embed.add_field(name="Requests", value=cfg["request_count"])
-        if cfg["last_request_time"]:
-            ts = int(datetime.fromisoformat(cfg["last_request_time"]).timestamp())
-            embed.add_field(name="Last", value=f"<t:{ts}:R>")
-        if cfg["rate_limited_until"]:
-            until = datetime.fromisoformat(cfg["rate_limited_until"])
-            if datetime.now() < until:
-                embed.add_field(name="🔒 Locked", value=f"<t:{int(until.timestamp())}:R>")
+        embed.add_field(name="Checks", value=cfg["request_count"])
         await ctx.send(embed=embed)
 
     @grok.group(name="set")
@@ -214,10 +213,10 @@ class GrokCog(commands.Cog):
     @grok_set.command(name="apikey")
     @checks.is_owner()
     async def apikey(self, ctx: commands.Context, key: str):
-        """Set API key from https://console.x.ai/"""
+        """Set API key from https://console.groq.com/"""
         await ctx.message.delete()
         await self.config.api_key.set(key)
-        await ctx.send("✅ API key set", delete_after=15)
+        await ctx.send("✅ Set", delete_after=15)
 
     @grok_set.command(name="toggle")
     @checks.admin_or_permissions(manage_guild=True)
@@ -225,52 +224,13 @@ class GrokCog(commands.Cog):
         """Toggle on/off."""
         cur = await self.config.guild(ctx.guild).enabled()
         await self.config.guild(ctx.guild).enabled.set(not cur)
-        await ctx.send(f"Grok {'✅ on' if not cur else '❌ off'}")
-
-    @grok_set.command(name="maxtokens")
-    @checks.is_owner()
-    async def maxtokens(self, ctx: commands.Context, n: int):
-        """Max tokens (50-4000)."""
-        if not 50 <= n <= 4000:
-            return await ctx.send("❌ 50-4000")
-        await self.config.max_tokens.set(n)
-        await ctx.send(f"✅ {n}")
-
-    @grok_set.command(name="timeout")
-    @checks.is_owner()
-    async def timeout_cmd(self, ctx: commands.Context, n: int):
-        """Timeout (10-120s)."""
-        if not 10 <= n <= 120:
-            return await ctx.send("❌ 10-120")
-        await self.config.timeout.set(n)
-        await ctx.send(f"✅ {n}s")
-
-    @grok_set.command(name="show")
-    @checks.admin_or_permissions(manage_guild=True)
-    async def show_settings(self, ctx: commands.Context):
-        """Show config."""
-        g = await self.config.all()
-        guild = await self.config.guild(ctx.guild).all()
-        embed = discord.Embed(title="Config", color=discord.Color.gold())
-        embed.add_field(
-            name="Global",
-            value=f"Model: {g['model']}\nTokens: {g['max_tokens']}\nTimeout: {g['timeout']}s\nKey: {'✅' if g['api_key'] else '❌'}",
-        )
-        embed.add_field(
-            name="Server",
-            value=f"Enabled: {guild['enabled']}\nMax input: {guild['max_input_length']}",
-        )
-        await ctx.send(embed=embed)
+        await ctx.send(f"{'✅ on' if not cur else '❌ off'}")
 
     async def cog_command_error(self, ctx, err):
         if hasattr(ctx, "_handled"):
             return
         if isinstance(err, commands.CommandOnCooldown):
             await ctx.send(f"⏱️ {err.retry_after:.1f}s")
-        elif isinstance(err, commands.CommandInvokeError) and isinstance(
-            err.original, commands.UserFeedbackCheckFailure
-        ):
-            await ctx.send(str(err.original))
         else:
             log.error(f"Error: {err}", exc_info=err)
         ctx._handled = True
