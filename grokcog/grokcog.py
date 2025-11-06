@@ -43,7 +43,7 @@ class GrokCog(commands.Cog):
     @staticmethod
     def _web_search(query: str) -> str:
         try:
-            from duckduckgo_search import DDGS
+            from ddgs import DDGS
             results = DDGS().text(query, max_results=5)
             if not results:
                 return "No search results found."
@@ -53,7 +53,7 @@ class GrokCog(commands.Cog):
                 formatted += f"\n{i}. {r['title']}\n   {r['body'][:300]}\n"
             return formatted
         except ImportError:
-            return "[ERROR] Run: pip install duckduckgo-search"
+            return "[ERROR] Run: pip install ddgs"
         except Exception as e:
             log.error(f"Search error: {e}")
             return "[Search failed]"
@@ -117,29 +117,29 @@ REASON: [Brief explanation citing the search results]"""
 
         raise commands.UserFeedbackCheckFailure("❌ Max retries")
 
-    async def _process(self, user_id: int, guild_id: int, question: str, ctx):
+    async def _process(self, user_id: int, guild_id: int, question: str, channel):
         guild_cfg = await self.config.guild_from_id(guild_id).all()
         if not guild_cfg["enabled"]:
-            return await ctx.send("❌ Disabled")
+            return await channel.send("❌ Disabled")
 
         if len(question) > guild_cfg["max_input_length"]:
-            return await ctx.send("❌ Too long")
+            return await channel.send("❌ Too long")
 
         if not question.strip():
-            return await ctx.send("❌ Empty")
+            return await channel.send("❌ Empty")
 
         if user_id in self._active_requests and not self._active_requests[user_id].done():
-            return await ctx.send("❌ Already processing")
+            return await channel.send("❌ Already processing")
 
         api_key = await self.config.api_key()
         if not api_key:
-            return await ctx.send("❌ No API key (set in DMs: `>grok set apikey KEY`)")
+            return await channel.send("❌ No API key (set in DMs: `>grok set apikey KEY`)")
 
         self._active_requests[user_id] = asyncio.current_task()
         search_msg = None
 
         try:
-            search_msg = await ctx.send("🔍 Searching...")
+            search_msg = await channel.send("🔍 Searching...")
             search_data = await asyncio.to_thread(self._web_search, question)
             await search_msg.edit(content="📊 Fact-checking...")
 
@@ -154,7 +154,7 @@ REASON: [Brief explanation citing the search results]"""
             )
             
             await search_msg.delete()
-            await ctx.send(response)
+            await channel.send(response)
             
             async with self.config.user_from_id(user_id).all() as cfg:
                 cfg["request_count"] += 1
@@ -163,7 +163,7 @@ REASON: [Brief explanation citing the search results]"""
         except commands.UserFeedbackCheckFailure as e:
             if search_msg:
                 await search_msg.delete()
-            await ctx.send(str(e))
+            await channel.send(str(e))
         except asyncio.CancelledError:
             if search_msg:
                 await search_msg.delete()
@@ -171,7 +171,7 @@ REASON: [Brief explanation citing the search results]"""
             if search_msg:
                 await search_msg.delete()
             log.error(f"Error: {e}", exc_info=True)
-            await ctx.send("❌ Error")
+            await channel.send("❌ Error")
         finally:
             self._active_requests.pop(user_id, None)
 
@@ -183,7 +183,7 @@ REASON: [Brief explanation citing the search results]"""
         for u in msg.mentions:
             q = q.replace(f"<@{u.id}>", "").replace(f"<@!{u.id}>", "")
         if q := q.strip():
-            await self._process(msg.author.id, msg.guild.id, q, msg)
+            await self._process(msg.author.id, msg.guild.id, q, msg.channel)
 
     @commands.group(name="grok", invoke_without_command=True)
     @commands.cooldown(1, 30, commands.BucketType.user)
@@ -195,7 +195,7 @@ REASON: [Brief explanation citing the search results]"""
         if not ctx.guild:
             return await ctx.send("❌ Fact-check in a server")
         
-        await self._process(ctx.author.id, ctx.guild.id, question, ctx)
+        await self._process(ctx.author.id, ctx.guild.id, question, ctx.channel)
 
     @grok.command(name="stats")
     async def stats(self, ctx: commands.Context):
