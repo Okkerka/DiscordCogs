@@ -4,7 +4,7 @@ import logging
 from typing import Optional, Dict
 from datetime import datetime, timedelta
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 
 import discord
 from redbot.core import commands, Config, checks
@@ -54,23 +54,18 @@ class GrokCog(commands.Cog):
         until = (datetime.now() + timedelta(seconds=600)).isoformat()
         await self.config.user_from_id(user_id).rate_limited_until.set(until)
 
-    async def _call_grok(self, prompt: str, user_id: int) -> str:
-        api_key = await self.config.api_key()
-        if not api_key:
-            raise RuntimeError("API key not set")
-
+    @staticmethod
+    def _call_grok_sync(api_key: str, model: str, system_prompt: str, prompt: str, max_tokens: int, timeout: int, max_retries: int) -> str:
         payload = {
-            "model": await self.config.model(),
+            "model": model,
             "messages": [
-                {"role": "system", "content": await self.config.system_prompt()},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
-            "max_tokens": await self.config.max_tokens(),
+            "max_tokens": max_tokens,
             "temperature": 0.7,
         }
 
-        max_retries = await self.config.max_retries()
-        
         for attempt in range(max_retries):
             try:
                 req = Request(
@@ -82,22 +77,15 @@ class GrokCog(commands.Cog):
                     },
                 )
                 
-                resp = urlopen(req, timeout=await self.config.timeout())
+                resp = urlopen(req, timeout=timeout)
                 result = json.loads(resp.read().decode("utf-8"))
-                content = result["choices"][0]["message"]["content"].strip()
-                
-                async with self.config.user_from_id(user_id).all() as cfg:
-                    cfg["request_count"] += 1
-                    cfg["last_request_time"] = datetime.now().isoformat()
-                return content
+                return result["choices"][0]["message"]["content"].strip()
 
             except HTTPError as e:
                 if e.code == 429:
-                    await self._apply_penalty(user_id)
                     raise commands.UserFeedbackCheckFailure("❌ Rate limited (10 min)")
                 
                 if e.code >= 500 and attempt < max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)
                     continue
                 
                 if e.code >= 400:
@@ -108,14 +96,12 @@ class GrokCog(commands.Cog):
                         msg = "Unknown error"
                     raise commands.UserFeedbackCheckFailure(f"❌ {msg}")
 
-            except URLError:
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)
-                    continue
-                raise commands.UserFeedbackCheckFailure("❌ Network error")
-
             except commands.UserFeedbackCheckFailure:
                 raise
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    continue
+                raise commands.UserFeedbackCheckFailure("❌ Network error")
 
         raise commands.UserFeedbackCheckFailure("❌ Max retries exceeded")
 
@@ -136,15 +122,31 @@ class GrokCog(commands.Cog):
         if user_id in self._active_requests and not self._active_requests[user_id].done():
             return await ctx.send("❌ Already processing")
 
-        if not await self.config.api_key():
+        api_key = await self.config.api_key()
+        if not api_key:
             return await ctx.send("❌ No API key")
 
         self._active_requests[user_id] = asyncio.current_task()
 
         try:
-            response = await asyncio.to_thread(self._call_grok_sync, question, user_id)
+            response = await asyncio.to_thread(
+                self._call_grok_sync,
+                api_key,
+                await self.config.model(),
+                await self.config.system_prompt(),
+                question,
+                await self.config.max_tokens(),
+                await self.config.timeout(),
+                await self.config.max_retries(),
+            )
+            
             for page in pagify(response, page_length=2000):
                 await ctx.send(page)
+            
+            async with self.config.user_from_id(user_id).all() as cfg:
+                cfg["request_count"] += 1
+                cfg["last_request_time"] = datetime.now().isoformat()
+
         except commands.UserFeedbackCheckFailure as e:
             await ctx.send(str(e))
         except Exception as e:
@@ -152,34 +154,6 @@ class GrokCog(commands.Cog):
             await ctx.send("❌ Error. Check logs.")
         finally:
             self._active_requests.pop(user_id, None)
-
-    def _call_grok_sync(self, prompt: str, user_id: int) -> str:
-        api_key = asyncio.get_event_loop().run_until_complete(self.config.api_key())
-        if not api_key:
-            raise RuntimeError("API key not set")
-
-        payload = {
-            "model": asyncio.get_event_loop().run_until_complete(self.config.model()),
-            "messages": [
-                {"role": "system", "content": asyncio.get_event_loop().run_until_complete(self.config.system_prompt())},
-                {"role": "user", "content": prompt},
-            ],
-            "max_tokens": asyncio.get_event_loop().run_until_complete(self.config.max_tokens()),
-            "temperature": 0.7,
-        }
-
-        req = Request(
-            "https://api.x.ai/v1/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-        )
-        
-        resp = urlopen(req, timeout=30)
-        result = json.loads(resp.read().decode("utf-8"))
-        return result["choices"][0]["message"]["content"].strip()
 
     @commands.Cog.listener()
     async def on_message(self, msg: discord.Message):
