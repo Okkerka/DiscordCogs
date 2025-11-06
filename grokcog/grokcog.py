@@ -12,7 +12,7 @@ log = logging.getLogger("red.grokcog")
 
 
 class GrokCog(commands.Cog):
-    """Production-ready Grok AI integration for Red-DiscordBot."""
+    """Production-ready Grok AI integration for Red-DiscordBot with @mention support."""
 
     __version__ = "1.0.0"
     __author__ = "YourName"
@@ -23,7 +23,6 @@ class GrokCog(commands.Cog):
             self, identifier=987654321098765, force_registration=True
         )
 
-        # Global settings (bot-wide)
         default_global = {
             "api_key": None,
             "model": "grok-beta",
@@ -33,14 +32,12 @@ class GrokCog(commands.Cog):
             "system_prompt": "You are Grok, a helpful and witty AI assistant.",
         }
 
-        # Guild settings (per-server)
         default_guild = {
             "enabled": True,
             "cooldown_seconds": 30,
             "max_input_length": 2000,
         }
 
-        # User settings (per-user stats)
         default_user = {
             "request_count": 0,
             "last_request_time": None,
@@ -51,7 +48,6 @@ class GrokCog(commands.Cog):
         self.config.register_guild(**default_guild)
         self.config.register_user(**default_user)
 
-        # In-memory tracking
         self._active_requests: Dict[int, asyncio.Task] = {}
         self.base_url = "https://api.x.ai/v1"
         self._client_session: Optional[httpx.AsyncClient] = None
@@ -73,7 +69,6 @@ class GrokCog(commands.Cog):
 
     async def cog_unload(self):
         """Cleanup client session and cancel active requests."""
-        # Cancel all active requests
         for user_id, task in self._active_requests.items():
             if not task.done():
                 task.cancel()
@@ -83,7 +78,6 @@ class GrokCog(commands.Cog):
                     pass
         self._active_requests.clear()
 
-        # Close HTTP client
         if self._client_session:
             await self._client_session.aclose()
             log.info("GrokCog unloaded, client session closed")
@@ -97,7 +91,6 @@ class GrokCog(commands.Cog):
         """Check if user is rate limited. Returns error message if limited."""
         user_config = await self.config.user_from_id(user_id).all()
 
-        # Check penalty-based rate limit
         if user_config["rate_limited_until"]:
             limited_until = datetime.fromisoformat(user_config["rate_limited_until"])
             if datetime.now() < limited_until:
@@ -116,7 +109,6 @@ class GrokCog(commands.Cog):
         self, prompt: str, user_id: int, max_tokens: Optional[int] = None
     ) -> str:
         """Make request to Grok API with exponential backoff retry."""
-        # Validate config
         api_key = await self.config.api_key()
         if not api_key:
             raise RuntimeError("API key not configured. Contact bot owner.")
@@ -129,7 +121,6 @@ class GrokCog(commands.Cog):
         if max_tokens is None:
             max_tokens = await self.config.max_tokens()
 
-        # Prepare request payload
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
@@ -147,7 +138,6 @@ class GrokCog(commands.Cog):
             "Content-Type": "application/json",
         }
 
-        # Retry loop with exponential backoff
         for attempt in range(max_retries):
             try:
                 if not self._client_session:
@@ -160,7 +150,6 @@ class GrokCog(commands.Cog):
                     timeout=timeout,
                 )
 
-                # Handle rate limit (429)
                 if response.status_code == 429:
                     log.warning(f"Rate limit (429) for user {user_id}")
                     await self._apply_penalty(user_id, 600)
@@ -168,7 +157,6 @@ class GrokCog(commands.Cog):
                         "❌ API rate limit hit. Penalty applied (10 min)."
                     )
 
-                # Handle server errors (5xx) with retry
                 if response.status_code >= 500:
                     if attempt < max_retries - 1:
                         backoff = 2 ** attempt
@@ -179,7 +167,6 @@ class GrokCog(commands.Cog):
                         await asyncio.sleep(backoff)
                         continue
 
-                # Handle client errors (4xx, non-429)
                 if response.status_code >= 400:
                     try:
                         error_data = response.json()
@@ -190,11 +177,9 @@ class GrokCog(commands.Cog):
                     log.error(f"API error {response.status_code}: {error_msg}")
                     raise commands.UserFeedbackCheckFailure(f"❌ API error: {error_msg}")
 
-                # Success
                 result = response.json()
                 content = result["choices"][0]["message"]["content"].strip()
 
-                # Update user stats
                 async with self.config.user_from_id(user_id).all() as user_data:
                     user_data["request_count"] += 1
                     user_data["last_request_time"] = datetime.now().isoformat()
@@ -233,81 +218,102 @@ class GrokCog(commands.Cog):
                     "❌ Unexpected error. Contact bot owner."
                 )
 
-        # If we exit the loop without returning, all retries failed
         raise commands.UserFeedbackCheckFailure(
             f"❌ All {max_retries} retries failed. Try again later."
         )
+
+    async def _process_request(self, user_id: int, guild_id: int, question: str, response_target):
+        """Process a Grok request (used by both mention and prefix commands)."""
+        guild_config = await self.config.guild_from_id(guild_id).all()
+        if not guild_config["enabled"]:
+            await response_target.send("❌ Grok is disabled in this server.")
+            return
+
+        max_length = guild_config["max_input_length"]
+        if len(question) > max_length:
+            await response_target.send(
+                f"❌ Question too long ({len(question)}/{max_length} chars)."
+            )
+            return
+
+        if not question.strip():
+            await response_target.send("❌ Question cannot be empty.")
+            return
+
+        rate_msg = await self._check_user_rate_limit(user_id)
+        if rate_msg:
+            await response_target.send(rate_msg)
+            return
+
+        if user_id in self._active_requests:
+            task = self._active_requests[user_id]
+            if not task.done():
+                await response_target.send("❌ You already have a request in progress.")
+                return
+            else:
+                del self._active_requests[user_id]
+
+        if not await self._validate_api_key():
+            await response_target.send("❌ Bot owner hasn't configured API key yet.")
+            return
+
+        task = asyncio.current_task()
+        self._active_requests[user_id] = task
+
+        try:
+            response = await self._make_api_request(question, user_id)
+
+            if len(response) > 2000:
+                pages = list(pagify(response, delims=["\n\n", "\n", " "], page_length=2000))
+                for i, page in enumerate(pages, 1):
+                    prefix = f"[{i}/{len(pages)}] " if len(pages) > 1 else ""
+                    await response_target.send(prefix + page)
+            else:
+                await response_target.send(response)
+
+            log.info(f"Grok request succeeded for user {user_id}")
+
+        except commands.UserFeedbackCheckFailure as e:
+            await response_target.send(str(e))
+
+        except asyncio.CancelledError:
+            await response_target.send("❌ Request was cancelled.")
+            log.info(f"Grok request cancelled for user {user_id}")
+
+        except Exception as e:
+            log.error(f"Grok error for user {user_id}: {e}", exc_info=True)
+            await response_target.send(
+                "❌ An unexpected error occurred. Check logs or contact bot owner."
+            )
+
+        finally:
+            self._active_requests.pop(user_id, None)
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        """Listen for @bot mentions."""
+        if message.author.bot or not message.guild:
+            return
+
+        if self.bot.user not in message.mentions:
+            return
+
+        question = message.content
+        for user in message.mentions:
+            question = question.replace(f"<@{user.id}>", "").replace(f"<@!{user.id}>", "")
+        question = question.strip()
+
+        if not question:
+            return
+
+        await self._process_request(message.author.id, message.guild.id, question, message)
 
     @commands.group(name="grok", invoke_without_command=True)
     @commands.guild_only()
     @commands.cooldown(1, 30, commands.BucketType.user)
     async def grok(self, ctx: commands.Context, *, question: str):
         """Ask Grok AI a question. Example: [p]grok What is Python?"""
-        # Check if enabled in guild
-        if not await self.config.guild(ctx.guild).enabled():
-            return await ctx.send("❌ Grok is disabled in this server.")
-
-        # Check input length
-        max_length = await self.config.guild(ctx.guild).max_input_length()
-        if len(question) > max_length:
-            return await ctx.send(
-                f"❌ Question too long ({len(question)}/{max_length} chars)."
-            )
-
-        # Check input is not empty
-        if not question.strip():
-            return await ctx.send("❌ Question cannot be empty.")
-
-        # Check user rate limit
-        rate_msg = await self._check_user_rate_limit(ctx.author.id)
-        if rate_msg:
-            return await ctx.send(rate_msg)
-
-        # Check if user already has active request
-        if ctx.author.id in self._active_requests:
-            task = self._active_requests[ctx.author.id]
-            if not task.done():
-                return await ctx.send("❌ You already have a request in progress.")
-            else:
-                del self._active_requests[ctx.author.id]
-
-        # Validate API key
-        if not await self._validate_api_key():
-            return await ctx.send("❌ Bot owner hasn't configured API key yet.")
-
-        async with ctx.typing():
-            task = asyncio.current_task()
-            self._active_requests[ctx.author.id] = task
-
-            try:
-                response = await self._make_api_request(question, ctx.author.id)
-
-                # Split long responses
-                if len(response) > 2000:
-                    pages = list(pagify(response, delims=["\n\n", "\n", " "], page_length=2000))
-                    for i, page in enumerate(pages, 1):
-                        prefix = f"[{i}/{len(pages)}] " if len(pages) > 1 else ""
-                        await ctx.send(prefix + page)
-                else:
-                    await ctx.send(response)
-
-                log.info(f"Grok request succeeded for {ctx.author} in {ctx.guild.name}")
-
-            except commands.UserFeedbackCheckFailure as e:
-                await ctx.send(str(e))
-
-            except asyncio.CancelledError:
-                await ctx.send("❌ Request was cancelled.")
-                log.info(f"Grok request cancelled for {ctx.author}")
-
-            except Exception as e:
-                log.error(f"Grok error for {ctx.author}: {e}", exc_info=True)
-                await ctx.send(
-                    "❌ An unexpected error occurred. Check logs or contact bot owner."
-                )
-
-            finally:
-                self._active_requests.pop(ctx.author.id, None)
+        await self._process_request(ctx.author.id, ctx.guild.id, question, ctx)
 
     @grok.command(name="stats")
     async def grok_stats(self, ctx: commands.Context):
