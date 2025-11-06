@@ -191,10 +191,22 @@ REASON: [1 sentence with your reasoning and source]"""
     async def on_message(self, msg: discord.Message):
         if msg.author.bot or not msg.guild or self.bot.user not in msg.mentions:
             return
+        
+        # Get the claim to fact-check
         q = msg.content
         for u in msg.mentions:
             q = q.replace(f"<@{u.id}>", "").replace(f"<@!{u.id}>", "")
-        if q := q.strip():
+        q = q.strip()
+        
+        # If replying to someone, check that message instead
+        if msg.reference:
+            try:
+                replied_msg = await msg.channel.fetch_message(msg.reference.message_id)
+                q = replied_msg.content
+            except:
+                pass
+        
+        if q:
             await self._process(msg.author.id, msg.guild.id, q, msg.channel)
 
     @commands.group(name="grok", invoke_without_command=True)
