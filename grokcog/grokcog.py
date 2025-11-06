@@ -29,8 +29,8 @@ class GrokCog(commands.Cog):
             timeout=30,
             max_retries=3,
         )
-        self.config.register_guild(enabled=True, cooldown_seconds=30, max_input_length=2000)
-        self.config.register_user(request_count=0, last_request_time=None, rate_limited_until=None)
+        self.config.register_guild(enabled=True, max_input_length=2000)
+        self.config.register_user(request_count=0, last_request_time=None)
 
         self._active_requests: Dict[int, asyncio.Task] = {}
 
@@ -39,19 +39,6 @@ class GrokCog(commands.Cog):
             if not task.done():
                 task.cancel()
         self._active_requests.clear()
-
-    async def _check_rate_limit(self, user_id: int) -> Optional[str]:
-        user_cfg = await self.config.user_from_id(user_id).all()
-        if user_cfg["rate_limited_until"]:
-            until = datetime.fromisoformat(user_cfg["rate_limited_until"])
-            if datetime.now() < until:
-                remaining = int((until - datetime.now()).total_seconds())
-                return f"⏱️ Rate limited. Retry in {remaining}s."
-        return None
-
-    async def _apply_penalty(self, user_id: int):
-        until = (datetime.now() + timedelta(seconds=600)).isoformat()
-        await self.config.user_from_id(user_id).rate_limited_until.set(until)
 
     @staticmethod
     def _web_search(query: str) -> str:
@@ -69,7 +56,7 @@ class GrokCog(commands.Cog):
             return "[ERROR] Run: pip install duckduckgo-search"
         except Exception as e:
             log.error(f"Search error: {e}")
-            return f"[Search failed: {type(e).__name__}]"
+            return f"[Search failed]"
 
     @staticmethod
     def _fact_check_sync(api_key: str, model: str, claim: str, search_data: str, timeout: int, max_retries: int) -> str:
@@ -128,7 +115,7 @@ REASON: [Brief explanation citing the search results]"""
                     continue
                 raise commands.UserFeedbackCheckFailure("❌ API error")
 
-        raise commands.UserFeedbackCheckFailure("❌ Max retries exceeded")
+        raise commands.UserFeedbackCheckFailure("❌ Max retries")
 
     async def _process(self, user_id: int, guild_id: int, question: str, ctx):
         guild_cfg = await self.config.guild_from_id(guild_id).all()
@@ -141,15 +128,12 @@ REASON: [Brief explanation citing the search results]"""
         if not question.strip():
             return await ctx.send("❌ Empty")
 
-        if rate_msg := await self._check_rate_limit(user_id):
-            return await ctx.send(rate_msg)
-
         if user_id in self._active_requests and not self._active_requests[user_id].done():
             return await ctx.send("❌ Already processing")
 
         api_key = await self.config.api_key()
         if not api_key:
-            return await ctx.send("❌ No API key set (owner: set in DMs)")
+            return await ctx.send("❌ No API key (set in DMs: `>grok set apikey KEY`)")
 
         self._active_requests[user_id] = asyncio.current_task()
         search_msg = None
@@ -183,12 +167,11 @@ REASON: [Brief explanation citing the search results]"""
         except asyncio.CancelledError:
             if search_msg:
                 await search_msg.delete()
-            log.info(f"Fact-check cancelled for user {user_id}")
         except Exception as e:
             if search_msg:
                 await search_msg.delete()
-            log.error(f"Fatal error: {e}", exc_info=True)
-            await ctx.send("❌ Error - check logs")
+            log.error(f"Error: {e}", exc_info=True)
+            await ctx.send("❌ Error")
         finally:
             self._active_requests.pop(user_id, None)
 
@@ -222,70 +205,68 @@ REASON: [Brief explanation citing the search results]"""
         await ctx.send(embed=embed)
 
     @grok.group(name="set")
-    @checks.is_owner()
     async def grok_set(self, ctx):
+        """Settings."""
         pass
 
     @grok_set.command(name="apikey")
-    @checks.is_owner()
     async def apikey(self, ctx: commands.Context, key: str):
-        """Set API key (DMs ONLY). Get from https://console.groq.com/"""
-        if ctx.guild:
-            return await ctx.send("❌ Set API key in DMs only")
+        """Set API key. Get from https://console.groq.com/"""
+        if not await self.bot.is_owner(ctx.author):
+            return await ctx.send("❌ Owner only")
         
         if not key or len(key) < 10:
-            return await ctx.send("❌ Invalid key format")
+            return await ctx.send("❌ Invalid key")
         
         await self.config.api_key.set(key)
-        await ctx.send("✅ API key saved securely")
+        await ctx.send("✅ API key saved")
 
     @grok_set.command(name="toggle")
     @checks.admin_or_permissions(manage_guild=True)
+    @commands.guild_only()
     async def toggle(self, ctx: commands.Context):
-        """Toggle fact-checker on/off."""
-        if not ctx.guild:
-            return await ctx.send("❌ Use in a server")
-        
+        """Toggle on/off."""
         cur = await self.config.guild(ctx.guild).enabled()
         await self.config.guild(ctx.guild).enabled.set(not cur)
-        await ctx.send(f"Fact-checker {'✅ on' if not cur else '❌ off'}")
+        await ctx.send(f"{'✅ On' if not cur else '❌ Off'}")
 
     @grok_set.command(name="maxtokens")
-    @checks.is_owner()
     async def maxtokens(self, ctx: commands.Context, n: int):
         """Max tokens (50-4000)."""
+        if not await self.bot.is_owner(ctx.author):
+            return await ctx.send("❌ Owner only")
+        
         if not 50 <= n <= 4000:
             return await ctx.send("❌ 50-4000")
+        
         await self.config.max_tokens.set(n)
         await ctx.send(f"✅ {n}")
 
     @grok_set.command(name="timeout")
-    @checks.is_owner()
     async def timeout_cmd(self, ctx: commands.Context, n: int):
         """Timeout (10-120s)."""
+        if not await self.bot.is_owner(ctx.author):
+            return await ctx.send("❌ Owner only")
+        
         if not 10 <= n <= 120:
             return await ctx.send("❌ 10-120")
+        
         await self.config.timeout.set(n)
         await ctx.send(f"✅ {n}s")
 
     @grok_set.command(name="show")
     @checks.admin_or_permissions(manage_guild=True)
+    @commands.guild_only()
     async def show_settings(self, ctx: commands.Context):
         """Show config."""
-        if not ctx.guild:
-            return await ctx.send("❌ Use in a server")
-        
         g = await self.config.all()
         guild = await self.config.guild(ctx.guild).all()
         embed = discord.Embed(title="Config", color=discord.Color.gold())
         embed.add_field(
             name="Global",
-            value=f"Model: {g['model']}\nTokens: {g['max_tokens']}\nTimeout: {g['timeout']}s\nKey: {'✅ Set' if g['api_key'] else '❌ Not set'}",
+            value=f"Model: {g['model']}\nTokens: {g['max_tokens']}\nTimeout: {g['timeout']}s\nKey: {'✅' if g['api_key'] else '❌'}",
         )
-        embed.add_field(
-            name="Server",
-            value=f"Enabled: {guild['enabled']}",
-        )
+        embed.add_field(name="Server", value=f"Enabled: {guild['enabled']}")
         await ctx.send(embed=embed)
 
     async def cog_command_error(self, ctx, err):
@@ -293,19 +274,10 @@ REASON: [Brief explanation citing the search results]"""
             return
         if isinstance(err, commands.CommandOnCooldown):
             await ctx.send(f"⏱️ {err.retry_after:.1f}s")
-        elif isinstance(err, commands.MissingRequiredArgument):
-            await ctx.send("❌ Missing argument")
-        elif isinstance(err, commands.BadArgument):
-            await ctx.send("❌ Invalid argument")
         else:
-            log.error(f"Command error: {err}", exc_info=err)
+            log.error(f"Error: {err}", exc_info=err)
         ctx._handled = True
 
 
 async def setup(bot):
-    try:
-        await bot.add_cog(GrokCog(bot))
-        log.info("GrokCog loaded")
-    except Exception as e:
-        log.error(f"Failed to load GrokCog: {e}", exc_info=True)
-        raise
+    await bot.add_cog(GrokCog(bot))
