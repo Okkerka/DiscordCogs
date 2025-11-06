@@ -60,26 +60,26 @@ class GrokCog(commands.Cog):
 
     @staticmethod
     def _fact_check_sync(api_key: str, model: str, claim: str, search_data: str, timeout: int, max_retries: int) -> str:
-        system_prompt = """You are a fact-checker. Evaluate the claim based on search results.
+        system_prompt = """You are a fact-checker. Your job is to read search results and determine if a claim is TRUE or FALSE.
 
-Rules:
-1. If search results directly confirm or deny the claim → TRUE/FALSE
-2. If search results contradict the claim → FALSE
-3. If search results are ambiguous or insufficient → UNCLEAR
-4. Use the search results to support your verdict
+IMPORTANT:
+- If search results mention the answer → claim is TRUE
+- If search results contradict the claim → claim is FALSE
+- ONLY say UNCLEAR if there's absolutely no info in search results about the claim
+- Be decisive. Don't hedge. Use the search data you're given.
 
-Format:
+Output format:
 VERDICT: [TRUE/FALSE/UNCLEAR]
-REASON: [1-2 sentence explanation with source citation]"""
+REASON: [1 sentence with your reasoning and source]"""
 
         payload = {
             "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"CLAIM: {claim}\n\nSEARCH RESULTS:\n{search_data}"},
+                {"role": "user", "content": f"CLAIM: {claim}\n\nSEARCH DATA:\n{search_data}"},
             ],
-            "max_tokens": 300,
-            "temperature": 0.2,
+            "max_tokens": 200,
+            "temperature": 0.1,
         }
 
         for attempt in range(max_retries):
@@ -96,7 +96,13 @@ REASON: [1-2 sentence explanation with source citation]"""
                 
                 resp = urlopen(req, timeout=timeout)
                 result = json.loads(resp.read().decode("utf-8"))
-                return result["choices"][0]["message"]["content"].strip()
+                text = result["choices"][0]["message"]["content"].strip()
+                
+                # If model refuses, return UNCLEAR
+                if "cannot" in text.lower() or "unable" in text.lower():
+                    return "VERDICT: UNCLEAR\nREASON: Not enough information in search results."
+                
+                return text
 
             except HTTPError as e:
                 if e.code == 429:
