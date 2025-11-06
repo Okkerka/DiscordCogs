@@ -14,7 +14,7 @@ log = logging.getLogger("red.grokcog")
 
 
 class GrokCog(commands.Cog):
-    """Production-ready fact-checker with LLaMA 3.3 70B."""
+    """Production-ready intelligent assistant with LLaMA 3.3 70B."""
 
     __version__ = "1.0.0"
 
@@ -60,26 +60,24 @@ class GrokCog(commands.Cog):
 
     @staticmethod
     def _fact_check_sync(api_key: str, model: str, claim: str, search_data: str, timeout: int, max_retries: int) -> str:
-        system_prompt = """You are a fact-checker. Your job is to read search results and determine if a claim is TRUE or FALSE.
+        system_prompt = """You are an intelligent assistant. Your job is to analyze questions/claims and provide thoughtful responses.
 
-IMPORTANT:
-- If search results mention the answer → claim is TRUE
-- If search results contradict the claim → claim is FALSE
-- ONLY say UNCLEAR if there's absolutely no info in search results about the claim
-- Be decisive. Don't hedge. Use the search data you're given.
+TASK:
+1. If it's a factual claim → analyze with search results, provide verdict + evidence
+2. If it's a general question → use search results + reasoning to answer comprehensively
+3. If it's an argument → strengthen it with evidence from search results
+4. Always be concise but thorough
 
-Output format:
-VERDICT: [TRUE/FALSE/UNCLEAR]
-REASON: [1 sentence with your reasoning and source]"""
+Respond naturally, thinking through the topic."""
 
         payload = {
             "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"CLAIM: {claim}\n\nSEARCH DATA:\n{search_data}"},
+                {"role": "user", "content": f"Question/Claim:\n{claim}\n\nContext from web:\n{search_data}"},
             ],
-            "max_tokens": 200,
-            "temperature": 0.1,
+            "max_tokens": 400,
+            "temperature": 0.5,
         }
 
         for attempt in range(max_retries):
@@ -97,11 +95,6 @@ REASON: [1 sentence with your reasoning and source]"""
                 resp = urlopen(req, timeout=timeout)
                 result = json.loads(resp.read().decode("utf-8"))
                 text = result["choices"][0]["message"]["content"].strip()
-                
-                # If model refuses, return UNCLEAR
-                if "cannot" in text.lower() or "unable" in text.lower():
-                    return "VERDICT: UNCLEAR\nREASON: Not enough information in search results."
-                
                 return text
 
             except HTTPError as e:
@@ -153,7 +146,7 @@ REASON: [1 sentence with your reasoning and source]"""
         try:
             search_msg = await channel.send("🔍 Searching...")
             search_data = await asyncio.to_thread(self._web_search, question)
-            await search_msg.edit(content="📊 Fact-checking...")
+            await search_msg.edit(content="💭 Thinking...")
 
             response = await asyncio.to_thread(
                 self._fact_check_sync,
@@ -192,13 +185,13 @@ REASON: [1 sentence with your reasoning and source]"""
         if msg.author.bot or not msg.guild or self.bot.user not in msg.mentions:
             return
         
-        # Get the claim to fact-check
+        # Get the claim to analyze
         q = msg.content
         for u in msg.mentions:
             q = q.replace(f"<@{u.id}>", "").replace(f"<@!{u.id}>", "")
         q = q.strip()
         
-        # If replying to someone, check that message instead
+        # If replying to someone, analyze that message instead
         if msg.reference:
             try:
                 replied_msg = await msg.channel.fetch_message(msg.reference.message_id)
@@ -212,21 +205,21 @@ REASON: [1 sentence with your reasoning and source]"""
     @commands.group(name="grok", invoke_without_command=True)
     @commands.cooldown(1, 30, commands.BucketType.user)
     async def grok(self, ctx: commands.Context, *, question: str = None):
-        """Fact-check a claim or manage settings."""
+        """Ask AI a question or analyze something."""
         if not question:
             return
         
         if not ctx.guild:
-            return await ctx.send("❌ Fact-check in a server")
+            return await ctx.send("❌ Use in a server")
         
         await self._process(ctx.author.id, ctx.guild.id, question, ctx.channel)
 
     @grok.command(name="stats")
     async def stats(self, ctx: commands.Context):
-        """Your fact-check stats (works in DMs)."""
+        """Your stats (works in DMs)."""
         cfg = await self.config.user(ctx.author).all()
         embed = discord.Embed(title="Stats", color=discord.Color.blue())
-        embed.add_field(name="Checks", value=cfg["request_count"])
+        embed.add_field(name="Queries", value=cfg["request_count"])
         if cfg["last_request_time"]:
             ts = int(datetime.fromisoformat(cfg["last_request_time"]).timestamp())
             embed.add_field(name="Last", value=f"<t:{ts}:R>")
@@ -234,7 +227,7 @@ REASON: [1 sentence with your reasoning and source]"""
 
     @grok.group(name="set")
     async def grok_set(self, ctx):
-        """Settings (DM-safe commands here)."""
+        """Settings."""
         pass
 
     @grok_set.command(name="apikey")
