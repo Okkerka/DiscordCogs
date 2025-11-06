@@ -60,20 +60,26 @@ class GrokCog(commands.Cog):
 
     @staticmethod
     def _fact_check_sync(api_key: str, model: str, claim: str, search_data: str, timeout: int, max_retries: int) -> str:
-        system_prompt = """You are a fact-checker. Based on the search results provided, determine if the claim is TRUE, FALSE, or UNCLEAR.
+        system_prompt = """You are a fact-checker. Evaluate the claim based on search results.
 
-Format your response as:
+Rules:
+1. If search results directly confirm or deny the claim → TRUE/FALSE
+2. If search results contradict the claim → FALSE
+3. If search results are ambiguous or insufficient → UNCLEAR
+4. Use the search results to support your verdict
+
+Format:
 VERDICT: [TRUE/FALSE/UNCLEAR]
-REASON: [Brief explanation citing the search results]"""
+REASON: [1-2 sentence explanation with source citation]"""
 
         payload = {
             "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"CLAIM: {claim}\n\n{search_data}"},
+                {"role": "user", "content": f"CLAIM: {claim}\n\nSEARCH RESULTS:\n{search_data}"},
             ],
             "max_tokens": 300,
-            "temperature": 0.3,
+            "temperature": 0.2,
         }
 
         for attempt in range(max_retries):
@@ -94,7 +100,7 @@ REASON: [Brief explanation citing the search results]"""
 
             except HTTPError as e:
                 if e.code == 429:
-                    raise commands.UserFeedbackCheckFailure("❌ Rate limited by API")
+                    raise commands.UserFeedbackCheckFailure("❌ Rate limited")
                 if e.code == 401:
                     raise commands.UserFeedbackCheckFailure("❌ Invalid API key")
                 if e.code >= 500 and attempt < max_retries - 1:
