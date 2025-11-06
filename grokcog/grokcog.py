@@ -56,7 +56,7 @@ class GrokCog(commands.Cog):
             return "[ERROR] Run: pip install duckduckgo-search"
         except Exception as e:
             log.error(f"Search error: {e}")
-            return f"[Search failed]"
+            return "[Search failed]"
 
     @staticmethod
     def _fact_check_sync(api_key: str, model: str, claim: str, search_data: str, timeout: int, max_retries: int) -> str:
@@ -186,16 +186,20 @@ REASON: [Brief explanation citing the search results]"""
             await self._process(msg.author.id, msg.guild.id, q, msg)
 
     @commands.group(name="grok", invoke_without_command=True)
-    @commands.guild_only()
     @commands.cooldown(1, 30, commands.BucketType.user)
-    async def grok(self, ctx: commands.Context, *, question: str):
-        """Fact-check a claim."""
+    async def grok(self, ctx: commands.Context, *, question: str = None):
+        """Fact-check a claim or manage settings."""
+        if not question:
+            return
+        
+        if not ctx.guild:
+            return await ctx.send("❌ Fact-check in a server")
+        
         await self._process(ctx.author.id, ctx.guild.id, question, ctx)
 
     @grok.command(name="stats")
-    @commands.guild_only()
     async def stats(self, ctx: commands.Context):
-        """Your fact-check stats."""
+        """Your fact-check stats (works in DMs)."""
         cfg = await self.config.user(ctx.author).all()
         embed = discord.Embed(title="Stats", color=discord.Color.blue())
         embed.add_field(name="Checks", value=cfg["request_count"])
@@ -206,33 +210,24 @@ REASON: [Brief explanation citing the search results]"""
 
     @grok.group(name="set")
     async def grok_set(self, ctx):
-        """Settings."""
+        """Settings (DM-safe commands here)."""
         pass
 
     @grok_set.command(name="apikey")
     async def apikey(self, ctx: commands.Context, key: str):
-        """Set API key. Get from https://console.groq.com/"""
+        """Set API key (DM only). Get from https://console.groq.com/"""
         if not await self.bot.is_owner(ctx.author):
             return await ctx.send("❌ Owner only")
         
         if not key or len(key) < 10:
-            return await ctx.send("❌ Invalid key")
+            return await ctx.send("❌ Invalid key format")
         
         await self.config.api_key.set(key)
         await ctx.send("✅ API key saved")
 
-    @grok_set.command(name="toggle")
-    @checks.admin_or_permissions(manage_guild=True)
-    @commands.guild_only()
-    async def toggle(self, ctx: commands.Context):
-        """Toggle on/off."""
-        cur = await self.config.guild(ctx.guild).enabled()
-        await self.config.guild(ctx.guild).enabled.set(not cur)
-        await ctx.send(f"{'✅ On' if not cur else '❌ Off'}")
-
     @grok_set.command(name="maxtokens")
     async def maxtokens(self, ctx: commands.Context, n: int):
-        """Max tokens (50-4000)."""
+        """Max tokens (50-4000, owner only)."""
         if not await self.bot.is_owner(ctx.author):
             return await ctx.send("❌ Owner only")
         
@@ -244,7 +239,7 @@ REASON: [Brief explanation citing the search results]"""
 
     @grok_set.command(name="timeout")
     async def timeout_cmd(self, ctx: commands.Context, n: int):
-        """Timeout (10-120s)."""
+        """Timeout (10-120s, owner only)."""
         if not await self.bot.is_owner(ctx.author):
             return await ctx.send("❌ Owner only")
         
@@ -255,10 +250,14 @@ REASON: [Brief explanation citing the search results]"""
         await ctx.send(f"✅ {n}s")
 
     @grok_set.command(name="show")
-    @checks.admin_or_permissions(manage_guild=True)
-    @commands.guild_only()
     async def show_settings(self, ctx: commands.Context):
-        """Show config."""
+        """Show config (server-only)."""
+        if not ctx.guild:
+            return await ctx.send("❌ Use in a server")
+        
+        if not await checks.admin_or_permissions(manage_guild=True).predicate(ctx):
+            return await ctx.send("❌ Admin only")
+        
         g = await self.config.all()
         guild = await self.config.guild(ctx.guild).all()
         embed = discord.Embed(title="Config", color=discord.Color.gold())
@@ -268,6 +267,19 @@ REASON: [Brief explanation citing the search results]"""
         )
         embed.add_field(name="Server", value=f"Enabled: {guild['enabled']}")
         await ctx.send(embed=embed)
+
+    @grok.command(name="toggle")
+    async def toggle(self, ctx: commands.Context):
+        """Toggle on/off (server admin only)."""
+        if not ctx.guild:
+            return await ctx.send("❌ Use in a server")
+        
+        if not await checks.admin_or_permissions(manage_guild=True).predicate(ctx):
+            return await ctx.send("❌ Admin only")
+        
+        cur = await self.config.guild(ctx.guild).enabled()
+        await self.config.guild(ctx.guild).enabled.set(not cur)
+        await ctx.send(f"{'✅ On' if not cur else '❌ Off'}")
 
     async def cog_command_error(self, ctx, err):
         if hasattr(ctx, "_handled"):
