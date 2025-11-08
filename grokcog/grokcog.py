@@ -150,7 +150,7 @@ class GrokCog(commands.Cog):
 
     def __init__(self, bot: Red):
         self.bot = bot
-        self.config = Config.get_conf(self, identifier=0x_GROK, force_registration=True)
+        self.config = Config.get_conf(self, identifier=1234567890, force_registration=True)
         self.session: Optional[aiohttp.ClientSession] = None
         self._search_cache = LRUCache(CACHE_SIZE)
         self._answer_cache = LRUCache(CACHE_SIZE)
