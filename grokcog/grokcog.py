@@ -11,6 +11,7 @@ from urllib.error import HTTPError, URLError
 import discord
 from redbot.core import commands, Config, checks
 from redbot.core.utils.chat_formatting import pagify
+from redbot.core.utils.mod import is_admin_or_superior
 
 log = logging.getLogger("red.grokcog")
 
@@ -383,7 +384,7 @@ class GrokCog(commands.Cog):
         """Change LLM temperature for this server (0.0–2.0)."""
         if not ctx.guild:
             return await ctx.send("❌ Use in a server")
-        if not await checks.admin_or_permissions(manage_guild=True).predicate(ctx):
+        if not await is_admin_or_superior(self.bot, ctx.author):
             return await ctx.send("❌ Admin only")
         if not (0.0 <= value <= 2.0):
             return await ctx.send("❌ Value must be between 0.0 and 2.0")
