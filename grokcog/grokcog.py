@@ -44,7 +44,7 @@ def _looks_like_math(text: str) -> bool:
 class GrokCog(commands.Cog):
     """Intelligent assistant (Groq Llama 3.3 70B) with search, mentions, >grok, and DMs."""
 
-    __version__ = "1.3.1"
+    __version__ = "1.4.0"
 
     def __init__(self, bot):
         self.bot = bot
@@ -56,7 +56,11 @@ class GrokCog(commands.Cog):
             timeout=30,
             max_retries=3,
         )
-        self.config.register_guild(enabled=True, max_input_length=2000)
+        self.config.register_guild(
+            enabled=True,
+            max_input_length=2000,
+            temperature=0.3,          # <-- NEW
+        )
         self.config.register_user(request_count=0, last_request_time=None)
 
         self._active_requests: Dict[int, asyncio.Task] = {}
@@ -97,7 +101,6 @@ class GrokCog(commands.Cog):
         for k, _ in items[: len(items) // 2]:
             store.pop(k, None)
 
-    # ---------- safe delete helper ----------
     async def _safe_delete(self, msg: Optional[discord.Message]) -> None:
         if msg:
             try:
@@ -190,7 +193,7 @@ class GrokCog(commands.Cog):
             return "UNCLEAR"
         return max(set(labels), key=labels.count)
 
-    def _answer_json(self, api_key: str, model: str, user_input: str, sources_text: str, forced_verdict: Optional[str]) -> Dict:
+    def _answer_json(self, api_key: str, model: str, user_input: str, sources_text: str, forced_verdict: Optional[str], temperature: float) -> Dict:
         base_user = f"User: {user_input}\n\n{sources_text}"
         if forced_verdict:
             base_user += f"\n\nGivenVerdict: {forced_verdict}"
@@ -200,12 +203,10 @@ class GrokCog(commands.Cog):
         ]
 
         is_math = _looks_like_math(user_input)
-
         if is_math:
-            out = self._groq_chat(api_key, model, messages, temperature=0.1, top_p=1.0, max_tokens=120)
-        else:
-            out = self._groq_chat(api_key, model, messages, temperature=0.3, top_p=0.9, max_tokens=640)
-
+            temperature = 0.1
+        out = self._groq_chat(api_key, model, messages, temperature=temperature, top_p=0.9,
+                              max_tokens=120 if is_math else 640)
         try:
             data = json.loads(out)
         except Exception:
@@ -262,7 +263,8 @@ class GrokCog(commands.Cog):
             if self._decide_type(question) != "qa":
                 forced_verdict = await asyncio.to_thread(self._verdict_vote, api_key, model, question, sources_text)
 
-            data = await asyncio.to_thread(self._answer_json, api_key, model, question, sources_text, forced_verdict)
+            temperature = await self.config.guild_from_id(guild_id).temperature()
+            data = await asyncio.to_thread(self._answer_json, api_key, model, question, sources_text, forced_verdict, temperature)
 
             if data.get("type") == "fact":
                 verdict = data.get("verdict", forced_verdict or "UNCLEAR")
@@ -375,6 +377,18 @@ class GrokCog(commands.Cog):
             return await ctx.send("❌ Owner only")
         await self.config.model.set(name)
         await ctx.send(f"✅ Model set to {name}")
+
+    @grok_set.command(name="temperature")
+    async def set_temperature(self, ctx: commands.Context, value: float):
+        """Change LLM temperature for this server (0.0–2.0)."""
+        if not ctx.guild:
+            return await ctx.send("❌ Use in a server")
+        if not await checks.admin_or_permissions(manage_guild=True).predicate(ctx):
+            return await ctx.send("❌ Admin only")
+        if not (0.0 <= value <= 2.0):
+            return await ctx.send("❌ Value must be between 0.0 and 2.0")
+        await self.config.guild(ctx.guild).temperature.set(value)
+        await ctx.send(f"✅ Temperature set to {value}")
 
     @grok_set.command(name="toggle")
     async def toggle(self, ctx: commands.Context):
