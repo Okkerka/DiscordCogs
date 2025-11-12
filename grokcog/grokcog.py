@@ -1,8 +1,7 @@
-# grokk2.py
+# grokk2.py - FIXED VERSION
 """
 GrokK2Cog - Ultra-minimalist AI assistant using Kimi K2 Thinking Model
-Version: 3.0.0
-Philosophy: K2 does the thinking, DripBot delivers the answers
+Version: 3.0.1
 """
 
 import asyncio
@@ -15,6 +14,7 @@ import aiohttp
 
 import discord
 from redbot.core import commands, Config, checks
+from redbot.core.utils.mod import is_admin_or_superior  # <-- FIXED: Added this import
 
 log = logging.getLogger("red.grokk2")
 
@@ -40,12 +40,12 @@ RULES:
 class GrokK2Cog(commands.Cog):
     """🧠 DripBot's AI brain - Powered by Kimi K2 Thinking"""
 
-    __version__ = "3.0.0"
+    __version__ = "3.0.1"
 
     def __init__(self, bot):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=0x4B324B32, force_registration=True)
-        
+
         self.config.register_global(
             api_key=None,
             timeout=60
@@ -102,7 +102,6 @@ class GrokK2Cog(commands.Cog):
                 pass
 
     async def _ask_k2(self, question: str) -> Dict:
-        """Single API call - K2 handles everything"""
         api_key = await self.config.api_key()
         if not api_key:
             raise ValueError("API key not configured")
@@ -138,40 +137,40 @@ class GrokK2Cog(commands.Cog):
         if not (question := question.strip()) or len(question) > 4000:
             await channel.send("❌ Invalid question")
             return
-        
+
         if user_id in self._active:
             await channel.send("⏳ Already processing")
             return
-        
+
         if guild_id and not await self.config.guild_from_id(guild_id).enabled():
             await channel.send("❌ Disabled here")
             return
 
         self._active[user_id] = asyncio.current_task()
         status = None
-        
+
         try:
             key = self._key(question)
             if cached := self._cache_get(key):
                 await channel.send(cached)
                 return
-            
+
             status = await channel.send("🧠 **DripBot is thinking...**")
-            
+
             result = await self._ask_k2(question)
             text = self._format(result)
-            
+
             await self._delete(status)
             await channel.send(text)
             self._cache_set(key, text)
-            
+
             await self.config.user_from_id(user_id).request_count.set(
                 await self.config.user_from_id(user_id).request_count() + 1
             )
             await self.config.user_from_id(user_id).last_request_time.set(
                 datetime.utcnow().isoformat()
             )
-            
+
         except Exception as e:
             await self._delete(status)
             log.error(f"Error: {e}")
@@ -183,42 +182,42 @@ class GrokK2Cog(commands.Cog):
         answer = data.get("answer", "")
         confidence = data.get("confidence", 0.0)
         sources = data.get("sources", [])
-        
+
         text = answer
-        
+
         if confidence > 0:
             emoji = "🟢" if confidence > 0.8 else "🟡" if confidence > 0.6 else "🔴"
             text += f"\n\n{emoji} **Confidence:** {confidence:.0%}"
-        
+
         if sources:
             text += "\n\n**📚 Sources:**"
             for i, src in enumerate(sources[:3], 1):
                 title = src.get("title", "Source")[:60]
                 url = src.get("url", "")
                 text += f"\n{i}. {title} – {url}"
-        
+
         return text
 
     @commands.Cog.listener()
     async def on_message(self, msg: discord.Message):
         if msg.author.bot:
             return
-        
+
         if msg.guild and self.bot.user in msg.mentions:
             if not await self.config.guild(msg.guild).enabled():
                 return
-            
+
             content = msg.content
             for mention in msg.mentions:
                 content = content.replace(f"<@{mention.id}>", "")
             question = content.strip()
-            
+
             if msg.reference and (replied := await msg.channel.fetch_message(msg.reference.message_id)):
                 question += f"\n\nContext: {replied.content[:500]}"
-            
+
             if question:
                 await self._process(msg.author.id, msg.guild.id, question, msg.channel)
-        
+
         elif isinstance(msg.channel, discord.DMChannel):
             if not msg.content.startswith((">", "/", "!")):
                 await self._process(msg.author.id, None, msg.content, msg.channel)
