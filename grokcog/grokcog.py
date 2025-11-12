@@ -1,6 +1,6 @@
-# grokk2.py - FIXED VERSION
+# grokcog.py - FIXED FOR YOUR FILE NAME
 """
-GrokK2Cog - Ultra-minimalist AI assistant using Kimi K2 Thinking Model
+GrokCog - K2 Thinking with DripBot branding
 Version: 3.0.1
 """
 
@@ -14,9 +14,9 @@ import aiohttp
 
 import discord
 from redbot.core import commands, Config, checks
-from redbot.core.utils.mod import is_admin_or_superior  # <-- FIXED: Added this import
+from redbot.core.utils.mod import is_admin_or_superior
 
-log = logging.getLogger("red.grokk2")
+log = logging.getLogger("red.grokcog")
 
 K2_MODEL = "kimi-k2-thinking"
 K2_PROMPT = """You are DripBot's AI brain, powered by Kimi K2. You have built-in search and advanced reasoning.
@@ -37,7 +37,7 @@ RULES:
 - Be direct, helpful, and occasionally witty
 """
 
-class GrokK2Cog(commands.Cog):
+class GrokCog(commands.Cog):
     """🧠 DripBot's AI brain - Powered by Kimi K2 Thinking"""
 
     __version__ = "3.0.1"
@@ -65,7 +65,7 @@ class GrokK2Cog(commands.Cog):
 
     async def cog_load(self):
         self._session = aiohttp.ClientSession()
-        log.info("GrokK2 (DripBot AI) loaded successfully")
+        log.info("GrokCog (DripBot AI) loaded successfully")
 
     async def cog_unload(self):
         if self._session:
@@ -260,4 +260,4 @@ class GrokK2Cog(commands.Cog):
         await ctx.send(f"{'✅ Grok **ENABLED**' if not enabled else '❌ Grok **DISABLED**'}")
 
 async def setup(bot):
-    await bot.add_cog(GrokK2Cog(bot))
+    await bot.add_cog(GrokCog(bot))
