@@ -1,312 +1,202 @@
-# grokcog.py
+# grokk2.py - FIXED VERSION
+"""
+GrokK2Cog - Ultra-minimalist AI assistant using Kimi K2 Thinking Model
+Version: 3.0.1
+"""
+
 import asyncio
 import json
 import logging
-import hashlib
-from typing import Dict, List, Optional, Tuple
 from datetime import datetime
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
+from typing import Dict, Optional, Tuple
+import hashlib
+import aiohttp
 
 import discord
 from redbot.core import commands, Config, checks
-from redbot.core.utils.chat_formatting import pagify
-from redbot.core.utils.mod import is_admin_or_superior
+from redbot.core.utils.mod import is_admin_or_superior  # <-- FIXED: Added this import
 
-log = logging.getLogger("red.grokcog")
+log = logging.getLogger("red.grokk2")
 
-ROUTER_SYSTEM_PROMPT = """Role: Helpful analyst that answers clearly and cites web snippets when available.
+K2_MODEL = "kimi-k2-thinking"
+K2_PROMPT = """You are DripBot's AI brain, powered by Kimi K2. You have built-in search and advanced reasoning.
 
-Router:
-- If pure math or arithmetic → compute exactly.
-- If time/date → answer directly.
-- If a checkable claim → do fact-check.
-- Else → general Q&A with concise answer + 2-3 key bullets.
+TASK: Answer the user's question accurately. Use your search capability when needed. Cite sources naturally.
 
-Policies:
-- For math return JSON: {"type":"math","answer":"<number or simplified expression>"}
-- For fact-check return JSON: {"type":"fact","verdict":"TRUE|FALSE|UNCLEAR","reason":"...", "citations":[1,2]}
-- For general Q&A return JSON: {"type":"qa","answer":"...","bullets":["...","..."], "citations":[1,3]}
-- Use evidence from provided Sources only; if weak, say so.
-- Think step-by-step privately; do not reveal chain-of-thought.
+RESPONSE FORMAT:
+{
+  "answer": "Your clear, concise answer with [1], [2] citations",
+  "confidence": 0.95,
+  "sources": [{"title": "Page Title", "url": "https://example.com"}]
+}
+
+RULES:
+- Search the web if you lack recent information
+- Cite sources using bracket notation
+- Confidence score 0.0-1.0
+- Be direct, helpful, and occasionally witty
 """
 
-def _sha(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:10]
+class GrokK2Cog(commands.Cog):
+    """🧠 DripBot's AI brain - Powered by Kimi K2 Thinking"""
 
-def _looks_like_math(text: str) -> bool:
-    t = text.strip().lower()
-    if t.startswith(("what is", "what's", "calculate", "compute", "eval", "evaluate", "solve")):
-        return True
-    allowed = set("0123456789.+-*/%^()= xX ")
-    return all(ch in allowed for ch in t) and any(op in t for op in "+-*/%^")
-
-
-class GrokCog(commands.Cog):
-    """Intelligent assistant (Groq Llama 3.3 70B) with search, mentions, >grok, and DMs."""
-
-    __version__ = "1.4.0"
+    __version__ = "3.0.1"
 
     def __init__(self, bot):
         self.bot = bot
-        self.config = Config.get_conf(self, identifier=1234567890, force_registration=True)
+        self.config = Config.get_conf(self, identifier=0x4B324B32, force_registration=True)
 
         self.config.register_global(
             api_key=None,
-            model="llama-3.3-70b-versatile",
-            timeout=30,
-            max_retries=3,
+            timeout=60
         )
         self.config.register_guild(
             enabled=True,
-            max_input_length=2000,
-            temperature=0.3,          # <-- NEW
+            max_input_length=4000
         )
-        self.config.register_user(request_count=0, last_request_time=None)
+        self.config.register_user(
+            request_count=0,
+            last_request_time=None
+        )
 
-        self._active_requests: Dict[int, asyncio.Task] = {}
-        self._cache_search: Dict[str, Tuple[float, str]] = {}
-        self._cache_answer: Dict[str, Tuple[float, str]] = {}
+        self._active: Dict[int, asyncio.Task] = {}
+        self._cache: Dict[str, Tuple[float, str]] = {}
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def cog_load(self):
+        self._session = aiohttp.ClientSession()
+        log.info("GrokK2 (DripBot AI) loaded successfully")
 
     async def cog_unload(self):
-        for task in self._active_requests.values():
-            if not task.done():
-                task.cancel()
-        self._active_requests.clear()
-
-    # ------------------ Utils ------------------
+        if self._session:
+            await self._session.close()
+        for task in self._active.values():
+            task.cancel()
+        self._active.clear()
 
     @staticmethod
-    def _trim(s: str, n: int) -> str:
-        return s if len(s) <= n else s[: n - 1] + "…"
+    def _key(text: str) -> str:
+        return hashlib.sha256(text.encode()).hexdigest()[:12]
 
-    def _cache_get(self, store: Dict[str, Tuple[float, str]], key: str, ttl: int = 86400) -> Optional[str]:
-        now = datetime.utcnow().timestamp()
-        item = store.get(key)
-        if not item:
+    def _cache_get(self, key: str, ttl: int = 3600) -> Optional[str]:
+        if not (item := self._cache.get(key)):
             return None
         ts, val = item
-        if now - ts > ttl:
-            store.pop(key, None)
+        if datetime.utcnow().timestamp() - ts > ttl:
+            self._cache.pop(key, None)
             return None
         return val
 
-    def _cache_set(self, store: Dict[str, Tuple[float, str]], key: str, val: str):
-        self._cache_prune(store)
-        store[key] = (datetime.utcnow().timestamp(), val)
+    def _cache_set(self, key: str, val: str):
+        self._cache[key] = (datetime.utcnow().timestamp(), val)
+        if len(self._cache) > 256:
+            oldest = sorted(self._cache.items(), key=lambda x: x[1][0])[:64]
+            for k, _ in oldest:
+                self._cache.pop(k, None)
 
-    def _cache_prune(self, store: Dict[str, Tuple[float, str]], max_items: int = 256):
-        if len(store) <= max_items:
-            return
-        items = sorted(store.items(), key=lambda kv: kv[1][0])
-        for k, _ in items[: len(items) // 2]:
-            store.pop(k, None)
-
-    async def _safe_delete(self, msg: Optional[discord.Message]) -> None:
+    async def _delete(self, msg: Optional[discord.Message]):
         if msg:
             try:
                 await msg.delete()
-            except (discord.NotFound, discord.HTTPException):
+            except:
                 pass
 
-    # ------------------ Search ------------------
-
-    @staticmethod
-    def _web_search(query: str, max_results: int = 5) -> List[Dict[str, str]]:
-        try:
-            from ddgs import DDGS
-            results = list(DDGS().text(query, max_results=max_results))
-            cleaned = []
-            for r in results:
-                title = r.get("title") or "Untitled"
-                body = r.get("body") or ""
-                href = r.get("href") or ""
-                cleaned.append({"title": title, "snippet": body.strip(), "url": href})
-            return cleaned
-        except ImportError:
-            return [{"title": "Dependency missing", "snippet": "Run: pip install ddgs", "url": ""}]
-        except Exception as e:
-            log.error(f"Search error: {e}")
-            return [{"title": "Search failed", "snippet": "Search provider error", "url": ""}]
-
-    def _format_sources(self, results: List[Dict[str, str]], limit: int = 5) -> str:
-        results = results[:limit]
-        if not results:
-            return "Sources:\n"
-        scored = sorted(results, key=lambda r: len(r.get("snippet", "")), reverse=True)
-        if len(scored) >= 2:
-            first = scored[0]
-            last = scored[1]
-            rest = scored[2:]
-            ordered = [first] + rest + [last]
-        else:
-            ordered = scored
-        lines = ["Sources:"]
-        for i, r in enumerate(ordered, 1):
-            snippet = self._trim(r.get("snippet", "").replace("\n", " "), 280)
-            title = self._trim(r.get("title", ""), 80)
-            lines.append(f"{i}) {title} — \"{snippet}\"")
-        return "\n".join(lines)
-
-    # ------------------ Groq Calls ------------------
-
-    def _groq_chat(self, api_key: str, model: str, messages: List[Dict], temperature: float, top_p: float, max_tokens: int) -> str:
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "top_p": top_p,
-            "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"},
-        }
-        req = Request(
-            "https://api.groq.com/openai/v1/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            method="POST",
-        )
-        resp = urlopen(req, timeout=30)
-        result = json.loads(resp.read().decode("utf-8"))
-        return result["choices"][0]["message"]["content"].strip()
-
-    def _decide_type(self, text: str) -> str:
-        t = text.lower()
-        if any(k in t for k in ["true or false", "is it true", "prove", "alleg", "fact check", "fact-check"]):
-            return "fact"
-        return "qa" if "?" in t and len(t) < 300 else "auto"
-
-    def _verdict_vote(self, api_key: str, model: str, user_input: str, sources_text: str) -> str:
-        messages = [
-            {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
-            {"role": "user", "content": f"Task: Decide verdict only.\nUser: {user_input}\n\n{sources_text}\nReturn JSON: {{\"verdict\":\"TRUE|FALSE|UNCLEAR\"}}"},
-        ]
-        labels = []
-        for _ in range(3):
-            try:
-                out = self._groq_chat(api_key, model, messages, temperature=0.6, top_p=0.9, max_tokens=60)
-                data = json.loads(out)
-                v = str(data.get("verdict", "")).upper()
-                if v in ("TRUE", "FALSE", "UNCLEAR"):
-                    labels.append(v)
-            except Exception as e:
-                log.debug(f"vote error: {e}")
-        if not labels:
-            return "UNCLEAR"
-        return max(set(labels), key=labels.count)
-
-    def _answer_json(self, api_key: str, model: str, user_input: str, sources_text: str, forced_verdict: Optional[str], temperature: float) -> Dict:
-        base_user = f"User: {user_input}\n\n{sources_text}"
-        if forced_verdict:
-            base_user += f"\n\nGivenVerdict: {forced_verdict}"
-        messages = [
-            {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
-            {"role": "user", "content": base_user},
-        ]
-
-        is_math = _looks_like_math(user_input)
-        if is_math:
-            temperature = 0.1
-        out = self._groq_chat(api_key, model, messages, temperature=temperature, top_p=0.9,
-                              max_tokens=120 if is_math else 640)
-        try:
-            data = json.loads(out)
-        except Exception:
-            if is_math:
-                data = {"type": "math", "answer": out}
-            else:
-                data = {"type": "qa", "answer": out, "bullets": [], "citations": []}
-        return data
-
-    # ------------------ Core processing ------------------
-
-    async def _process(self, user_id: int, guild_id: int, question: str, channel: discord.abc.Messageable):
-        if isinstance(channel, discord.TextChannel):
-            guild_cfg = await self.config.guild_from_id(guild_id).all()
-            if not guild_cfg["enabled"]:
-                return await channel.send("❌ Disabled here")
-
-        if not question.strip():
-            return await channel.send("❌ Empty")
-        if len(question) > 2000:
-            return await channel.send("❌ Too long")
-
-        if user_id in self._active_requests and not self._active_requests[user_id].done():
-            return await channel.send("❌ Already processing")
-
+    async def _ask_k2(self, question: str) -> Dict:
         api_key = await self.config.api_key()
-        model = await self.config.model()
         if not api_key:
-            return await channel.send("❌ No API key set")
+            raise ValueError("API key not configured")
 
-        self._active_requests[user_id] = asyncio.current_task()
-        search_msg = None
+        messages = [
+            {"role": "system", "content": K2_PROMPT},
+            {"role": "user", "content": question}
+        ]
+
+        payload = {
+            "model": K2_MODEL,
+            "messages": messages,
+            "temperature": 0.3,
+            "max_tokens": 2000,
+            "tools": [{"type": "builtin", "name": "search"}]
+        }
+
+        async with self._session.post(
+            "https://api.moonshot.cn/v1/chat/completions",
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            },
+            timeout=aiohttp.ClientTimeout(total=60)
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            content = data["choices"][0]["message"]["content"]
+            return json.loads(content)
+
+    async def _process(self, user_id: int, guild_id: Optional[int], question: str, channel):
+        if not (question := question.strip()) or len(question) > 4000:
+            await channel.send("❌ Invalid question")
+            return
+
+        if user_id in self._active:
+            await channel.send("⏳ Already processing")
+            return
+
+        if guild_id and not await self.config.guild_from_id(guild_id).enabled():
+            await channel.send("❌ Disabled here")
+            return
+
+        self._active[user_id] = asyncio.current_task()
+        status = None
+
         try:
-            cache_key = _sha(question)
-            cached = self._cache_get(self._cache_answer, cache_key)
-            if cached:
-                for page in pagify(cached, page_length=1900):
-                    await channel.send(page)
+            key = self._key(question)
+            if cached := self._cache_get(key):
+                await channel.send(cached)
                 return
 
-            search_msg = await channel.send("🔍 Searching…")
-            s_key = _sha("search|" + question.lower())
-            s_cached = self._cache_get(self._cache_search, s_key)
-            if s_cached:
-                sources_text = s_cached
-            else:
-                results = await asyncio.to_thread(self._web_search, question, 5)
-                sources_text = self._format_sources(results, 5)
-                self._cache_set(self._cache_search, s_key, sources_text)
+            status = await channel.send("🧠 **DripBot is thinking...**")
 
-            await search_msg.edit(content="🧠 Thinking…")
+            result = await self._ask_k2(question)
+            text = self._format(result)
 
-            forced_verdict: Optional[str] = None
-            if self._decide_type(question) != "qa":
-                forced_verdict = await asyncio.to_thread(self._verdict_vote, api_key, model, question, sources_text)
+            await self._delete(status)
+            await channel.send(text)
+            self._cache_set(key, text)
 
-            temperature = await self.config.guild_from_id(guild_id).temperature()
-            data = await asyncio.to_thread(self._answer_json, api_key, model, question, sources_text, forced_verdict, temperature)
+            await self.config.user_from_id(user_id).request_count.set(
+                await self.config.user_from_id(user_id).request_count() + 1
+            )
+            await self.config.user_from_id(user_id).last_request_time.set(
+                datetime.utcnow().isoformat()
+            )
 
-            if data.get("type") == "fact":
-                verdict = data.get("verdict", forced_verdict or "UNCLEAR")
-                reason = data.get("reason", "")
-                text = f"VERDICT: {verdict}\nREASON: {reason}"
-            elif data.get("type") == "math":
-                ans = str(data.get("answer", "")).strip()
-                text = f"{ans}"
-            else:
-                answer = data.get("answer", "")
-                bullets = data.get("bullets", [])[:3]
-                parts = [answer] + [f"• {b}" for b in bullets if b]
-                text = "\n".join([p for p in parts if p])
-
-            await self._safe_delete(search_msg)
-            for page in pagify(text, page_length=1900):
-                await channel.send(page)
-
-            self._cache_set(self._cache_answer, cache_key, text)
-
-            async with self.config.user_from_id(user_id).all() as u:
-                u["request_count"] += 1
-                u["last_request_time"] = datetime.utcnow().isoformat()
-
-        except commands.UserFeedbackCheckFailure as e:
-            await self._safe_delete(search_msg)
-            await channel.send(str(e))
-        except asyncio.CancelledError:
-            await self._safe_delete(search_msg)
-        except HTTPError as e:
-            await self._safe_delete(search_msg)
-            await channel.send(f"❌ API error {e.code}")
         except Exception as e:
-            await self._safe_delete(search_msg)
-            log.error(f"Error: {e}", exc_info=True)
-            await channel.send("❌ Error")
+            await self._delete(status)
+            log.error(f"Error: {e}")
+            await channel.send(f"❌ Error: {str(e)[:100]}")
         finally:
-            self._active_requests.pop(user_id, None)
-            await self._safe_delete(search_msg)
+            self._active.pop(user_id, None)
 
-    # ------------------ Triggers ------------------
+    def _format(self, data: Dict) -> str:
+        answer = data.get("answer", "")
+        confidence = data.get("confidence", 0.0)
+        sources = data.get("sources", [])
+
+        text = answer
+
+        if confidence > 0:
+            emoji = "🟢" if confidence > 0.8 else "🟡" if confidence > 0.6 else "🔴"
+            text += f"\n\n{emoji} **Confidence:** {confidence:.0%}"
+
+        if sources:
+            text += "\n\n**📚 Sources:**"
+            for i, src in enumerate(sources[:3], 1):
+                title = src.get("title", "Source")[:60]
+                url = src.get("url", "")
+                text += f"\n{i}. {title} – {url}"
+
+        return text
 
     @commands.Cog.listener()
     async def on_message(self, msg: discord.Message):
@@ -314,102 +204,60 @@ class GrokCog(commands.Cog):
             return
 
         if msg.guild and self.bot.user in msg.mentions:
-            q = msg.content
-            for u in msg.mentions:
-                q = q.replace(f"<@{u.id}>", "").replace(f"<@!{u.id}>", "")
-            q = q.strip()
+            if not await self.config.guild(msg.guild).enabled():
+                return
 
-            if msg.reference:
-                try:
-                    replied = await msg.channel.fetch_message(msg.reference.message_id)
-                    if replied and replied.content:
-                        q = replied.content
-                except Exception:
-                    pass
+            content = msg.content
+            for mention in msg.mentions:
+                content = content.replace(f"<@{mention.id}>", "")
+            question = content.strip()
 
-            if q:
-                await self._process(msg.author.id, msg.guild.id, q, msg.channel)
+            if msg.reference and (replied := await msg.channel.fetch_message(msg.reference.message_id)):
+                question += f"\n\nContext: {replied.content[:500]}"
 
-        elif isinstance(msg.channel, (discord.DMChannel, discord.GroupChannel)):
-            q = msg.content.strip()
-            if q and not q.startswith((">", "/")):
-                await self._process(msg.author.id, msg.channel.id, q, msg.channel)
+            if question:
+                await self._process(msg.author.id, msg.guild.id, question, msg.channel)
 
-    # ------------------ Commands ------------------
+        elif isinstance(msg.channel, discord.DMChannel):
+            if not msg.content.startswith((">", "/", "!")):
+                await self._process(msg.author.id, None, msg.content, msg.channel)
 
-    @commands.group(name="grok", invoke_without_command=True)
-    @commands.cooldown(1, 20, commands.BucketType.user)
-    async def grok(self, ctx: commands.Context, *, question: str = None):
-        """Ask a question or fact-check a claim."""
-        if not question:
-            return
-        if not ctx.guild:
-            return await ctx.send("❌ Use in a server channel or DM me directly.")
+    @commands.hybrid_group(name="grok", invoke_without_command=True)
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def grok(self, ctx: commands.Context, *, question: str):
+        """Ask DripBot's AI anything - it searches and reasons automatically"""
         await self._process(ctx.author.id, ctx.guild.id, question, ctx.channel)
 
     @grok.command(name="stats")
     async def stats(self, ctx: commands.Context):
-        """Show your usage stats."""
-        cfg = await self.config.user(ctx.author).all()
-        embed = discord.Embed(title="Grok Stats", color=discord.Color.blue())
-        embed.add_field(name="Queries", value=cfg["request_count"])
-        if cfg["last_request_time"]:
-            ts = int(datetime.fromisoformat(cfg["last_request_time"]).timestamp())
+        """Your usage stats"""
+        stats = await self.config.user(ctx.author).all()
+        embed = discord.Embed(title="📊 Your Grok Stats", color=discord.Color.gold())
+        embed.add_field(name="Queries", value=stats["request_count"])
+        if stats["last_request_time"]:
+            ts = int(datetime.fromisoformat(stats["last_request_time"]).timestamp())
             embed.add_field(name="Last", value=f"<t:{ts}:R>")
         await ctx.send(embed=embed)
 
-    @grok.group(name="set")
-    async def grok_set(self, ctx):
-        """Owner/admin settings."""
+    @grok.group(name="admin")
+    @commands.check(is_admin_or_superior)
+    async def grok_admin(self, ctx: commands.Context):
+        """Admin settings for Grok"""
         pass
 
-    @grok_set.command(name="apikey")
-    async def apikey(self, ctx: commands.Context, key: str):
-        if not await self.bot.is_owner(ctx.author):
-            return await ctx.send("❌ Owner only")
-        if not key or len(key) < 10:
-            return await ctx.send("❌ Invalid key")
+    @grok_admin.command(name="apikey")
+    @commands.is_owner()
+    async def apikey(self, ctx: commands.Context, *, key: str):
+        """Set the API key (Owner only)"""
         await self.config.api_key.set(key)
         await ctx.send("✅ API key saved")
 
-    @grok_set.command(name="model")
-    async def set_model(self, ctx: commands.Context, *, name: str = "llama-3.3-70b-versatile"):
-        if not await self.bot.is_owner(ctx.author):
-            return await ctx.send("❌ Owner only")
-        await self.config.model.set(name)
-        await ctx.send(f"✅ Model set to {name}")
-
-    @grok_set.command(name="temperature")
-    async def set_temperature(self, ctx: commands.Context, value: float):
-        """Change LLM temperature for this server (0.0–2.0)."""
-        if not ctx.guild:
-            return await ctx.send("❌ Use in a server")
-        if not await is_admin_or_superior(self.bot, ctx.author):
-            return await ctx.send("❌ Admin only")
-        if not (0.0 <= value <= 2.0):
-            return await ctx.send("❌ Value must be between 0.0 and 2.0")
-        await self.config.guild(ctx.guild).temperature.set(value)
-        await ctx.send(f"✅ Temperature set to {value}")
-
-    @grok_set.command(name="toggle")
+    @grok_admin.command(name="toggle")
     async def toggle(self, ctx: commands.Context):
-        if not ctx.guild:
-            return await ctx.send("❌ Use in a server")
-        if not await checks.admin_or_permissions(manage_guild=True).predicate(ctx):
-            return await ctx.send("❌ Admin only")
-        cur = await self.config.guild(ctx.guild).enabled()
-        await self.config.guild(ctx.guild).enabled.set(not cur)
-        await ctx.send(f"{'✅ Enabled' if not cur else '❌ Disabled'} here")
-
-    async def cog_command_error(self, ctx, err):
-        if hasattr(ctx, "_handled"):
-            return
-        if isinstance(err, commands.CommandOnCooldown):
-            await ctx.send(f"⏱️ {err.retry_after:.1f}s")
-        else:
-            log.error(f"Error: {err}", exc_info=err)
-        ctx._handled = True
-
+        """Toggle Grok in this server"""
+        enabled = await self.config.guild(ctx.guild).enabled()
+        await self.config.guild(ctx.guild).enabled.set(not enabled)
+        await ctx.send(f"{'✅ Grok **ENABLED**' if not enabled else '❌ Grok **DISABLED**'}")
 
 async def setup(bot):
-    await bot.add_cog(GrokCog(bot))
+    await bot.add_cog(GrokK2Cog(bot))
