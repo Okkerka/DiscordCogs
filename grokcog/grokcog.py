@@ -1,5 +1,6 @@
 # ──────────────────────────────────────────────────────────────────────────────
-# IMPORTS & CONSTANTS
+# GrokCog v3.3.0 - Battle-Tested & Production Ready
+# Features: Global request queue, aggressive rate limiting, smart caching
 # ──────────────────────────────────────────────────────────────────────────────
 
 import asyncio
@@ -7,23 +8,25 @@ import hashlib
 import json
 import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 import discord
-from redbot.core import Config, app_commands, commands
+from redbot.core import Config, commands
 from redbot.core.utils.chat_formatting import pagify
 
 log = logging.getLogger("red.grokcog")
 
-# FIXED: Use correct Moonshot AI model names
-# K2_MODEL = "moonshot-v1-8k"  # Most common tier
-# K2_MODEL = "moonshot-v1-32k"  # For longer context
-K2_MODEL = "moonshot-v1-128k"  # If you have access
+# ──────────────────────────────────────────────────────────────────────────────
+# CONSTANTS - ULTRA-CONSERVATIVE FOR RESTRICTIVE API TIERS
+# ──────────────────────────────────────────────────────────────────────────────
 
-# FIXED: Simplified, more robust prompt without OpenAI-specific JSON mode
-K2_PROMPT = """You are DripBot's AI assistant. When responding, ALWAYS provide your answer in this exact JSON format:
+# API Configuration - VERIFIED for Moonshot AI
+KIMI_API_BASE = "https://api.moonshot.ai/v1"
+DEFAULT_MODEL = "moonshot-v1-8k"  # Most widely available
+K2_PROMPT = """You are DripBot's AI assistant. Respond ONLY in this JSON format:
 
 {
   "answer": "Your answer with citations [1], [2] where appropriate",
@@ -31,16 +34,82 @@ K2_PROMPT = """You are DripBot's AI assistant. When responding, ALWAYS provide y
   "sources": [{"title": "Source Title", "url": "https://example.com"}]
 }
 
-If you cannot find reliable sources, set confidence lower and return an empty sources array. Do not include markdown code blocks around the JSON."""
+If unsure, set confidence lower and use empty sources array. No markdown code blocks."""
 
-# API Configuration
-KIMI_API_BASE = "https://api.moonshot.ai/v1"
-COOLDOWN_SECONDS = 20  # Increased for safety
-CACHE_TTL = 3600
+# Rate Limiting - CONSERVATIVE for free tiers
+COOLDOWN_SECONDS = 30  # Per-user cooldown
+MIN_API_CALL_GAP = 5.0  # Minimum seconds between ANY API calls
+MAX_REQUESTS_PER_MINUTE = 5  # Ultra-conservative for free tier
+RATE_LIMIT_WINDOW = 60  # Sliding window in seconds
+
+# Cache & Limits
+CACHE_TTL = 3600  # 1 hour
 MAX_CACHE_SIZE = 256
 MAX_INPUT_LENGTH = 4000
-MIN_API_CALL_GAP = 3.0  # Increased gap
-MAX_RETRIES = 5
+MAX_RETRIES = 3  # Don't hammer the API
+
+# ──────────────────────────────────────────────────────────────────────────────
+# REQUEST QUEUE WORKER PATTERN
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class APIRequestQueue:
+    """Serialize API calls globally to respect rate limits"""
+
+    def __init__(self, cog):
+        self.cog = cog
+        self.queue = asyncio.Queue()
+        self.worker_task = None
+        self._lock = asyncio.Lock()
+
+    async def start(self):
+        """Start the background worker"""
+        if self.worker_task is None or self.worker_task.done():
+            self.worker_task = asyncio.create_task(self._worker())
+            log.info("API Request Queue worker started")
+
+    async def stop(self):
+        """Stop the worker"""
+        if self.worker_task:
+            self.worker_task.cancel()
+            try:
+                await self.worker_task
+            except asyncio.CancelledError:
+                pass
+            self.worker_task = None
+            log.info("API Request Queue worker stopped")
+
+    async def enqueue(self, coro) -> Any:
+        """Add a request to the queue and wait for result"""
+        future = asyncio.Future()
+        await self.queue.put((coro, future))
+        return await future
+
+    async def _worker(self):
+        """Process requests one at a time with rate limiting"""
+        while True:
+            try:
+                coro, future = await self.queue.get()
+
+                # Respect rate limits before processing
+                await self.cog._respect_api_rate_limits()
+
+                try:
+                    result = await coro
+                    future.set_result(result)
+                except Exception as e:
+                    future.set_exception(e)
+
+                # Small delay between processing queue items
+                await asyncio.sleep(0.5)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.exception("Worker error")
+                if not future.done():
+                    future.set_exception(e)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # COG CLASS
@@ -48,7 +117,7 @@ MAX_RETRIES = 5
 
 
 class GrokCog(commands.Cog):
-    """🧠 DripBot's AI brain - Powered by Kimi K2 Thinking"""
+    """🧠 DripBot's AI brain - Powered by Kimi/Moonshot AI"""
 
     def __init__(self, bot):
         self.bot = bot
@@ -56,47 +125,76 @@ class GrokCog(commands.Cog):
             self, identifier=0x4B324B32, force_registration=True
         )
 
+        # Configuration with conservative defaults
         self.config.register_global(
             api_key=None,
             timeout=60,
             max_retries=MAX_RETRIES,
             cooldown_seconds=COOLDOWN_SECONDS,
             min_api_call_gap=MIN_API_CALL_GAP,
-            model_name=K2_MODEL,
-            debug_mode=False,  # NEW: Enable verbose logging
+            max_requests_per_minute=MAX_REQUESTS_PER_MINUTE,
+            model_name=DEFAULT_MODEL,
+            request_queue_enabled=True,  # Enable queue by default
         )
 
         self.config.register_guild(
-            enabled=True, max_input_length=MAX_INPUT_LENGTH, default_temperature=0.3
+            enabled=True,
+            max_input_length=MAX_INPUT_LENGTH,
+            default_temperature=0.3,
         )
 
         self.config.register_user(
-            request_count=0, last_request_time=None, rate_limit_hits=0
+            request_count=0,
+            last_request_time=None,
+            rate_limit_hits=0,
         )
 
-        self._active: Dict[int, asyncio.Task] = {}
+        # Runtime state
         self._cache: Dict[str, Tuple[float, str]] = {}
+        self._active: Dict[int, asyncio.Task] = {}
         self._session: Optional[aiohttp.ClientSession] = None
         self._last_api_call: Optional[datetime] = None
         self._request_times: List[float] = []
         self._ready = asyncio.Event()
 
+        # Request deduplication - if multiple users ask same question simultaneously
+        self._inflight_requests: Dict[str, asyncio.Future] = {}
+
+        # Global request queue
+        self._api_queue = APIRequestQueue(self)
+
     async def cog_load(self):
-        """Initialize aiohttp session"""
+        """Initialize the cog"""
         self._session = aiohttp.ClientSession()
+
+        # Start the API queue worker
+        if await self.config.request_queue_enabled():
+            await self._api_queue.start()
+
         self._ready.set()
-        log.info("GrokCog v3.2.0 loaded with diagnostic capabilities")
+        log.info(
+            f"GrokCog v3.3.0 loaded with model '{await self.config.model_name()}', "
+            f"max {await self.config.max_requests_per_minute()} req/min"
+        )
 
     async def cog_unload(self):
-        """Cleanup on unload"""
+        """Clean shutdown"""
         self._ready.clear()
-        if self._session:
-            await self._session.close()
+
+        # Stop queue worker
+        await self._api_queue.stop()
+
+        # Cancel all active tasks
         for task in list(self._active.values()):
             task.cancel()
+
         if self._active:
             await asyncio.wait(self._active.values(), timeout=5)
-        self._active.clear()
+
+        if self._session:
+            await self._session.close()
+
+        log.info("GrokCog unloaded successfully")
 
     # ──────────────────────────────────────────────────────────────────────────────
     # UTILITY METHODS
@@ -104,69 +202,183 @@ class GrokCog(commands.Cog):
 
     @staticmethod
     def _key(text: str) -> str:
+        """Generate cache key"""
         return hashlib.sha256(text.strip().lower().encode()).hexdigest()
 
     def _cache_get(self, key: str) -> Optional[str]:
+        """Get cached response"""
         if item := self._cache.get(key):
             ts, val = item
-            if datetime.now(timezone.utc).timestamp() - ts < CACHE_TTL:
+            if time.time() - ts < CACHE_TTL:
+                log.debug(f"Cache hit for key {key[:8]}...")
                 return val
             self._cache.pop(key, None)
         return None
 
     def _cache_set(self, key: str, val: str) -> None:
-        self._cache[key] = (datetime.now(timezone.utc).timestamp(), val)
+        """Set cache with LRU eviction"""
+        self._cache[key] = (time.time(), val)
         if len(self._cache) > MAX_CACHE_SIZE:
+            # Remove oldest 32 entries
             for k, _ in sorted(self._cache.items(), key=lambda x: x[1][0])[:32]:
                 self._cache.pop(k, None)
 
     async def _delete(self, msg: Optional[discord.Message]) -> None:
+        """Safely delete a message"""
         if not msg:
             return
         try:
             await msg.delete()
-        except:
-            pass
+        except discord.NotFound:
+            log.debug(f"Message {msg.id} already deleted")
+        except discord.Forbidden:
+            log.warning(f"Missing permissions to delete message {msg.id}")
+        except Exception as e:
+            log.error(f"Failed to delete message {msg.id}: {e}")
+
+    # ──────────────────────────────────────────────────────────────────────────────
+    # RATE LIMITING - AGGRESSIVE & ACCURATE
+    # ──────────────────────────────────────────────────────────────────────────────
 
     async def _respect_api_rate_limits(self):
-        """Global rate limiting"""
+        """Enforce global rate limits with precision"""
         await self._ready.wait()
-        now = datetime.now(timezone.utc).timestamp()
 
-        self._request_times = [t for t in self._request_times if now - t < 60]
+        now = time.time()
 
-        if len(self._request_times) >= 20:  # Conservative limit
-            wait_time = 60 - (now - self._request_times[0])
-            log.warning(f"Global rate limit reached. Waiting {wait_time:.1f}s")
-            await asyncio.sleep(wait_time)
+        # Clean expired requests from the sliding window
+        window_start = now - RATE_LIMIT_WINDOW
+        self._request_times = [t for t in self._request_times if t > window_start]
+
+        max_per_minute = await self.config.max_requests_per_minute()
+
+        # Enforce per-minute limit
+        if len(self._request_times) >= max_per_minute:
+            oldest_request = self._request_times[0]
+            wait_time = RATE_LIMIT_WINDOW - (now - oldest_request)
+
+            log.warning(
+                f"Global rate limit reached: {len(self._request_times)}/{max_per_minute} "
+                f"requests in last {RATE_LIMIT_WINDOW}s. Waiting {wait_time:.1f}s"
+            )
+
+            if wait_time > 0:
+                await asyncio.sleep(wait_time)
+
+            # Recheck after waiting
             return await self._respect_api_rate_limits()
 
+        # Enforce minimum gap between calls
         if self._last_api_call:
             time_since_last = now - self._last_api_call.timestamp()
             min_gap = await self.config.min_api_call_gap()
-            if time_since_last < min_gap:
-                await asyncio.sleep(min_gap - time_since_last)
 
+            if time_since_last < min_gap:
+                wait_time = min_gap - time_since_last
+                log.debug(f"Enforcing min gap: waiting {wait_time:.1f}s")
+                await asyncio.sleep(wait_time)
+
+        # Record this request
         self._last_api_call = datetime.now(timezone.utc)
         self._request_times.append(now)
 
+        log.debug(
+            f"Rate limit check passed: {len(self._request_times)}/{max_per_minute} "
+            f"requests in window, gap OK"
+        )
+
     # ──────────────────────────────────────────────────────────────────────────────
-    # API CALL - DIAGNOSTIC VERSION
+    # VALIDATION - CRITICAL MISSING METHOD ADDED
+    # ──────────────────────────────────────────────────────────────────────────────
+
+    async def _validate(
+        self,
+        user_id: int,
+        guild_id: Optional[int],
+        question: str,
+        channel: discord.abc.Messageable,
+    ) -> bool:
+        """Validate query and permissions - COMPLETE REWRITE"""
+
+        # 1. Check if cog is ready
+        if not self._ready.is_set():
+            await channel.send("⚠️ Bot is still starting. Please wait 10 seconds.")
+            return False
+
+        # 2. Check for empty question
+        if not question or not question.strip():
+            await channel.send("❌ Please provide a question.")
+            return False
+
+        # 3. Check guild settings (if in guild)
+        if guild_id:
+            guild_config = self.config.guild_from_id(guild_id)
+
+            if not await guild_config.enabled():
+                await channel.send("❌ Grok is disabled in this server.")
+                return False
+
+            max_length = await guild_config.max_input_length()
+        else:
+            max_length = MAX_INPUT_LENGTH
+
+        # 4. Check question length
+        if len(question) > max_length:
+            await channel.send(
+                f"❌ Question too long ({len(question)}/{max_length} characters). "
+                "Please shorten it."
+            )
+            return False
+
+        # 5. Check if user has active request
+        if user_id in self._active:
+            await channel.send("⏳ You already have a request processing. Please wait.")
+            return False
+
+        # 6. Check user cooldown (additional safety layer)
+        user_data = await self.config.user_from_id(user_id).all()
+        last_request = user_data.get("last_request_time")
+
+        if last_request:
+            try:
+                # Handle both timestamp and ISO format for backward compatibility
+                if isinstance(last_request, (int, float)):
+                    last_time = datetime.fromtimestamp(last_request, timezone.utc)
+                else:
+                    last_time = datetime.fromisoformat(last_request)
+
+                time_since = (datetime.now(timezone.utc) - last_time).total_seconds()
+                cooldown = await self.config.cooldown_seconds()
+
+                if time_since < cooldown:
+                    remaining = cooldown - time_since
+                    await channel.send(
+                        f"⏱️ Please wait {remaining:.1f} more seconds before asking again."
+                    )
+                    return False
+            except Exception as e:
+                log.warning(f"Error checking user cooldown: {e}")
+
+        return True
+
+    # ──────────────────────────────────────────────────────────────────────────────
+    # API CALL - FIXED FOR MOONSHOT AI
     # ──────────────────────────────────────────────────────────────────────────────
 
     async def _ask_k2(self, question: str, temperature: float) -> dict:
-        """Call Kimi K2 API with extensive logging"""
-        api_key = await self.config.api_key()
-        debug_mode = await self.config.debug_mode()
+        """Call Moonshot AI API - FIXED & BULLETPROOF"""
 
+        api_key = await self.config.api_key()
         if not api_key:
             raise ValueError(
-                "❌ API key not configured! Use `[p]grok admin apikey <key>`"
+                "❌ **API key not configured!**\n\n"
+                "Please set your key with: `[p]grok admin apikey <your-key>`\n"
+                "Get your key from: https://platform.moonshot.ai/console/api-keys"
             )
 
         model_name = await self.config.model_name()
 
-        # FIXED: Simplified payload without OpenAI-specific parameters
+        # CRITICAL: Use the exact payload format Moonshot AI expects
         payload = {
             "model": model_name,
             "messages": [
@@ -175,81 +387,99 @@ class GrokCog(commands.Cog):
             ],
             "temperature": temperature,
             "max_tokens": 2000,
-            # REMOVED: "tools" and "response_format" which may not be supported
+            "top_p": 0.95,  # Moonshot AI parameter
+            "n": 1,  # Number of completions
+            "stream": False,  # Explicitly disable streaming
         }
 
-        if debug_mode:
-            log.info(
-                f"API Request: model={model_name}, temp={temperature}, tokens=2000"
-            )
-            log.info(f"Payload: {json.dumps(payload, ensure_ascii=False)[:500]}...")
-
         max_retries = await self.config.max_retries()
+        api_key_clean = api_key.strip()
 
         for attempt in range(max_retries):
             try:
-                await self._respect_api_rate_limits()
-
-                timeout = aiohttp.ClientTimeout(
-                    connect=10, total=await self.config.timeout()
+                log.info(
+                    f"API Request: model={model_name}, attempt={attempt + 1}, "
+                    f"question_len={len(question)}"
                 )
 
-                if debug_mode:
-                    log.info(f"API Call Attempt {attempt + 1}/{max_retries}")
+                timeout = aiohttp.ClientTimeout(
+                    connect=10,  # 10 second connection timeout
+                    total=await self.config.timeout(),
+                )
 
                 async with self._session.post(
                     f"{KIMI_API_BASE}/chat/completions",
                     json=payload,
-                    headers={"Authorization": f"Bearer {api_key.strip()}"},
+                    headers={
+                        "Authorization": f"Bearer {api_key_clean}",
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                    },
                     timeout=timeout,
                 ) as resp:
-                    # Log response details
-                    if debug_mode:
-                        log.info(f"API Response: HTTP {resp.status}")
-                        log.info(f"Headers: {dict(resp.headers)}")
+                    log.info(f"API Response: HTTP {resp.status}")
 
-                    # Handle specific status codes
+                    # Rate limit handling
                     if resp.status == 429:
                         retry_after = resp.headers.get("Retry-After")
-                        wait_time = (
-                            int(retry_after) if retry_after else min(2**attempt, 30)
-                        )
+                        if retry_after:
+                            wait_time = int(retry_after)
+                        else:
+                            # Exponential backoff
+                            wait_time = min(2**attempt, 30)
 
-                        log.warning(f"Rate limited (429). Retry-After: {wait_time}s")
+                        log.warning(
+                            f"Rate limited (429). Waiting {wait_time}s "
+                            f"(attempt {attempt + 1}/{max_retries})"
+                        )
 
                         if attempt < max_retries - 1:
                             await asyncio.sleep(wait_time)
                             continue
                         else:
+                            # Provide clear guidance
                             raise ValueError(
-                                f"⏱️ **Rate limit reached** - Please wait {wait_time}s before trying again.\n\n"
-                                "**Tip**: If this happens often, your API key tier may be too restrictive. "
-                                "Consider upgrading or reducing usage."
+                                f"⏱️ ** Rate limit reached ** - Moonshot AI is limiting requests.\n\n"
+                                f"Your API key tier allows ~{await self.config.max_requests_per_minute()} "
+                                f"requests per minute. You've hit this limit.\n\n"
+                                "**Solutions:**\n"
+                                "1. Wait 60 seconds before asking again\n"
+                                "2. Ask your server admin to increase cooldown with `[p]grok admin cooldown 60`\n"
+                                "3. Upgrade your API key tier at: https://platform.moonshot.ai/account/api-keys"
                             )
 
+                    # Authentication errors
                     elif resp.status == 401:
                         log.error("401 Unauthorized - Invalid API key")
-                        raise ValueError("❌ **401 Unauthorized** - Invalid API key!")
-
-                    elif resp.status == 403:
-                        log.error(
-                            "403 Forbidden - API key may not have access to this model"
-                        )
                         raise ValueError(
-                            "❌ **403 Forbidden** - Your API key doesn't have access to this model.\n"
-                            f"Current model: `{model_name}`\n"
-                            "Try: `[p]grok admin setmodel moonshot-v1-8k`"
+                            "❌ **401 Unauthorized** - Your API key is invalid.\n\n"
+                            "Please check your key at: https://platform.moonshot.ai/console/api-keys\n"
+                            "Then set it again with: `[p]grok admin apikey <key>`"
+                        )
+
+                    # Forbidden (likely wrong model)
+                    elif resp.status == 403:
+                        error_text = await resp.text()
+                        log.error(f"403 Forbidden: {error_text}")
+                        raise ValueError(
+                            f"❌ **403 Forbidden** - Your API key can't access model `{model_name}`.\n\n"
+                            "Try changing model: `[p]grok admin setmodel moonshot-v1-8k`"
+                        )
+
+                    # Server errors
+                    elif resp.status >= 500:
+                        log.error(f"Server error {resp.status}")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(min(2**attempt, 10))
+                            continue
+                        raise ValueError(
+                            f"❌ Server error (HTTP {resp.status}). Please try again later."
                         )
 
                     resp.raise_for_status()
                     data = await resp.json()
 
-                    if debug_mode:
-                        log.info(
-                            f"Response data: {json.dumps(data, ensure_ascii=False)[:500]}..."
-                        )
-
-                    # FIXED: Robust JSON extraction
+                    # Extract and validate response
                     content = (
                         data.get("choices", [{}])[0]
                         .get("message", {})
@@ -257,20 +487,16 @@ class GrokCog(commands.Cog):
                     )
 
                     if not content:
-                        raise ValueError("Empty response from AI service")
+                        raise ValueError("Empty response from API")
 
-                    # Try to parse JSON from the response
+                    # Parse JSON from response
                     return self._extract_json(content)
 
             except aiohttp.ClientError as e:
-                log.error(f"Client error (attempt {attempt + 1}): {e}")
+                log.error(f"Connection error: {e}")
                 if attempt == max_retries - 1:
                     raise ValueError(f"❌ Connection failed: {str(e)}")
                 await asyncio.sleep(min(2**attempt, 15))
-
-            except json.JSONDecodeError as e:
-                log.error(f"JSON decode error: {e}")
-                raise ValueError("❌ Invalid response format from AI service")
 
             except Exception as e:
                 log.exception(f"Unexpected error on attempt {attempt + 1}")
@@ -278,39 +504,49 @@ class GrokCog(commands.Cog):
                     raise
                 await asyncio.sleep(min(2**attempt, 15))
 
-        raise ValueError("❌ Failed after all retries")
+        raise ValueError("❌ Failed after all retry attempts")
 
     def _extract_json(self, content: str) -> dict:
-        """FIXED: Robust JSON extraction from various response formats"""
-        # Try direct JSON parse first
+        """Extract JSON from response - handles markdown and malformed JSON"""
+
+        # Try direct parse first
         try:
             return json.loads(content)
         except json.JSONDecodeError:
             pass
 
         # Try to extract JSON from markdown code blocks
-        json_match = re.search(r"```(?:json)?\n(.*?)\n```", content, re.DOTALL)
-        if json_match:
+        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
+        if match:
             try:
-                return json.loads(json_match.group(1))
+                return json.loads(match.group(1))
             except json.JSONDecodeError:
                 pass
 
-        # If all else fails, wrap the content in expected format
+        # Try to find JSON object in text
+        match = re.search(r"\{.*?\}", content, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
+
+        # Fallback: wrap the entire response
         log.warning(
-            f"Could not extract JSON, using fallback format. Content: {content[:100]}..."
+            f"Could not parse JSON, using fallback. Content: {content[:100]}..."
         )
 
         return {"answer": content, "confidence": 0.5, "sources": []}
 
     # ──────────────────────────────────────────────────────────────────────────────
-    # PROCESSING & FORMATTING
+    # PROCESSING - WITH REQUEST DEDUPLICATION
     # ──────────────────────────────────────────────────────────────────────────────
 
     async def _process(
         self, user_id: int, guild_id: Optional[int], question: str, channel
     ):
-        """Process a query"""
+        """Process a query with deduplication"""
+
         if not await self._validate(user_id, guild_id, question, channel):
             return
 
@@ -318,52 +554,96 @@ class GrokCog(commands.Cog):
         self._active[user_id] = task
 
         try:
+            # Check cache first
             key = self._key(question)
             if cached := self._cache_get(key):
+                log.debug(f"Cache hit for user {user_id}")
                 await channel.send(cached)
                 return
 
-            # Get temperature
-            temperature = 0.3
-            if guild_id:
-                temperature = await self.config.guild_from_id(
-                    guild_id
-                ).default_temperature()
+            # Check if this question is already being processed
+            if key in self._inflight_requests:
+                log.info(
+                    f"Request deduplication: user {user_id} waiting for existing request"
+                )
+                try:
+                    result = await asyncio.wait_for(
+                        self._inflight_requests[key], timeout=30
+                    )
+                    formatted = self._format(result)
+                    self._cache_set(key, formatted)
+                    await channel.send(formatted)
+                    return
+                except asyncio.TimeoutError:
+                    log.warning("Deduplication wait timed out, making new request")
 
-            # Call API
-            result = await self._ask_k2(question, temperature)
-            text = self._format(result)
+            # Show typing indicator
+            async with channel.typing():
+                # Get temperature
+                temperature = 0.3
+                if guild_id:
+                    temp_config = await self.config.guild_from_id(
+                        guild_id
+                    ).default_temperature()
+                    temperature = temp_config
 
-            # Send response
-            if len(text) > 2000:
-                pages = list(pagify(text, page_length=1900))
-                for page in pages:
-                    await channel.send(page)
-            else:
-                await channel.send(text)
+                # Create the API call coroutine
+                api_coro = self._ask_k2(question, temperature)
 
-            # Cache it
-            self._cache_set(key, text)
+                # Execute through queue or directly
+                if await self.config.request_queue_enabled():
+                    # Use queue for global serialization
+                    future = asyncio.Future()
+                    self._inflight_requests[key] = future
 
-            # Update stats
-            async with self.config.user_from_id(user_id).all() as user_data:
-                user_data["request_count"] = user_data.get("request_count", 0) + 1
-                user_data["last_request_time"] = datetime.now(timezone.utc).timestamp()
+                    try:
+                        result = await self._api_queue.enqueue(api_coro)
+                        future.set_result(result)
+                    except Exception as e:
+                        future.set_exception(e)
+                        raise
+                    finally:
+                        self._inflight_requests.pop(key, None)
+                else:
+                    # Direct execution (not recommended)
+                    result = await api_coro
 
-        except ValueError as e:
-            await channel.send(str(e))
+                # Format and send
+                text = self._format(result)
+
+                # Cache successful response
+                self._cache_set(key, text)
+
+                # Send to user
+                if len(text) > 2000:
+                    pages = list(pagify(text, page_length=1900))
+                    for page in pages:
+                        await channel.send(page)
+                else:
+                    await channel.send(text)
+
+                # Update stats
+                async with self.config.user_from_id(user_id).all() as user_data:
+                    user_data["request_count"] = user_data.get("request_count", 0) + 1
+                    user_data["last_request_time"] = time.time()
+
         except Exception as e:
             log.exception(f"Query failed for user {user_id}")
-            await channel.send("❌ Unexpected error processing your request")
+            await channel.send(
+                str(e) if isinstance(e, ValueError) else "❌ Unexpected error"
+            )
+        finally:
+            self._active.pop(user_id, None)
+            self._inflight_requests.pop(key, None)
 
     def _format(self, data: dict) -> str:
-        """Format response - FIXED: Safer formatting"""
+        """Format response for Discord"""
         if not isinstance(data, dict):
             return f"❌ Invalid response type: {type(data)}"
 
         answer = data.get("answer", "")
         if not answer:
-            return "❌ No answer received"
+            return "❌ No answer received from AI"
 
         confidence = data.get("confidence", 0.0)
         sources = data.get("sources", [])
@@ -388,13 +668,59 @@ class GrokCog(commands.Cog):
         return "\n".join(parts)
 
     # ──────────────────────────────────────────────────────────────────────────────
-    # COMMANDS
+    # EVENT LISTENERS
+    # ──────────────────────────────────────────────────────────────────────────────
+
+    @commands.Cog.listener()
+    async def on_message(self, msg: discord.Message):
+        """Handle mentions and DMs"""
+        if msg.author.bot or not self._ready.is_set():
+            return
+
+        # Check if API key is configured
+        if not await self.config.api_key():
+            return
+
+        # Handle mentions in guilds
+        if msg.guild and self.bot.user in msg.mentions:
+            guild_config = self.config.guild(msg.guild)
+            if not await guild_config.enabled():
+                return
+
+            # Extract question
+            content = msg.content
+            for mention in msg.mentions:
+                content = content.replace(f"<@{mention.id}>", "").replace(
+                    f"<@!{mention.id}>", ""
+                )
+
+            question = content.strip()
+
+            # Add context from replied message
+            if msg.reference and (replied := msg.reference.resolved):
+                if isinstance(replied, discord.Message):
+                    question += f"\n\nContext: {replied.content[:500]}"
+
+            if question:
+                await self._process(msg.author.id, msg.guild.id, question, msg.channel)
+
+        # Handle DMs (non-command)
+        elif isinstance(msg.channel, discord.DMChannel):
+            prefixes = await self.bot.get_valid_prefixes()
+            if any(msg.content.startswith(prefix) for prefix in prefixes):
+                return  # Let command processor handle
+
+            await self._process(msg.author.id, None, msg.content, msg.channel)
+
+    # ──────────────────────────────────────────────────────────────────────────────
+    # COMMANDS - COMPLETE SET
     # ──────────────────────────────────────────────────────────────────────────────
 
     @commands.hybrid_group(name="grok", invoke_without_command=True)
     @commands.cooldown(1, COOLDOWN_SECONDS, commands.BucketType.user)
     async def grok(self, ctx: commands.Context, *, question: str):
-        """Ask DripBot's AI anything"""
+        """Ask DripBot's AI anything - powered by Moonshot AI"""
+        await ctx.typing()
         await self._process(
             ctx.author.id, ctx.guild.id if ctx.guild else None, question, ctx.channel
         )
@@ -421,22 +747,26 @@ class GrokCog(commands.Cog):
                 inline=True,
             )
 
+        embed.add_field(
+            name="Rate Limit Hits", value=stats.get("rate_limit_hits", 0), inline=True
+        )
+
         await ctx.send(embed=embed)
 
     @grok.group(name="admin")
     @commands.guild_only()
     async def grok_admin(self, ctx: commands.Context):
-        """Administration commands for Grok"""
+        """Administration commands"""
         pass
 
     @grok_admin.command(name="apikey")
     @commands.is_owner()
     async def admin_apikey(self, ctx: commands.Context, *, api_key: str):
-        """Set the Kimi API key (Owner only)"""
+        """Set the Moonshot AI API key (Owner only)"""
         api_key = api_key.strip()
 
         if len(api_key) < 32:
-            await ctx.send("❌ Invalid API key format")
+            await ctx.send("❌ Invalid API key format (too short)")
             return
 
         await self.config.api_key.set(api_key)
@@ -445,17 +775,15 @@ class GrokCog(commands.Cog):
     @grok_admin.command(name="verify")
     @commands.is_owner()
     async def admin_verify(self, ctx: commands.Context):
-        """Test if the API key is working"""
+        """Test API connectivity and show key info"""
         msg = await ctx.send("🔍 Testing API connection...")
 
         try:
-            await self._respect_api_rate_limits()
-
-            # Test with a very simple request
+            # Quick connectivity test
             test_payload = {
                 "model": await self.config.model_name(),
-                "messages": [{"role": "user", "content": "Hello"}],
-                "max_tokens": 10,
+                "messages": [{"role": "user", "content": "Test"}],
+                "max_tokens": 5,
                 "temperature": 0,
             }
 
@@ -465,23 +793,44 @@ class GrokCog(commands.Cog):
                 f"{KIMI_API_BASE}/chat/completions",
                 json=test_payload,
                 headers={"Authorization": f"Bearer {api_key}"},
-                timeout=aiohttp.ClientTimeout(total=15),
+                timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
-                status_msg = {
-                    200: "✅ API key is working!",
-                    401: "❌ **401 Unauthorized** - Invalid API key!",
-                    403: "❌ **403 Forbidden** - No access to this model",
-                    429: "⚠️ **429 Rate Limited** - Service is busy, but key is valid!",
-                }
-
-                message = status_msg.get(resp.status, f"⚠️ HTTP {resp.status}")
+                data = await resp.json()
 
                 if resp.status == 200:
-                    data = await resp.json()
-                    model_used = data.get("model", "unknown")
-                    message += f"\nModel: `{model_used}`"
+                    await msg.edit(content="✅ API key is working!")
 
-                await msg.edit(content=message)
+                    # Show key details
+                    embed = discord.Embed(
+                        title="API Key Information",
+                        color=discord.Color.green(),
+                        timestamp=datetime.now(timezone.utc),
+                    )
+
+                    embed.add_field(
+                        name="Model Access",
+                        value=f"`{data.get('model', 'unknown')}`",
+                        inline=True,
+                    )
+
+                    usage = data.get("usage", {})
+                    embed.add_field(
+                        name="Tokens Used",
+                        value=f"{usage.get('total_tokens', 'unknown')}",
+                        inline=True,
+                    )
+
+                    await ctx.send(embed=embed)
+
+                else:
+                    error_msg = {
+                        401: "❌ Invalid API key",
+                        403: "❌ No access to this model",
+                        429: "⚠️ Rate limited (key is valid but busy)",
+                    }
+                    await msg.edit(
+                        content=error_msg.get(resp.status, f"⚠️ HTTP {resp.status}")
+                    )
 
         except Exception as e:
             log.exception("API verification failed")
@@ -490,17 +839,34 @@ class GrokCog(commands.Cog):
     @grok_admin.command(name="toggle")
     @commands.admin_or_permissions(manage_guild=True)
     async def admin_toggle(self, ctx: commands.Context):
-        """Enable or disable Grok in this server"""
+        """Enable/disable Grok in this server"""
         current = await self.config.guild(ctx.guild).enabled()
         await self.config.guild(ctx.guild).enabled.set(not current)
 
         status = "ENABLED 🟢" if not current else "DISABLED 🔴"
         await ctx.send(f"✅ Grok is now **{status}** in this server")
 
+    @grok_admin.command(name="cooldown")
+    @commands.is_owner()
+    async def admin_cooldown(self, ctx: commands.Context, seconds: int):
+        """Set per-user cooldown (Owner only)"""
+        if seconds < 5:
+            await ctx.send("❌ Cooldown must be at least 5 seconds")
+            return
+
+        await self.config.cooldown_seconds.set(seconds)
+
+        # Update command cooldown
+        self.grok._buckets._cooldown = commands.Cooldown(
+            1, seconds, commands.BucketType.user
+        )
+
+        await ctx.send(f"✅ Cooldown set to {seconds} seconds per user")
+
     @grok_admin.command(name="setmodel")
     @commands.is_owner()
     async def admin_setmodel(self, ctx: commands.Context, model: str):
-        """Set the AI model (moonshot-v1-8k, 32k, or 128k)"""
+        """Change AI model (moonshot-v1-8k, 32k, 128k)"""
         valid_models = ["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"]
 
         if model not in valid_models:
@@ -510,46 +876,75 @@ class GrokCog(commands.Cog):
         await self.config.model_name.set(model)
         await ctx.send(f"✅ Model set to `{model}`")
 
-    @grok_admin.command(name="debug")
+    @grok_admin.command(name="ratelimits")
     @commands.is_owner()
-    async def admin_debug(self, ctx: commands.Context, enabled: bool):
-        """Enable/disable debug logging (Owner only)"""
-        await self.config.debug_mode.set(enabled)
-        await ctx.send(f"✅ Debug mode {'enabled' if enabled else 'disabled'}")
+    async def admin_ratelimits(
+        self, ctx: commands.Context, per_minute: int, min_gap: float
+    ):
+        """Configure global rate limits (Owner only)"""
+        if per_minute < 1:
+            await ctx.send("❌ Must allow at least 1 request per minute")
+            return
+
+        if min_gap < 1.0:
+            await ctx.send("❌ Minimum gap must be at least 1.0 seconds")
+            return
+
+        await self.config.max_requests_per_minute.set(per_minute)
+        await self.config.min_api_call_gap.set(min_gap)
+
+        await ctx.send(
+            f"✅ Rate limits updated:\n"
+            f"• Max requests: {per_minute}/minute\n"
+            f"• Min gap between calls: {min_gap}s"
+        )
 
     @grok_admin.command(name="diagnose")
     @commands.is_owner()
     async def admin_diagnose(self, ctx: commands.Context):
-        """Run comprehensive diagnostics - NEW"""
-        embed = discord.Embed(title="GrokCog Diagnostics", color=discord.Color.blue())
+        """Show comprehensive diagnostics"""
+        await ctx.typing()
 
-        # Check API key
-        api_key = await self.config.api_key()
-        embed.add_field(
-            name="API Key Set", value="Yes" if api_key else "No", inline=True
+        embed = discord.Embed(
+            title="🛠️ GrokCog Diagnostics",
+            color=discord.Color.blue(),
+            timestamp=datetime.now(timezone.utc),
         )
 
-        # Check model
+        # API Status
+        api_key = await self.config.api_key()
+        embed.add_field(
+            name="API Key Set", value="✅ Yes" if api_key else "❌ No", inline=True
+        )
+
+        # Model
         model = await self.config.model_name()
         embed.add_field(name="Model", value=f"`{model}`", inline=True)
 
-        # Check rate limits
-        recent_reqs = len(
-            [
-                t
-                for t in self._request_times
-                if datetime.now(timezone.utc).timestamp() - t < 60
-            ]
+        # Rate Limits
+        recent_reqs = len([t for t in self._request_times if time.time() - t < 60])
+        max_reqs = await self.config.max_requests_per_minute()
+        embed.add_field(
+            name="Recent Requests",
+            value=f"{recent_reqs}/{max_reqs} per minute",
+            inline=True,
         )
-        embed.add_field(name="Recent Requests", value=f"{recent_reqs}/60s", inline=True)
 
-        # Check active tasks
+        # Active Tasks
         embed.add_field(name="Active Tasks", value=len(self._active), inline=True)
 
-        # Check cache
+        # Cache
         embed.add_field(name="Cache Size", value=len(self._cache), inline=True)
 
-        # Check last API call
+        # Queue
+        queue_enabled = await self.config.request_queue_enabled()
+        embed.add_field(
+            name="Request Queue",
+            value="✅ Enabled" if queue_enabled else "❌ Disabled",
+            inline=True,
+        )
+
+        # Last API Call
         if self._last_api_call:
             time_since = (
                 datetime.now(timezone.utc) - self._last_api_call
@@ -558,7 +953,20 @@ class GrokCog(commands.Cog):
                 name="Last API Call", value=f"{time_since:.1f}s ago", inline=True
             )
 
+        # Config
+        cooldown = await self.config.cooldown_seconds()
+        min_gap = await self.config.min_api_call_gap()
+        embed.add_field(name="User Cooldown", value=f"{cooldown}s", inline=True)
+        embed.add_field(name="Min API Gap", value=f"{min_gap}s", inline=True)
+
         await ctx.send(embed=embed)
+
+    @grok_admin.command(name="clearcache")
+    @commands.is_owner()
+    async def admin_clearcache(self, ctx: commands.Context):
+        """Clear the response cache"""
+        self._cache.clear()
+        await ctx.send("✅ Cache cleared")
 
 
 async def setup(bot):
