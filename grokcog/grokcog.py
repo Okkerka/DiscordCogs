@@ -1,5 +1,5 @@
-# grokcog.py - FINAL BUG-FREE VERSION
-# Version: 3.0.3 - All errors fixed
+# grokcog.py - PRODUCTION VERSION WITH BETTER ERROR HANDLING
+# Version: 3.0.4 - Handles 401 errors gracefully
 
 import asyncio
 import hashlib
@@ -106,14 +106,21 @@ class GrokCog(commands.Cog):
                 pass
 
     # ──────────────────────────────────────────────────────────────────────────────
-    # K2 API
+    # K2 API CALL - IMPROVED ERROR HANDLING
     # ──────────────────────────────────────────────────────────────────────────────
 
     async def _ask_k2(self, question: str, temperature: float) -> dict:
-        """Call Kimi K2 API with retry logic"""
+        """Call Kimi K2 API with retry logic and proper error handling"""
         api_key = await self.config.api_key()
+
+        # Check if API key is set
         if not api_key:
-            raise ValueError("API key not configured")
+            raise ValueError(
+                "❌ API key not configured!\n\n"
+                "Please set your Kimi API key using:\n"
+                "`[p]grok admin apikey <your-key-here>`\n\n"
+                "Get your API key from: https://platform.moonshot.cn/api-keys"
+            )
 
         payload = {
             "model": K2_MODEL,
@@ -136,15 +143,47 @@ class GrokCog(commands.Cog):
                     headers={"Authorization": f"Bearer {api_key}"},
                     timeout=aiohttp.ClientTimeout(total=await self.config.timeout()),
                 ) as resp:
+                    # Handle 401 Unauthorized specifically
+                    if resp.status == 401:
+                        log.error(f"401 Unauthorized - Invalid API key")
+                        raise ValueError(
+                            "❌ **401 Unauthorized** - Invalid API key!\n\n"
+                            "Your API key is incorrect or expired.\n"
+                            "Please reset it with: `[p]grok admin apikey <new-key>`\n"
+                            "Get a new key from: https://platform.moonshot.cn/api-keys"
+                        )
+
+                    # Handle 429 Rate Limit
                     if resp.status == 429:
-                        await asyncio.sleep(int(resp.headers.get("Retry-After", 5)))
-                        continue
+                        retry_after = int(resp.headers.get("Retry-After", 5))
+                        log.warning(f"Rate limited, retrying after {retry_after}s")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(retry_after)
+                            continue
+
                     resp.raise_for_status()
                     data = await resp.json()
                     return json.loads(data["choices"][0]["message"]["content"])
+
+            except aiohttp.ClientResponseError as e:
+                if e.status == 401:
+                    # Re-raise as ValueError with helpful message
+                    raise ValueError(
+                        "❌ **401 Unauthorized** - Invalid API key!\n\n"
+                        "Please verify your API key is correct and active.\n"
+                        "Reset with: `[p]grok admin apikey <your-key>`\n"
+                        "Get keys at: https://platform.moonshot.cn/api-keys"
+                    )
+                elif e.status == 429:
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2**attempt)
+                        continue
+                raise
+
             except Exception as e:
                 if attempt == max_retries - 1:
-                    raise
+                    log.exception(f"API call failed after {max_retries} attempts")
+                    raise ValueError(f"❌ API Error: {str(e)}")
                 await asyncio.sleep(2**attempt)
 
     # ──────────────────────────────────────────────────────────────────────────────
@@ -217,16 +256,17 @@ class GrokCog(commands.Cog):
             else:
                 await channel.send(text)
 
-            # Cache and update stats
+            # Cache response
             await self._cache_set(key, text)
 
+            # Update stats
             async with self.config.user_from_id(user_id).all() as user_data:
                 user_data["request_count"] += 1
                 user_data["last_request_time"] = datetime.utcnow().isoformat()
 
         except ValueError as e:
             await self._delete(status)
-            await channel.send(f"⚠️ {str(e)}")
+            await channel.send(str(e))  # Show the helpful error message directly
         except Exception as e:
             await self._delete(status)
             log.exception(f"Query failed: {e}")
@@ -265,7 +305,6 @@ class GrokCog(commands.Cog):
         if msg.author.bot:
             return
 
-        # --- Guild Mentions ---
         if msg.guild and self.bot.user in msg.mentions:
             if not await self.config.guild(msg.guild).enabled():
                 return
@@ -286,9 +325,7 @@ class GrokCog(commands.Cog):
             if question:
                 await self._process(msg.author.id, msg.guild.id, question, msg.channel)
 
-        # --- Direct Messages ---
         elif isinstance(msg.channel, discord.DMChannel):
-            # Ignore command prefixes
             prefixes = await self.bot.get_valid_prefixes()
             if not any(msg.content.startswith(prefix) for prefix in prefixes):
                 await self._process(msg.author.id, None, msg.content, msg.channel)
@@ -331,16 +368,86 @@ class GrokCog(commands.Cog):
     @grok_admin.command(name="apikey")
     @commands.is_owner()
     async def admin_apikey(self, ctx: commands.Context, *, api_key: str):
-        """Set the Kimi API key (Bot Owner only)"""
+        """Set the Kimi API key (Bot Owner only)
+
+        Get your API key from: https://platform.moonshot.cn/api-keys
+        """
         if len(api_key.strip()) < 32:
-            await ctx.send("❌ Invalid API key format")
+            await ctx.send(
+                "❌ Invalid API key format (should be at least 32 characters)"
+            )
             return
 
         await self.config.api_key.set(api_key.strip())
-        await ctx.send("✅ API key saved")
+
+        # Verify immediately
+        msg = await ctx.send("🔍 Verifying API key...")
+        try:
+            test_payload = {
+                "model": K2_MODEL,
+                "messages": [{"role": "user", "content": "Respond with OK"}],
+                "max_tokens": 10,
+            }
+
+            async with self._session.post(
+                "https://api.moonshot.cn/v1/chat/completions",
+                json=test_payload,
+                headers={"Authorization": f"Bearer {api_key.strip()}"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    await msg.edit(content="✅ API key saved and verified!")
+                elif resp.status == 401:
+                    await msg.edit(
+                        content="❌ API key verification failed: Invalid key (401)"
+                    )
+                else:
+                    await msg.edit(
+                        content=f"⚠️ API key saved but verification failed (HTTP {resp.status})"
+                    )
+
+        except Exception as e:
+            await msg.edit(content=f"⚠️ API key saved but verification error: {str(e)}")
+
+    @grok_admin.command(name="verify")
+    @commands.is_owner()
+    async def admin_verify(self, ctx: commands.Context):
+        """Test if the API key is working"""
+        msg = await ctx.send("🔍 Testing API connection...")
+
+        try:
+            api_key = await self.config.api_key()
+            if not api_key:
+                await msg.edit(
+                    content="❌ No API key is set. Use `[p]grok admin apikey <key>`"
+                )
+                return
+
+            test_payload = {
+                "model": K2_MODEL,
+                "messages": [{"role": "user", "content": "OK"}],
+                "max_tokens": 10,
+            }
+
+            async with self._session.post(
+                "https://api.moonshot.cn/v1/chat/completions",
+                json=test_payload,
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    await msg.edit(content="✅ API key is working!")
+                elif resp.status == 401:
+                    await msg.edit(
+                        content="❌ **401 Unauthorized** - Invalid API key!\n\nPlease check your key at: https://platform.moonshot.cn/api-keys"
+                    )
+                else:
+                    await msg.edit(content=f"⚠️ API test failed: HTTP {resp.status}")
+
+        except Exception as e:
+            await msg.edit(content=f"❌ API test error: {str(e)}")
 
     @grok_admin.command(name="toggle")
-    # FIX: Use proper lambda for is_admin_or_superior check
     @commands.check(lambda ctx: is_admin_or_superior(ctx.bot, ctx.author))
     async def admin_toggle(self, ctx: commands.Context):
         """Enable or disable Grok in this server"""
@@ -349,20 +456,6 @@ class GrokCog(commands.Cog):
 
         status = "ENABLED 🟢" if not current else "DISABLED 🔴"
         await ctx.send(f"✅ Grok is now **{status}**")
-
-    async def cog_command_error(
-        self, ctx: commands.Context, error: commands.CommandError
-    ):
-        """Global error handler"""
-        if isinstance(error, commands.CommandOnCooldown):
-            await ctx.send(f"⏱️ Cooldown: Wait `{error.retry_after:.1f}` seconds")
-        elif isinstance(error, commands.CheckFailure):
-            await ctx.send(f"❌ {error}")
-        elif isinstance(error, commands.BadArgument):
-            await ctx.send(f"⚠️ {error}")
-        else:
-            log.exception(f"Error in {ctx.command}: {error}")
-            await ctx.send("❌ Internal error")
 
 
 async def setup(bot):
