@@ -1,11 +1,11 @@
-# grokcog.py - FIXED API ENDPOINT
-# Version: 3.0.5 - Uses correct Moonshot AI .ai domain
+# grokcog.py - RATE LIMIT ENHANCED VERSION
+# Version: 3.0.5 - Handles 429 gracefully with user feedback
 
 import asyncio
 import hashlib
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import aiohttp
@@ -17,13 +17,11 @@ from redbot.core.utils.mod import is_admin_or_superior
 log = logging.getLogger("red.grokcog")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CRITICAL FIX: Use .ai endpoint (not .cn)
+# CONSTANTS & RATE LIMITING
 # ──────────────────────────────────────────────────────────────────────────────
 
 COOLDOWN_SECONDS = 10
 K2_MODEL = "kimi-k2-thinking"
-
-# FIX: Changed from https://api.moonshot.cn to https://api.moonshot.ai
 KIMI_API_BASE = "https://api.moonshot.ai/v1"
 
 K2_PROMPT = """You are DripBot's AI brain, powered by Kimi K2 with native search and reasoning.
@@ -38,6 +36,39 @@ RESPOND WITH VALID JSON:
 CACHE_TTL = 3600
 MAX_CACHE_SIZE = 256
 MAX_INPUT_LENGTH = 4000
+
+
+# NEW: Global rate limit tracking
+class RateLimiter:
+    def __init__(self):
+        self.request_times: List[datetime] = []
+        self.lock = asyncio.Lock()
+
+    async def acquire(self, max_requests: int = 10, window_seconds: int = 60):
+        """Ensure we don't exceed rate limits"""
+        async with self.lock:
+            now = datetime.utcnow()
+            # Remove old requests outside the window
+            self.request_times = [
+                t
+                for t in self.request_times
+                if now - t < timedelta(seconds=window_seconds)
+            ]
+
+            if len(self.request_times) >= max_requests:
+                oldest = self.request_times[0]
+                wait_time = (
+                    oldest + timedelta(seconds=window_seconds) - now
+                ).total_seconds()
+                raise ValueError(
+                    f"⏱️ **Rate Limit Hit** - Please wait {wait_time:.0f} seconds before making another request.\n\n"
+                    "Moonshot AI limits requests to prevent overloading their service."
+                )
+
+            self.request_times.append(now)
+
+
+rate_limiter = RateLimiter()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # COG CLASS
@@ -57,7 +88,8 @@ class GrokCog(commands.Cog):
             api_key=None,
             timeout=60,
             max_retries=3,
-            api_base=KIMI_API_BASE,  # NEW: Configurable endpoint
+            rate_limit_requests=15,  # NEW: Configurable rate limit
+            rate_limit_window=60,  # NEW: Configurable time window
         )
         self.config.register_guild(
             enabled=True, max_input_length=MAX_INPUT_LENGTH, default_temperature=0.3
@@ -67,11 +99,14 @@ class GrokCog(commands.Cog):
         self._active: Dict[int, asyncio.Task] = {}
         self._cache: Dict[str, Tuple[float, str]] = {}
         self._session: Optional[aiohttp.ClientSession] = None
+        self._user_rate_limits: Dict[
+            int, RateLimiter
+        ] = {}  # NEW: Per-user rate limiting
 
     async def cog_load(self):
         """Initialize aiohttp session"""
         self._session = aiohttp.ClientSession()
-        log.info("GrokCog loaded successfully")
+        log.info("GrokCog v3.0.5 loaded with enhanced rate limiting")
 
     async def cog_unload(self):
         """Cleanup on unload"""
@@ -115,14 +150,12 @@ class GrokCog(commands.Cog):
                 pass
 
     # ──────────────────────────────────────────────────────────────────────────────
-    # K2 API CALL - WITH PROPER ERROR MESSAGES
+    # K2 API CALL - ENHANCED RATE LIMIT HANDLING
     # ──────────────────────────────────────────────────────────────────────────────
 
     async def _ask_k2(self, question: str, temperature: float) -> dict:
-        """Call Kimi K2 API with retry logic"""
+        """Call Kimi K2 API with intelligent retry logic"""
         api_key = await self.config.api_key()
-        api_base = await self.config.api_base()  # NEW: Configurable endpoint
-
         if not api_key:
             raise ValueError(
                 "❌ **API key not configured!**\n\n"
@@ -144,45 +177,62 @@ class GrokCog(commands.Cog):
         }
 
         max_retries = await self.config.max_retries()
+
         for attempt in range(max_retries):
             try:
                 async with self._session.post(
-                    f"{api_base}/chat/completions",  # NEW: Use configurable endpoint
+                    f"{KIMI_API_BASE}/chat/completions",
                     json=payload,
                     headers={"Authorization": f"Bearer {api_key}"},
                     timeout=aiohttp.ClientTimeout(total=await self.config.timeout()),
                 ) as resp:
-                    # Handle 401 Unauthorized
-                    if resp.status == 401:
-                        log.error(
-                            f"401 Unauthorized - Invalid API key for endpoint {api_base}"
-                        )
-                        raise ValueError(
-                            "❌ **401 Unauthorized** - Invalid API key!\n\n"
-                            f"Endpoint: `{api_base}`\n\n"
-                            "Please check:\n"
-                            "1. Your API key is correct and active\n"
-                            "2. You're using a key from: https://platform.moonshot.ai/console/projects/api-keys\n"
-                            "3. Your project has billing enabled\n\n"
-                            "Reset your key with: `[p]grok admin apikey <new-key>`"
+                    # Handle 429 with smart retry
+                    if resp.status == 429:
+                        retry_after = resp.headers.get("Retry-After")
+                        if retry_after:
+                            wait_time = int(retry_after)
+                        else:
+                            wait_time = 2**attempt  # Exponential backoff
+
+                        log.warning(
+                            f"Rate limited (429). Retry {attempt + 1}/{max_retries} after {wait_time}s"
                         )
 
-                    # Handle 429 Rate Limit
-                    if resp.status == 429:
                         if attempt < max_retries - 1:
-                            await asyncio.sleep(2**attempt)
+                            await asyncio.sleep(wait_time)
                             continue
+                        else:
+                            raise ValueError(
+                                f"⏱️ **Rate Limit Exceeded** - Please wait {wait_time} seconds before trying again.\n\n"
+                                "The service is currently experiencing high demand. "
+                                "Try again in a few moments."
+                            )
+
+                    # Handle 401 Unauthorized
+                    if resp.status == 401:
+                        log.error(f"401 Unauthorized - Invalid API key")
+                        raise ValueError(
+                            "❌ **401 Unauthorized** - Invalid API key!\n\n"
+                            "Please check your API key at: https://platform.moonshot.ai/console/projects/api-keys\n"
+                            "Then reset it with: `[p]grok admin apikey <your-key>`"
+                        )
 
                     resp.raise_for_status()
                     data = await resp.json()
                     return json.loads(data["choices"][0]["message"]["content"])
 
             except aiohttp.ClientResponseError as e:
-                if e.status == 401:
+                if e.status == 429:
+                    # Final retry failed
+                    raise ValueError(
+                        f"⏱️ **Rate Limit Exceeded** - The service is too busy.\n\n"
+                        f"Error: {e.message}\n\n"
+                        "Please wait a minute and try again."
+                    )
+                elif e.status == 401:
                     raise ValueError(
                         "❌ **401 Unauthorized** - Invalid API key!\n\n"
-                        "Please verify your API key at: https://platform.moonshot.ai/console/projects/api-keys\n"
-                        "Then reset it with: `[p]grok admin apikey <your-key>`"
+                        "Please verify your API key and reset it if needed."
                     )
                 raise
 
@@ -226,8 +276,30 @@ class GrokCog(commands.Cog):
     async def _process(
         self, user_id: int, guild_id: Optional[int], question: str, channel
     ):
-        """Process a query from start to finish"""
+        """Process a query with rate limiting"""
         if not await self._validate(user_id, guild_id, question, channel):
+            return
+
+        # NEW: Global rate limiting
+        try:
+            max_req = await self.config.rate_limit_requests()
+            window = await self.config.rate_limit_window()
+            await rate_limiter.acquire(max_req, window)
+        except ValueError as e:
+            await channel.send(str(e))
+            return
+
+        # NEW: Per-user rate limiting
+        if user_id not in self._user_rate_limits:
+            self._user_rate_limits[user_id] = RateLimiter()
+
+        try:
+            user_limiter = self._user_rate_limits[user_id]
+            await user_limiter.acquire(max_req=5, window=60)  # Stricter per-user limit
+        except ValueError as e:
+            await channel.send(
+                f"⏱️ **You're sending requests too fast!** - Wait a moment before asking again."
+            )
             return
 
         self._active[user_id] = asyncio.current_task()
@@ -272,8 +344,7 @@ class GrokCog(commands.Cog):
 
         except ValueError as e:
             await self._delete(status)
-            # Show the helpful error message directly
-            await channel.send(str(e))
+            await channel.send(str(e))  # Show helpful error
         except Exception as e:
             await self._delete(status)
             log.exception(f"Query failed: {e}")
@@ -375,10 +446,7 @@ class GrokCog(commands.Cog):
     @grok_admin.command(name="apikey")
     @commands.is_owner()
     async def admin_apikey(self, ctx: commands.Context, *, api_key: str):
-        """Set the Kimi API key (Bot Owner only)
-
-        Get your API key from: https://platform.moonshot.ai/console/projects/api-keys
-        """
+        """Set the Kimi API key (Bot Owner only)"""
         if len(api_key.strip()) < 32:
             await ctx.send(
                 "❌ Invalid API key format (should be at least 32 characters)"
@@ -396,19 +464,21 @@ class GrokCog(commands.Cog):
                 "max_tokens": 10,
             }
 
-            async with (
-                self._session.post(
-                    f"{await self.config.api_base()}/chat/completions",  # Use configured endpoint
-                    json=test_payload,
-                    headers={"Authorization": f"Bearer {api_key.strip()}"},
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp
-            ):
+            async with self._session.post(
+                f"{KIMI_API_BASE}/chat/completions",
+                json=test_payload,
+                headers={"Authorization": f"Bearer {api_key.strip()}"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
                 if resp.status == 200:
                     await msg.edit(content="✅ API key saved and verified!")
                 elif resp.status == 401:
                     await msg.edit(
                         content="❌ API key verification failed: Invalid key (401)"
+                    )
+                elif resp.status == 429:
+                    await msg.edit(
+                        content="⚠️ API key verified but rate limited (429) - Key is valid but service is busy"
                     )
                 else:
                     await msg.edit(
@@ -426,7 +496,6 @@ class GrokCog(commands.Cog):
 
         try:
             api_key = await self.config.api_key()
-            api_base = await self.config.api_base()
 
             if not api_key:
                 await msg.edit(
@@ -441,20 +510,20 @@ class GrokCog(commands.Cog):
             }
 
             async with self._session.post(
-                f"{api_base}/chat/completions",
+                f"{KIMI_API_BASE}/chat/completions",
                 json=test_payload,
                 headers={"Authorization": f"Bearer {api_key}"},
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status == 200:
-                    await msg.edit(
-                        content=f"✅ API key is working! (Endpoint: `{api_base}`)"
-                    )
+                    await msg.edit(content=f"✅ API key is working!")
                 elif resp.status == 401:
                     await msg.edit(
-                        content=f"❌ **401 Unauthorized** - Invalid API key!\n\n"
-                        f"Endpoint: `{api_base}`\n\n"
-                        "Please verify your API key at: https://platform.moonshot.ai/console/projects/api-keys"
+                        content=f"❌ **401 Unauthorized** - Invalid API key!"
+                    )
+                elif resp.status == 429:
+                    await msg.edit(
+                        content=f"⚠️ **429 Rate Limited** - Service is busy, but key is valid!"
                     )
                 else:
                     await msg.edit(content=f"⚠️ API test failed: HTTP {resp.status}")
@@ -471,6 +540,22 @@ class GrokCog(commands.Cog):
 
         status = "ENABLED 🟢" if not current else "DISABLED 🔴"
         await ctx.send(f"✅ Grok is now **{status}**")
+
+    @grok_admin.command(name="rate_limit")
+    @commands.is_owner()
+    async def admin_rate_limit(
+        self, ctx: commands.Context, requests: int, window_seconds: int
+    ):
+        """Configure rate limiting (Owner only)"""
+        if requests < 1 or window_seconds < 1:
+            await ctx.send("❌ Values must be positive integers")
+            return
+
+        await self.config.rate_limit_requests.set(requests)
+        await self.config.rate_limit_window.set(window_seconds)
+        await ctx.send(
+            f"✅ Rate limit set to {requests} requests per {window_seconds} seconds"
+        )
 
 
 async def setup(bot):
