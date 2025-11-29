@@ -518,7 +518,7 @@ class GrokCog(commands.Cog):
                 embed.add_field(name="Sources", value=source_text[:1024], inline=False)
 
         embed.set_footer(
-            text="Powered by Kimi K2 via Groq • Fact-checked responses only"
+            text="Powered by 2 Romanian kids • Retardation only (fact checks)"
         )
 
         return embed
