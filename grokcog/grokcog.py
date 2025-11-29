@@ -129,29 +129,31 @@ class GrokCog(commands.Cog):
             return {"answer": "⚠️ **Connection Error**: Could not reach AI provider.", "confidence": 0, "sources": []}
 
     def _parse_json(self, text: str) -> dict:
-        """Robust JSON parsing that handles common LLM output formats."""
+        """Robust JSON parsing."""
         try:
             return json.loads(text)
         except:
             pass
 
-        # Check for markdown code block with JSON
-        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```
-        if match:
+        # Safer regex for code blocks
+        # We look for curly braces inside triple backticks OR standalone
+
+        # 1. Try extracting from code block
+        block_match = re.search(r"```(?:json)?(.*?)```
+        if block_match:
             try:
-                return json.loads(match.group(1))
+                return json.loads(block_match.group(1).strip())
             except:
                 pass
 
-        # Check for raw JSON object braces
-        match = re.search(r"\{.*?\}", text, re.DOTALL)
-        if match:
+        # 2. Try extracting raw JSON object
+        brace_match = re.search(r"\{.*\}", text, re.DOTALL)
+        if brace_match:
             try:
-                return json.loads(match.group(0))
+                return json.loads(brace_match.group(0))
             except:
                 pass
 
-        # Fallback if no JSON found
         return {"answer": text, "confidence": 0.5, "sources": []}
 
     def _create_embed(self, data: dict) -> discord.Embed:
