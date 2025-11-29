@@ -462,7 +462,7 @@ class GrokCog(commands.Cog):
     def _format(self, data: dict) -> discord.Embed:
         if not isinstance(data, dict):
             embed = discord.Embed(
-                title="❌ Error",
+                title="Error",
                 description=f"Invalid response type: {type(data)}",
                 color=discord.Color.red(),
             )
@@ -471,7 +471,7 @@ class GrokCog(commands.Cog):
         answer = data.get("answer", "")
         if not answer:
             embed = discord.Embed(
-                title="❌ No Response",
+                title="No Response",
                 description="No answer received from AI",
                 color=discord.Color.red(),
             )
@@ -482,27 +482,21 @@ class GrokCog(commands.Cog):
 
         if confidence >= 0.9:
             color = discord.Color.green()
-            conf_emoji = ""
         elif confidence >= 0.7:
             color = discord.Color.blue()
-            conf_emoji = ""
         elif confidence >= 0.5:
             color = discord.Color.gold()
-            conf_emoji = ""
         else:
             color = discord.Color.orange()
-            conf_emoji = ""
 
         embed = discord.Embed(
-            title="DripBot's Response",
+            title="DripBot AI Response",
             description=answer[:4096],
             color=color,
             timestamp=datetime.now(timezone.utc),
         )
 
-        embed.add_field(
-            name=f"{conf_emoji} Confidence", value=f"{confidence:.0%}", inline=True
-        )
+        embed.add_field(name="Confidence", value=f"{confidence:.0%}", inline=True)
 
         if sources and isinstance(sources, list):
             source_text = ""
@@ -518,7 +512,7 @@ class GrokCog(commands.Cog):
                 embed.add_field(name="Sources", value=source_text[:1024], inline=False)
 
         embed.set_footer(
-            text="Powered by 2 Romanians • Retardation only Cough i mean Fact Checks"
+            text="Powered by 2 Romanian kids • Retardation only (fact-checks)"
         )
 
         return embed
