@@ -482,19 +482,19 @@ class GrokCog(commands.Cog):
 
         if confidence >= 0.9:
             color = discord.Color.green()
-            conf_emoji = "🟢"
+            conf_emoji = ""
         elif confidence >= 0.7:
             color = discord.Color.blue()
-            conf_emoji = "🔵"
+            conf_emoji = ""
         elif confidence >= 0.5:
             color = discord.Color.gold()
-            conf_emoji = "🟡"
+            conf_emoji = ""
         else:
             color = discord.Color.orange()
-            conf_emoji = "🟠"
+            conf_emoji = ""
 
         embed = discord.Embed(
-            title="🤖 DripBot AI Response",
+            title="DripBot's Response",
             description=answer[:4096],
             color=color,
             timestamp=datetime.now(timezone.utc),
@@ -515,9 +515,7 @@ class GrokCog(commands.Cog):
                     else:
                         source_text += f"{i}. {title}\n"
             if source_text:
-                embed.add_field(
-                    name="📚 Sources", value=source_text[:1024], inline=False
-                )
+                embed.add_field(name="Sources", value=source_text[:1024], inline=False)
 
         embed.set_footer(
             text="Powered by Kimi K2 via Groq • Fact-checked responses only"
