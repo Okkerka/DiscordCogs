@@ -32,7 +32,7 @@ MODE SWITCHING:
 
 2. INFORMATION/FACTS ("who is...", "explain...", "news"):
    - Use the provided SEARCH RESULTS to answer.
-   - Cite sources with [1] inline.
+   - Cite sources with  inline.[1]
    - Be accurate and detailed.
 
 OUTPUT FORMAT (JSON ONLY):
@@ -74,7 +74,7 @@ class GrokCog(commands.Cog):
             return []
 
         # Skip casual/short queries
-        if len(query) < 5 or query.lower().split()[0] in ["hi", "hello", "hey", "yo"]:
+        if len(query) < 5 or query.lower().split() in ["hi", "hello", "hey", "yo"]:
             return []
 
         def _search():
@@ -122,24 +122,37 @@ class GrokCog(commands.Cog):
                     return {"answer": f"⚠️ **API Error {resp.status}**: {await resp.text()}", "confidence": 0, "sources": []}
 
                 data = await resp.json()
-                content = data["choices"][0]["message"]["content"]
+                content = data["choices"]["message"]["content"]
                 return self._parse_json(content)
         except Exception as e:
             log.error(f"API Request Failed: {e}")
             return {"answer": "⚠️ **Connection Error**: Could not reach AI provider.", "confidence": 0, "sources": []}
 
     def _parse_json(self, text: str) -> dict:
+        """Robust JSON parsing that handles common LLM output formats."""
         try:
             return json.loads(text)
         except:
-            # Regex fallback for formatted blocks
-            for pattern in [r"``````", r"\{.*?\}"]:
-                match = re.search(pattern, text, re.DOTALL)
-                if match:
-                    try:
-                        return json.loads(match.group(1 if '```
-                    except: pass
-            return {"answer": text, "confidence": 0.5, "sources": []}
+            pass
+
+        # Check for markdown code block with JSON
+        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except:
+                pass
+
+        # Check for raw JSON object braces
+        match = re.search(r"\{.*?\}", text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except:
+                pass
+
+        # Fallback if no JSON found
+        return {"answer": text, "confidence": 0.5, "sources": []}
 
     def _create_embed(self, data: dict) -> discord.Embed:
         answer = data.get("answer", "No response.")
@@ -171,7 +184,6 @@ class GrokCog(commands.Cog):
     @commands.cooldown(1, 3, commands.BucketType.user)
     async def grok(self, ctx: commands.Context, *, query: str):
         """Ask DripBot."""
-        # Safety check to prevent silent failures
         try:
             async with ctx.typing():
                 key = hashlib.md5(query.lower().encode()).hexdigest()
@@ -202,7 +214,7 @@ class GrokCog(commands.Cog):
     async def on_message(self, message: discord.Message):
         if message.author.bot: return
         if self.bot.user in message.mentions:
-            # Fix: Handle both <@ID> and <@!ID> (nickname) mentions
+            # Handle <@ID> and <@!ID> mentions
             content = re.sub(f"<@!?{self.bot.user.id}>", "", message.content).strip()
             if content:
                 ctx = await self.bot.get_context(message)
