@@ -583,7 +583,6 @@ class GrokCog(commands.Cog):
         await ctx.send(embed=embed)
 
     @grok.group(name="admin")
-    @commands.guild_only()
     async def grok_admin(self, ctx: commands.Context):
         pass
 
