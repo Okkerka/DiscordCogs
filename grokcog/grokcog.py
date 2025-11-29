@@ -11,7 +11,7 @@ import aiohttp
 import discord
 from redbot.core import Config, commands
 
-# --- WEB SEARCH MODULE ---
+# --- WEB SEARCH SETUP ---
 try:
     from duckduckgo_search import DDGS
 
@@ -21,21 +21,23 @@ except ImportError:
 
 log = logging.getLogger("red.grokcog")
 
+# --- USER CONFIGURATION ---
 GROQ_API_BASE = "https://api.groq.com/openai/v1"
+# Restored to your requested model
 DEFAULT_MODEL = "moonshotai/kimi-k2-instruct-0905"
 
 K2_PROMPT = """You are a fact-based AI assistant.
 
-CRITICAL RULES:
-1. If SEARCH RESULTS are provided, use them to answer and cite [1].
-2. If no search results, use your general knowledge.
-3. For casual chat ("hi"), just be friendly and brief.
+INSTRUCTIONS:
+1. Use the SEARCH RESULTS below (if any) to answer the question.
+2. Cite specific sources using [1] notation inline.
+3. If no search results help, use your general knowledge.
 
-Response Format (valid JSON only):
+RESPONSE FORMAT (JSON ONLY):
 {
   "answer": "Your answer here.",
   "confidence": 0.9,
-  "sources": [{"title": "Source Title", "url": "https://url.com"}]
+  "sources": [{"title": "Source Title", "url": "https://link.com"}]
 }
 """
 
@@ -64,20 +66,21 @@ class GrokCog(commands.Cog):
         if self._session:
             await self._session.close()
 
-    # --- NEW WEB SEARCH METHOD ---
     async def _get_search_results(self, query: str) -> List[Dict[str, str]]:
+        """Fetch web search results if enabled."""
         if not HAS_DDG or not await self.config.enable_search():
             return []
 
-        # Skip search for casual greetings
-        if len(query) < 5 or query.lower().split()[0] in ["hi", "hello", "hey", "yo"]:
+        # Skip for short greetings to save time
+        if len(query) < 4 or query.lower().split()[0] in ["hi", "hello", "yo"]:
             return []
 
         def _search():
             try:
                 with DDGS() as ddgs:
                     return list(ddgs.text(query, max_results=3))
-            except:
+            except Exception as e:
+                log.warning(f"DDG Search Failed: {e}")
                 return []
 
         return await self.bot.loop.run_in_executor(None, _search)
@@ -85,7 +88,11 @@ class GrokCog(commands.Cog):
     async def _ask_api(self, prompt: str, context: str = "") -> dict:
         api_key = await self.config.api_key()
         if not api_key:
-            return {"answer": "⚠️ API Key missing.", "confidence": 0, "sources": []}
+            return {
+                "answer": "⚠️ **API Key Missing**. Use `[p]grokadmin setkey`.",
+                "confidence": 0,
+                "sources": [],
+            }
 
         async with self._api_lock:
             now = time.time()
@@ -96,13 +103,12 @@ class GrokCog(commands.Cog):
 
         messages = [{"role": "system", "content": K2_PROMPT}]
 
-        # Inject search context if available
         if context:
-            user_msg = f"SEARCH RESULTS:\n{context}\n\nUSER QUESTION:\n{prompt}"
+            content = f"SEARCH RESULTS:\n{context}\n\nUSER QUESTION:\n{prompt}"
         else:
-            user_msg = prompt
+            content = prompt
 
-        messages.append({"role": "user", "content": user_msg})
+        messages.append({"role": "user", "content": content})
 
         payload = {
             "model": await self.config.model_name(),
@@ -119,32 +125,44 @@ class GrokCog(commands.Cog):
                 headers={"Authorization": f"Bearer {api_key}"},
                 timeout=30,
             ) as resp:
+                response_text = await resp.text()
+
+                # Debugging: Print error if not 200
                 if resp.status != 200:
+                    log.error(f"API Error {resp.status}: {response_text}")
                     return {
-                        "answer": f"Error {resp.status}: {await resp.text()}",
+                        "answer": f"⚠️ **API Error {resp.status}**: {response_text[:200]}...",
                         "confidence": 0,
+                        "sources": [],
                     }
 
-                data = await resp.json()
-                content = data["choices"][0]["message"]["content"]
-                return self._parse_json(content)
+                data = json.loads(response_text)
+                return self._parse_json(data["choices"][0]["message"]["content"])
+
         except Exception as e:
-            log.error(f"API Error: {e}")
-            return {"answer": "API Connection Failed", "confidence": 0}
+            log.exception("API Request Exception")
+            return {
+                "answer": f"⚠️ **Connection Failed**: {str(e)}",
+                "confidence": 0,
+                "sources": [],
+            }
 
     def _parse_json(self, text: str) -> dict:
+        """Parse JSON safely."""
         try:
             return json.loads(text)
         except:
             pass
-        # Regex to find JSON block
+
+        # 1. Try Code Block
         match = re.search(r"``````", text, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group(1))
             except:
                 pass
-        # Regex to find raw braces
+
+        # 2. Try Raw Braces
         match = re.search(r"\{.*?\}", text, re.DOTALL)
         if match:
             try:
@@ -160,7 +178,7 @@ class GrokCog(commands.Cog):
         sources = data.get("sources", [])
 
         color = discord.Color.green() if confidence > 0.8 else discord.Color.gold()
-        if "Error" in answer:
+        if "⚠️" in answer:
             color = discord.Color.red()
 
         embed = discord.Embed(
@@ -170,8 +188,9 @@ class GrokCog(commands.Cog):
             timestamp=datetime.now(timezone.utc),
         )
 
-        # Smart display: Hide stats for casual chat
-        if sources or (len(answer) > 100 and "Error" not in answer):
+        show_stats = sources or (len(answer) > 100 and "⚠️" not in answer)
+
+        if show_stats:
             embed.add_field(name="Confidence", value=f"{confidence:.0%}", inline=True)
 
         if sources:
@@ -200,7 +219,7 @@ class GrokCog(commands.Cog):
                         await ctx.send(embed=embed)
                         return
 
-                # 1. SEARCH
+                # 1. Get Search Context
                 search_res = await self._get_search_results(query)
                 context = ""
                 if search_res:
@@ -208,15 +227,16 @@ class GrokCog(commands.Cog):
                         [f"- {r.get('title')}: {r.get('body')}" for r in search_res]
                     )
 
-                # 2. ASK
+                # 2. Ask API
                 response = await self._ask_api(query, context)
 
-                # 3. SEND
+                # 3. Send Result
                 embed = self._create_embed(response)
                 self._cache[key] = (time.time(), embed)
                 await ctx.send(embed=embed)
+
         except Exception as e:
-            await ctx.send(f"❌ Error: {e}")
+            await ctx.send(f"❌ **Critical Error**: {e}")
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -242,7 +262,7 @@ class GrokCog(commands.Cog):
     async def togglesearch(self, ctx):
         val = not await self.config.enable_search()
         await self.config.enable_search.set(val)
-        await ctx.send(f"Web search: {val}")
+        await ctx.send(f"Web Search: {val}")
 
 
 async def setup(bot):
