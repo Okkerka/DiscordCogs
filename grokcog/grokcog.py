@@ -52,7 +52,7 @@ Source Citation Rules:
 - Never fabricate URLs, publication names, or dates
 - Better to have no sources than fake sources"""
 
-COOLDOWN_SECONDS = 30
+COOLDOWN_SECONDS = 5
 MIN_API_CALL_GAP = 0.5
 MAX_REQUESTS_PER_MINUTE = 60
 RATE_LIMIT_WINDOW = 60
@@ -459,63 +459,65 @@ class GrokCog(commands.Cog):
             self._active.pop(user_id, None)
             self._inflight_requests.pop(key, None)
 
-    def _format(self, data: dict) -> discord.Embed:
-        if not isinstance(data, dict):
-            embed = discord.Embed(
-                title="Error",
-                description=f"Invalid response type: {type(data)}",
-                color=discord.Color.red(),
-            )
-            return embed
 
-        answer = data.get("answer", "")
-        if not answer:
-            embed = discord.Embed(
-                title="No Response",
-                description="No answer received from AI",
-                color=discord.Color.red(),
-            )
-            return embed
-
-        confidence = data.get("confidence", 0.0)
-        sources = data.get("sources", [])
-
-        if confidence >= 0.9:
-            color = discord.Color.green()
-        elif confidence >= 0.7:
-            color = discord.Color.blue()
-        elif confidence >= 0.5:
-            color = discord.Color.gold()
-        else:
-            color = discord.Color.orange()
-
+def _format(self, data: dict) -> discord.Embed:
+    if not isinstance(data, dict):
         embed = discord.Embed(
-            title="DripBot AI Response",
-            description=answer[:4096],
-            color=color,
-            timestamp=datetime.now(timezone.utc),
+            title="Error",
+            description=f"Invalid response type: {type(data)}",
+            color=discord.Color.red(),
         )
+        return embed
 
+    answer = data.get("answer", "")
+    if not answer:
+        embed = discord.Embed(
+            title="No Response",
+            description="No answer received from AI",
+            color=discord.Color.red(),
+        )
+        return embed
+
+    confidence = data.get("confidence", 0.0)
+    sources = data.get("sources", [])
+
+    if confidence >= 0.9:
+        color = discord.Color.green()
+    elif confidence >= 0.7:
+        color = discord.Color.blue()
+    elif confidence >= 0.5:
+        color = discord.Color.gold()
+    else:
+        color = discord.Color.orange()
+
+    embed = discord.Embed(
+        title="DripBot's Response",
+        description=answer[:4096],
+        color=color,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    is_informational = sources or confidence >= 0.7
+
+    if is_informational:
         embed.add_field(name="Confidence", value=f"{confidence:.0%}", inline=True)
 
-        if sources and isinstance(sources, list):
-            source_text = ""
-            for i, src in enumerate(sources[:5], 1):
-                if isinstance(src, dict):
-                    title = src.get("title", "Source")[:100]
-                    url = src.get("url", "")
-                    if url:
-                        source_text += f"{i}. [{title}]({url})\n"
-                    else:
-                        source_text += f"{i}. {title}\n"
-            if source_text:
-                embed.add_field(name="Sources", value=source_text[:1024], inline=False)
+    if sources and isinstance(sources, list):
+        source_text = ""
+        for i, src in enumerate(sources[:5], 1):
+            if isinstance(src, dict):
+                title = src.get("title", "Source")[:100]
+                url = src.get("url", "")
+                if url:
+                    source_text += f"{i}. [{title}]({url})\n"
+                else:
+                    source_text += f"{i}. {title}\n"
+        if source_text:
+            embed.add_field(name="Sources", value=source_text[:1024], inline=False)
 
-        embed.set_footer(
-            text="Powered by 2 Romanian kids • Retardation only (fact-checks)"
-        )
+    embed.set_footer(text="Powered by 2 Romanian kids • Retardation only (fact-checks)")
 
-        return embed
+    return embed
 
     @commands.Cog.listener()
     async def on_message(self, msg: discord.Message):
