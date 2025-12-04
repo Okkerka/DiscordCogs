@@ -1,5 +1,5 @@
 """
-ChatTriggers v4.8 - Multi-Trigger System (UX Polish)
+ChatTriggers v5.0 - Optimized & Polished
 """
 
 import logging
@@ -18,9 +18,13 @@ except ImportError:
 
 log = logging.getLogger("red.chattriggers")
 
+# --- Constants for UI Modes (Robustness) ---
+EDIT_MODE = "edit"
+TOGGLE_MODE = "toggle"
+DELETE_MODE = "delete"
+
 
 class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
-    # STRICT CLASS ATTRIBUTES
     phrase = discord.ui.TextInput(
         label="Trigger Phrase",
         placeholder="e.g. !Containment Breach!",
@@ -43,14 +47,14 @@ class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
     embed_title = discord.ui.TextInput(
         label="Embed Title",
         placeholder="e.g. 🚨 ALERT TRIGGERED 🚨",
-        default="",  # Empty default
+        default="",
         required=False,
         custom_id="title",
     )
     embed_desc = discord.ui.TextInput(
         label="Embed Message",
         placeholder="e.g. CONTAINMENT BREACH DETECTED",
-        default="",  # Empty default
+        default="",
         style=discord.TextStyle.paragraph,
         required=False,
         custom_id="desc",
@@ -72,12 +76,6 @@ class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
 
     async def on_submit(self, interaction: discord.Interaction):
         phrase_key = self.phrase.value.lower().strip()
-
-        # Fallback for title if user leaves it blank?
-        # No, user wants it empty by default.
-        # But an embed needs *something*.
-        # We will handle "empty title" in play_trigger by using a generic fallback ONLY if desc is also empty?
-        # Or just let it be empty string (valid if image exists).
 
         new_data = {
             "phrase_case": self.phrase.value.strip(),
@@ -104,7 +102,7 @@ class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
 
 
 class TriggerSelect(discord.ui.Select):
-    def __init__(self, triggers, mode="edit"):
+    def __init__(self, triggers, mode=EDIT_MODE):
         self.mode = mode
         options = []
         keys = sorted(list(triggers.keys()))[:25]
@@ -113,17 +111,17 @@ class TriggerSelect(discord.ui.Select):
             active_status = "✅" if data.get("active", True) else "❌"
             label = f"{active_status} {data['phrase_case']}"
 
-            if mode == "delete":
+            if mode == DELETE_MODE:
                 label = f"🗑️ {data['phrase_case']}"
-            elif mode == "toggle":
+            elif mode == TOGGLE_MODE:
                 label = f"{'Disable' if data.get('active', True) else 'Enable'} {data['phrase_case']}"
 
             options.append(discord.SelectOption(label=label, value=t))
 
         placeholder = "Select trigger..."
-        if mode == "delete":
+        if mode == DELETE_MODE:
             placeholder = "Select to DELETE..."
-        elif mode == "toggle":
+        elif mode == TOGGLE_MODE:
             placeholder = "Select to TOGGLE..."
 
         super().__init__(
@@ -139,7 +137,7 @@ class TriggerSelect(discord.ui.Select):
                 "❌ Not found.", ephemeral=True
             )
 
-        if self.mode == "edit":
+        if self.mode == EDIT_MODE:
             data = triggers[key]
             defaults = {
                 "sound": data["sound"],
@@ -152,12 +150,12 @@ class TriggerSelect(discord.ui.Select):
             )
             await interaction.response.send_modal(modal)
 
-        elif self.mode == "delete":
+        elif self.mode == DELETE_MODE:
             async with self.view.cog.config.guild(interaction.guild).triggers() as t:
                 del t[key]
             await interaction.response.send_message("🗑️ Deleted.", ephemeral=True)
 
-        elif self.mode == "toggle":
+        elif self.mode == TOGGLE_MODE:
             async with self.view.cog.config.guild(interaction.guild).triggers() as t:
                 current = t[key].get("active", True)
                 t[key]["active"] = not current
@@ -189,7 +187,7 @@ class MainView(discord.ui.View):
             )
         view = discord.ui.View()
         view.cog = self.cog
-        view.add_item(TriggerSelect(self.triggers, mode="edit"))
+        view.add_item(TriggerSelect(self.triggers, mode=EDIT_MODE))
         await interaction.response.send_message("Edit:", view=view, ephemeral=True)
 
     @discord.ui.button(label="Toggle", style=discord.ButtonStyle.secondary, emoji="🔘")
@@ -202,7 +200,7 @@ class MainView(discord.ui.View):
             )
         view = discord.ui.View()
         view.cog = self.cog
-        view.add_item(TriggerSelect(self.triggers, mode="toggle"))
+        view.add_item(TriggerSelect(self.triggers, mode=TOGGLE_MODE))
         await interaction.response.send_message("Toggle:", view=view, ephemeral=True)
 
     @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, emoji="🗑️")
@@ -215,7 +213,7 @@ class MainView(discord.ui.View):
             )
         view = discord.ui.View()
         view.cog = self.cog
-        view.add_item(TriggerSelect(self.triggers, mode="delete"))
+        view.add_item(TriggerSelect(self.triggers, mode=DELETE_MODE))
         await interaction.response.send_message("Delete:", view=view, ephemeral=True)
 
 
@@ -249,7 +247,7 @@ class ChatTriggers(commands.Cog):
             if not target_vc and guild.voice_client:
                 target_vc = guild.voice_client.channel
             if not target_vc:
-                return await channel.send("❌ User not in VC.")
+                return await channel.send("❌ User not in VC.", delete_after=10)
 
             try:
                 player = lavalink.get_player(guild.id)
@@ -267,19 +265,14 @@ class ChatTriggers(commands.Cog):
                     player.add(user, results.tracks[0])
                     await player.play()
             except Exception as e:
-                return await channel.send(f"❌ Audio Error: {e}")
+                return await channel.send(f"❌ Audio Error: {e}", delete_after=10)
 
-            # Visuals
-            title = data.get("title", "")  # Empty if not set
+            title = data.get("title", "")
             desc = data.get("desc", "")
-
-            # Fallback if both are empty?
-            # If title and desc are empty, Discord allows it IF there is an image.
-            # If no image, we force a title.
             gif = data.get("gif", "")
 
             if not title and not desc and not gif:
-                title = "ALERT"  # Hard fallback to prevent error
+                title = "ALERT"  # Fallback to prevent empty embed error
 
             embed = discord.Embed(
                 title=title if title else None,
@@ -313,9 +306,10 @@ class ChatTriggers(commands.Cog):
 
         desc = f"**Total:** {total} | **Active:** {active} | **Disabled:** {disabled}"
 
-        # Custom Title Styling
         embed = discord.Embed(
-            title="   Triggers Config   ", description=desc, color=discord.Color.red()
+            title="   ChatTriggers Config   ",
+            description=desc,
+            color=discord.Color.red(),
         )
         await ctx.send(embed=embed, view=MainView(self, triggers))
 
@@ -344,24 +338,31 @@ class ChatTriggers(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message):
-        if message.author.bot or not message.guild:
+        if (
+            message.author.bot
+            or not message.guild
+            or not message.channel.permissions_for(message.guild.me).send_messages
+        ):
+            return
+
+        # Optimization: One config call per message
+        guild_config = await self.config.guild(message.guild).all()
+        triggers = guild_config.get("triggers")
+        if not triggers:
             return
 
         content = message.content.lower()
-        triggers = await self.config.guild(message.guild).triggers()
-
         matched_data = None
         for phrase_key, data in triggers.items():
-            if phrase_key in content:
-                if data.get("active", True):
-                    matched_data = data
-                    break
+            if phrase_key in content and data.get("active", True):
+                matched_data = data
+                break
 
         if matched_data:
-            settings = await self.config.guild(message.guild).all()
+            # Permissions are already in guild_config
             is_owner = await self.bot.is_owner(message.author)
-            is_admin = message.author.id in settings["admin_users"]
-            is_allowed = message.author.id in settings["allowed_users"]
+            is_admin = message.author.id in guild_config["admin_users"]
+            is_allowed = message.author.id in guild_config["allowed_users"]
 
             if is_owner or is_admin or is_allowed:
                 await self.play_trigger(message.channel, message.author, matched_data)
