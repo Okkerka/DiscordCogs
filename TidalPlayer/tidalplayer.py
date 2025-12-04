@@ -487,7 +487,7 @@ class TidalPlayer(commands.Cog):
     ) -> bool:
         """
         Loads track, MUTATES it with Tidal metadata, and queues it.
-        This ensures [p]queue sees the correct title/artist.
+        ATTEMPTING 3-LINE FORMAT
         """
         try:
             meta = self._extract_meta(tidal_track)
@@ -495,13 +495,11 @@ class TidalPlayer(commands.Cog):
             if not url:
                 return False
 
-            # Get Player
             player = await self._get_player(ctx)
             if not player:
                 await ctx.send(Messages.ERROR_NO_PLAYER)
                 return False
 
-            # Load REAL track from Lavalink
             try:
                 results = await player.load_tracks(url)
             except Exception:
@@ -510,22 +508,22 @@ class TidalPlayer(commands.Cog):
             if not results or not results.tracks:
                 return False
 
-            # Get the playable track object
             track = results.tracks[0]
 
-            # === MAGIC HAPPENS HERE ===
-            # We overwrite the metadata on the real Lavalink object
+            # === METADATA MUTATION (3-LINE HACK) ===
             track.title = meta["title"]
-            track.author = meta["artist"]
-            # Add extra data if needed
-            if not hasattr(track, "extra"):
-                track.extra = {}
-            track.extra.update(
-                {"tidal_album": meta["album"], "tidal_quality": meta["quality"]}
-            )
-            # ==========================
 
-            # Add to queue
+            if meta.get("album"):
+                # Start with newline to push Album/Artist down
+                # Result expectation:
+                # Title -
+                # Album
+                # Artist
+                track.author = f"\n{meta['album']}\n{meta['artist']}"
+            else:
+                track.author = meta["artist"]
+            # =======================================
+
             player.add(ctx.author, track)
 
             if not player.current:
@@ -534,9 +532,7 @@ class TidalPlayer(commands.Cog):
             if show_embed:
                 await self._send_now_playing(ctx, meta)
 
-            # Also update our cache just in case
             self._track_meta_cache.set(url, meta)
-
             return True
 
         except Exception as e:
