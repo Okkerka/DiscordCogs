@@ -1,5 +1,5 @@
 """
-ChatTriggers v5.0 - Optimized & Polished
+ChatTriggers v5.2 - Clean & Optimized (Auto-Cleanup)
 """
 
 import logging
@@ -8,7 +8,6 @@ import discord
 from redbot.core import Config, commands
 from redbot.core.bot import Red
 
-# Optional Lavalink import
 try:
     import lavalink
 
@@ -18,7 +17,6 @@ except ImportError:
 
 log = logging.getLogger("red.chattriggers")
 
-# --- Constants for UI Modes (Robustness) ---
 EDIT_MODE = "edit"
 TOGGLE_MODE = "toggle"
 DELETE_MODE = "delete"
@@ -60,9 +58,10 @@ class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
         custom_id="desc",
     )
 
-    def __init__(self, cog, trigger_name=None, defaults=None):
+    def __init__(self, cog, view_message=None, trigger_name=None, defaults=None):
         super().__init__()
         self.cog = cog
+        self.view_message = view_message  # Reference to the menu message
         self.trigger_name = trigger_name
 
         if trigger_name:
@@ -100,10 +99,18 @@ class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
             f"✅ Trigger `{self.phrase.value}` saved!", ephemeral=True
         )
 
+        # Cleanup: Delete the original menu message if possible
+        if self.view_message:
+            try:
+                await self.view_message.delete()
+            except (discord.NotFound, discord.Forbidden):
+                pass
+
 
 class TriggerSelect(discord.ui.Select):
-    def __init__(self, triggers, mode=EDIT_MODE):
+    def __init__(self, triggers, origin_message=None, mode=EDIT_MODE):
         self.mode = mode
+        self.origin_message = origin_message
         options = []
         keys = sorted(list(triggers.keys()))[:25]
         for t in keys:
@@ -145,8 +152,12 @@ class TriggerSelect(discord.ui.Select):
                 "title": data.get("title", ""),
                 "desc": data.get("desc", ""),
             }
+            # Pass origin_message to modal so it can delete it on submit
             modal = TriggerModal(
-                self.view.cog, trigger_name=data["phrase_case"], defaults=defaults
+                self.view.cog,
+                view_message=self.origin_message,
+                trigger_name=data["phrase_case"],
+                defaults=defaults,
             )
             await interaction.response.send_modal(modal)
 
@@ -154,6 +165,11 @@ class TriggerSelect(discord.ui.Select):
             async with self.view.cog.config.guild(interaction.guild).triggers() as t:
                 del t[key]
             await interaction.response.send_message("🗑️ Deleted.", ephemeral=True)
+            if self.origin_message:
+                try:
+                    await self.origin_message.delete()
+                except:
+                    pass
 
         elif self.mode == TOGGLE_MODE:
             async with self.view.cog.config.guild(interaction.guild).triggers() as t:
@@ -163,19 +179,36 @@ class TriggerSelect(discord.ui.Select):
             await interaction.response.send_message(
                 f"✅ Trigger {state}.", ephemeral=True
             )
+            if self.origin_message:
+                try:
+                    await self.origin_message.delete()
+                except:
+                    pass
 
 
 class MainView(discord.ui.View):
-    def __init__(self, cog, triggers):
-        super().__init__(timeout=None)
+    def __init__(self, cog, triggers, message=None):
+        super().__init__(timeout=60)  # 60 second timeout
         self.cog = cog
         self.triggers = triggers
+        self.message = message
+
+    async def on_timeout(self):
+        # Delete message on timeout
+        if self.message:
+            try:
+                await self.message.delete()
+            except (discord.NotFound, discord.Forbidden):
+                pass
 
     @discord.ui.button(label="New", style=discord.ButtonStyle.success, emoji="➕")
     async def new_btn(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        await interaction.response.send_modal(TriggerModal(self.cog))
+        # Pass self.message to modal for cleanup
+        await interaction.response.send_modal(
+            TriggerModal(self.cog, view_message=self.message)
+        )
 
     @discord.ui.button(label="Edit", style=discord.ButtonStyle.primary, emoji="⚙️")
     async def edit_btn(
@@ -187,7 +220,9 @@ class MainView(discord.ui.View):
             )
         view = discord.ui.View()
         view.cog = self.cog
-        view.add_item(TriggerSelect(self.triggers, mode=EDIT_MODE))
+        view.add_item(
+            TriggerSelect(self.triggers, origin_message=self.message, mode=EDIT_MODE)
+        )
         await interaction.response.send_message("Edit:", view=view, ephemeral=True)
 
     @discord.ui.button(label="Toggle", style=discord.ButtonStyle.secondary, emoji="🔘")
@@ -200,7 +235,9 @@ class MainView(discord.ui.View):
             )
         view = discord.ui.View()
         view.cog = self.cog
-        view.add_item(TriggerSelect(self.triggers, mode=TOGGLE_MODE))
+        view.add_item(
+            TriggerSelect(self.triggers, origin_message=self.message, mode=TOGGLE_MODE)
+        )
         await interaction.response.send_message("Toggle:", view=view, ephemeral=True)
 
     @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, emoji="🗑️")
@@ -213,7 +250,9 @@ class MainView(discord.ui.View):
             )
         view = discord.ui.View()
         view.cog = self.cog
-        view.add_item(TriggerSelect(self.triggers, mode=DELETE_MODE))
+        view.add_item(
+            TriggerSelect(self.triggers, origin_message=self.message, mode=DELETE_MODE)
+        )
         await interaction.response.send_message("Delete:", view=view, ephemeral=True)
 
 
@@ -272,7 +311,7 @@ class ChatTriggers(commands.Cog):
             gif = data.get("gif", "")
 
             if not title and not desc and not gif:
-                title = "ALERT"  # Fallback to prevent empty embed error
+                title = "ALERT"
 
             embed = discord.Embed(
                 title=title if title else None,
@@ -311,7 +350,11 @@ class ChatTriggers(commands.Cog):
             description=desc,
             color=discord.Color.red(),
         )
-        await ctx.send(embed=embed, view=MainView(self, triggers))
+
+        # Create view first, then send message, then assign message to view
+        view = MainView(self, triggers)
+        msg = await ctx.send(embed=embed, view=view)
+        view.message = msg
 
     @chattrigger.command(name="add_perm")
     async def add_perm(self, ctx, user: discord.User):
@@ -345,7 +388,6 @@ class ChatTriggers(commands.Cog):
         ):
             return
 
-        # Optimization: One config call per message
         guild_config = await self.config.guild(message.guild).all()
         triggers = guild_config.get("triggers")
         if not triggers:
@@ -359,7 +401,6 @@ class ChatTriggers(commands.Cog):
                 break
 
         if matched_data:
-            # Permissions are already in guild_config
             is_owner = await self.bot.is_owner(message.author)
             is_admin = message.author.id in guild_config["admin_users"]
             is_allowed = message.author.id in guild_config["allowed_users"]
