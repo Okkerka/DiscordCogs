@@ -1,5 +1,5 @@
 """
-ChatTriggers v4.5 - Multi-Trigger System (No Ping)
+ChatTriggers v4.6 - Multi-Trigger System (Toggle Support)
 """
 
 import logging
@@ -20,7 +20,6 @@ log = logging.getLogger("red.chattriggers")
 
 
 class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
-    # STRICT CLASS ATTRIBUTES
     phrase = discord.ui.TextInput(
         label="Trigger Phrase",
         placeholder="e.g. !Containment Breach!",
@@ -79,12 +78,20 @@ class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
             "gif": self.gif.value.strip(),
             "title": self.embed_title.value.strip(),
             "desc": self.embed_desc.value.strip(),
+            "active": True,  # Default to active
         }
 
         async with self.cog.config.guild(interaction.guild).triggers() as triggers:
             if self.trigger_name and self.trigger_name.lower() != phrase_key:
                 if self.trigger_name.lower() in triggers:
+                    # Preserve active state if renaming? No, reset is safer or copy.
+                    # Let's just delete old.
                     del triggers[self.trigger_name.lower()]
+
+            # Preserve active state if editing existing
+            if phrase_key in triggers:
+                new_data["active"] = triggers[phrase_key].get("active", True)
+
             triggers[phrase_key] = new_data
 
         await interaction.response.send_message(
@@ -93,69 +100,67 @@ class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
 
 
 class TriggerSelect(discord.ui.Select):
-    def __init__(self, triggers):
+    def __init__(self, triggers, mode="edit"):
+        self.mode = mode
         options = []
         keys = sorted(list(triggers.keys()))[:25]
         for t in keys:
-            options.append(
-                discord.SelectOption(label=triggers[t]["phrase_case"], value=t)
-            )
+            data = triggers[t]
+            active_status = "✅" if data.get("active", True) else "❌"
+            label = f"{active_status} {data['phrase_case']}"
+
+            if mode == "delete":
+                label = f"🗑️ {data['phrase_case']}"
+            elif mode == "toggle":
+                label = f"{'Disable' if data.get('active', True) else 'Enable'} {data['phrase_case']}"
+
+            options.append(discord.SelectOption(label=label, value=t))
+
+        placeholder = "Select trigger..."
+        if mode == "delete":
+            placeholder = "Select to DELETE..."
+        elif mode == "toggle":
+            placeholder = "Select to TOGGLE..."
+
         super().__init__(
-            placeholder="Select a trigger to EDIT...",
-            min_values=1,
-            max_values=1,
-            options=options,
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        trigger_key = self.values[0]
-        triggers = await self.view.cog.config.guild(interaction.guild).triggers()
-        data = triggers.get(trigger_key)
-
-        if not data:
-            return await interaction.response.send_message(
-                "❌ Trigger not found.", ephemeral=True
-            )
-
-        defaults = {
-            "sound": data["sound"],
-            "gif": data["gif"],
-            "title": data.get("title", ""),
-            "desc": data.get("desc", ""),
-        }
-        modal = TriggerModal(
-            self.view.cog, trigger_name=data["phrase_case"], defaults=defaults
-        )
-        await interaction.response.send_modal(modal)
-
-
-class DeleteSelect(discord.ui.Select):
-    def __init__(self, triggers):
-        options = []
-        keys = sorted(list(triggers.keys()))[:25]
-        for t in keys:
-            options.append(
-                discord.SelectOption(
-                    label=f"DELETE: {triggers[t]['phrase_case']}", value=t, emoji="🗑️"
-                )
-            )
-        super().__init__(
-            placeholder="Select a trigger to DELETE...",
-            min_values=1,
-            max_values=1,
-            options=options,
+            placeholder=placeholder, min_values=1, max_values=1, options=options
         )
 
     async def callback(self, interaction: discord.Interaction):
         key = self.values[0]
-        async with self.view.cog.config.guild(interaction.guild).triggers() as triggers:
-            if key in triggers:
-                del triggers[key]
-                await interaction.response.send_message(
-                    f"🗑️ Deleted trigger.", ephemeral=True
-                )
-            else:
-                await interaction.response.send_message("❌ Not found.", ephemeral=True)
+        triggers = await self.view.cog.config.guild(interaction.guild).triggers()
+
+        if key not in triggers:
+            return await interaction.response.send_message(
+                "❌ Not found.", ephemeral=True
+            )
+
+        if self.mode == "edit":
+            data = triggers[key]
+            defaults = {
+                "sound": data["sound"],
+                "gif": data["gif"],
+                "title": data.get("title", ""),
+                "desc": data.get("desc", ""),
+            }
+            modal = TriggerModal(
+                self.view.cog, trigger_name=data["phrase_case"], defaults=defaults
+            )
+            await interaction.response.send_modal(modal)
+
+        elif self.mode == "delete":
+            async with self.view.cog.config.guild(interaction.guild).triggers() as t:
+                del t[key]
+            await interaction.response.send_message("🗑️ Deleted.", ephemeral=True)
+
+        elif self.mode == "toggle":
+            async with self.view.cog.config.guild(interaction.guild).triggers() as t:
+                current = t[key].get("active", True)
+                t[key]["active"] = not current
+                state = "Disabled" if current else "Enabled"
+            await interaction.response.send_message(
+                f"✅ Trigger {state}.", ephemeral=True
+            )
 
 
 class MainView(discord.ui.View):
@@ -164,35 +169,14 @@ class MainView(discord.ui.View):
         self.cog = cog
         self.triggers = triggers
 
-    @discord.ui.button(
-        label="New Trigger", style=discord.ButtonStyle.success, emoji="➕"
-    )
-    async def new_trigger(
+    @discord.ui.button(label="New", style=discord.ButtonStyle.success, emoji="➕")
+    async def new_btn(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
         await interaction.response.send_modal(TriggerModal(self.cog))
 
-    @discord.ui.button(
-        label="Edit Trigger", style=discord.ButtonStyle.primary, emoji="⚙️"
-    )
-    async def edit_trigger(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        if not self.triggers:
-            return await interaction.response.send_message(
-                "No triggers to edit.", ephemeral=True
-            )
-        view = discord.ui.View()
-        view.cog = self.cog
-        view.add_item(TriggerSelect(self.triggers))
-        await interaction.response.send_message(
-            "Select trigger to edit:", view=view, ephemeral=True
-        )
-
-    @discord.ui.button(
-        label="Delete Trigger", style=discord.ButtonStyle.danger, emoji="🗑️"
-    )
-    async def delete_trigger(
+    @discord.ui.button(label="Edit", style=discord.ButtonStyle.primary, emoji="⚙️")
+    async def edit_btn(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
         if not self.triggers:
@@ -201,10 +185,34 @@ class MainView(discord.ui.View):
             )
         view = discord.ui.View()
         view.cog = self.cog
-        view.add_item(DeleteSelect(self.triggers))
-        await interaction.response.send_message(
-            "Select trigger to DELETE:", view=view, ephemeral=True
-        )
+        view.add_item(TriggerSelect(self.triggers, mode="edit"))
+        await interaction.response.send_message("Edit:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="Toggle", style=discord.ButtonStyle.secondary, emoji="🔘")
+    async def toggle_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if not self.triggers:
+            return await interaction.response.send_message(
+                "No triggers.", ephemeral=True
+            )
+        view = discord.ui.View()
+        view.cog = self.cog
+        view.add_item(TriggerSelect(self.triggers, mode="toggle"))
+        await interaction.response.send_message("Toggle:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def del_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if not self.triggers:
+            return await interaction.response.send_message(
+                "No triggers.", ephemeral=True
+            )
+        view = discord.ui.View()
+        view.cog = self.cog
+        view.add_item(TriggerSelect(self.triggers, mode="delete"))
+        await interaction.response.send_message("Delete:", view=view, ephemeral=True)
 
 
 class ChatTriggers(commands.Cog):
@@ -239,7 +247,6 @@ class ChatTriggers(commands.Cog):
             if not target_vc:
                 return await channel.send("❌ User not in VC.")
 
-            # Audio Logic
             try:
                 player = lavalink.get_player(guild.id)
                 if not player:
@@ -250,7 +257,6 @@ class ChatTriggers(commands.Cog):
                         await player.stop()
                     await player.move_to(target_vc)
 
-                # Play
                 results = await player.load_tracks(sound_url)
                 if results.tracks:
                     player.queue.clear()
@@ -259,14 +265,11 @@ class ChatTriggers(commands.Cog):
             except Exception as e:
                 return await channel.send(f"❌ Audio Error: {e}")
 
-            # Visuals - NO PING
             embed = discord.Embed(
                 title=data.get("title", "ALERT"),
                 description=data.get("desc", "TRIGGERED"),
                 color=discord.Color.red(),
             )
-
-            # Footer Credit
             embed.set_footer(
                 text=f"Triggered by: {user.display_name}",
                 icon_url=user.display_avatar.url,
@@ -276,26 +279,31 @@ class ChatTriggers(commands.Cog):
             if gif:
                 embed.set_image(url=gif)
 
-            # Pure Embed (Content is None)
             await channel.send(embed=embed)
 
         except Exception as e:
             log.error(f"Trigger failed: {e}")
 
-    @commands.group(name="chattrigger", aliases=["alert"])
+    # invoke_without_command=True hides the Help Menu when running >chattrigger
+    @commands.group(name="chattrigger", aliases=["alert"], invoke_without_command=True)
     async def chattrigger(self, ctx):
         """Manage ChatTriggers."""
-        if ctx.invoked_subcommand is None:
-            if not await self.is_admin_or_manager(ctx):
-                return await ctx.send("⛔ Denied.")
+        if not await self.is_admin_or_manager(ctx):
+            return await ctx.send("⛔ Denied.")
 
-            triggers = await self.config.guild(ctx.guild).triggers()
-            embed = discord.Embed(
-                title="🚨 Triggers Config",
-                description=f"Active Triggers: {len(triggers)}",
-                color=discord.Color.red(),
-            )
-            await ctx.send(embed=embed, view=MainView(self, triggers))
+        triggers = await self.config.guild(ctx.guild).triggers()
+
+        # Stats
+        total = len(triggers)
+        active = sum(1 for t in triggers.values() if t.get("active", True))
+        disabled = total - active
+
+        desc = f"**Total:** {total} | **Active:** {active} | **Disabled:** {disabled}"
+
+        embed = discord.Embed(
+            title="🚨 Triggers Config", description=desc, color=discord.Color.red()
+        )
+        await ctx.send(embed=embed, view=MainView(self, triggers))
 
     @chattrigger.command(name="add_perm")
     async def add_perm(self, ctx, user: discord.User):
@@ -314,9 +322,10 @@ class ChatTriggers(commands.Cog):
         if not triggers:
             return await ctx.send("No triggers.")
 
-        msg = "**Active Triggers:**\n"
+        msg = "**Triggers:**\n"
         for t in triggers.values():
-            msg += f"- `{t['phrase_case']}`\n"
+            status = "✅" if t.get("active", True) else "❌"
+            msg += f"{status} `{t['phrase_case']}`\n"
         await ctx.send(msg)
 
     @commands.Cog.listener()
@@ -327,12 +336,13 @@ class ChatTriggers(commands.Cog):
         content = message.content.lower()
         triggers = await self.config.guild(message.guild).triggers()
 
-        # Check for matches
         matched_data = None
         for phrase_key, data in triggers.items():
             if phrase_key in content:
-                matched_data = data
-                break
+                # CHECK IF ACTIVE
+                if data.get("active", True):
+                    matched_data = data
+                    break
 
         if matched_data:
             settings = await self.config.guild(message.guild).all()
