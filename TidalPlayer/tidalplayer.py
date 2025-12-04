@@ -1,6 +1,6 @@
 """
 TidalPlayer - Tidal music integration for Red Discord Bot
-Final fixed version - Robust metadata with reliable playback
+Metadata Injection Version - Fixes [p]queue display
 """
 
 import asyncio
@@ -8,7 +8,6 @@ import logging
 import re
 import time
 from collections import OrderedDict
-from contextlib import asynccontextmanager
 from datetime import datetime
 from functools import wraps
 from typing import Any, Callable, Dict, List, Optional, TypedDict
@@ -17,6 +16,14 @@ import discord
 from redbot.core import Config, commands
 from redbot.core.bot import Red
 from redbot.core.utils.menus import DEFAULT_CONTROLS, menu
+
+# We NEED lavalink for this fix
+try:
+    import lavalink
+
+    LAVALINK_AVAILABLE = True
+except ImportError:
+    LAVALINK_AVAILABLE = False
 
 try:
     import tidalapi
@@ -40,13 +47,47 @@ try:
 except ImportError:
     SPOTIFY_AVAILABLE = False
 
-# We don't need direct lavalink import anymore - we use Audio cog
-LAVALINK_AVAILABLE = False
-
 log = logging.getLogger("red.tidalplayer")
 
 # =============================================================================
-# TYPE DEFINITIONS & CONSTANTS
+# CONSTANTS
+# =============================================================================
+
+COG_IDENTIFIER = 160819386
+MAX_QUEUE_SIZE = 1000
+MAX_CACHE_SIZE = 500
+API_SEMAPHORE_LIMIT = 3
+SEARCH_RETRY_ATTEMPTS = 3
+API_TIMEOUT = 30.0
+CACHE_TTL = 300
+BATCH_UPDATE_INTERVAL = 5
+INTERACTIVE_TIMEOUT = 30
+
+REACTION_NUMBERS = ("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣")
+CANCEL_EMOJI = "❌"
+
+QUALITY_LABELS = {
+    "HI_RES": "HI-RES (MQA)",
+    "HI_RES_LOSSLESS": "HI-RES LOSSLESS",
+    "LOSSLESS": "LOSSLESS (FLAC)",
+    "HIGH": "HIGH (320kbps)",
+    "LOW": "LOW (96kbps)",
+}
+
+FILTER_KEYWORDS = frozenset(
+    {"sped up", "slowed", "tiktok", "reverb", "8d audio", "bass boosted"}
+)
+
+# Regex Patterns
+TIDAL_TRACK_PATTERN = re.compile(r"tidal\\.com/(?:browse/)?track/(\\d+)")
+TIDAL_ALBUM_PATTERN = re.compile(r"tidal\\.com/(?:browse/)?album/(\\d+)")
+TIDAL_PLAYLIST_PATTERN = re.compile(r"tidal\\.com/(?:browse/)?playlist/([a-f0-9-]+)")
+TIDAL_URL_PATTERN = re.compile(r"tidal\\.com/(?:browse/)?(track|album|playlist)")
+SPOTIFY_PLAYLIST_PATTERN = re.compile(r"open\\.spotify\\.com/playlist/([a-zA-Z0-9]+)")
+YOUTUBE_PLAYLIST_PATTERN = re.compile(r"youtube\\.com/.*[?&]list=([a-zA-Z0-9_-]+)")
+
+# =============================================================================
+# TYPES & MESSAGES
 # =============================================================================
 
 
@@ -64,50 +105,11 @@ class QueueResult(TypedDict):
     total: int
 
 
-MAX_QUEUE_SIZE = 1000
-MAX_CACHE_SIZE = 500
-BATCH_UPDATE_INTERVAL = 5
-API_SEMAPHORE_LIMIT = 3
-SEARCH_RETRY_ATTEMPTS = 3
-COG_IDENTIFIER = 160819386
-INTERACTIVE_TIMEOUT = 30
-RETRY_BASE_DELAY = 0.5
-RETRY_MAX_DELAY = 5.0
-API_TIMEOUT = 30.0
-CACHE_TTL = 300
-
-REACTION_NUMBERS = ("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣")
-CANCEL_EMOJI = "❌"
-
-QUALITY_LABELS: Dict[str, str] = {
-    "HI_RES": "HI-RES (MQA)",
-    "HI_RES_LOSSLESS": "HI-RES LOSSLESS",
-    "LOSSLESS": "LOSSLESS (FLAC)",
-    "HIGH": "HIGH (320kbps)",
-    "LOW": "LOW (96kbps)",
-}
-
-FILTER_KEYWORDS = frozenset(
-    {"sped up", "slowed", "tiktok", "reverb", "8d audio", "bass boosted"}
-)
-
-# Compiled Regex Patterns
-TIDAL_TRACK_PATTERN = re.compile(r"tidal\.com/(?:browse/)?track/(\d+)")
-TIDAL_ALBUM_PATTERN = re.compile(r"tidal\.com/(?:browse/)?album/(\d+)")
-TIDAL_PLAYLIST_PATTERN = re.compile(r"tidal\.com/(?:browse/)?playlist/([a-f0-9-]+)")
-TIDAL_URL_PATTERN = re.compile(r"tidal\.com/(?:browse/)?(track|album|playlist)")
-SPOTIFY_PLAYLIST_PATTERN = re.compile(r"open\.spotify\.com/playlist/([a-zA-Z0-9]+)")
-YOUTUBE_PLAYLIST_PATTERN = re.compile(r"youtube\.com/.*[?&]list=([a-zA-Z0-9_-]+)")
-
-# =============================================================================
-# MESSAGES
-# =============================================================================
-
-
 class Messages:
     ERROR_NO_TIDALAPI = "tidalapi not installed. Run: `[p]pipinstall tidalapi`"
     ERROR_NOT_AUTHENTICATED = "Not authenticated. Run: `>tidalsetup`"
     ERROR_NO_AUDIO_COG = "Audio cog not loaded. Run: `[p]load audio`"
+    ERROR_NO_PLAYER = "No active player. Join a voice channel first."
     ERROR_NO_TRACKS_FOUND = "No tracks found."
     ERROR_INVALID_URL = "Invalid {platform} {content_type} URL"
     ERROR_CONTENT_UNAVAILABLE = "Content unavailable (private/region-locked)"
@@ -125,7 +127,7 @@ class Messages:
     SUCCESS_QUEUED = "Queued {count} tracks from {name}"
     SUCCESS_PARTIAL_QUEUE = "Queued {queued}/{total} ({skipped} not found on Tidal)"
     SUCCESS_QUEUE_CLEARED = "Queue cleared."
-    SUCCESS_TOKENS_CLEARED = "Tokens cleared. Run:\n1. `[p]pipinstall --force-reinstall tidalapi`\n2. Restart bot\n3. `>tidalsetup`"
+    SUCCESS_TOKENS_CLEARED = "Tokens cleared. Run:\\n1. `[p]pipinstall --force-reinstall tidalapi`\\n2. Restart bot\\n3. `>tidalsetup`"
     SUCCESS_TIDAL_SETUP = "Tidal setup complete!"
     SUCCESS_SPOTIFY_CONFIGURED = "Spotify configured."
     SUCCESS_YOUTUBE_CONFIGURED = "YouTube configured."
@@ -147,11 +149,6 @@ class Messages:
     STATUS_PLAYING = "Playing from Tidal"
 
 
-# =============================================================================
-# EXCEPTIONS
-# =============================================================================
-
-
 class TidalPlayerError(Exception):
     pass
 
@@ -165,7 +162,7 @@ class APIError(TidalPlayerError):
 
 
 # =============================================================================
-# UTILITY CLASSES
+# HELPERS
 # =============================================================================
 
 
@@ -215,9 +212,6 @@ def async_retry(
                     last_exception = e
                     if attempt < max_attempts - 1:
                         delay = min(base_delay * (2**attempt), RETRY_MAX_DELAY)
-                        log.warning(
-                            f"Attempt {attempt + 1}/{max_attempts} failed for {func.__name__}: {type(e).__name__}: {e}"
-                        )
                         await asyncio.sleep(delay)
             raise last_exception
 
@@ -232,7 +226,7 @@ def async_retry(
 
 
 class TidalPlayer(commands.Cog):
-    """Play music from Tidal with full metadata support."""
+    """Play music from Tidal with full metadata support in native queue."""
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -271,7 +265,7 @@ class TidalPlayer(commands.Cog):
         self._quality_label_cache.clear()
         log.info("TidalPlayer cog unloaded")
 
-    # ... INITIALIZATION & UTILS (Same as before) ...
+    # ... INITIALIZATION ...
     async def _initialize_apis(self) -> None:
         await self.bot.wait_until_ready()
         try:
@@ -294,7 +288,6 @@ class TidalPlayer(commands.Cog):
         try:
             expiry_ts = creds.get("expiry_time")
             expiry_dt = datetime.fromtimestamp(expiry_ts) if expiry_ts else None
-
             await asyncio.wait_for(
                 self.bot.loop.run_in_executor(
                     None,
@@ -315,15 +308,12 @@ class TidalPlayer(commands.Cog):
     async def _initialize_spotify(self, creds: Dict[str, Any]) -> None:
         if not SPOTIFY_AVAILABLE:
             return
-        cid, csecret = (
-            creds.get("spotify_client_id"),
-            creds.get("spotify_client_secret"),
-        )
-        if not (cid and csecret):
+        cid, csec = creds.get("spotify_client_id"), creds.get("spotify_client_secret")
+        if not (cid and csec):
             return
         try:
             self.sp = spotipy.Spotify(
-                client_credentials_manager=SpotifyClientCredentials(cid, csecret)
+                client_credentials_manager=SpotifyClientCredentials(cid, csec)
             )
             await asyncio.wait_for(
                 self.bot.loop.run_in_executor(
@@ -347,6 +337,7 @@ class TidalPlayer(commands.Cog):
         except Exception:
             self.yt = None
 
+    # ... UTILS ...
     async def _get_guild_settings(
         self, guild_id: int, force_refresh: bool = False
     ) -> Dict[str, Any]:
@@ -418,30 +409,6 @@ class TidalPlayer(commands.Cog):
         ]
         return filtered if filtered else tracks
 
-    async def _add_meta(self, guild_id: int, meta: TrackMeta) -> bool:
-        try:
-            async with self.config.guild_from_id(guild_id).track_metadata() as queue:
-                if len(queue) >= MAX_QUEUE_SIZE:
-                    return False
-                queue.append(dict(meta))
-                return True
-        except Exception:
-            return False
-
-    async def _pop_meta(self, guild_id: int) -> None:
-        try:
-            async with self.config.guild_from_id(guild_id).track_metadata() as queue:
-                if queue:
-                    queue.pop(0)
-        except Exception:
-            pass
-
-    async def _clear_meta(self, guild_id: int) -> None:
-        try:
-            await self.config.guild_from_id(guild_id).track_metadata.set([])
-        except Exception:
-            pass
-
     async def _should_cancel(self, guild_id: int) -> bool:
         try:
             return (await self._get_guild_settings(guild_id)).get("cancel_queue", False)
@@ -456,8 +423,23 @@ class TidalPlayer(commands.Cog):
             pass
 
     # =========================================================================
-    # CORE PLAYBACK LOGIC (Simplified & Robust)
+    # CORE PLAYBACK LOGIC (Object Mutation)
     # =========================================================================
+
+    async def _get_player(self, ctx: commands.Context) -> Optional[Any]:
+        """Get player, creating it if necessary."""
+        if not LAVALINK_AVAILABLE:
+            return None
+        try:
+            return lavalink.get_player(ctx.guild.id)
+        except Exception:
+            if ctx.author.voice and ctx.author.voice.channel:
+                try:
+                    await lavalink.connect(ctx.author.voice.channel)
+                    return lavalink.get_player(ctx.guild.id)
+                except Exception:
+                    pass
+            return None
 
     @async_retry(exceptions=(APIError, asyncio.TimeoutError))
     async def _search_tidal(self, query: str, guild_id: int) -> List[Any]:
@@ -492,8 +474,8 @@ class TidalPlayer(commands.Cog):
         if not self.session or not self.session.check_login():
             await ctx.send(Messages.ERROR_NOT_AUTHENTICATED)
             return False
-        if not self.bot.get_cog("Audio"):
-            await ctx.send(Messages.ERROR_NO_AUDIO_COG)
+        if not LAVALINK_AVAILABLE:
+            await ctx.send(Messages.ERROR_NO_LAVALINK)
             return False
         return True
 
@@ -501,50 +483,58 @@ class TidalPlayer(commands.Cog):
         self, ctx: commands.Context, tidal_track: Any, show_embed: bool = True
     ) -> bool:
         """
-        Load Tidal track metadata, get URL, and queue via Audio cog.
-        Does NOT touch lavalink directly to avoid duplicates/errors.
+        Loads track, MUTATES it with Tidal metadata, and queues it.
+        This ensures [p]queue sees the correct title/artist.
         """
         try:
             meta = self._extract_meta(tidal_track)
             url = await self._get_track_url(tidal_track)
             if not url:
-                log.error(f"No URL for: {meta['title']}")
                 return False
 
-            audio_cog = self.bot.get_cog("Audio")
-            if not audio_cog:
+            # Get Player
+            player = await self._get_player(ctx)
+            if not player:
+                await ctx.send(Messages.ERROR_NO_PLAYER)
                 return False
 
-            # Store metadata FIRST
-            await self._add_meta(ctx.guild.id, meta)
-            self._track_meta_cache.set(url, meta)
+            # Load REAL track from Lavalink
+            try:
+                results = await player.load_tracks(url)
+            except Exception:
+                return False
+
+            if not results or not results.tracks:
+                return False
+
+            # Get the playable track object
+            track = results.tracks[0]
+
+            # === MAGIC HAPPENS HERE ===
+            # We overwrite the metadata on the real Lavalink object
+            track.title = meta["title"]
+            track.author = meta["artist"]
+            # Add extra data if needed
+            if not hasattr(track, "extra"):
+                track.extra = {}
+            track.extra.update(
+                {"tidal_album": meta["album"], "tidal_quality": meta["quality"]}
+            )
+            # ==========================
+
+            # Add to queue
+            player.add(ctx.author, track)
+
+            if not player.current:
+                await player.play()
 
             if show_embed:
                 await self._send_now_playing(ctx, meta)
 
-            # Suppress Audio's "Enqueued" message
-            orig_send = ctx.send
+            # Also update our cache just in case
+            self._track_meta_cache.set(url, meta)
 
-            async def silent_send(*args, **kwargs):
-                e = kwargs.get("embed") or (
-                    args[0] if args and isinstance(args[0], discord.Embed) else None
-                )
-                if e and "Track Enqueued" in (getattr(e, "title", "") or ""):
-                    return
-                return await orig_send(*args, **kwargs)
-
-            ctx.send = silent_send
-            try:
-                # Queue using standard Audio command - reliable playback
-                await audio_cog.command_play(ctx, query=url)
-                return True
-            except Exception as e:
-                log.error(f"Audio play failed: {e}")
-                # Rollback metadata if play failed
-                await self._pop_meta(ctx.guild.id)
-                return False
-            finally:
-                ctx.send = orig_send
+            return True
 
         except Exception as e:
             log.error(f"Queue error: {e}", exc_info=True)
@@ -553,7 +543,7 @@ class TidalPlayer(commands.Cog):
     async def _send_now_playing(self, ctx: commands.Context, meta: TrackMeta) -> None:
         desc = f"**{meta['title']}** • {meta['artist']}"
         if meta.get("album"):
-            desc += f"\n_{meta['album']}_"
+            desc += f"\\n_{meta['album']}_"
         embed = discord.Embed(
             title=Messages.STATUS_PLAYING, description=desc, color=discord.Color.blue()
         )
@@ -579,6 +569,7 @@ class TidalPlayer(commands.Cog):
         except Exception:
             return False
 
+    # ... INTERACTIVE & PLAYLISTS (Standard) ...
     async def _interactive_select(
         self, ctx: commands.Context, tracks: List[Any]
     ) -> Optional[Any]:
@@ -594,7 +585,7 @@ class TidalPlayer(commands.Cog):
 
         embed = discord.Embed(
             title="Search Results",
-            description="\n".join(lines),
+            description="\\n".join(lines),
             color=discord.Color.blue(),
         )
         embed.set_footer(text=Messages.STATUS_CHOOSE_TRACK.format(cancel=CANCEL_EMOJI))
@@ -625,7 +616,6 @@ class TidalPlayer(commands.Cog):
             await ctx.send(Messages.ERROR_TIMEOUT)
             return None
 
-    # ... PLAYLIST BATCHING (Same robust logic, simplified imports) ...
     async def _queue_playlist_batch(
         self,
         ctx: commands.Context,
@@ -668,132 +658,7 @@ class TidalPlayer(commands.Cog):
         finally:
             await self._set_cancel(ctx.guild.id, False)
 
-    # ... SPOTIFY & YOUTUBE Handlers (Standard implementation) ...
-    async def _queue_spotify_playlist(self, ctx: commands.Context, pl_id: str) -> None:
-        if not SPOTIFY_AVAILABLE or not self.sp:
-            await ctx.send(Messages.ERROR_NO_SPOTIFY)
-            return
-        pmsg = await ctx.send(Messages.PROGRESS_FETCHING_SPOTIFY)
-        try:
-            pl = await asyncio.wait_for(
-                self.bot.loop.run_in_executor(None, self.sp.playlist, pl_id),
-                timeout=API_TIMEOUT,
-            )
-            tracks = pl["tracks"]["items"] if pl else []
-            if not tracks:
-                await pmsg.edit(
-                    content=Messages.ERROR_NO_TRACKS_IN_CONTENT.format(
-                        content_type="playlist"
-                    )
-                )
-                return
-
-            queued, skipped, last_up = 0, 0, 0
-            for i, item in enumerate(tracks, 1):
-                if await self._should_cancel(ctx.guild.id):
-                    break
-                t = item.get("track")
-                if not t:
-                    skipped += 1
-                    continue
-                query = f"{t['name']} {t['artists'][0]['name']}"
-                if await self._search_and_queue(ctx, query, t["name"]):
-                    queued += 1
-                else:
-                    skipped += 1
-
-                if i - last_up >= BATCH_UPDATE_INTERVAL:
-                    embed = discord.Embed(
-                        title=Messages.PROGRESS_QUEUEING_SPOTIFY.format(
-                            count=len(tracks)
-                        ),
-                        description=Messages.PROGRESS_UPDATE.format(
-                            queued=queued, skipped=skipped, current=i, total=len(tracks)
-                        ),
-                        color=discord.Color.green(),
-                    )
-                    try:
-                        await pmsg.edit(embed=embed)
-                        last_up = i
-                    except Exception:
-                        pass
-                await asyncio.sleep(0.05)
-
-            await pmsg.edit(
-                embed=discord.Embed(
-                    title=Messages.SUCCESS_PARTIAL_QUEUE.format(
-                        queued=queued, total=len(tracks), skipped=skipped
-                    ),
-                    color=discord.Color.green(),
-                )
-            )
-        except Exception:
-            await pmsg.edit(content=Messages.ERROR_FETCH_FAILED)
-        finally:
-            await self._set_cancel(ctx.guild.id, False)
-
-    async def _queue_youtube_playlist(self, ctx: commands.Context, pl_id: str) -> None:
-        if not YOUTUBE_API_AVAILABLE or not self.yt:
-            await ctx.send(Messages.ERROR_NO_YOUTUBE)
-            return
-        pmsg = await ctx.send(Messages.PROGRESS_FETCHING_YOUTUBE)
-        try:
-            req = self.yt.playlistItems().list(
-                part="snippet", playlistId=pl_id, maxResults=50
-            )
-            resp = await asyncio.wait_for(
-                self.bot.loop.run_in_executor(None, req.execute), timeout=API_TIMEOUT
-            )
-            items = resp.get("items", [])
-            if not items:
-                await pmsg.edit(
-                    content=Messages.ERROR_NO_TRACKS_IN_CONTENT.format(
-                        content_type="playlist"
-                    )
-                )
-                return
-
-            queued, skipped, last_up = 0, 0, 0
-            for i, item in enumerate(items, 1):
-                if await self._should_cancel(ctx.guild.id):
-                    break
-                title = item["snippet"]["title"]
-                if await self._search_and_queue(ctx, title, title):
-                    queued += 1
-                else:
-                    skipped += 1
-
-                if i - last_up >= BATCH_UPDATE_INTERVAL:
-                    embed = discord.Embed(
-                        title=Messages.PROGRESS_QUEUEING_YOUTUBE.format(
-                            count=len(items)
-                        ),
-                        description=Messages.PROGRESS_UPDATE.format(
-                            queued=queued, skipped=skipped, current=i, total=len(items)
-                        ),
-                        color=discord.Color.red(),
-                    )
-                    try:
-                        await pmsg.edit(embed=embed)
-                        last_up = i
-                    except Exception:
-                        pass
-                await asyncio.sleep(0.05)
-
-            await pmsg.edit(
-                embed=discord.Embed(
-                    title=Messages.SUCCESS_PARTIAL_QUEUE.format(
-                        queued=queued, total=len(items), skipped=skipped
-                    ),
-                    color=discord.Color.red(),
-                )
-            )
-        except Exception:
-            await pmsg.edit(content=Messages.ERROR_FETCH_FAILED)
-        finally:
-            await self._set_cancel(ctx.guild.id, False)
-
-    # ... URL HANDLERS ...
+    # ... HANDLERS ...
     async def _handle_tidal_url(self, ctx: commands.Context, url: str) -> None:
         tm = TIDAL_TRACK_PATTERN.search(url)
         am = TIDAL_ALBUM_PATTERN.search(url)
@@ -895,6 +760,135 @@ class TidalPlayer(commands.Cog):
         except Exception:
             await ctx.send(Messages.ERROR_API_TIMEOUT)
 
+    async def _queue_spotify_playlist(self, ctx: commands.Context, pl_id: str) -> None:
+        if not SPOTIFY_AVAILABLE or not self.sp:
+            await ctx.send(Messages.ERROR_NO_SPOTIFY)
+            return
+        pmsg = await ctx.send(Messages.PROGRESS_FETCHING_SPOTIFY)
+        try:
+            pl = await asyncio.wait_for(
+                self.bot.loop.run_in_executor(None, self.sp.playlist, pl_id),
+                timeout=API_TIMEOUT,
+            )
+            tracks = pl["tracks"]["items"] if pl else []
+            if not tracks:
+                await pmsg.edit(
+                    content=Messages.ERROR_NO_TRACKS_IN_CONTENT.format(
+                        content_type="playlist"
+                    )
+                )
+                return
+
+            queued, skipped, last_up = 0, 0, 0
+            for i, item in enumerate(tracks, 1):
+                if await self._should_cancel(ctx.guild.id):
+                    break
+                t = item.get("track")
+                if not t:
+                    skipped += 1
+                    continue
+                query = f"{t['name']} {t['artists'][0]['name']}"
+                if await self._search_and_queue(ctx, query, t["name"]):
+                    queued += 1
+                else:
+                    skipped += 1
+
+                if i - last_up >= BATCH_UPDATE_INTERVAL:
+                    try:
+                        await pmsg.edit(
+                            embed=discord.Embed(
+                                title=Messages.PROGRESS_QUEUEING_SPOTIFY.format(
+                                    count=len(tracks)
+                                ),
+                                description=Messages.PROGRESS_UPDATE.format(
+                                    queued=queued,
+                                    skipped=skipped,
+                                    current=i,
+                                    total=len(tracks),
+                                ),
+                                color=discord.Color.green(),
+                            )
+                        )
+                        last_up = i
+                    except Exception:
+                        pass
+                await asyncio.sleep(0.05)
+            await pmsg.edit(
+                embed=discord.Embed(
+                    title=Messages.SUCCESS_PARTIAL_QUEUE.format(
+                        queued=queued, total=len(tracks), skipped=skipped
+                    ),
+                    color=discord.Color.green(),
+                )
+            )
+        except Exception:
+            await pmsg.edit(content=Messages.ERROR_FETCH_FAILED)
+        finally:
+            await self._set_cancel(ctx.guild.id, False)
+
+    async def _queue_youtube_playlist(self, ctx: commands.Context, pl_id: str) -> None:
+        if not YOUTUBE_API_AVAILABLE or not self.yt:
+            await ctx.send(Messages.ERROR_NO_YOUTUBE)
+            return
+        pmsg = await ctx.send(Messages.PROGRESS_FETCHING_YOUTUBE)
+        try:
+            req = self.yt.playlistItems().list(
+                part="snippet", playlistId=pl_id, maxResults=50
+            )
+            resp = await asyncio.wait_for(
+                self.bot.loop.run_in_executor(None, req.execute), timeout=API_TIMEOUT
+            )
+            items = resp.get("items", [])
+            if not items:
+                await pmsg.edit(
+                    content=Messages.ERROR_NO_TRACKS_IN_CONTENT.format(
+                        content_type="playlist"
+                    )
+                )
+                return
+
+            queued, skipped, last_up = 0, 0, 0
+            for i, item in enumerate(items, 1):
+                if await self._should_cancel(ctx.guild.id):
+                    break
+                title = item["snippet"]["title"]
+                if await self._search_and_queue(ctx, title, title):
+                    queued += 1
+                else:
+                    skipped += 1
+                if i - last_up >= BATCH_UPDATE_INTERVAL:
+                    try:
+                        await pmsg.edit(
+                            embed=discord.Embed(
+                                title=Messages.PROGRESS_QUEUEING_YOUTUBE.format(
+                                    count=len(items)
+                                ),
+                                description=Messages.PROGRESS_UPDATE.format(
+                                    queued=queued,
+                                    skipped=skipped,
+                                    current=i,
+                                    total=len(items),
+                                ),
+                                color=discord.Color.red(),
+                            )
+                        )
+                        last_up = i
+                    except Exception:
+                        pass
+                await asyncio.sleep(0.05)
+            await pmsg.edit(
+                embed=discord.Embed(
+                    title=Messages.SUCCESS_PARTIAL_QUEUE.format(
+                        queued=queued, total=len(items), skipped=skipped
+                    ),
+                    color=discord.Color.red(),
+                )
+            )
+        except Exception:
+            await pmsg.edit(content=Messages.ERROR_FETCH_FAILED)
+        finally:
+            await self._set_cancel(ctx.guild.id, False)
+
     # ... COMMANDS ...
     @commands.command(name="tplay")
     async def tplay(self, ctx: commands.Context, *, query: str) -> None:
@@ -912,7 +906,6 @@ class TidalPlayer(commands.Cog):
                 if not tracks:
                     await ctx.send(Messages.ERROR_NO_TRACKS_FOUND)
                     return
-
                 settings = await self._get_guild_settings(ctx.guild.id)
                 if settings.get("interactive_search", False):
                     sel = await self._interactive_select(ctx, tracks)
@@ -930,29 +923,31 @@ class TidalPlayer(commands.Cog):
 
     @commands.command(name="tqueue")
     async def tqueue(self, ctx: commands.Context) -> None:
+        # This command reads from metadata cache primarily, or fallback to lavalink
         try:
-            queue_items = await self.config.guild(ctx.guild).track_metadata()
-            if not queue_items:
+            player = await self._get_player(ctx)
+            if not player or not player.queue:
                 await ctx.send(Messages.STATUS_EMPTY_QUEUE)
                 return
 
-            pages, per_page = [], 10
-            for i in range(0, len(queue_items), per_page):
-                chunk = queue_items[i : i + per_page]
-                lines = []
-                for j, m in enumerate(chunk, start=i + 1):
-                    d = self._format_duration(m.get("duration", 0))
-                    q = self._get_quality_label(m.get("quality", "LOSSLESS"))
-                    lines.append(f"**{j}.** {m.get('title')} - {m.get('artist')} ({d})")
+            items = []
+            for t in player.queue:
+                # Read our injected metadata if available
+                title = getattr(t, "title", "Unknown")
+                author = getattr(t, "author", "Unknown")
+                length = getattr(t, "length", 0) // 1000
+                items.append(f"{title} - {author} ({self._format_duration(length)})")
 
+            pages = []
+            for i in range(0, len(items), 10):
+                chunk = items[i : i + 10]
+                lines = [f"**{j}.** {l}" for j, l in enumerate(chunk, start=i + 1)]
                 embed = discord.Embed(
-                    title=f"Tidal Queue ({len(queue_items)} tracks)",
-                    description="\n".join(lines),
+                    title=f"Queue ({len(items)})",
+                    description="\\n".join(lines),
                     color=discord.Color.blue(),
                 )
-                embed.set_footer(
-                    text=f"Page {len(pages) + 1}/{(len(queue_items) - 1) // per_page + 1}"
-                )
+                embed.set_footer(text=f"Page {len(pages) + 1}")
                 pages.append(embed)
 
             if len(pages) == 1:
@@ -960,15 +955,19 @@ class TidalPlayer(commands.Cog):
             else:
                 await menu(ctx, pages, DEFAULT_CONTROLS)
         except Exception:
-            await ctx.send("Error displaying queue.")
+            await ctx.send("Queue error.")
 
     @commands.command(name="tclear")
     async def tclear(self, ctx: commands.Context) -> None:
-        await self._clear_meta(ctx.guild.id)
-        self._track_meta_cache.clear()
-        await ctx.send(Messages.SUCCESS_QUEUE_CLEARED)
+        try:
+            player = await self._get_player(ctx)
+            if player:
+                player.queue.clear()
+            self._track_meta_cache.clear()
+            await ctx.send(Messages.SUCCESS_QUEUE_CLEARED)
+        except Exception:
+            pass
 
-    # ... OTHER COMMANDS & LISTENERS (Standard) ...
     @commands.command(name="tfilter")
     async def tfilter(self, ctx: commands.Context) -> None:
         curr = await self.config.guild(ctx.guild).filter_remixes()
@@ -1012,7 +1011,6 @@ class TidalPlayer(commands.Cog):
                 await ctx.send("Check DMs.")
             except:
                 await ctx.send(embed=e)
-
             await self.bot.loop.run_in_executor(None, f.result, 300)
             if self.session.check_login():
                 await self.config.token_type.set(self.session.token_type)
@@ -1029,7 +1027,6 @@ class TidalPlayer(commands.Cog):
         except Exception as err:
             await ctx.send(f"Setup failed: {err}")
 
-    # ... CONFIGURATION COMMANDS ...
     @commands.is_owner()
     @commands.group(name="tidalplay")
     async def tidalplay(self, ctx: commands.Context) -> None:
@@ -1058,18 +1055,6 @@ class TidalPlayer(commands.Cog):
         await self.config.refresh_token.set(None)
         await self.config.expiry_time.set(None)
         await ctx.send(Messages.SUCCESS_TOKENS_CLEARED)
-
-    @commands.Cog.listener()
-    async def on_red_audio_track_start(
-        self, guild: discord.Guild, track: Any, requester: discord.Member
-    ) -> None:
-        await self._pop_meta(guild.id)
-
-    @commands.Cog.listener()
-    async def on_red_audio_queue_end(
-        self, guild: discord.Guild, track_count: int, total_duration: int
-    ) -> None:
-        await self._clear_meta(guild.id)
 
 
 async def setup(bot: Red) -> None:
