@@ -1,7 +1,8 @@
 """
-ChatTriggers v5.2 - Clean & Optimized (Auto-Cleanup)
+ChatTriggers v5.3 - Complete Cleanup
 """
 
+import asyncio
 import logging
 
 import discord
@@ -61,7 +62,7 @@ class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
     def __init__(self, cog, view_message=None, trigger_name=None, defaults=None):
         super().__init__()
         self.cog = cog
-        self.view_message = view_message  # Reference to the menu message
+        self.view_message = view_message
         self.trigger_name = trigger_name
 
         if trigger_name:
@@ -99,7 +100,6 @@ class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
             f"✅ Trigger `{self.phrase.value}` saved!", ephemeral=True
         )
 
-        # Cleanup: Delete the original menu message if possible
         if self.view_message:
             try:
                 await self.view_message.delete()
@@ -152,7 +152,6 @@ class TriggerSelect(discord.ui.Select):
                 "title": data.get("title", ""),
                 "desc": data.get("desc", ""),
             }
-            # Pass origin_message to modal so it can delete it on submit
             modal = TriggerModal(
                 self.view.cog,
                 view_message=self.origin_message,
@@ -188,13 +187,12 @@ class TriggerSelect(discord.ui.Select):
 
 class MainView(discord.ui.View):
     def __init__(self, cog, triggers, message=None):
-        super().__init__(timeout=60)  # 60 second timeout
+        super().__init__(timeout=60)
         self.cog = cog
         self.triggers = triggers
         self.message = message
 
     async def on_timeout(self):
-        # Delete message on timeout
         if self.message:
             try:
                 await self.message.delete()
@@ -205,7 +203,6 @@ class MainView(discord.ui.View):
     async def new_btn(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        # Pass self.message to modal for cleanup
         await interaction.response.send_modal(
             TriggerModal(self.cog, view_message=self.message)
         )
@@ -334,8 +331,14 @@ class ChatTriggers(commands.Cog):
     @commands.group(name="chattrigger", aliases=["alert"], invoke_without_command=True)
     async def chattrigger(self, ctx):
         """Manage ChatTriggers."""
+        # Delete user's command message immediately
+        try:
+            await ctx.message.delete()
+        except:
+            pass
+
         if not await self.is_admin_or_manager(ctx):
-            return await ctx.send("⛔ Denied.")
+            return await ctx.send("⛔ Denied.", delete_after=5)
 
         triggers = await self.config.guild(ctx.guild).triggers()
 
@@ -351,7 +354,6 @@ class ChatTriggers(commands.Cog):
             color=discord.Color.red(),
         )
 
-        # Create view first, then send message, then assign message to view
         view = MainView(self, triggers)
         msg = await ctx.send(embed=embed, view=view)
         view.message = msg
@@ -359,6 +361,11 @@ class ChatTriggers(commands.Cog):
     @chattrigger.command(name="add_perm")
     async def add_perm(self, ctx, user: discord.User):
         """Allow user to trigger alerts."""
+        try:
+            await ctx.message.delete()
+        except:
+            pass
+
         if not await self.is_admin_or_manager(ctx):
             return
         async with self.config.guild(ctx.guild).allowed_users() as l:
@@ -369,15 +376,20 @@ class ChatTriggers(commands.Cog):
     @chattrigger.command(name="list")
     async def ct_list(self, ctx):
         """List all triggers."""
+        try:
+            await ctx.message.delete()
+        except:
+            pass
+
         triggers = await self.config.guild(ctx.guild).triggers()
         if not triggers:
-            return await ctx.send("No triggers.")
+            return await ctx.send("No triggers.", delete_after=10)
 
         msg = "**Triggers:**\n"
         for t in triggers.values():
             status = "✅" if t.get("active", True) else "❌"
             msg += f"{status} `{t['phrase_case']}`\n"
-        await ctx.send(msg)
+        await ctx.send(msg, delete_after=30)
 
     @commands.Cog.listener()
     async def on_message(self, message):
