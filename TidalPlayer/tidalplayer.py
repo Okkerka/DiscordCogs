@@ -81,12 +81,13 @@ FILTER_KEYWORDS = frozenset(
 )
 
 # Regex Patterns
-TIDAL_TRACK_PATTERN = re.compile(r"tidal\\.com/(?:browse/)?track/(\\d+)")
-TIDAL_ALBUM_PATTERN = re.compile(r"tidal\\.com/(?:browse/)?album/(\\d+)")
-TIDAL_PLAYLIST_PATTERN = re.compile(r"tidal\\.com/(?:browse/)?playlist/([a-f0-9-]+)")
-TIDAL_URL_PATTERN = re.compile(r"tidal\\.com/(?:browse/)?(track|album|playlist)")
-SPOTIFY_PLAYLIST_PATTERN = re.compile(r"open\\.spotify\\.com/playlist/([a-zA-Z0-9]+)")
-YOUTUBE_PLAYLIST_PATTERN = re.compile(r"youtube\\.com/.*[?&]list=([a-zA-Z0-9_-]+)")
+TIDAL_TRACK_PATTERN = re.compile(r"tidal\.com/(?:browse/)?track/(\d+)")
+TIDAL_ALBUM_PATTERN = re.compile(r"tidal\.com/(?:browse/)?album/(\d+)")
+TIDAL_PLAYLIST_PATTERN = re.compile(r"tidal\.com/(?:browse/)?playlist/([a-f0-9-]+)")
+TIDAL_URL_PATTERN = re.compile(r"tidal\.com/(?:browse/)?(track|album|playlist)")
+SPOTIFY_PLAYLIST_PATTERN = re.compile(r"open\.spotify\.com/playlist/([a-zA-Z0-9]+)")
+YOUTUBE_PLAYLIST_PATTERN = re.compile(r"youtube\.com/.*[?&]list=([a-zA-Z0-9_-]+)")
+
 
 # =============================================================================
 # TYPES & MESSAGES
