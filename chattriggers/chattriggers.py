@@ -1,5 +1,5 @@
 """
-ChatTriggers v4.2 - Multi-Trigger System (Fixed)
+ChatTriggers v4.3 - Multi-Trigger System (Fixed)
 """
 
 import logging
@@ -19,52 +19,57 @@ except ImportError:
 log = logging.getLogger("red.chattriggers")
 
 
-class TriggerModal(discord.ui.Modal):
-    def __init__(self, cog, trigger_name=None):
-        super().__init__(title="Configure Trigger")
+class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
+    # STRICT CLASS ATTRIBUTES (Safe for serialization)
+    phrase = discord.ui.TextInput(
+        label="Trigger Phrase",
+        placeholder="e.g. !Containment Breach!",
+        required=True,
+        max_length=50,
+        custom_id="phrase",
+    )
+    sound = discord.ui.TextInput(
+        label="Sound URL",
+        placeholder="https://example.com/alarm.mp3",
+        required=True,
+        custom_id="sound",
+    )
+    gif = discord.ui.TextInput(
+        label="GIF URL (Direct Link)",
+        placeholder="https://media.tenor.com/....gif",
+        required=False,
+        custom_id="gif",
+    )
+    embed_title = discord.ui.TextInput(  # Renamed to avoid conflict
+        label="Embed Title",
+        default="🚨 ALERT TRIGGERED 🚨",
+        required=False,
+        custom_id="title",
+    )
+    embed_desc = discord.ui.TextInput(
+        label="Embed Message",
+        default="CONTAINMENT BREACH DETECTED",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        custom_id="desc",
+    )
+
+    def __init__(self, cog, trigger_name=None, defaults=None):
+        super().__init__()
         self.cog = cog
         self.trigger_name = trigger_name
 
-        # Explicit definitions with custom_id to prevent serialization errors
-        self.phrase = discord.ui.TextInput(
-            label="Trigger Phrase",
-            placeholder="e.g. !Containment Breach!",
-            default=trigger_name if trigger_name else "",
-            required=True,
-            max_length=50,
-            custom_id="phrase",
-        )
-        self.sound = discord.ui.TextInput(
-            label="Sound URL",
-            placeholder="https://example.com/alarm.mp3",
-            required=True,
-            custom_id="sound",
-        )
-        self.gif = discord.ui.TextInput(
-            label="GIF URL (Direct Link)",
-            placeholder="https://media.tenor.com/....gif",
-            required=False,
-            custom_id="gif",
-        )
-        self.title = discord.ui.TextInput(
-            label="Embed Title",
-            default="🚨 ALERT TRIGGERED 🚨",
-            required=False,
-            custom_id="title",
-        )
-        self.desc = discord.ui.TextInput(
-            label="Embed Message",
-            default="CONTAINMENT BREACH DETECTED",
-            style=discord.TextStyle.paragraph,
-            required=False,
-            custom_id="desc",
-        )
+        # Set dynamic defaults safely
+        if trigger_name:
+            self.phrase.default = trigger_name
 
-        self.add_item(self.phrase)
-        self.add_item(self.sound)
-        self.add_item(self.gif)
-        self.add_item(self.title)
-        self.add_item(self.desc)
+        if defaults:
+            self.sound.default = defaults.get("sound", "")
+            self.gif.default = defaults.get("gif", "")
+            self.embed_title.default = defaults.get("title", "🚨 ALERT TRIGGERED 🚨")
+            self.embed_desc.default = defaults.get(
+                "desc", "CONTAINMENT BREACH DETECTED"
+            )
 
     async def on_submit(self, interaction: discord.Interaction):
         phrase_key = self.phrase.value.lower().strip()
@@ -73,12 +78,12 @@ class TriggerModal(discord.ui.Modal):
             "phrase_case": self.phrase.value.strip(),
             "sound": self.sound.value.strip(),
             "gif": self.gif.value.strip(),
-            "title": self.title.value.strip(),
-            "desc": self.desc.value.strip(),
+            "title": self.embed_title.value.strip(),
+            "desc": self.embed_desc.value.strip(),
         }
 
         async with self.cog.config.guild(interaction.guild).triggers() as triggers:
-            # If editing (renaming), delete old
+            # If renaming, delete old key
             if self.trigger_name and self.trigger_name.lower() != phrase_key:
                 if self.trigger_name.lower() in triggers:
                     del triggers[self.trigger_name.lower()]
@@ -93,7 +98,9 @@ class TriggerModal(discord.ui.Modal):
 class TriggerSelect(discord.ui.Select):
     def __init__(self, triggers):
         options = []
-        for t in list(triggers.keys())[:25]:  # Max 25 options
+        # Sort keys for consistency
+        keys = sorted(list(triggers.keys()))[:25]
+        for t in keys:
             options.append(
                 discord.SelectOption(label=triggers[t]["phrase_case"], value=t)
             )
@@ -114,21 +121,24 @@ class TriggerSelect(discord.ui.Select):
                 "❌ Trigger not found.", ephemeral=True
             )
 
-        # Pre-fill modal
-        modal = TriggerModal(self.view.cog, trigger_name=data["phrase_case"])
-        # Default values must be set in __init__ or accessing the TextInput object directly
-        modal.sound.default = data["sound"]
-        modal.gif.default = data["gif"]
-        modal.title.default = data["title"]
-        modal.desc.default = data["desc"]
-
+        # Create modal with defaults
+        defaults = {
+            "sound": data["sound"],
+            "gif": data["gif"],
+            "title": data.get("title", ""),
+            "desc": data.get("desc", ""),
+        }
+        modal = TriggerModal(
+            self.view.cog, trigger_name=data["phrase_case"], defaults=defaults
+        )
         await interaction.response.send_modal(modal)
 
 
 class DeleteSelect(discord.ui.Select):
     def __init__(self, triggers):
         options = []
-        for t in list(triggers.keys())[:25]:
+        keys = sorted(list(triggers.keys()))[:25]
+        for t in keys:
             options.append(
                 discord.SelectOption(
                     label=f"DELETE: {triggers[t]['phrase_case']}", value=t, emoji="🗑️"
