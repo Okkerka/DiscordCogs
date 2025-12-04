@@ -1,5 +1,5 @@
 """
-ChatTriggers v4.1 - Multi-Trigger System (Fixed)
+ChatTriggers v4.2 - Multi-Trigger System (Fixed)
 """
 
 import logging
@@ -21,37 +21,43 @@ log = logging.getLogger("red.chattriggers")
 
 class TriggerModal(discord.ui.Modal):
     def __init__(self, cog, trigger_name=None):
-        super().__init__(
-            title=f"Config: {trigger_name}" if trigger_name else "New Trigger"
-        )
+        super().__init__(title="Configure Trigger")
         self.cog = cog
         self.trigger_name = trigger_name
 
+        # Explicit definitions with custom_id to prevent serialization errors
         self.phrase = discord.ui.TextInput(
             label="Trigger Phrase",
             placeholder="e.g. !Containment Breach!",
             default=trigger_name if trigger_name else "",
             required=True,
             max_length=50,
+            custom_id="phrase",
         )
         self.sound = discord.ui.TextInput(
             label="Sound URL",
             placeholder="https://example.com/alarm.mp3",
             required=True,
+            custom_id="sound",
         )
         self.gif = discord.ui.TextInput(
             label="GIF URL (Direct Link)",
             placeholder="https://media.tenor.com/....gif",
             required=False,
+            custom_id="gif",
         )
         self.title = discord.ui.TextInput(
-            label="Embed Title", default="🚨 ALERT TRIGGERED 🚨", required=False
+            label="Embed Title",
+            default="🚨 ALERT TRIGGERED 🚨",
+            required=False,
+            custom_id="title",
         )
         self.desc = discord.ui.TextInput(
             label="Embed Message",
             default="CONTAINMENT BREACH DETECTED",
             style=discord.TextStyle.paragraph,
             required=False,
+            custom_id="desc",
         )
 
         self.add_item(self.phrase)
@@ -110,6 +116,7 @@ class TriggerSelect(discord.ui.Select):
 
         # Pre-fill modal
         modal = TriggerModal(self.view.cog, trigger_name=data["phrase_case"])
+        # Default values must be set in __init__ or accessing the TextInput object directly
         modal.sound.default = data["sound"]
         modal.gif.default = data["gif"]
         modal.title.default = data["title"]
