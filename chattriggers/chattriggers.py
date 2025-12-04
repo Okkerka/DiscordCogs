@@ -1,5 +1,5 @@
 """
-ChatTriggers v4.3 - Multi-Trigger System (Fixed)
+ChatTriggers v4.4 - Multi-Trigger System (Clean Visuals)
 """
 
 import logging
@@ -20,7 +20,7 @@ log = logging.getLogger("red.chattriggers")
 
 
 class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
-    # STRICT CLASS ATTRIBUTES (Safe for serialization)
+    # STRICT CLASS ATTRIBUTES
     phrase = discord.ui.TextInput(
         label="Trigger Phrase",
         placeholder="e.g. !Containment Breach!",
@@ -40,7 +40,7 @@ class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
         required=False,
         custom_id="gif",
     )
-    embed_title = discord.ui.TextInput(  # Renamed to avoid conflict
+    embed_title = discord.ui.TextInput(
         label="Embed Title",
         default="🚨 ALERT TRIGGERED 🚨",
         required=False,
@@ -59,7 +59,6 @@ class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
         self.cog = cog
         self.trigger_name = trigger_name
 
-        # Set dynamic defaults safely
         if trigger_name:
             self.phrase.default = trigger_name
 
@@ -83,11 +82,9 @@ class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
         }
 
         async with self.cog.config.guild(interaction.guild).triggers() as triggers:
-            # If renaming, delete old key
             if self.trigger_name and self.trigger_name.lower() != phrase_key:
                 if self.trigger_name.lower() in triggers:
                     del triggers[self.trigger_name.lower()]
-
             triggers[phrase_key] = new_data
 
         await interaction.response.send_message(
@@ -98,7 +95,6 @@ class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
 class TriggerSelect(discord.ui.Select):
     def __init__(self, triggers):
         options = []
-        # Sort keys for consistency
         keys = sorted(list(triggers.keys()))[:25]
         for t in keys:
             options.append(
@@ -121,7 +117,6 @@ class TriggerSelect(discord.ui.Select):
                 "❌ Trigger not found.", ephemeral=True
             )
 
-        # Create modal with defaults
         defaults = {
             "sound": data["sound"],
             "gif": data["gif"],
@@ -220,11 +215,7 @@ class ChatTriggers(commands.Cog):
         self.config = Config.get_conf(
             self, identifier=999888777, force_registration=True
         )
-        self.config.register_guild(
-            triggers={},  # Dict[phrase_lower, data_dict]
-            allowed_users=[],
-            admin_users=[],
-        )
+        self.config.register_guild(triggers={}, allowed_users=[], admin_users=[])
 
     async def is_admin_or_manager(self, ctx):
         if ctx.author.guild_permissions.manage_guild:
@@ -268,18 +259,25 @@ class ChatTriggers(commands.Cog):
             except Exception as e:
                 return await channel.send(f"❌ Audio Error: {e}")
 
-            # Visuals
+            # Visuals - CLEANER LOOK
             embed = discord.Embed(
                 title=data.get("title", "ALERT"),
                 description=data.get("desc", "TRIGGERED"),
                 color=discord.Color.red(),
             )
 
+            # Footer Credit
+            embed.set_footer(
+                text=f"Triggered by: {user.display_name}",
+                icon_url=user.display_avatar.url,
+            )
+
             gif = data.get("gif", "")
             if gif:
                 embed.set_image(url=gif)
 
-            await channel.send(content=f"## 🚨 ALERT: {user.mention}", embed=embed)
+            # Ping in content (Invisible? No, visible ping is better for alerts)
+            await channel.send(content=user.mention, embed=embed)
 
         except Exception as e:
             log.error(f"Trigger failed: {e}")
