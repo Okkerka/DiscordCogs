@@ -125,66 +125,67 @@ class ChatTriggers(commands.Cog):
             allowed_users=[],
         )
 
-    async def trigger_alert(self, channel, user, manual=False):
-        guild = channel.guild
-        settings = await self.config.guild(guild).all()
+        async def trigger_alert(self, channel, user, manual=False):
+            guild = channel.guild
+            settings = await self.config.guild(guild).all()
 
-        if not settings["sound_url"]:
-            return await channel.send("❌ No sound configured!")
+            if not settings["sound_url"]:
+                return await channel.send("❌ No sound configured!")
 
-        if not LAVALINK_AVAILABLE:
-            return await channel.send("❌ Lavalink not available (Audio cog needed).")
+            if not LAVALINK_AVAILABLE:
+                return await channel.send(
+                    "❌ Lavalink not available (Audio cog needed)."
+                )
 
-        try:
-            # 1. Find Target Voice Channel
-            target_vc = user.voice.channel if user.voice else None
-            if not target_vc and guild.voice_client:
-                target_vc = guild.voice_client.channel
-
-            if not target_vc:
-                return await channel.send("❌ You need to be in a Voice Channel!")
-
-            # 2. Hijack Player
             try:
-                player = lavalink.get_player(guild.id)
-                if player:
-                    await player.stop()  # KILL THE MUSIC
-                    current_channel_id = getattr(player, 'channel_id', None)
-                                        # Sometimes it's just stored in the node, but let's trust move_to
+                # 1. Find Target Voice Channel
+                target_vc = user.voice.channel if user.voice else None
+                if not target_vc and guild.voice_client:
+                    target_vc = guild.voice_client.channel
 
-                                        await player.move_to(target_vc)
-                else:
-                    # Connect if no player
-                    await lavalink.connect(target_vc)
+                if not target_vc:
+                    return await channel.send("❌ You need to be in a Voice Channel!")
+
+                # 2. Hijack Player
+                try:
                     player = lavalink.get_player(guild.id)
+                    if player:
+                        await player.stop()  # KILL THE MUSIC
+                        # Force move to user's channel (avoids channel_id attribute error)
+                        await player.move_to(target_vc)
+                    else:
+                        # Connect if no player
+                        await lavalink.connect(target_vc)
+                        player = lavalink.get_player(guild.id)
+                except Exception as e:
+                    return await channel.send(f"❌ Audio Connection Error: {e}")
+
+                # 3. Force Play Alarm
+                # Load the track directly
+                results = await player.load_tracks(settings["sound_url"])
+                if results.tracks:
+                    track = results.tracks[0]
+                    # Clear queue to prevent other songs from playing
+                    player.queue.clear()
+                    player.add(user, track)
+                    await player.play()
+                else:
+                    await channel.send("❌ Could not load alarm sound URL.")
+
+                # 4. Visual Nuke
+                if settings["gif_url"]:
+                    embed = discord.Embed(
+                        title="🚨 ALERT TRIGGERED 🚨", color=discord.Color.red()
+                    )
+                    embed.set_image(url=settings["gif_url"])
+                    await channel.send(
+                        content=f"## 🚨 ALERT TRIGGERED BY {user.mention} 🚨",
+                        embed=embed,
+                    )
+
             except Exception as e:
-                return await channel.send(f"❌ Audio Connection Error: {e}")
-
-            # 3. Force Play Alarm
-            # Load the track directly
-            results = await player.load_tracks(settings["sound_url"])
-            if results.tracks:
-                track = results.tracks[0]
-                # Clear queue to prevent other songs from playing
-                player.queue.clear()
-                player.add(user, track)
-                await player.play()
-            else:
-                await channel.send("❌ Could not load alarm sound URL.")
-
-            # 4. Visual Nuke
-            if settings["gif_url"]:
-                embed = discord.Embed(
-                    title="🚨 ALERT TRIGGERED 🚨", color=discord.Color.red()
-                )
-                embed.set_image(url=settings["gif_url"])
-                await channel.send(
-                    content=f"## 🚨 ALERT TRIGGERED BY {user.mention} 🚨", embed=embed
-                )
-
-        except Exception as e:
-            log.error(f"Alert failed: {e}")
-            await channel.send(f"⚠️ Alert malfunction: {e}")
+                log.error(f"Alert failed: {e}")
+                await channel.send(f"⚠️ Alert malfunction: {e}")
 
     @commands.group(name="chattrigger", aliases=["alert"])
     @commands.admin_or_permissions(manage_guild=True)
