@@ -1,5 +1,5 @@
 """
-ChatTriggers v4.4 - Multi-Trigger System (Clean Visuals)
+ChatTriggers v4.5 - Multi-Trigger System (No Ping)
 """
 
 import logging
@@ -259,7 +259,7 @@ class ChatTriggers(commands.Cog):
             except Exception as e:
                 return await channel.send(f"❌ Audio Error: {e}")
 
-            # Visuals - CLEANER LOOK
+            # Visuals - NO PING
             embed = discord.Embed(
                 title=data.get("title", "ALERT"),
                 description=data.get("desc", "TRIGGERED"),
@@ -276,8 +276,8 @@ class ChatTriggers(commands.Cog):
             if gif:
                 embed.set_image(url=gif)
 
-            # Ping in content (Invisible? No, visible ping is better for alerts)
-            await channel.send(content=user.mention, embed=embed)
+            # Pure Embed (Content is None)
+            await channel.send(embed=embed)
 
         except Exception as e:
             log.error(f"Trigger failed: {e}")
