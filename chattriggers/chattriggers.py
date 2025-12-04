@@ -149,8 +149,10 @@ class ChatTriggers(commands.Cog):
                 player = lavalink.get_player(guild.id)
                 if player:
                     await player.stop()  # KILL THE MUSIC
-                    if player.channel_id != target_vc.id:
-                        await player.move_to(target_vc)
+                    current_channel_id = getattr(player, 'channel_id', None)
+                                        # Sometimes it's just stored in the node, but let's trust move_to
+
+                                        await player.move_to(target_vc)
                 else:
                     # Connect if no player
                     await lavalink.connect(target_vc)
