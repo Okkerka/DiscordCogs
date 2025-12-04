@@ -1,5 +1,5 @@
 """
-ChatTriggers v4.7 - Multi-Trigger System (Empty Defaults)
+ChatTriggers v4.8 - Multi-Trigger System (UX Polish)
 """
 
 import logging
@@ -20,6 +20,7 @@ log = logging.getLogger("red.chattriggers")
 
 
 class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
+    # STRICT CLASS ATTRIBUTES
     phrase = discord.ui.TextInput(
         label="Trigger Phrase",
         placeholder="e.g. !Containment Breach!",
@@ -29,26 +30,27 @@ class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
     )
     sound = discord.ui.TextInput(
         label="Sound URL",
-        placeholder="https://example.com/alarm.mp3",
+        placeholder="Use a Youtube link",
         required=True,
         custom_id="sound",
     )
     gif = discord.ui.TextInput(
-        label="GIF URL (Direct Link)",
-        placeholder="https://media.tenor.com/....gif",
+        label="GIF URL",
+        placeholder="Use discord attachment links or direct links",
         required=False,
         custom_id="gif",
     )
     embed_title = discord.ui.TextInput(
         label="Embed Title",
-        default="🚨 ALERT TRIGGERED 🚨",
+        placeholder="e.g. 🚨 ALERT TRIGGERED 🚨",
+        default="",  # Empty default
         required=False,
         custom_id="title",
     )
     embed_desc = discord.ui.TextInput(
-        label="Embed Message (Optional)",
+        label="Embed Message",
         placeholder="e.g. CONTAINMENT BREACH DETECTED",
-        default="",  # Empty by default
+        default="",  # Empty default
         style=discord.TextStyle.paragraph,
         required=False,
         custom_id="desc",
@@ -65,11 +67,17 @@ class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
         if defaults:
             self.sound.default = defaults.get("sound", "")
             self.gif.default = defaults.get("gif", "")
-            self.embed_title.default = defaults.get("title", "🚨 ALERT TRIGGERED 🚨")
-            self.embed_desc.default = defaults.get("desc", "")  # Keep empty if not set
+            self.embed_title.default = defaults.get("title", "")
+            self.embed_desc.default = defaults.get("desc", "")
 
     async def on_submit(self, interaction: discord.Interaction):
         phrase_key = self.phrase.value.lower().strip()
+
+        # Fallback for title if user leaves it blank?
+        # No, user wants it empty by default.
+        # But an embed needs *something*.
+        # We will handle "empty title" in play_trigger by using a generic fallback ONLY if desc is also empty?
+        # Or just let it be empty string (valid if image exists).
 
         new_data = {
             "phrase_case": self.phrase.value.strip(),
@@ -262,12 +270,20 @@ class ChatTriggers(commands.Cog):
                 return await channel.send(f"❌ Audio Error: {e}")
 
             # Visuals
-            title = data.get("title", "ALERT")
-            desc = data.get("desc", "")  # Empty by default now
+            title = data.get("title", "")  # Empty if not set
+            desc = data.get("desc", "")
+
+            # Fallback if both are empty?
+            # If title and desc are empty, Discord allows it IF there is an image.
+            # If no image, we force a title.
+            gif = data.get("gif", "")
+
+            if not title and not desc and not gif:
+                title = "ALERT"  # Hard fallback to prevent error
 
             embed = discord.Embed(
-                title=title,
-                description=desc if desc else None,  # Only set if not empty
+                title=title if title else None,
+                description=desc if desc else None,
                 color=discord.Color.red(),
             )
             embed.set_footer(
@@ -275,7 +291,6 @@ class ChatTriggers(commands.Cog):
                 icon_url=user.display_avatar.url,
             )
 
-            gif = data.get("gif", "")
             if gif:
                 embed.set_image(url=gif)
 
@@ -298,8 +313,9 @@ class ChatTriggers(commands.Cog):
 
         desc = f"**Total:** {total} | **Active:** {active} | **Disabled:** {disabled}"
 
+        # Custom Title Styling
         embed = discord.Embed(
-            title=" Triggers Config ", description=desc, color=discord.Color.red()
+            title="   Triggers Config   ", description=desc, color=discord.Color.red()
         )
         await ctx.send(embed=embed, view=MainView(self, triggers))
 
