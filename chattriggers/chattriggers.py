@@ -301,7 +301,7 @@ class ChatTriggers(commands.Cog):
         desc = f"**Total:** {total} | **Active:** {active} | **Disabled:** {disabled}"
 
         embed = discord.Embed(
-            title="🚨 Triggers Config", description=desc, color=discord.Color.red()
+            title=" Triggers Config ", description=desc, color=discord.Color.red()
         )
         await ctx.send(embed=embed, view=MainView(self, triggers))
 
