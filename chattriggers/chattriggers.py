@@ -1,5 +1,5 @@
 """
-ChatTriggers v4.6 - Multi-Trigger System (Toggle Support)
+ChatTriggers v4.7 - Multi-Trigger System (Empty Defaults)
 """
 
 import logging
@@ -46,8 +46,9 @@ class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
         custom_id="title",
     )
     embed_desc = discord.ui.TextInput(
-        label="Embed Message",
-        default="CONTAINMENT BREACH DETECTED",
+        label="Embed Message (Optional)",
+        placeholder="e.g. CONTAINMENT BREACH DETECTED",
+        default="",  # Empty by default
         style=discord.TextStyle.paragraph,
         required=False,
         custom_id="desc",
@@ -65,9 +66,7 @@ class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
             self.sound.default = defaults.get("sound", "")
             self.gif.default = defaults.get("gif", "")
             self.embed_title.default = defaults.get("title", "🚨 ALERT TRIGGERED 🚨")
-            self.embed_desc.default = defaults.get(
-                "desc", "CONTAINMENT BREACH DETECTED"
-            )
+            self.embed_desc.default = defaults.get("desc", "")  # Keep empty if not set
 
     async def on_submit(self, interaction: discord.Interaction):
         phrase_key = self.phrase.value.lower().strip()
@@ -78,17 +77,14 @@ class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
             "gif": self.gif.value.strip(),
             "title": self.embed_title.value.strip(),
             "desc": self.embed_desc.value.strip(),
-            "active": True,  # Default to active
+            "active": True,
         }
 
         async with self.cog.config.guild(interaction.guild).triggers() as triggers:
             if self.trigger_name and self.trigger_name.lower() != phrase_key:
                 if self.trigger_name.lower() in triggers:
-                    # Preserve active state if renaming? No, reset is safer or copy.
-                    # Let's just delete old.
                     del triggers[self.trigger_name.lower()]
 
-            # Preserve active state if editing existing
             if phrase_key in triggers:
                 new_data["active"] = triggers[phrase_key].get("active", True)
 
@@ -265,9 +261,13 @@ class ChatTriggers(commands.Cog):
             except Exception as e:
                 return await channel.send(f"❌ Audio Error: {e}")
 
+            # Visuals
+            title = data.get("title", "ALERT")
+            desc = data.get("desc", "")  # Empty by default now
+
             embed = discord.Embed(
-                title=data.get("title", "ALERT"),
-                description=data.get("desc", "TRIGGERED"),
+                title=title,
+                description=desc if desc else None,  # Only set if not empty
                 color=discord.Color.red(),
             )
             embed.set_footer(
@@ -284,7 +284,6 @@ class ChatTriggers(commands.Cog):
         except Exception as e:
             log.error(f"Trigger failed: {e}")
 
-    # invoke_without_command=True hides the Help Menu when running >chattrigger
     @commands.group(name="chattrigger", aliases=["alert"], invoke_without_command=True)
     async def chattrigger(self, ctx):
         """Manage ChatTriggers."""
@@ -293,7 +292,6 @@ class ChatTriggers(commands.Cog):
 
         triggers = await self.config.guild(ctx.guild).triggers()
 
-        # Stats
         total = len(triggers)
         active = sum(1 for t in triggers.values() if t.get("active", True))
         disabled = total - active
@@ -301,7 +299,7 @@ class ChatTriggers(commands.Cog):
         desc = f"**Total:** {total} | **Active:** {active} | **Disabled:** {disabled}"
 
         embed = discord.Embed(
-            title=" Triggers Config ", description=desc, color=discord.Color.red()
+            title="🚨 Triggers Config", description=desc, color=discord.Color.red()
         )
         await ctx.send(embed=embed, view=MainView(self, triggers))
 
@@ -339,7 +337,6 @@ class ChatTriggers(commands.Cog):
         matched_data = None
         for phrase_key, data in triggers.items():
             if phrase_key in content:
-                # CHECK IF ACTIVE
                 if data.get("active", True):
                     matched_data = data
                     break
