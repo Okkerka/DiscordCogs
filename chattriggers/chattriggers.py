@@ -1,11 +1,11 @@
 """
-ChatTriggers v3.1 - Fully Optimized Panic Button
+ChatTriggers v4.0 - Multi-Trigger System
 """
 
 import logging
 
 import discord
-from redbot.core import Config, checks, commands
+from redbot.core import Config, commands
 from redbot.core.bot import Red
 
 # Optional Lavalink import
@@ -19,148 +19,184 @@ except ImportError:
 log = logging.getLogger("red.chattriggers")
 
 
-class ConfigModal(discord.ui.Modal, title="ChatTriggers Config"):
-    trigger_phrase = discord.ui.TextInput(
-        label="Trigger Phrase",
-        placeholder="e.g. !Containment Breach!",
-        required=True,
-        max_length=100,
-    )
-    gif_url = discord.ui.TextInput(
-        label="GIF URL (Tenor/Direct)",
-        placeholder="https://media.tenor.com/...",
-        required=False,
-        style=discord.TextStyle.short,
-    )
-    sound_url = discord.ui.TextInput(
-        label="Sound URL", placeholder="https://example.com/alarm.mp3", required=True
-    )
-    embed_title = discord.ui.TextInput(
-        label="Embed Title",
-        placeholder="Title...",
-        default="🚨 ALERT TRIGGERED 🚨",
-        required=False,
-        max_length=256,
-    )
-    embed_desc = discord.ui.TextInput(
-        label="Embed Message",
-        placeholder="Description...",
-        default="CONTAINMENT BREACH DETECTED",
-        required=False,
-        style=discord.TextStyle.paragraph,
-        max_length=1000,
-    )
-
-    def __init__(self, cog):
-        super().__init__()
+class TriggerModal(discord.ui.Modal):
+    def __init__(self, cog, trigger_name=None):
+        super().__init__(
+            title=f"Config: {trigger_name}" if trigger_name else "New Trigger"
+        )
         self.cog = cog
+        self.trigger_name = trigger_name
+
+        self.phrase = discord.ui.TextInput(
+            label="Trigger Phrase",
+            placeholder="e.g. !Containment Breach!",
+            default=trigger_name if trigger_name else "",
+            required=True,
+            max_length=50,
+        )
+        self.sound = discord.ui.TextInput(
+            label="Sound URL",
+            placeholder="https://example.com/alarm.mp3",
+            required=True,
+        )
+        self.gif = discord.ui.TextInput(
+            label="GIF URL (Direct Link)",
+            placeholder="https://media.tenor.com/....gif",
+            required=False,
+        )
+        self.title = discord.ui.TextInput(
+            label="Embed Title", default="🚨 ALERT TRIGGERED 🚨", required=False
+        )
+        self.desc = discord.ui.TextInput(
+            label="Embed Message",
+            default="CONTAINMENT BREACH DETECTED",
+            style=discord.TextStyle.paragraph,
+            required=False,
+        )
+
+        self.add_item(self.phrase)
+        self.add_item(self.sound)
+        self.add_item(self.gif)
+        self.add_item(self.title)
+        self.add_item(self.desc)
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Batch update for efficiency
-        async with self.cog.config.guild(interaction.guild).all() as settings:
-            settings["trigger_phrase"] = self.trigger_phrase.value
-            settings["gif_url"] = self.gif_url.value
-            settings["sound_url"] = self.sound_url.value
-            settings["embed_title"] = self.embed_title.value
-            settings["embed_desc"] = self.embed_desc.value
+        phrase_key = self.phrase.value.lower().strip()
+
+        new_data = {
+            "phrase_case": self.phrase.value.strip(),
+            "sound": self.sound.value.strip(),
+            "gif": self.gif.value.strip(),
+            "title": self.title.value.strip(),
+            "desc": self.desc.value.strip(),
+        }
+
+        async with self.cog.config.guild(interaction.guild).triggers() as triggers:
+            # If editing (renaming), delete old
+            if self.trigger_name and self.trigger_name.lower() != phrase_key:
+                if self.trigger_name.lower() in triggers:
+                    del triggers[self.trigger_name.lower()]
+
+            triggers[phrase_key] = new_data
 
         await interaction.response.send_message(
-            "✅ Configuration updated!", ephemeral=True
+            f"✅ Trigger `{self.phrase.value}` saved!", ephemeral=True
         )
 
 
-class UserSelectView(discord.ui.View):
-    def __init__(self, cog, mode="trigger"):
-        super().__init__()
-        self.cog = cog
-        self.mode = mode  # "trigger" or "admin"
-
-    @discord.ui.select(
-        cls=discord.ui.UserSelect,
-        placeholder="Select users...",
-        min_values=0,
-        max_values=25,
-    )
-    async def select_users(
-        self, interaction: discord.Interaction, select: discord.ui.UserSelect
-    ):
-        guild = interaction.guild
-        new_ids = [user.id for user in select.values]
-
-        key = "allowed_users" if self.mode == "trigger" else "admin_users"
-
-        async with getattr(self.cog.config.guild(guild), key)() as current_list:
-            # Optimized merge
-            updated = list(set(current_list + new_ids))
-            current_list.clear()
-            current_list.extend(updated)
-
-        await interaction.response.send_message(
-            f"✅ Added {len(new_ids)} users to {self.mode} list.", ephemeral=True
+class TriggerSelect(discord.ui.Select):
+    def __init__(self, triggers):
+        options = []
+        for t in list(triggers.keys())[:25]:  # Max 25 options
+            options.append(
+                discord.SelectOption(label=triggers[t]["phrase_case"], value=t)
+            )
+        super().__init__(
+            placeholder="Select a trigger to EDIT...",
+            min_values=1,
+            max_values=1,
+            options=options,
         )
+
+    async def callback(self, interaction: discord.Interaction):
+        trigger_key = self.values[0]
+        triggers = await self.view.cog.config.guild(interaction.guild).triggers()
+        data = triggers.get(trigger_key)
+
+        if not data:
+            return await interaction.response.send_message(
+                "❌ Trigger not found.", ephemeral=True
+            )
+
+        # Pre-fill modal
+        modal = TriggerModal(self.view.cog, trigger_name=data["phrase_case"])
+        modal.sound.default = data["sound"]
+        modal.gif.default = data["gif"]
+        modal.title.default = data["title"]
+        modal.desc.default = data["desc"]
+
+        await interaction.response.send_modal(modal)
+
+
+class DeleteSelect(discord.ui.Select):
+    def __init__(self, triggers):
+        options = []
+        for t in list(triggers.keys())[:25]:
+            options.append(
+                discord.SelectOption(
+                    label=f"DELETE: {triggers[t]['phrase_case']}", value=t, emoji="🗑️"
+                )
+            )
+        super().__init__(
+            placeholder="Select a trigger to DELETE...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        key = self.values[0]
+        async with self.view.cog.config.guild(interaction.guild).triggers() as triggers:
+            if key in triggers:
+                del triggers[key]
+                await interaction.response.send_message(
+                    f"🗑️ Deleted trigger.", ephemeral=True
+                )
+            else:
+                await interaction.response.send_message("❌ Not found.", ephemeral=True)
 
 
 class MainView(discord.ui.View):
-    def __init__(self, cog):
+    def __init__(self, cog, triggers):
         super().__init__(timeout=None)
         self.cog = cog
+        self.triggers = triggers
 
     @discord.ui.button(
-        label="Edit Config", style=discord.ButtonStyle.primary, emoji="⚙️"
+        label="New Trigger", style=discord.ButtonStyle.success, emoji="VX"
     )
-    async def config_button(
+    async def new_trigger(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        await interaction.response.send_modal(ConfigModal(self.cog))
+        await interaction.response.send_modal(TriggerModal(self.cog))
 
     @discord.ui.button(
-        label="View Settings", style=discord.ButtonStyle.secondary, emoji="📄"
+        label="Edit Trigger", style=discord.ButtonStyle.primary, emoji="⚙️"
     )
-    async def view_settings(
+    async def edit_trigger(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        s = await self.cog.config.guild(interaction.guild).all()
-
-        # Simplified formatting to avoid SyntaxError
-        t = s["trigger_phrase"]
-        snd = s["sound_url"]
-        gf = s["gif_url"]
-
-        desc = f"**Trigger:** `{t}`\n**Sound:** [Link]({snd})\n"
-        if gf:
-            desc += f"**GIF:** [Link]({gf})\n"
-        else:
-            desc += "**GIF:** None\n"
-
-        desc += f"\n**Title:** {s['embed_title']}\n**Msg:** {s['embed_desc']}"
-
-        embed = discord.Embed(
-            title="Current Config", description=desc, color=discord.Color.blue()
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    @discord.ui.button(
-        label="Add Users", style=discord.ButtonStyle.secondary, emoji="👥"
-    )
-    async def users_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
+        if not self.triggers:
+            return await interaction.response.send_message(
+                "No triggers to edit.", ephemeral=True
+            )
+        view = discord.ui.View()
+        view.cog = self.cog
+        view.add_item(TriggerSelect(self.triggers))
         await interaction.response.send_message(
-            "Add TRIGGER users:",
-            view=UserSelectView(self.cog, "trigger"),
-            ephemeral=True,
+            "Select trigger to edit:", view=view, ephemeral=True
         )
 
-    @discord.ui.button(label="TEST ALERT", style=discord.ButtonStyle.danger, emoji="🚨")
-    async def test_button(
+    @discord.ui.button(
+        label="Delete Trigger", style=discord.ButtonStyle.danger, emoji="🗑️"
+    )
+    async def delete_trigger(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        await self.cog.trigger_alert(interaction.channel, interaction.user, manual=True)
-        await interaction.response.defer()
+        if not self.triggers:
+            return await interaction.response.send_message(
+                "No triggers.", ephemeral=True
+            )
+        view = discord.ui.View()
+        view.cog = self.cog
+        view.add_item(DeleteSelect(self.triggers))
+        await interaction.response.send_message(
+            "Select trigger to DELETE:", view=view, ephemeral=True
+        )
 
 
 class ChatTriggers(commands.Cog):
-    """Emergency Alert System with Granular Permissions."""
+    """Multi-Trigger Alert System."""
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -168,74 +204,10 @@ class ChatTriggers(commands.Cog):
             self, identifier=999888777, force_registration=True
         )
         self.config.register_guild(
-            trigger_phrase="!Containment Breach!",
-            gif_url="",
-            sound_url="",
-            embed_title="🚨 ALERT TRIGGERED 🚨",
-            embed_desc="CONTAINMENT BREACH DETECTED",
-            allowed_users=[],  # Can trigger
-            admin_users=[],  # Can configure
+            triggers={},  # Dict[phrase_lower, data_dict]
+            allowed_users=[],
+            admin_users=[],
         )
-
-    async def trigger_alert(self, channel, user, manual=False):
-        if not LAVALINK_AVAILABLE:
-            return await channel.send("❌ Lavalink not available.")
-
-        guild = channel.guild
-        settings = await self.config.guild(guild).all()
-
-        if not settings["sound_url"]:
-            return await channel.send("❌ No sound configured!")
-
-        try:
-            target_vc = user.voice.channel if user.voice else None
-            if not target_vc and guild.voice_client:
-                target_vc = guild.voice_client.channel
-
-            if not target_vc:
-                return await channel.send("❌ You need to be in a Voice Channel!")
-
-            try:
-                player = lavalink.get_player(guild.id)
-                if not player:
-                    await lavalink.connect(target_vc)
-                    player = lavalink.get_player(guild.id)
-                else:
-                    if player.is_playing:
-                        await player.stop()
-                    # Simple move without attribute check
-                    await player.move_to(target_vc)
-            except Exception as e:
-                return await channel.send(f"❌ Audio Error: {e}")
-
-            try:
-                results = await player.load_tracks(settings["sound_url"])
-                if results.tracks:
-                    player.queue.clear()
-                    player.add(user, results.tracks[0])
-                    await player.play()
-            except Exception as e:
-                await channel.send(f"❌ Playback Error: {e}")
-
-            embed = discord.Embed(
-                title=settings.get("embed_title", "🚨 ALERT"),
-                description=settings.get("embed_desc", "ALERT"),
-                color=discord.Color.red(),
-            )
-
-            msg_content = f"## 🚨 ALERT TRIGGERED BY {user.mention} 🚨"
-            gif = settings.get("gif_url", "")
-
-            if gif:
-                if any(x in gif.lower() for x in ["tenor.com", "giphy.com"]):
-                    msg_content += f"\n{gif}"
-                else:
-                    embed.set_image(url=gif)
-
-            await channel.send(content=msg_content, embed=embed)
-
-        except Exception as e:
-            log.error(f"Alert failed: {e}")
 
     async def is_admin_or_manager(self, ctx):
         if ctx.author.guild_permissions.manage_guild:
@@ -245,94 +217,116 @@ class ChatTriggers(commands.Cog):
         admins = await self.config.guild(ctx.guild).admin_users()
         return ctx.author.id in admins
 
+    async def play_trigger(self, channel, user, data):
+        if not LAVALINK_AVAILABLE:
+            return
+
+        guild = channel.guild
+        sound_url = data["sound"]
+
+        try:
+            target_vc = user.voice.channel if user.voice else None
+            if not target_vc and guild.voice_client:
+                target_vc = guild.voice_client.channel
+            if not target_vc:
+                return await channel.send("❌ User not in VC.")
+
+            # Audio Logic
+            try:
+                player = lavalink.get_player(guild.id)
+                if not player:
+                    await lavalink.connect(target_vc)
+                    player = lavalink.get_player(guild.id)
+                else:
+                    if player.is_playing:
+                        await player.stop()
+                    await player.move_to(target_vc)
+
+                # Play
+                results = await player.load_tracks(sound_url)
+                if results.tracks:
+                    player.queue.clear()
+                    player.add(user, results.tracks[0])
+                    await player.play()
+            except Exception as e:
+                return await channel.send(f"❌ Audio Error: {e}")
+
+            # Visuals
+            embed = discord.Embed(
+                title=data.get("title", "ALERT"),
+                description=data.get("desc", "TRIGGERED"),
+                color=discord.Color.red(),
+            )
+
+            gif = data.get("gif", "")
+            if gif:
+                embed.set_image(url=gif)
+
+            await channel.send(content=f"## 🚨 ALERT: {user.mention}", embed=embed)
+
+        except Exception as e:
+            log.error(f"Trigger failed: {e}")
+
     @commands.group(name="chattrigger", aliases=["alert"])
     async def chattrigger(self, ctx):
-        """Manage the ChatTriggers system."""
+        """Manage ChatTriggers."""
         if ctx.invoked_subcommand is None:
             if not await self.is_admin_or_manager(ctx):
-                return await ctx.send(
-                    "⛔ You do not have permission to configure alerts."
-                )
+                return await ctx.send("⛔ Denied.")
 
+            triggers = await self.config.guild(ctx.guild).triggers()
             embed = discord.Embed(
-                title="🚨 ChatTriggers Panel",
-                description="Configure your emergency broadcast system.",
-                color=discord.Color.dark_red(),
+                title="🚨 Triggers Config",
+                description=f"Active Triggers: {len(triggers)}",
+                color=discord.Color.red(),
             )
-            await ctx.send(embed=embed, view=MainView(self))
+            await ctx.send(embed=embed, view=MainView(self, triggers))
 
-    @chattrigger.command(name="add")
-    async def ct_add(self, ctx, user: discord.User):
-        """Authorize a user to TRIGGER the alert."""
+    @chattrigger.command(name="add_perm")
+    async def add_perm(self, ctx, user: discord.User):
+        """Allow user to trigger alerts."""
         if not await self.is_admin_or_manager(ctx):
-            return await ctx.send("⛔ Permission Denied.")
+            return
+        async with self.config.guild(ctx.guild).allowed_users() as l:
+            if user.id not in l:
+                l.append(user.id)
+        await ctx.tick()
 
-        async with self.config.guild(ctx.guild).allowed_users() as allowed:
-            if user.id not in allowed:
-                allowed.append(user.id)
-                await ctx.send(f"✅ Added {user.mention} to Trigger list.")
-            else:
-                await ctx.send("⚠️ Already authorized.")
+    @chattrigger.command(name="list")
+    async def ct_list(self, ctx):
+        """List all triggers."""
+        triggers = await self.config.guild(ctx.guild).triggers()
+        if not triggers:
+            return await ctx.send("No triggers.")
 
-    @chattrigger.command(name="remove")
-    async def ct_remove(self, ctx, user: discord.User):
-        """Revoke trigger permission."""
-        if not await self.is_admin_or_manager(ctx):
-            return await ctx.send("⛔ Permission Denied.")
-
-        async with self.config.guild(ctx.guild).allowed_users() as allowed:
-            if user.id in allowed:
-                allowed.remove(user.id)
-                await ctx.send(f"✅ Removed {user.mention}.")
-            else:
-                await ctx.send("⚠️ Not found.")
-
-    @chattrigger.group(name="permission", aliases=["admin"])
-    async def ct_perm(self, ctx):
-        """Manage Admin permissions."""
-        pass
-
-    @ct_perm.command(name="add")
-    async def ct_perm_add(self, ctx, user: discord.User):
-        """Authorize a user to CONFIGURE settings."""
-        if not await self.is_admin_or_manager(ctx):
-            return await ctx.send("⛔ Permission Denied.")
-
-        async with self.config.guild(ctx.guild).admin_users() as admins:
-            if user.id not in admins:
-                admins.append(user.id)
-                await ctx.send(f"🛡️ Added {user.mention} as ChatTrigger Admin.")
-            else:
-                await ctx.send("⚠️ Already admin.")
-
-    @ct_perm.command(name="remove")
-    async def ct_perm_remove(self, ctx, user: discord.User):
-        """Revoke admin permission."""
-        if not await self.is_admin_or_manager(ctx):
-            return await ctx.send("⛔ Permission Denied.")
-
-        async with self.config.guild(ctx.guild).admin_users() as admins:
-            if user.id in admins:
-                admins.remove(user.id)
-                await ctx.send(f"🛡️ Removed {user.mention} from Admins.")
-            else:
-                await ctx.send("⚠️ Not found.")
+        msg = "**Active Triggers:**\n"
+        for t in triggers.values():
+            msg += f"- `{t['phrase_case']}`\n"
+        await ctx.send(msg)
 
     @commands.Cog.listener()
     async def on_message(self, message):
         if message.author.bot or not message.guild:
             return
 
-        phrase = await self.config.guild(message.guild).trigger_phrase()
-        if phrase and phrase.lower() in message.content.lower():
-            settings = await self.config.guild(message.guild).all()
+        content = message.content.lower()
+        triggers = await self.config.guild(message.guild).triggers()
 
+        # Check for matches
+        matched_data = None
+        for phrase_key, data in triggers.items():
+            if phrase_key in content:
+                matched_data = data
+                break
+
+        if matched_data:
+            settings = await self.config.guild(message.guild).all()
             is_owner = await self.bot.is_owner(message.author)
             is_admin = message.author.id in settings["admin_users"]
             is_allowed = message.author.id in settings["allowed_users"]
 
             if is_owner or is_admin or is_allowed:
-                await self.trigger_alert(message.channel, message.author)
+                await self.play_trigger(message.channel, message.author, matched_data)
 
 
 async def setup(bot):
