@@ -1,5 +1,5 @@
 """
-ChatTriggers v4.0 - Multi-Trigger System
+ChatTriggers v4.1 - Multi-Trigger System (Fixed)
 """
 
 import logging
@@ -153,7 +153,7 @@ class MainView(discord.ui.View):
         self.triggers = triggers
 
     @discord.ui.button(
-        label="New Trigger", style=discord.ButtonStyle.success, emoji="VX"
+        label="New Trigger", style=discord.ButtonStyle.success, emoji="➕"
     )
     async def new_trigger(
         self, interaction: discord.Interaction, button: discord.ui.Button
