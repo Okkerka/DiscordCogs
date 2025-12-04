@@ -1,5 +1,5 @@
 """
-ChatTriggers v5.3 - Complete Cleanup
+ChatTriggers v5.4 - Strict Validation
 """
 
 import asyncio
@@ -32,26 +32,26 @@ class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
         custom_id="phrase",
     )
     sound = discord.ui.TextInput(
-        label="Sound URL",
+        label="Sound URL (Optional)",
         placeholder="Use a Youtube link",
-        required=True,
+        required=False,  # Now optional
         custom_id="sound",
     )
     gif = discord.ui.TextInput(
-        label="GIF URL",
-        placeholder="Use discord attachment links or direct links",
+        label="GIF URL (Optional)",
+        placeholder="Use a discord attachment link",  # Updated placeholder
         required=False,
         custom_id="gif",
     )
     embed_title = discord.ui.TextInput(
-        label="Embed Title",
+        label="Embed Title (Optional)",
         placeholder="e.g. 🚨 ALERT TRIGGERED 🚨",
         default="",
         required=False,
         custom_id="title",
     )
     embed_desc = discord.ui.TextInput(
-        label="Embed Message",
+        label="Embed Message (Optional)",
         placeholder="e.g. CONTAINMENT BREACH DETECTED",
         default="",
         style=discord.TextStyle.paragraph,
@@ -75,14 +75,35 @@ class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
             self.embed_desc.default = defaults.get("desc", "")
 
     async def on_submit(self, interaction: discord.Interaction):
+        # --- Minimum Content Validation ---
+        sound_val = self.sound.value.strip()
+        gif_val = self.gif.value.strip()
+        title_val = self.embed_title.value.strip()
+        desc_val = self.embed_desc.value.strip()
+
+        if not any([sound_val, gif_val, title_val, desc_val]):
+            return await interaction.response.send_message(
+                "❌ Invalid Trigger: You must provide at least a Sound, GIF, or Embed Title/Message.",
+                ephemeral=True,
+            )
+
         phrase_key = self.phrase.value.lower().strip()
+
+        # --- Duplicate Phrase Validation (for new triggers only) ---
+        if self.trigger_name is None:  # This is a new trigger
+            triggers = await self.cog.config.guild(interaction.guild).triggers()
+            if phrase_key in triggers:
+                return await interaction.response.send_message(
+                    "❌ A trigger with this phrase already exists. Please edit it instead.",
+                    ephemeral=True,
+                )
 
         new_data = {
             "phrase_case": self.phrase.value.strip(),
-            "sound": self.sound.value.strip(),
-            "gif": self.gif.value.strip(),
-            "title": self.embed_title.value.strip(),
-            "desc": self.embed_desc.value.strip(),
+            "sound": sound_val,
+            "gif": gif_val,
+            "title": title_val,
+            "desc": desc_val,
             "active": True,
         }
 
@@ -147,8 +168,8 @@ class TriggerSelect(discord.ui.Select):
         if self.mode == EDIT_MODE:
             data = triggers[key]
             defaults = {
-                "sound": data["sound"],
-                "gif": data["gif"],
+                "sound": data.get("sound", ""),
+                "gif": data.get("gif", ""),
                 "title": data.get("title", ""),
                 "desc": data.get("desc", ""),
             }
@@ -272,43 +293,45 @@ class ChatTriggers(commands.Cog):
         return ctx.author.id in admins
 
     async def play_trigger(self, channel, user, data):
-        if not LAVALINK_AVAILABLE:
-            return
+        sound_url = data.get("sound")
 
-        guild = channel.guild
-        sound_url = data["sound"]
-
-        try:
-            target_vc = user.voice.channel if user.voice else None
-            if not target_vc and guild.voice_client:
-                target_vc = guild.voice_client.channel
-            if not target_vc:
-                return await channel.send("❌ User not in VC.", delete_after=10)
-
+        # --- Audio Logic (Optional) ---
+        if sound_url and LAVALINK_AVAILABLE:
             try:
-                player = lavalink.get_player(guild.id)
-                if not player:
-                    await lavalink.connect(target_vc)
-                    player = lavalink.get_player(guild.id)
+                guild = channel.guild
+                target_vc = user.voice.channel if user.voice else None
+                if not target_vc and guild.voice_client:
+                    target_vc = guild.voice_client.channel
+                if not target_vc:
+                    log.warning(
+                        f"ChatTrigger: User {user.name} not in VC."
+                    )  # Log instead of sending message
                 else:
-                    if player.is_playing:
-                        await player.stop()
-                    await player.move_to(target_vc)
+                    player = lavalink.get_player(guild.id)
+                    if not player:
+                        await lavalink.connect(target_vc)
+                        player = lavalink.get_player(guild.id)
+                    else:
+                        if player.is_playing:
+                            await player.stop()
+                        await player.move_to(target_vc)
 
-                results = await player.load_tracks(sound_url)
-                if results.tracks:
-                    player.queue.clear()
-                    player.add(user, results.tracks[0])
-                    await player.play()
+                    results = await player.load_tracks(sound_url)
+                    if results.tracks:
+                        player.queue.clear()
+                        player.add(user, results.tracks[0])
+                        await player.play()
             except Exception as e:
-                return await channel.send(f"❌ Audio Error: {e}", delete_after=10)
+                log.error(f"ChatTrigger Audio Error: {e}")
 
+        # --- Visuals Logic ---
+        try:
             title = data.get("title", "")
             desc = data.get("desc", "")
             gif = data.get("gif", "")
 
-            if not title and not desc and not gif:
-                title = "ALERT"
+            if not title and not desc and not gif:  # This is a sound-only trigger
+                return  # Don't send any message
 
             embed = discord.Embed(
                 title=title if title else None,
@@ -326,12 +349,11 @@ class ChatTriggers(commands.Cog):
             await channel.send(embed=embed)
 
         except Exception as e:
-            log.error(f"Trigger failed: {e}")
+            log.error(f"ChatTrigger Visual Error: {e}")
 
     @commands.group(name="chattrigger", aliases=["alert"], invoke_without_command=True)
     async def chattrigger(self, ctx):
         """Manage ChatTriggers."""
-        # Delete user's command message immediately
         try:
             await ctx.message.delete()
         except:
