@@ -1,5 +1,5 @@
 """
-ChatTriggers v5.4 - Strict Validation
+ChatTriggers v5.5 - Error Cleanup
 """
 
 import asyncio
@@ -34,12 +34,12 @@ class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
     sound = discord.ui.TextInput(
         label="Sound URL (Optional)",
         placeholder="Use a Youtube link",
-        required=False,  # Now optional
+        required=False,
         custom_id="sound",
     )
     gif = discord.ui.TextInput(
         label="GIF URL (Optional)",
-        placeholder="Use a discord attachment link",  # Updated placeholder
+        placeholder="Use a discord attachment link",
         required=False,
         custom_id="gif",
     )
@@ -75,28 +75,42 @@ class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
             self.embed_desc.default = defaults.get("desc", "")
 
     async def on_submit(self, interaction: discord.Interaction):
-        # --- Minimum Content Validation ---
         sound_val = self.sound.value.strip()
         gif_val = self.gif.value.strip()
         title_val = self.embed_title.value.strip()
         desc_val = self.embed_desc.value.strip()
 
+        # --- Minimum Content Validation ---
         if not any([sound_val, gif_val, title_val, desc_val]):
-            return await interaction.response.send_message(
+            await interaction.response.send_message(
                 "❌ Invalid Trigger: You must provide at least a Sound, GIF, or Embed Title/Message.",
                 ephemeral=True,
             )
+            # Cleanup even on error
+            if self.view_message:
+                try:
+                    await self.view_message.delete()
+                except:
+                    pass
+            return
 
         phrase_key = self.phrase.value.lower().strip()
 
-        # --- Duplicate Phrase Validation (for new triggers only) ---
-        if self.trigger_name is None:  # This is a new trigger
+        # --- Duplicate Phrase Validation ---
+        if self.trigger_name is None:
             triggers = await self.cog.config.guild(interaction.guild).triggers()
             if phrase_key in triggers:
-                return await interaction.response.send_message(
+                await interaction.response.send_message(
                     "❌ A trigger with this phrase already exists. Please edit it instead.",
                     ephemeral=True,
                 )
+                # Cleanup even on error
+                if self.view_message:
+                    try:
+                        await self.view_message.delete()
+                    except:
+                        pass
+                return
 
         new_data = {
             "phrase_case": self.phrase.value.strip(),
@@ -303,9 +317,7 @@ class ChatTriggers(commands.Cog):
                 if not target_vc and guild.voice_client:
                     target_vc = guild.voice_client.channel
                 if not target_vc:
-                    log.warning(
-                        f"ChatTrigger: User {user.name} not in VC."
-                    )  # Log instead of sending message
+                    log.warning(f"ChatTrigger: User {user.name} not in VC.")
                 else:
                     player = lavalink.get_player(guild.id)
                     if not player:
@@ -330,8 +342,8 @@ class ChatTriggers(commands.Cog):
             desc = data.get("desc", "")
             gif = data.get("gif", "")
 
-            if not title and not desc and not gif:  # This is a sound-only trigger
-                return  # Don't send any message
+            if not title and not desc and not gif:
+                return
 
             embed = discord.Embed(
                 title=title if title else None,
