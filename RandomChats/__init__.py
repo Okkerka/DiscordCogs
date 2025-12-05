@@ -1,7 +1,5 @@
-from redbot.core.bot import Red
-
 from .randomtext import RandomText
 
 
-async def setup(bot: Red) -> None:
+async def setup(bot):
     await bot.add_cog(RandomText(bot))
