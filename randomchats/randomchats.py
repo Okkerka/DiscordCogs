@@ -428,5 +428,5 @@ class RandomText(commands.Cog):
         await self.send_split_message(ctx.channel, text)
 
 
-async def setup(bot: Red):
+async def setup(bot):
     await bot.add_cog(RandomText(bot))
