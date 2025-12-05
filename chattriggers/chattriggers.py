@@ -1,5 +1,5 @@
 """
-ChatTriggers v5.8 - Optimized
+ChatTriggers v5.9 - Ultimate
 """
 
 import logging
@@ -333,27 +333,34 @@ class ChatTriggers(commands.Cog):
             try:
                 guild = channel.guild
                 target_vc = user.voice.channel if user.voice else None
-                if not target_vc and guild.voice_client:
-                    target_vc = guild.voice_client.channel
+
                 if not target_vc:
-                    log.warning(f"ChatTrigger: User {user.name} not in VC.")
+                    log.debug(
+                        f"ChatTrigger: User {user.name} not in VC, skipping audio."
+                    )
                 else:
                     player = lavalink.get_player(guild.id)
+
                     if not player:
-                        await lavalink.connect(target_vc)
-                        player = lavalink.get_player(guild.id)
+                        player = await lavalink.connect(target_vc)
                     else:
                         if player.is_playing:
                             await player.stop()
-                        await player.move_to(target_vc)
+                        if player.channel.id != target_vc.id:
+                            await player.move_to(target_vc)
 
                     results = await player.load_tracks(sound_url)
                     if results.tracks:
                         player.queue.clear()
                         player.add(user, results.tracks[0])
                         await player.play()
+                    else:
+                        log.warning(
+                            f"ChatTrigger: No tracks found for URL: {sound_url}"
+                        )
+
             except Exception as e:
-                log.error(f"ChatTrigger Audio Error: {e}")
+                log.error(f"ChatTrigger Audio Error: {e}", exc_info=True)
 
         try:
             title = data.get("title", "")
@@ -379,7 +386,7 @@ class ChatTriggers(commands.Cog):
             await channel.send(embed=embed)
 
         except Exception as e:
-            log.error(f"ChatTrigger Visual Error: {e}")
+            log.error(f"ChatTrigger Visual Error: {e}", exc_info=True)
 
     @commands.group(name="chattrigger", aliases=["alert"], invoke_without_command=True)
     async def chattrigger(self, ctx):
@@ -412,7 +419,7 @@ class ChatTriggers(commands.Cog):
 
     @chattrigger.command(name="add_perm")
     async def add_perm(self, ctx, user: discord.User):
-        """Allow user to trigger alerts."""
+        """Allow a user to trigger alerts (but not configure them)."""
         try:
             await ctx.message.delete()
         except:
@@ -423,7 +430,46 @@ class ChatTriggers(commands.Cog):
         async with self.config.guild(ctx.guild).allowed_users() as l:
             if user.id not in l:
                 l.append(user.id)
-        await ctx.tick()
+        await ctx.send(f"✅ {user.mention} can now trigger alerts.", delete_after=10)
+
+    @chattrigger.command(name="add_manager")
+    async def add_manager(self, ctx, user: discord.User):
+        """Allow a user to manage triggers (add/edit/delete)."""
+        try:
+            await ctx.message.delete()
+        except:
+            pass
+
+        if not await self.is_admin_or_manager(ctx):
+            return
+
+        async with self.config.guild(ctx.guild).admin_users() as admins:
+            if user.id not in admins:
+                admins.append(user.id)
+
+        await ctx.send(f"✅ {user.mention} can now manage triggers.", delete_after=10)
+
+    @chattrigger.command(name="remove_manager")
+    async def remove_manager(self, ctx, user: discord.User):
+        """Remove a user's trigger management permissions."""
+        try:
+            await ctx.message.delete()
+        except:
+            pass
+
+        if not await self.is_admin_or_manager(ctx):
+            return
+
+        async with self.config.guild(ctx.guild).admin_users() as admins:
+            if user.id in admins:
+                admins.remove(user.id)
+                await ctx.send(
+                    f"✅ {user.mention} can no longer manage triggers.", delete_after=10
+                )
+            else:
+                await ctx.send(
+                    f"❌ {user.mention} is not a trigger manager.", delete_after=10
+                )
 
     @chattrigger.command(name="list")
     async def ct_list(self, ctx):
@@ -459,7 +505,6 @@ class ChatTriggers(commands.Cog):
 
         content = message.content.lower()
 
-        # Optimization: Calculate min/max trigger phrase lengths
         active_triggers = {k: v for k, v in triggers.items() if v.get("active", True)}
         if not active_triggers:
             return
@@ -468,7 +513,6 @@ class ChatTriggers(commands.Cog):
         min_trigger_len = min(trigger_lengths)
         max_trigger_len = max(trigger_lengths)
 
-        # Skip if message is too short or too long to match any trigger
         content_len = len(content)
         if content_len < min_trigger_len or content_len > max_trigger_len * 10:
             return
