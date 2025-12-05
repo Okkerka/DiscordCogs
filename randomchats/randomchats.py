@@ -13,21 +13,19 @@ from redbot.core.bot import Red
 class RandomText(commands.Cog):
     """Randomly sends Brainrot, Showerthoughts, Jokes, and Facts in chat."""
 
-    def __init__(self, bot):
+    def __init__(self, bot: Red):
         self.bot = bot
         self.session = aiohttp.ClientSession()
         self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
         # Config to store per-channel settings
-        self.config = Config.get_conf(self, identifier=98429482394)
-        default_channel = {
-            "enabled": False,
-            "counter": 0,
-            "target": 50,  # Default target (randomized between 10-100 later)
-        }
+        self.config = Config.get_conf(
+            self, identifier=98429482394, force_registration=True
+        )
+        default_channel = {"enabled": False, "counter": 0, "target": 50}
         self.config.register_channel(**default_channel)
 
-        # Transient Cache (resets on bot restart)
+        # Transient Cache
         self.cache = {"brainrot": [], "showerthought": [], "dadjoke": [], "fact": []}
 
     async def cog_unload(self):
@@ -36,7 +34,6 @@ class RandomText(commands.Cog):
     # --- HELPERS ---
 
     async def check_cache(self, category, content):
-        """Returns True if content is unique."""
         if content in self.cache[category]:
             return False
         self.cache[category].append(content)
@@ -67,15 +64,13 @@ class RandomText(commands.Cog):
         return re.sub(r"\s+", " ", content).strip()
 
     async def send_split_message(self, channel, text):
-        """Splits long text into <2000 char chunks."""
         if len(text) <= 2000:
             await channel.send(text)
             return
-
         chunks = [text[i : i + 1990] for i in range(0, len(text), 1990)]
         for chunk in chunks:
             await channel.send(chunk)
-            await asyncio.sleep(1)  # Prevent rate limit
+            await asyncio.sleep(1)
 
     # --- GENERATORS ---
 
@@ -267,17 +262,13 @@ class RandomText(commands.Cog):
             "trippi troppi",
         ]
 
-        # Logic: 20% chance for a double sentence, 10% chance for a triple chaos sentence
         roll = random.random()
-
         s1 = f"{random.choice(subjects)} {random.choice(actions)} {random.choice(objects)} {random.choice(locations)}. {random.choice(reactions)}"
 
         if roll < 0.2:
-            # Double Sentence
             s2 = f"{random.choice(subjects)} {random.choice(actions)} {random.choice(objects)}."
             final = f"{s1} {s2}"
         elif roll > 0.9:
-            # Pure Chaos (Just noises/reactions)
             s2 = f"{random.choice(reactions).upper()} {random.choice(reactions).upper()} {random.choice(subjects)} IS COOKED."
             final = f"{s1} {s2}"
         else:
@@ -369,7 +360,6 @@ class RandomText(commands.Cog):
         if current >= target:
             await self.trigger_random_text(message.channel)
             await self.config.channel(message.channel).counter.set(0)
-            # Randomize next target
             await self.config.channel(message.channel).target.set(
                 random.randint(10, 100)
             )
@@ -414,7 +404,6 @@ class RandomText(commands.Cog):
         if messages < 1:
             await ctx.send("❌ Number must be at least 1.")
             return
-
         await self.config.channel(ctx.channel).target.set(messages)
         await self.config.channel(ctx.channel).counter.set(0)
         await ctx.send(
@@ -426,7 +415,3 @@ class RandomText(commands.Cog):
         """Post a random copypasta (Manual Command)."""
         text = await self.get_copypasta_text()
         await self.send_split_message(ctx.channel, text)
-
-
-async def setup(bot):
-    await bot.add_cog(RandomText(bot))
