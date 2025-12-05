@@ -1,12 +1,14 @@
-import discord
-import aiohttp
-import random
-import html
-import xml.etree.ElementTree as ET
-import re
 import asyncio
-from redbot.core import commands, Config
+import html
+import random
+import re
+import xml.etree.ElementTree as ET
+
+import aiohttp
+import discord
+from redbot.core import Config, commands
 from redbot.core.bot import Red
+
 
 class RandomText(commands.Cog):
     """Randomly sends Brainrot, Showerthoughts, Jokes, and Facts in chat."""
@@ -16,21 +18,14 @@ class RandomText(commands.Cog):
         self.session = aiohttp.ClientSession()
         self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-        # SWITCHED TO GUILD CONFIG (Server-wide)
-        self.config = Config.get_conf(self, identifier=98429482394, force_registration=True)
-        default_guild = {
-            "enabled": False,
-            "counter": 0,
-            "target": 50
-        }
+        # Server-wide config
+        self.config = Config.get_conf(
+            self, identifier=98429482394, force_registration=True
+        )
+        default_guild = {"enabled": False, "counter": 0, "target": 50}
         self.config.register_guild(**default_guild)
 
-        self.cache = {
-            "brainrot": [],
-            "showerthought": [],
-            "dadjoke": [],
-            "fact": []
-        }
+        self.cache = {"brainrot": [], "showerthought": [], "dadjoke": [], "fact": []}
 
     async def cog_unload(self):
         await self.session.close()
@@ -47,7 +42,9 @@ class RandomText(commands.Cog):
 
     async def fetch_rss(self, url):
         try:
-            async with self.session.get(url, headers=self.headers, timeout=4) as response:
+            async with self.session.get(
+                url, headers=self.headers, timeout=4
+            ) as response:
                 if response.status == 200:
                     text = await response.text()
                     return ET.fromstring(text)
@@ -56,18 +53,20 @@ class RandomText(commands.Cog):
         return None
 
     def clean_content(self, content):
-        if not content: return ""
+        if not content:
+            return ""
         content = html.unescape(content)
-        if "submitted by" in content: content = content.split("submitted by")[0]
-        content = content.replace('<!-- SC_OFF -->', '').replace('<!-- SC_ON -->', '')
-        content = re.sub(r'<[^>]+>', '', content)
-        return re.sub(r'\s+', ' ', content).strip()
+        if "submitted by" in content:
+            content = content.split("submitted by")[0]
+        content = content.replace("<!-- SC_OFF -->", "").replace("<!-- SC_ON -->", "")
+        content = re.sub(r"<[^>]+>", "", content)
+        return re.sub(r"\s+", " ", content).strip()
 
     async def send_split_message(self, channel, text):
         if len(text) <= 2000:
             await channel.send(text)
             return
-        chunks = [text[i:i+1990] for i in range(0, len(text), 1990)]
+        chunks = [text[i : i + 1990] for i in range(0, len(text), 1990)]
         for chunk in chunks:
             await channel.send(chunk)
             await asyncio.sleep(1)
@@ -76,68 +75,190 @@ class RandomText(commands.Cog):
 
     async def get_brainrot(self):
         subjects = [
-            "Baby Gronk", "The Rizzler", "Livvy Dunne", "Kai Cenat", "Duke Dennis",
-            "Kevin G", "Grimace", "Skibidi Toilet", "John Pork", "IShowSpeed", "Caseoh",
-            "Quandale Dingle", "Adin Ross", "Andrew Tate", "The Ocky Way guy",
-            "The level 10 gyatt", "Average Ohio resident", "Glizzy Gladiator",
-            "The TikTok Rizz Party", "Generic npc", "The main character", "Lil bro",
-            "Blud", "The opps", "My sleep paralysis demon", "The skinwalker",
-            "Garten of Banban", "Huggy Wuggy", "Freddy Fazbear", "Cocomelon kid",
-            "The Jonkler", "Man (Arkham)", "DaBaby", "Ice Spice", "Hasbulla",
-            "The Pizza Tower guy", "Peppino", "Talking Ben", "MrBeast's clone",
-            "The imposter from Among Us", "A discord moderator", "A kitten",
-            "The alpha wolf", "The beta cuck", "Turkish Quandale Dingle",
-            "Galvanized Square Steel", "Little John", "Eco-friendly Wood Veneer"
+            "Baby Gronk",
+            "The Rizzler",
+            "Livvy Dunne",
+            "Kai Cenat",
+            "Duke Dennis",
+            "Kevin G",
+            "Grimace",
+            "Skibidi Toilet",
+            "John Pork",
+            "IShowSpeed",
+            "Caseoh",
+            "Quandale Dingle",
+            "Adin Ross",
+            "Andrew Tate",
+            "The Ocky Way guy",
+            "The level 10 gyatt",
+            "Average Ohio resident",
+            "Glizzy Gladiator",
+            "The TikTok Rizz Party",
+            "Generic npc",
+            "The main character",
+            "Lil bro",
+            "Blud",
+            "The opps",
+            "My sleep paralysis demon",
+            "The skinwalker",
+            "Garten of Banban",
+            "Huggy Wuggy",
+            "Freddy Fazbear",
+            "Cocomelon kid",
+            "The Jonkler",
+            "Man (Arkham)",
+            "DaBaby",
+            "Ice Spice",
+            "Hasbulla",
+            "The Pizza Tower guy",
+            "Peppino",
+            "Talking Ben",
+            "MrBeast's clone",
+            "The imposter from Among Us",
+            "A discord moderator",
+            "A kitten",
+            "The alpha wolf",
+            "The beta cuck",
+            "Turkish Quandale Dingle",
+            "Galvanized Square Steel",
+            "Little John",
+            "Eco-friendly Wood Veneer",
         ]
 
         actions = [
-            "just fanum taxed", "is mewing at", "griddied on", "edged to",
-            "glazed", "mogged", "rizzed up", "gooned with", "hit the griddy on",
-            "gatekept", "looksmaxxed", "crashed out on", "hit the hawk tuah on",
-            "started jelqing with", "broke the edging streak of", "hit a clip on",
-            "hit the thug shaker with", "drank the grimace shake with", "fumbled the bag with",
-            "got caught in 4k by", "is yapping to", "is gaslighting", "is gatekeeping",
-            "hit the boogie down on", "cranked 90s on", "stream sniped", "ratioed",
-            "got fanum taxed by", "is gooning to", "started muning with",
-            "hit the griddy in front of", "did the lightskin stare at", "threw it back for",
-            "borrowed screws from aunt for", "expanded the room for"
+            "just fanum taxed",
+            "is mewing at",
+            "griddied on",
+            "edged to",
+            "glazed",
+            "mogged",
+            "rizzed up",
+            "gooned with",
+            "hit the griddy on",
+            "gatekept",
+            "looksmaxxed",
+            "crashed out on",
+            "hit the hawk tuah on",
+            "started jelqing with",
+            "broke the edging streak of",
+            "hit a clip on",
+            "hit the thug shaker with",
+            "drank the grimace shake with",
+            "fumbled the bag with",
+            "got caught in 4k by",
+            "is yapping to",
+            "is gaslighting",
+            "is gatekeeping",
+            "hit the boogie down on",
+            "cranked 90s on",
+            "stream sniped",
+            "ratioed",
+            "got fanum taxed by",
+            "is gooning to",
+            "started muning with",
+            "hit the griddy in front of",
+            "did the lightskin stare at",
+            "threw it back for",
+            "borrowed screws from aunt for",
+            "expanded the room for",
         ]
 
         objects = [
-            "the level 10 gyatt", "a grimace shake", "the ocky way", "the skibidi toilet",
-            "the ohio rizz", "the sigma", "the beta male", "the ice spice song",
-            "the edging streak", "the looksmaxxing tutorial", "the subway surfers gameplay",
-            "the family guy funny moments", "the goth mommy", "the rizz god",
-            "the fanum tax write-off", "the skibidi toilet episode 69", "the aura points",
-            "the grimace shake recipe", "the lunchly meal", "the prime bottle",
-            "the zaza", "the forbidden pre-workout", "the fortnite battle pass",
-            "the 19 dollar fortnite card", "the among us potion", "the sussy baka",
-            "the goofy ahh uncle", "the metal pipe falling sound", "the vine boom",
-            "the galvanized square steel", "the eco-friendly wood veneers", "the screws from aunt"
+            "the level 10 gyatt",
+            "a grimace shake",
+            "the ocky way",
+            "the skibidi toilet",
+            "the ohio rizz",
+            "the sigma",
+            "the beta male",
+            "the ice spice song",
+            "the edging streak",
+            "the looksmaxxing tutorial",
+            "the subway surfers gameplay",
+            "the family guy funny moments",
+            "the goth mommy",
+            "the rizz god",
+            "the fanum tax write-off",
+            "the skibidi toilet episode 69",
+            "the aura points",
+            "the grimace shake recipe",
+            "the lunchly meal",
+            "the prime bottle",
+            "the zaza",
+            "the forbidden pre-workout",
+            "the fortnite battle pass",
+            "the 19 dollar fortnite card",
+            "the among us potion",
+            "the sussy baka",
+            "the goofy ahh uncle",
+            "the metal pipe falling sound",
+            "the vine boom",
+            "the galvanized square steel",
+            "the eco-friendly wood veneers",
+            "the screws from aunt",
         ]
 
         locations = [
-            "in Ohio", "in the backrooms", "at the function", "in Fortnite",
-            "during the grimace shake incident", "at 3am", "in skibidi city",
-            "in the rizz academy", "at the sigma convention", "in tilted towers",
-            "in the pizza tower", "at the rizz party", "in roblox brookhaven",
-            "in the hood", "at the looksmaxxing clinic", "inside the walls",
-            "in the gulag", "at the fazbear pizzaria", "in chapter 5 season 2",
-            "at the wendy's dumpster", "in o block", "at the tiktok rizz party",
-            "in the goon cave", "during the winter arc"
+            "in Ohio",
+            "in the backrooms",
+            "at the function",
+            "in Fortnite",
+            "during the grimace shake incident",
+            "at 3am",
+            "in skibidi city",
+            "in the rizz academy",
+            "at the sigma convention",
+            "in tilted towers",
+            "in the pizza tower",
+            "at the rizz party",
+            "in roblox brookhaven",
+            "in the hood",
+            "at the looksmaxxing clinic",
+            "inside the walls",
+            "in the gulag",
+            "at the fazbear pizzaria",
+            "in chapter 5 season 2",
+            "at the wendy's dumpster",
+            "in o block",
+            "at the tiktok rizz party",
+            "in the goon cave",
+            "during the winter arc",
         ]
 
         reactions = [
-            "no cap fr", "on god", "what the sigma?", "blud is cooked",
-            "it's over for bro", "skull emoji x7", "vine boom sound effect",
-            "literally 1984", "average ohio moment", "L mans", "W rizz",
-            "negative canthal tilt", "bombastic side eye", "criminal offensive side eye",
-            "bro thinks he's him", "chat is this real?", "type sh*t",
-            "i'm calling the opps", "bro fell off", "skill issue", "L + ratio",
-            "imagine being this cooked", "bro needs to lock in", "absolute cinema",
-            "bro is onto nothing", "who let him cook?", "i'm crashing out",
-            "bro lost his aura", "minus 1000 aura", "looksmaxxing final boss",
-            "is this physiquemaxxing?", "hawk tuah spit on that thing", "trippi troppi"
+            "no cap fr",
+            "on god",
+            "what the sigma?",
+            "blud is cooked",
+            "it's over for bro",
+            "skull emoji x7",
+            "vine boom sound effect",
+            "literally 1984",
+            "average ohio moment",
+            "L mans",
+            "W rizz",
+            "negative canthal tilt",
+            "bombastic side eye",
+            "criminal offensive side eye",
+            "bro thinks he's him",
+            "chat is this real?",
+            "type sh*t",
+            "i'm calling the opps",
+            "bro fell off",
+            "skill issue",
+            "L + ratio",
+            "imagine being this cooked",
+            "bro needs to lock in",
+            "absolute cinema",
+            "bro is onto nothing",
+            "who let him cook?",
+            "i'm crashing out",
+            "bro lost his aura",
+            "minus 1000 aura",
+            "looksmaxxing final boss",
+            "is this physiquemaxxing?",
+            "hawk tuah spit on that thing",
+            "trippi troppi",
         ]
 
         roll = random.random()
@@ -157,7 +278,9 @@ class RandomText(commands.Cog):
         return await self.get_brainrot()
 
     async def get_showerthought(self):
-        root = await self.fetch_rss("https://www.reddit.com/r/showerthoughts/top.rss?t=week&limit=25")
+        root = await self.fetch_rss(
+            "https://www.reddit.com/r/showerthoughts/top.rss?t=week&limit=25"
+        )
         if root is not None:
             entries = root.findall("{http://www.w3.org/2005/Atom}entry")
             random.shuffle(entries)
@@ -169,10 +292,12 @@ class RandomText(commands.Cog):
 
     async def get_dadjoke(self):
         try:
-            async with self.session.get("https://icanhazdadjoke.com/", headers={"Accept": "application/json"}) as r:
+            async with self.session.get(
+                "https://icanhazdadjoke.com/", headers={"Accept": "application/json"}
+            ) as r:
                 if r.status == 200:
                     js = await r.json()
-                    joke = js['joke']
+                    joke = js["joke"]
                     if await self.check_cache("dadjoke", joke):
                         return f"😂 **Dad Joke:**\n{joke}"
         except:
@@ -181,10 +306,12 @@ class RandomText(commands.Cog):
 
     async def get_fact(self):
         try:
-            async with self.session.get("https://uselessfacts.jsph.pl/random.json?language=en") as r:
+            async with self.session.get(
+                "https://uselessfacts.jsph.pl/random.json?language=en"
+            ) as r:
                 if r.status == 200:
                     js = await r.json()
-                    fact = js['text']
+                    fact = js["text"]
                     if await self.check_cache("fact", fact):
                         return f"🧠 **Fact:**\n{fact}"
         except:
@@ -192,7 +319,9 @@ class RandomText(commands.Cog):
         return None
 
     async def get_copypasta_text(self):
-        root = await self.fetch_rss("https://www.reddit.com/r/copypasta/new.rss?limit=25")
+        root = await self.fetch_rss(
+            "https://www.reddit.com/r/copypasta/new.rss?limit=25"
+        )
         if root is not None:
             entries = root.findall("{http://www.w3.org/2005/Atom}entry")
             random.shuffle(entries)
@@ -214,10 +343,16 @@ class RandomText(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message):
-        if message.author.bot: return
-        if not message.guild: return
+        if message.author.bot:
+            return
+        if not message.guild:
+            return
 
-        # SERVER WIDE CHECK
+        # IGNORE COMMAND MESSAGES (Prevents triggering on "randomtext settarget" calls)
+        ctx = await self.bot.get_context(message)
+        if ctx.valid:
+            return
+
         if not await self.config.guild(message.guild).enabled():
             return
 
@@ -229,23 +364,31 @@ class RandomText(commands.Cog):
         if current >= target:
             await self.trigger_random_text(message.channel)
             await self.config.guild(message.guild).counter.set(0)
+            # Randomize next target
             await self.config.guild(message.guild).target.set(random.randint(10, 100))
         else:
             await self.config.guild(message.guild).counter.set(current)
 
     async def trigger_random_text(self, channel):
-        options = [self.get_brainrot, self.get_showerthought, self.get_dadjoke, self.get_fact]
+        options = [
+            self.get_brainrot,
+            self.get_showerthought,
+            self.get_dadjoke,
+            self.get_fact,
+        ]
         func = random.choice(options)
+
         text = await func()
         if text is None:
             text = await self.get_brainrot()
+
         await self.send_split_message(channel, text)
 
     # --- COMMANDS ---
 
     @commands.group()
     @commands.guild_only()
-    @commands.admin_or_permissions(manage_guild=True) # Changed perms since it's server-wide
+    @commands.admin_or_permissions(manage_guild=True)
     async def randomtext(self, ctx):
         """Manage Server-Wide Random Text settings."""
         pass
@@ -259,15 +402,17 @@ class RandomText(commands.Cog):
         await ctx.send(f"✅ Random Text is now **{state}** for this server.")
 
     @randomtext.command()
-    async def force(self, ctx, messages: int):
-        """Set the number of messages required (Server-Wide) to trigger the next text."""
+    async def settarget(self, ctx, messages: int):
+        """Set the number of messages required to trigger the NEXT text."""
         if messages < 1:
             await ctx.send("❌ Number must be at least 1.")
             return
 
         await self.config.guild(ctx.guild).target.set(messages)
         await self.config.guild(ctx.guild).counter.set(0)
-        await ctx.send(f"✅ Next random text will trigger after **{messages}** messages (server-wide).")
+        await ctx.send(
+            f"✅ Counter reset! The next random text will trigger after **{messages}** chat messages."
+        )
 
     @commands.command()
     async def copypasta(self, ctx):
