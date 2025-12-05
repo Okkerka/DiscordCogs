@@ -1,5 +1,5 @@
 """
-ChatTriggers v5.7 - Security Fix
+ChatTriggers v5.8 - Optimized
 """
 
 import logging
@@ -20,6 +20,7 @@ log = logging.getLogger("red.chattriggers")
 EDIT_MODE = "edit"
 TOGGLE_MODE = "toggle"
 DELETE_MODE = "delete"
+MENU_TIMEOUT = 10
 
 
 class TriggerModal(discord.ui.Modal, title="Configure Trigger"):
@@ -217,7 +218,7 @@ class TriggerSelect(discord.ui.Select):
 
 
 class SecureView(discord.ui.View):
-    def __init__(self, cog, author: discord.User, timeout=60):
+    def __init__(self, cog, author: discord.User, timeout=MENU_TIMEOUT):
         super().__init__(timeout=timeout)
         self.cog = cog
         self.author = author
@@ -233,7 +234,7 @@ class SecureView(discord.ui.View):
 
 class MainView(SecureView):
     def __init__(self, cog, triggers, author, message=None):
-        super().__init__(cog=cog, author=author, timeout=60)
+        super().__init__(cog=cog, author=author, timeout=MENU_TIMEOUT)
         self.triggers = triggers
         self.message = message
 
@@ -457,9 +458,24 @@ class ChatTriggers(commands.Cog):
             return
 
         content = message.content.lower()
+
+        # Optimization: Calculate min/max trigger phrase lengths
+        active_triggers = {k: v for k, v in triggers.items() if v.get("active", True)}
+        if not active_triggers:
+            return
+
+        trigger_lengths = [len(phrase) for phrase in active_triggers.keys()]
+        min_trigger_len = min(trigger_lengths)
+        max_trigger_len = max(trigger_lengths)
+
+        # Skip if message is too short or too long to match any trigger
+        content_len = len(content)
+        if content_len < min_trigger_len or content_len > max_trigger_len * 10:
+            return
+
         matched_data = None
-        for phrase_key, data in triggers.items():
-            if phrase_key in content and data.get("active", True):
+        for phrase_key, data in active_triggers.items():
+            if phrase_key in content:
                 matched_data = data
                 break
 
