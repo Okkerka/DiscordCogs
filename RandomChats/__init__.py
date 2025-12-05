@@ -1,4 +1,4 @@
-from .randomtext import RandomText
+from .randomchats import RandomText
 
 
 async def setup(bot):
