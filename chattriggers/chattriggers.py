@@ -339,15 +339,16 @@ class ChatTriggers(commands.Cog):
                         f"ChatTrigger: User {user.name} not in VC, skipping audio."
                     )
                 else:
-                    player = lavalink.get_player(guild.id)
-
-                    if not player:
+                    try:
+                        player = lavalink.get_player(guild.id)
+                    except:
                         player = await lavalink.connect(target_vc)
-                    else:
-                        if player.is_playing:
-                            await player.stop()
-                        if player.channel.id != target_vc.id:
-                            await player.move_to(target_vc)
+
+                    if player.channel.id != target_vc.id:
+                        await player.move_to(target_vc)
+
+                    if player.is_playing:
+                        await player.stop()
 
                     results = await player.load_tracks(sound_url)
                     if results.tracks:
