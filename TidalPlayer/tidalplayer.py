@@ -79,7 +79,6 @@ FILTER_KEYWORDS = frozenset(
 TIDAL_TRACK_PATTERN = re.compile(r"tidal\.com/(?:browse/)?track/(\d+)")
 TIDAL_ALBUM_PATTERN = re.compile(r"tidal\.com/(?:browse/)?album/(\d+)")
 TIDAL_PLAYLIST_PATTERN = re.compile(r"tidal\.com/(?:browse/)?playlist/([a-f0-9-]+)")
-# Updated Mix Pattern: Mix IDs are usually hex strings
 TIDAL_MIX_PATTERN = re.compile(r"tidal\.com/(?:browse/)?mix/([a-f0-9]+)")
 
 SPOTIFY_PLAYLIST_PATTERN = re.compile(r"open\.spotify\.com/playlist/([a-zA-Z0-9]+)")
@@ -459,7 +458,7 @@ class TidalPlayer(commands.Cog):
         except Exception:
             return False
 
-    # UNIFIED LIST PROCESSOR
+    # UNIFIED LIST PROCESSOR (FIXED: Instant Stop)
     async def _process_track_list(
         self,
         ctx: commands.Context,
@@ -483,7 +482,13 @@ class TidalPlayer(commands.Cog):
 
         try:
             for i, item in enumerate(items, 1):
-                if i % 5 == 0 and await self.config.guild(ctx.guild).cancel_queue():
+                # FIX: Instant cancellation check + Player check
+                if await self.config.guild(ctx.guild).cancel_queue():
+                    break
+
+                # FIX: Stop if bot lost connection (allows >leave to stop queue)
+                player = await self._get_player(ctx)
+                if not player or not player.is_connected:
                     break
 
                 query = item_processor(item)
@@ -547,7 +552,6 @@ class TidalPlayer(commands.Cog):
             elif pm:
                 await self._handle_tidal_playlist(ctx, pm.group(1))
             elif mm:
-                # Use dedicated Mix handler, do NOT route to playlist
                 await self._handle_tidal_mix(ctx, mm.group(1))
             else:
                 await ctx.send(
@@ -596,7 +600,6 @@ class TidalPlayer(commands.Cog):
 
     async def _handle_tidal_mix(self, ctx: commands.Context, mid: str) -> None:
         try:
-            # Use specific session.mix() method to avoid 404 from playlist endpoint
             if hasattr(self.session, "mix"):
                 mix = await self.bot.loop.run_in_executor(None, self.session.mix, mid)
             else:
@@ -609,7 +612,6 @@ class TidalPlayer(commands.Cog):
                 await ctx.send(Messages.ERROR_CONTENT_UNAVAILABLE)
                 return
 
-            # Mix items are retrieved via .items() in newer tidalapi
             tracks = await self.bot.loop.run_in_executor(None, mix.items)
             await self._process_track_list(
                 ctx, tracks, f"Mix: {mid}", lambda t: t, discord.Color.purple()
