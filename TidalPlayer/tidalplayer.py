@@ -1,5 +1,6 @@
 """
 TidalPlayer - Tidal music integration for Red Discord Bot
+Optimized for Performance and Reliability
 """
 
 import asyncio
@@ -78,6 +79,9 @@ FILTER_KEYWORDS = frozenset(
 TIDAL_TRACK_PATTERN = re.compile(r"tidal\.com/(?:browse/)?track/(\d+)")
 TIDAL_ALBUM_PATTERN = re.compile(r"tidal\.com/(?:browse/)?album/(\d+)")
 TIDAL_PLAYLIST_PATTERN = re.compile(r"tidal\.com/(?:browse/)?playlist/([a-f0-9-]+)")
+# NEW: Regex for Mixes
+TIDAL_MIX_PATTERN = re.compile(r"tidal\.com/(?:browse/)?mix/([a-f0-9]+)")
+
 SPOTIFY_PLAYLIST_PATTERN = re.compile(r"open\.spotify\.com/playlist/([a-zA-Z0-9]+)")
 YOUTUBE_PLAYLIST_PATTERN = re.compile(r"youtube\.com/.*[?&]list=([a-zA-Z0-9_-]+)")
 
@@ -341,7 +345,6 @@ class TidalPlayer(commands.Cog):
                 )
                 tracks = result.get("tracks", [])
 
-                # Check config directly
                 if (
                     await self.config.guild_from_id(guild_id).filter_remixes()
                     and tracks
@@ -529,16 +532,13 @@ class TidalPlayer(commands.Cog):
 
         try:
             for i, item in enumerate(items, 1):
-                # Check cancellation
                 if i % 5 == 0 and await self.config.guild(ctx.guild).cancel_queue():
                     break
 
-                # Get query from item
                 query = item_processor(item)
 
                 success = False
                 if query:
-                    # If it's a Tidal object, play directly, else search
                     if hasattr(query, "get_url"):
                         success = await self._play(ctx, query, show_embed=False)
                     else:
@@ -549,7 +549,6 @@ class TidalPlayer(commands.Cog):
                 else:
                     skipped += 1
 
-                # Update progress
                 if i - last_up >= BATCH_UPDATE_INTERVAL or i == total:
                     try:
                         embed = discord.Embed(
@@ -587,6 +586,7 @@ class TidalPlayer(commands.Cog):
         tm = TIDAL_TRACK_PATTERN.search(url)
         am = TIDAL_ALBUM_PATTERN.search(url)
         pm = TIDAL_PLAYLIST_PATTERN.search(url)
+        mm = TIDAL_MIX_PATTERN.search(url)
 
         try:
             if tm:
@@ -595,6 +595,9 @@ class TidalPlayer(commands.Cog):
                 await self._handle_tidal_album(ctx, am.group(1))
             elif pm:
                 await self._handle_tidal_playlist(ctx, pm.group(1))
+            elif mm:
+                # Mixes are often handled as playlists in the API
+                await self._handle_tidal_playlist(ctx, mm.group(1))
             else:
                 await ctx.send(
                     Messages.ERROR_INVALID_URL.format(
@@ -621,8 +624,6 @@ class TidalPlayer(commands.Cog):
                 await ctx.send(Messages.ERROR_CONTENT_UNAVAILABLE)
                 return
             tracks = await self.bot.loop.run_in_executor(None, alb.tracks)
-
-            # Identity lambda because tracks are already Tidal objects
             await self._process_track_list(
                 ctx, tracks, alb.name, lambda t: t, discord.Color.blue()
             )
@@ -636,7 +637,6 @@ class TidalPlayer(commands.Cog):
                 await ctx.send(Messages.ERROR_CONTENT_UNAVAILABLE)
                 return
             tracks = await self.bot.loop.run_in_executor(None, pl.tracks)
-
             await self._process_track_list(
                 ctx, tracks, pl.name, lambda t: t, discord.Color.blue()
             )
