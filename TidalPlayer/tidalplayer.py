@@ -79,7 +79,7 @@ FILTER_KEYWORDS = frozenset(
 TIDAL_TRACK_PATTERN = re.compile(r"tidal\.com/(?:browse/)?track/(\d+)")
 TIDAL_ALBUM_PATTERN = re.compile(r"tidal\.com/(?:browse/)?album/(\d+)")
 TIDAL_PLAYLIST_PATTERN = re.compile(r"tidal\.com/(?:browse/)?playlist/([a-f0-9-]+)")
-# NEW: Regex for Mixes
+# Updated Mix Pattern: Mix IDs are usually hex strings
 TIDAL_MIX_PATTERN = re.compile(r"tidal\.com/(?:browse/)?mix/([a-f0-9]+)")
 
 SPOTIFY_PLAYLIST_PATTERN = re.compile(r"open\.spotify\.com/playlist/([a-zA-Z0-9]+)")
@@ -459,55 +459,6 @@ class TidalPlayer(commands.Cog):
         except Exception:
             return False
 
-    # ... INTERACTIVE & PLAYLISTS ...
-
-    async def _interactive_select(
-        self, ctx: commands.Context, tracks: List[Any]
-    ) -> Optional[Any]:
-        if not tracks:
-            return None
-
-        to_show = min(5, len(tracks))
-        lines = [
-            f"{REACTION_NUMBERS[i]} **{t.name}** - {t.artist.name}"
-            for i, t in enumerate(tracks[:to_show])
-        ]
-
-        embed = discord.Embed(
-            title="Search Results",
-            description="\n".join(lines),
-            color=discord.Color.blue(),
-        )
-        embed.set_footer(text=Messages.STATUS_CHOOSE_TRACK.format(cancel=CANCEL_EMOJI))
-
-        msg = await ctx.send(embed=embed)
-
-        await asyncio.gather(
-            *(msg.add_reaction(r) for r in REACTION_NUMBERS[:to_show]),
-            msg.add_reaction(CANCEL_EMOJI),
-        )
-
-        def check(r, u):
-            return (
-                u == ctx.author
-                and r.message.id == msg.id
-                and str(r.emoji) in REACTION_NUMBERS[:to_show] + (CANCEL_EMOJI,)
-            )
-
-        try:
-            r, _ = await self.bot.wait_for(
-                "reaction_add", check=check, timeout=INTERACTIVE_TIMEOUT
-            )
-            await msg.delete()
-            if str(r.emoji) == CANCEL_EMOJI:
-                await ctx.send("Cancelled.")
-                return None
-            return tracks[REACTION_NUMBERS.index(str(r.emoji))]
-        except asyncio.TimeoutError:
-            await msg.delete()
-            await ctx.send(Messages.ERROR_TIMEOUT)
-            return None
-
     # UNIFIED LIST PROCESSOR
     async def _process_track_list(
         self,
@@ -596,8 +547,8 @@ class TidalPlayer(commands.Cog):
             elif pm:
                 await self._handle_tidal_playlist(ctx, pm.group(1))
             elif mm:
-                # Mixes are often handled as playlists in the API
-                await self._handle_tidal_playlist(ctx, mm.group(1))
+                # Use dedicated Mix handler, do NOT route to playlist
+                await self._handle_tidal_mix(ctx, mm.group(1))
             else:
                 await ctx.send(
                     Messages.ERROR_INVALID_URL.format(
@@ -641,6 +592,31 @@ class TidalPlayer(commands.Cog):
                 ctx, tracks, pl.name, lambda t: t, discord.Color.blue()
             )
         except Exception:
+            await ctx.send(Messages.ERROR_API_TIMEOUT)
+
+    async def _handle_tidal_mix(self, ctx: commands.Context, mid: str) -> None:
+        try:
+            # Use specific session.mix() method to avoid 404 from playlist endpoint
+            if hasattr(self.session, "mix"):
+                mix = await self.bot.loop.run_in_executor(None, self.session.mix, mid)
+            else:
+                await ctx.send(
+                    "Your `tidalapi` version might be too old to support Mixes. Try `pip install -U tidalapi`."
+                )
+                return
+
+            if not mix:
+                await ctx.send(Messages.ERROR_CONTENT_UNAVAILABLE)
+                return
+
+            # Mix items are retrieved via .items() in newer tidalapi
+            tracks = await self.bot.loop.run_in_executor(None, mix.items)
+            await self._process_track_list(
+                ctx, tracks, f"Mix: {mid}", lambda t: t, discord.Color.purple()
+            )
+
+        except Exception as e:
+            log.error(f"Mix fetch error: {e}")
             await ctx.send(Messages.ERROR_API_TIMEOUT)
 
     async def _queue_spotify_playlist(self, ctx: commands.Context, pl_id: str) -> None:
