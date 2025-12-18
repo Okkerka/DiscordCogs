@@ -6,7 +6,7 @@ Optimized for Performance and Reliability
 import asyncio
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 from typing import Any, Callable, Dict, List, Optional, TypedDict
 
@@ -210,10 +210,13 @@ class TidalPlayer(commands.Cog):
         self.api_semaphore = asyncio.Semaphore(API_SEMAPHORE_LIMIT)
 
         self._track_meta_cache: Dict[str, TrackMeta] = {}
+        self._refresh_task = self.bot.loop.create_task(self._auto_refresh_tokens())
 
         self.bot.loop.create_task(self._initialize_apis())
 
     def cog_unload(self) -> None:
+        if self._refresh_task:
+            self._refresh_task.cancel()
         self._track_meta_cache.clear()
         log.info("TidalPlayer cog unloaded")
 
@@ -281,6 +284,32 @@ class TidalPlayer(commands.Cog):
         except Exception:
             self.yt = None
 
+    async def _auto_refresh_tokens(self):
+        """Background task to keep Tidal session alive."""
+        await self.bot.wait_until_ready()
+        while True:
+            await asyncio.sleep(3600)  # Check every hour
+            if self.session and self.session.check_login():
+                # If expiry is within next 2 hours, refresh
+                if (
+                    self.session.expiry_time
+                    and datetime.now() + timedelta(hours=2) > self.session.expiry_time
+                ):
+                    try:
+                        # Attempt refresh (tidalapi handles this internally usually, but force load updates config)
+                        # We just save the new tokens if they changed
+                        await self.config.token_type.set(self.session.token_type)
+                        await self.config.access_token.set(self.session.access_token)
+                        await self.config.refresh_token.set(self.session.refresh_token)
+                        await self.config.expiry_time.set(
+                            int(self.session.expiry_time.timestamp())
+                            if self.session.expiry_time
+                            else None
+                        )
+                        log.info("Tidal tokens auto-refreshed")
+                    except Exception as e:
+                        log.error(f"Token refresh failed: {e}")
+
     # ... HELPERS ...
 
     def _extract_meta(self, track: Any) -> TrackMeta:
@@ -342,7 +371,12 @@ class TidalPlayer(commands.Cog):
                 result = await self.bot.loop.run_in_executor(
                     None, self.session.search, query
                 )
-                tracks = result.get("tracks", [])
+
+                # Handle both Dictionary (old) and Object (new) return types
+                if hasattr(result, "tracks"):
+                    tracks = result.tracks
+                else:
+                    tracks = result.get("tracks", [])
 
                 if (
                     await self.config.guild_from_id(guild_id).filter_remixes()
@@ -352,6 +386,7 @@ class TidalPlayer(commands.Cog):
 
                 return tracks
             except Exception as e:
+                log.error(f"Search error: {e}")
                 raise APIError(f"Search failed: {e}")
 
     async def _get_track_url(self, track: Any) -> Optional[str]:
@@ -458,7 +493,7 @@ class TidalPlayer(commands.Cog):
         except Exception:
             return False
 
-    # UNIFIED LIST PROCESSOR (FIXED: Instant Stop)
+    # UNIFIED LIST PROCESSOR
     async def _process_track_list(
         self,
         ctx: commands.Context,
@@ -482,11 +517,9 @@ class TidalPlayer(commands.Cog):
 
         try:
             for i, item in enumerate(items, 1):
-                # FIX: Instant cancellation check + Player check
                 if await self.config.guild(ctx.guild).cancel_queue():
                     break
 
-                # FIX: Stop if bot lost connection (allows >leave to stop queue)
                 player = await self._get_player(ctx)
                 if not player or not player.is_connected:
                     break

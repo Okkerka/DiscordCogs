@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 import discord
 from redbot.core import Config, commands
+from redbot.core.bot import Red
 
 log = logging.getLogger("red.grokcog")
 
@@ -107,7 +108,8 @@ class APIRequestQueue:
                 coro, future = await self.queue.get()
                 await self.cog._respect_api_rate_limits()
                 try:
-                    result = await coro
+                    # Added Timeout to prevent hanging threads if Groq stalls
+                    result = await asyncio.wait_for(coro, timeout=60)
                     if not future.done():
                         future.set_result(result)
                 except Exception as e:
@@ -243,6 +245,13 @@ class GrokCog(commands.Cog):
         if not question or not question.strip():
             return False
 
+        # FIX: Check API Key presence early and warn
+        if not await self.config.api_key():
+            await channel.send(
+                "⚠️ **Configuration Error:** API Key is not set. Use `[p]grok admin apikey`."
+            )
+            return False
+
         if guild_id:
             guild_config = self.config.guild_from_id(guild_id)
             if not await guild_config.enabled():
@@ -304,7 +313,8 @@ class GrokCog(commands.Cog):
                         raise ValueError("⏱️ Rate limit reached.")
 
                     if resp.status != 200:
-                        raise ValueError(f"⛔ Groq error {resp.status}")
+                        err_text = await resp.text()
+                        raise ValueError(f"⛔ Groq error {resp.status}: {err_text}")
 
                     data = await resp.json()
                     content = (
@@ -477,17 +487,12 @@ class GrokCog(commands.Cog):
             if source_text:
                 embed.add_field(name="Sources", value=source_text[:1024], inline=False)
 
-        embed.set_footer(
-            text="Powered by 2 Romanian kids • Retardation only (fact-checks)"
-        )
+        embed.set_footer(text=f"Model: {DEFAULT_MODEL} • Fact-Checked")
         return embed
 
     @commands.Cog.listener()
     async def on_message(self, msg: discord.Message):
         if msg.author.bot or not self._ready.is_set():
-            return
-
-        if not await self.config.api_key():
             return
 
         # Check for Reply Context FIRST
