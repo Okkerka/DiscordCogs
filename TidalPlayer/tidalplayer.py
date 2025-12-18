@@ -14,6 +14,7 @@ import discord
 from redbot.core import Config, commands
 from redbot.core.bot import Red
 
+# --- Dependency Checks ---
 try:
     import lavalink
 
@@ -24,9 +25,17 @@ except ImportError:
 try:
     import tidalapi
 
+    # Attempt to import media models for v0.7+ compatibility
+    try:
+        from tidalapi.media import Album, Playlist, Track
+
+        TIDAL_MODELS_AVAILABLE = True
+    except ImportError:
+        TIDAL_MODELS_AVAILABLE = False
     TIDALAPI_AVAILABLE = True
 except ImportError:
     TIDALAPI_AVAILABLE = False
+    TIDAL_MODELS_AVAILABLE = False
 
 try:
     from googleapiclient.discovery import build
@@ -45,6 +54,7 @@ except ImportError:
 
 log = logging.getLogger("red.tidalplayer")
 
+# --- Constants ---
 COG_IDENTIFIER = 160819386
 MAX_CACHE_SIZE = 500
 API_SEMAPHORE_LIMIT = 5
@@ -321,12 +331,14 @@ class TidalPlayer(commands.Cog):
         ]
 
     def _extract_tracks_from_result(self, result: Any) -> List[Any]:
+        # Handle v0.7+ SearchResult object
         if hasattr(result, "tracks"):
             t = result.tracks
             return (
                 t.items if hasattr(t, "items") else (t if isinstance(t, list) else [])
             )
 
+        # Handle dictionary
         if isinstance(result, dict):
             t = result.get("tracks", [])
             return (
@@ -356,9 +368,13 @@ class TidalPlayer(commands.Cog):
     async def _search_tidal(self, query: str, guild_id: int) -> List[Any]:
         async with self.api_semaphore:
             try:
-                result = await self.bot.loop.run_in_executor(
-                    None, lambda: self.session.search(query)
-                )
+                # Force "Track" model search for v0.7+ if available
+                if TIDAL_MODELS_AVAILABLE and "Track" in globals():
+                    search_func = lambda: self.session.search(query, models=[Track])
+                else:
+                    search_func = lambda: self.session.search(query)
+
+                result = await self.bot.loop.run_in_executor(None, search_func)
                 tracks = self._extract_tracks_from_result(result)
 
                 if await self.config.guild_from_id(guild_id).filter_remixes():
@@ -367,7 +383,13 @@ class TidalPlayer(commands.Cog):
                 return tracks
             except Exception as e:
                 log.error(f"Search failed: {e}")
-                raise APIError(f"Search failed: {e}")
+                # Fallback to generic search if strict model search fails
+                try:
+                    search_func = lambda: self.session.search(query)
+                    result = await self.bot.loop.run_in_executor(None, search_func)
+                    return self._extract_tracks_from_result(result)
+                except:
+                    raise APIError(f"Search failed: {e}")
 
     async def _get_track_url(self, track: Any) -> Optional[str]:
         if hasattr(track, "id"):
