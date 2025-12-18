@@ -25,9 +25,17 @@ except ImportError:
 try:
     import tidalapi
 
+    # Try to import media models for modern tidalapi (v0.7+)
+    try:
+        from tidalapi.media import Album, Playlist, Track
+
+        TIDAL_MODELS_AVAILABLE = True
+    except ImportError:
+        TIDAL_MODELS_AVAILABLE = False
     TIDALAPI_AVAILABLE = True
 except ImportError:
     TIDALAPI_AVAILABLE = False
+    TIDAL_MODELS_AVAILABLE = False
 
 try:
     from googleapiclient.discovery import build
@@ -365,25 +373,33 @@ class TidalPlayer(commands.Cog):
     async def _search_tidal(self, query: str, guild_id: int) -> List[Any]:
         async with self.api_semaphore:
             try:
-                # FIX: Explicitly search for tracks to avoid empty results for ambiguous queries
-                # Attempt to import Track model for specific filtering (Newer tidalapi)
-                try:
-                    from tidalapi.media import Track
-
-                    result = await self.bot.loop.run_in_executor(
-                        None, lambda: self.session.search(query, models=[Track])
-                    )
-                except (ImportError, TypeError, AttributeError):
-                    # Fallback for older versions or if models arg is not supported
-                    result = await self.bot.loop.run_in_executor(
-                        None, lambda: self.session.search(query, "track")
-                    )
-
-                # Handle both Dictionary (old) and Object (new) return types
-                if hasattr(result, "tracks"):
-                    tracks = result.tracks
+                # LOGIC FIX: Explicitly check if we can use modern 'models' param
+                if TIDAL_MODELS_AVAILABLE and "Track" in globals():
+                    # Modern tidalapi: use models=[Track] to force song search
+                    search_func = lambda: self.session.search(query, models=[Track])
                 else:
+                    # Fallback/Old tidalapi: use string 'track'
+                    search_func = lambda: self.session.search(query, "track")
+
+                result = await self.bot.loop.run_in_executor(None, search_func)
+
+                # Handling Different Result Structures (Robustness Fix)
+                tracks = []
+
+                # Case 1: Result is a dictionary (newer versions sometimes return dict of lists)
+                if isinstance(result, dict):
                     tracks = result.get("tracks", [])
+                    # Special case: 'top_hit' might be better
+                    if not tracks and "top_hit" in result:
+                        tracks = [result["top_hit"]]
+
+                # Case 2: Result is an Object (SearchResponse) with .tracks attribute
+                elif hasattr(result, "tracks"):
+                    tracks = result.tracks
+
+                # Case 3: Result IS the list (older versions)
+                elif isinstance(result, list):
+                    tracks = result
 
                 if (
                     await self.config.guild_from_id(guild_id).filter_remixes()
