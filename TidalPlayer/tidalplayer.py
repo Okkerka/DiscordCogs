@@ -317,26 +317,20 @@ class TidalPlayer(commands.Cog):
         return filtered if filtered else tracks
 
     def _extract_tracks_from_result(self, result: Any) -> List[Any]:
-        """Safely extracts a list of tracks from various result types."""
-        # 1. Handle objects with a 'tracks' attribute (common in v0.7+)
         if hasattr(result, "tracks"):
             t = result.tracks
-            # If result.tracks is itself a list, return it
             if isinstance(t, list):
                 return t
-            # If result.tracks is a SearchResult object with .items (v0.7.0+)
             if hasattr(t, "items"):
                 return t.items
             return []
 
-        # 2. Handle dictionary results (older versions or raw responses)
         if isinstance(result, dict):
             t = result.get("tracks", [])
             if hasattr(t, "items"):
                 return t.items
             return t if isinstance(t, list) else []
 
-        # 3. Handle direct list (very old versions)
         if isinstance(result, list):
             return result
 
@@ -359,13 +353,9 @@ class TidalPlayer(commands.Cog):
 
     @async_retry(exceptions=(APIError, asyncio.TimeoutError))
     async def _search_tidal(self, query: str, guild_id: int) -> List[Any]:
-        """Performs a broad search compatible with all tidalapi versions."""
         async with self.api_semaphore:
             try:
-                # REVERTED OPTIMIZATION:
-                # We do NOT pass 'models' or 'type' here. Passing 'models=[Track]' failed due to
-                # import availability, and passing 'track' failed due to type validation errors
-                # on strict v0.7+ installs. The safest method is the default broad search.
+                # Optimized for stability: use broad search
                 search_func = lambda: self.session.search(query)
 
                 result = await self.bot.loop.run_in_executor(None, search_func)
@@ -383,8 +373,14 @@ class TidalPlayer(commands.Cog):
                 raise APIError(f"Search failed: {e}")
 
     async def _get_track_url(self, track: Any) -> Optional[str]:
+        # FIX: Return standard Tidal URL instead of internal stream URL.
+        # This lets Lavalink handle resolution via its Source Managers.
         try:
-            return await self.bot.loop.run_in_executor(None, track.get_url)
+            if hasattr(track, "id"):
+                return f"https://tidal.com/browse/track/{track.id}"
+            if hasattr(track, "url"):
+                return track.url
+            return None
         except Exception:
             return None
 
@@ -419,6 +415,7 @@ class TidalPlayer(commands.Cog):
                 return False
 
             try:
+                # Load via Lavalink (it will handle the Tidal URL)
                 results = await player.load_tracks(url)
             except Exception:
                 return False
