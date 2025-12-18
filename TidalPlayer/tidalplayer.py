@@ -24,16 +24,9 @@ except ImportError:
 try:
     import tidalapi
 
-    try:
-        from tidalapi.media import Album, Playlist, Track
-
-        TIDAL_MODELS_AVAILABLE = True
-    except ImportError:
-        TIDAL_MODELS_AVAILABLE = False
     TIDALAPI_AVAILABLE = True
 except ImportError:
     TIDALAPI_AVAILABLE = False
-    TIDAL_MODELS_AVAILABLE = False
 
 try:
     from googleapiclient.discovery import build
@@ -324,12 +317,29 @@ class TidalPlayer(commands.Cog):
         return filtered if filtered else tracks
 
     def _extract_tracks_from_result(self, result: Any) -> List[Any]:
+        """Safely extracts a list of tracks from various result types."""
+        # 1. Handle objects with a 'tracks' attribute (common in v0.7+)
         if hasattr(result, "tracks"):
-            return result.tracks
+            t = result.tracks
+            # If result.tracks is itself a list, return it
+            if isinstance(t, list):
+                return t
+            # If result.tracks is a SearchResult object with .items (v0.7.0+)
+            if hasattr(t, "items"):
+                return t.items
+            return []
+
+        # 2. Handle dictionary results (older versions or raw responses)
         if isinstance(result, dict):
-            return result.get("tracks", [])
+            t = result.get("tracks", [])
+            if hasattr(t, "items"):
+                return t.items
+            return t if isinstance(t, list) else []
+
+        # 3. Handle direct list (very old versions)
         if isinstance(result, list):
             return result
+
         return []
 
     async def _get_player(self, ctx: commands.Context) -> Optional[Any]:
@@ -349,47 +359,28 @@ class TidalPlayer(commands.Cog):
 
     @async_retry(exceptions=(APIError, asyncio.TimeoutError))
     async def _search_tidal(self, query: str, guild_id: int) -> List[Any]:
+        """Performs a broad search compatible with all tidalapi versions."""
         async with self.api_semaphore:
-            tracks = []
-
-            if TIDAL_MODELS_AVAILABLE and "Track" in globals():
-                try:
-                    result = await self.bot.loop.run_in_executor(
-                        None, lambda: self.session.search(query, models=[Track])
-                    )
-                    tracks = self._extract_tracks_from_result(result)
-                    if tracks:
-                        if await self.config.guild_from_id(guild_id).filter_remixes():
-                            return self._filter_tracks(tracks)
-                        return tracks
-                except Exception as e:
-                    log.info(f"Strategy 1 (Models) failed: {e}")
-
             try:
-                result = await self.bot.loop.run_in_executor(
-                    None, lambda: self.session.search(query, "track")
-                )
-                tracks = self._extract_tracks_from_result(result)
-                if tracks:
-                    if await self.config.guild_from_id(guild_id).filter_remixes():
-                        return self._filter_tracks(tracks)
-                    return tracks
-            except Exception as e:
-                log.info(f"Strategy 2 (String) failed: {e}")
+                # REVERTED OPTIMIZATION:
+                # We do NOT pass 'models' or 'type' here. Passing 'models=[Track]' failed due to
+                # import availability, and passing 'track' failed due to type validation errors
+                # on strict v0.7+ installs. The safest method is the default broad search.
+                search_func = lambda: self.session.search(query)
 
-            try:
-                result = await self.bot.loop.run_in_executor(
-                    None, lambda: self.session.search(query)
-                )
+                result = await self.bot.loop.run_in_executor(None, search_func)
                 tracks = self._extract_tracks_from_result(result)
-                if tracks:
-                    if await self.config.guild_from_id(guild_id).filter_remixes():
-                        return self._filter_tracks(tracks)
-                    return tracks
-            except Exception as e:
-                log.error(f"All search strategies failed: {e}")
 
-            return []
+                if (
+                    await self.config.guild_from_id(guild_id).filter_remixes()
+                    and tracks
+                ):
+                    tracks = self._filter_tracks(tracks)
+
+                return tracks
+            except Exception as e:
+                log.error(f"Search failed: {e}")
+                raise APIError(f"Search failed: {e}")
 
     async def _get_track_url(self, track: Any) -> Optional[str]:
         try:
@@ -437,13 +428,11 @@ class TidalPlayer(commands.Cog):
 
             track = results.tracks[0]
 
-            # === METADATA MUTATION ===
             track.title = truncate(meta["title"], 100)
             if meta.get("album"):
                 track.author = f"{meta['artist']} - {meta['album']}"
             else:
                 track.author = meta["artist"]
-            # =========================
 
             player.add(ctx.author, track)
 
@@ -499,7 +488,7 @@ class TidalPlayer(commands.Cog):
         ctx: commands.Context,
         items: List[Any],
         name: str,
-        item_processor: Callable[[Any], str],  # Returns query or None if skipped
+        item_processor: Callable[[Any], str],
         color: discord.Color = discord.Color.blue(),
     ) -> None:
         total = len(items)
