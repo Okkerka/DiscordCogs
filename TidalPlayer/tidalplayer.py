@@ -1,6 +1,6 @@
 """
 TidalPlayer - Tidal music integration for Red Discord Bot
-Restored "Direct Stream" Logic with YouTube Fallback
+Strict High-Quality Mode (No YouTube Fallback)
 """
 
 import asyncio
@@ -104,12 +104,9 @@ class Messages:
     ERROR_NO_TRACKS_FOUND = "No tracks found."
     ERROR_INVALID_URL = "Invalid {platform} {content_type} URL"
     ERROR_CONTENT_UNAVAILABLE = "Content unavailable (private/region-locked)"
-    ERROR_LAVALINK_FAILED = (
-        "Playback failed (Tidal rejected stream & YouTube fallback failed)."
-    )
+    ERROR_LAVALINK_FAILED = "Playback failed: Could not retrieve Tidal stream."
 
     STATUS_PLAYING = "Playing from Tidal"
-    STATUS_PLAYING_FALLBACK = "Playing from YouTube (Tidal Fallback)"
     PROGRESS_QUEUEING = "Queueing {name} ({count} tracks)..."
     STATUS_STOPPING = "Stopping playlist queueing..."
 
@@ -319,17 +316,25 @@ class TidalPlayer(commands.Cog):
 
     async def _get_direct_stream_url(self, track: Any) -> Optional[str]:
         """Try to get the direct audio stream URL from Tidal."""
+        # 1. Try v0.7+ method (may require active session/login)
         try:
-            # v0.7+ method
             return await self.bot.loop.run_in_executor(None, track.get_url)
         except:
-            # Fallback/Legacy method
-            try:
-                return await self.bot.loop.run_in_executor(
-                    None, lambda: self.session.track.get_url(track.id)
-                )
-            except:
-                return None
+            pass
+
+        # 2. Try Fallback/Legacy method (manual session ID)
+        try:
+            return await self.bot.loop.run_in_executor(
+                None, lambda: self.session.track.get_url(track.id)
+            )
+        except:
+            pass
+
+        # 3. Last Resort: Web URL (Lavalink needs plugin for this)
+        if hasattr(track, "id"):
+            return f"https://tidal.com/browse/track/{track.id}"
+
+        return None
 
     async def _load_and_queue_track(
         self, ctx: commands.Context, tidal_track: Any, show_embed: bool = True
@@ -341,30 +346,19 @@ class TidalPlayer(commands.Cog):
             await ctx.send(Messages.ERROR_NO_PLAYER)
             return False
 
-        # 1. Try Direct Stream (Tidal)
+        # Try to get stream/URL
         stream_url = await self._get_direct_stream_url(tidal_track)
         loaded_track = None
-        is_fallback = False
 
         if stream_url:
             try:
                 results = await player.load_tracks(stream_url)
                 if results and results.tracks:
                     loaded_track = results.tracks[0]
-            except Exception:
-                pass
+            except Exception as e:
+                log.error(f"Lavalink load failed: {e}")
 
-        # 2. Fallback: YouTube Search
-        if not loaded_track:
-            is_fallback = True
-            yt_query = f"ytsearch:{meta['artist']} - {meta['title']}"
-            try:
-                results = await player.load_tracks(yt_query)
-                if results and results.tracks:
-                    loaded_track = results.tracks[0]
-            except Exception:
-                pass
-
+        # If strict mode fails, we stop here. No YouTube fallback.
         if not loaded_track:
             await ctx.send(Messages.ERROR_LAVALINK_FAILED)
             return False
@@ -382,29 +376,23 @@ class TidalPlayer(commands.Cog):
             await player.play()
 
         if show_embed:
-            await self._send_now_playing(ctx, meta, is_fallback)
+            await self._send_now_playing(ctx, meta)
 
         return True
 
-    async def _send_now_playing(
-        self, ctx: commands.Context, meta: TrackMeta, fallback: bool
-    ) -> None:
+    async def _send_now_playing(self, ctx: commands.Context, meta: TrackMeta) -> None:
         desc = f"**{meta['title']}**\n{meta['artist']}"
         if meta.get("album"):
             desc += f"\n_{meta['album']}_"
 
-        title = (
-            Messages.STATUS_PLAYING_FALLBACK if fallback else Messages.STATUS_PLAYING
+        embed = discord.Embed(
+            title=Messages.STATUS_PLAYING, description=desc, color=discord.Color.blue()
         )
-        color = discord.Color.red() if fallback else discord.Color.blue()
-
-        embed = discord.Embed(title=title, description=desc, color=color)
-        if not fallback:
-            embed.add_field(
-                name="Quality",
-                value=QUALITY_LABELS.get(meta["quality"], "LOSSLESS"),
-                inline=True,
-            )
+        embed.add_field(
+            name="Quality",
+            value=QUALITY_LABELS.get(meta["quality"], "LOSSLESS"),
+            inline=True,
+        )
         embed.set_footer(text=f"Duration: {self._format_duration(meta['duration'])}")
 
         await ctx.send(embed=embed)
@@ -625,6 +613,7 @@ class TidalPlayer(commands.Cog):
     # --- Commands ---
     @commands.command(name="tplay")
     async def tplay(self, ctx: commands.Context, *, query: str) -> None:
+        """Play a track, album, playlist, or search query."""
         if not await self._check_ready(ctx):
             return
 
