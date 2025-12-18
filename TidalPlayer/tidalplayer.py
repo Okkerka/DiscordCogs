@@ -355,7 +355,7 @@ class TidalPlayer(commands.Cog):
     async def _search_tidal(self, query: str, guild_id: int) -> List[Any]:
         async with self.api_semaphore:
             try:
-                # Optimized for stability: use broad search
+                # Optimized search: Default to broad search to avoid "invalid type" errors
                 search_func = lambda: self.session.search(query)
 
                 result = await self.bot.loop.run_in_executor(None, search_func)
@@ -373,16 +373,26 @@ class TidalPlayer(commands.Cog):
                 raise APIError(f"Search failed: {e}")
 
     async def _get_track_url(self, track: Any) -> Optional[str]:
-        # FIX: Return standard Tidal URL instead of internal stream URL.
-        # This lets Lavalink handle resolution via its Source Managers.
-        try:
-            if hasattr(track, "id"):
-                return f"https://tidal.com/browse/track/{track.id}"
-            if hasattr(track, "url"):
-                return track.url
-            return None
-        except Exception:
-            return None
+        # 1. Try Native get_url (Most accurate if object supports it)
+        if hasattr(track, "get_url"):
+            try:
+                return await self.bot.loop.run_in_executor(None, track.get_url)
+            except Exception:
+                pass
+
+        # 2. Try URL attribute
+        if hasattr(track, "url"):
+            return track.url
+
+        # 3. Construct URL from ID (Fallback)
+        if hasattr(track, "id"):
+            return f"https://tidal.com/browse/track/{track.id}"
+
+        # 4. Dictionary ID Fallback
+        if isinstance(track, dict) and "id" in track:
+            return f"https://tidal.com/browse/track/{track['id']}"
+
+        return None
 
     async def _check_ready(self, ctx: commands.Context) -> bool:
         if not TIDALAPI_AVAILABLE:
@@ -407,6 +417,7 @@ class TidalPlayer(commands.Cog):
             url = await self._get_track_url(tidal_track)
 
             if not url:
+                log.warning(f"Failed to generate URL for track: {meta.get('title')}")
                 return False
 
             player = await self._get_player(ctx)
@@ -415,12 +426,13 @@ class TidalPlayer(commands.Cog):
                 return False
 
             try:
-                # Load via Lavalink (it will handle the Tidal URL)
                 results = await player.load_tracks(url)
-            except Exception:
+            except Exception as e:
+                log.error(f"Lavalink load_tracks error: {e}")
                 return False
 
             if not results or not results.tracks:
+                log.warning(f"Lavalink found no matches for URL: {url}")
                 return False
 
             track = results.tracks[0]
@@ -446,7 +458,7 @@ class TidalPlayer(commands.Cog):
             return True
 
         except Exception as e:
-            log.error(f"Queue error: {e}", exc_info=True)
+            log.error(f"Queue error in _load_and_queue_track: {e}", exc_info=True)
             return False
 
     async def _send_now_playing(self, ctx: commands.Context, meta: TrackMeta) -> None:
