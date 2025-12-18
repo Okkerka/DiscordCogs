@@ -14,7 +14,6 @@ import discord
 from redbot.core import Config, commands
 from redbot.core.bot import Red
 
-# Optional Dependencies
 try:
     import lavalink
 
@@ -25,9 +24,16 @@ except ImportError:
 try:
     import tidalapi
 
+    try:
+        from tidalapi.media import Album, Playlist, Track
+
+        TIDAL_MODELS_AVAILABLE = True
+    except ImportError:
+        TIDAL_MODELS_AVAILABLE = False
     TIDALAPI_AVAILABLE = True
 except ImportError:
     TIDALAPI_AVAILABLE = False
+    TIDAL_MODELS_AVAILABLE = False
 
 try:
     from googleapiclient.discovery import build
@@ -75,7 +81,6 @@ FILTER_KEYWORDS = frozenset(
     {"sped up", "slowed", "tiktok", "reverb", "8d audio", "bass boosted"}
 )
 
-# Pre-compiled Regex
 TIDAL_TRACK_PATTERN = re.compile(r"tidal\.com/(?:browse/)?track/(\d+)")
 TIDAL_ALBUM_PATTERN = re.compile(r"tidal\.com/(?:browse/)?album/(\d+)")
 TIDAL_PLAYLIST_PATTERN = re.compile(r"tidal\.com/(?:browse/)?playlist/([a-f0-9-]+)")
@@ -148,8 +153,6 @@ def async_retry(
     base_delay: float = RETRY_BASE_DELAY,
     exceptions: tuple = (Exception,),
 ):
-    """Decorator for retrying async functions."""
-
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         async def wrapper(*args, **kwargs):
@@ -169,7 +172,6 @@ def async_retry(
 
 
 def truncate(text: str, limit: int) -> str:
-    """Safe string truncation for Discord limits."""
     return text[: limit - 3] + "..." if len(text) > limit else text
 
 
@@ -285,10 +287,9 @@ class TidalPlayer(commands.Cog):
             self.yt = None
 
     async def _auto_refresh_tokens(self):
-        """Background task to keep Tidal session alive."""
         await self.bot.wait_until_ready()
         while True:
-            await asyncio.sleep(3600)  # Check every hour
+            await asyncio.sleep(3600)
             if self.session and self.session.check_login():
                 if (
                     self.session.expiry_time
@@ -342,6 +343,15 @@ class TidalPlayer(commands.Cog):
 
         return filtered if filtered else tracks
 
+    def _extract_tracks_from_result(self, result: Any) -> List[Any]:
+        if hasattr(result, "tracks"):
+            return result.tracks
+        if isinstance(result, dict):
+            return result.get("tracks", [])
+        if isinstance(result, list):
+            return result
+        return []
+
     # =========================================================================
     # CORE PLAYBACK LOGIC
     # =========================================================================
@@ -364,30 +374,46 @@ class TidalPlayer(commands.Cog):
     @async_retry(exceptions=(APIError, asyncio.TimeoutError))
     async def _search_tidal(self, query: str, guild_id: int) -> List[Any]:
         async with self.api_semaphore:
+            tracks = []
+
+            if TIDAL_MODELS_AVAILABLE and "Track" in globals():
+                try:
+                    result = await self.bot.loop.run_in_executor(
+                        None, lambda: self.session.search(query, models=[Track])
+                    )
+                    tracks = self._extract_tracks_from_result(result)
+                    if tracks:
+                        if await self.config.guild_from_id(guild_id).filter_remixes():
+                            return self._filter_tracks(tracks)
+                        return tracks
+                except Exception as e:
+                    log.debug(f"Strategy 1 (Models) failed: {e}")
+
             try:
-                # FIX: Use simple string 'track' to avoid "invalid type" errors with models
-                search_func = lambda: self.session.search(query, "track")
-
-                result = await self.bot.loop.run_in_executor(None, search_func)
-
-                tracks = []
-                if hasattr(result, "tracks"):
-                    tracks = result.tracks
-                elif isinstance(result, dict):
-                    tracks = result.get("tracks", [])
-                elif isinstance(result, list):
-                    tracks = result
-
-                if (
-                    await self.config.guild_from_id(guild_id).filter_remixes()
-                    and tracks
-                ):
-                    tracks = self._filter_tracks(tracks)
-
-                return tracks
+                result = await self.bot.loop.run_in_executor(
+                    None, lambda: self.session.search(query, "track")
+                )
+                tracks = self._extract_tracks_from_result(result)
+                if tracks:
+                    if await self.config.guild_from_id(guild_id).filter_remixes():
+                        return self._filter_tracks(tracks)
+                    return tracks
             except Exception as e:
-                log.error(f"Search error: {e}")
-                raise APIError(f"Search failed: {e}")
+                log.debug(f"Strategy 2 (String) failed: {e}")
+
+            try:
+                result = await self.bot.loop.run_in_executor(
+                    None, lambda: self.session.search(query)
+                )
+                tracks = self._extract_tracks_from_result(result)
+                if tracks:
+                    if await self.config.guild_from_id(guild_id).filter_remixes():
+                        return self._filter_tracks(tracks)
+                    return tracks
+            except Exception as e:
+                log.error(f"All search strategies failed: {e}")
+
+            return []
 
     async def _get_track_url(self, track: Any) -> Optional[str]:
         try:
@@ -413,7 +439,6 @@ class TidalPlayer(commands.Cog):
     async def _load_and_queue_track(
         self, ctx: commands.Context, tidal_track: Any, show_embed: bool = True
     ) -> bool:
-        """Loads track, MUTATES it with Tidal metadata, and queues it."""
         try:
             meta = self._extract_meta(tidal_track)
             url = await self._get_track_url(tidal_track)
@@ -502,7 +527,6 @@ class TidalPlayer(commands.Cog):
         item_processor: Callable[[Any], str],  # Returns query or None if skipped
         color: discord.Color = discord.Color.blue(),
     ) -> None:
-        """Generic processor for iterating lists and queueing tracks."""
         total = len(items)
         if not total:
             await ctx.send(
