@@ -25,9 +25,8 @@ except ImportError:
 try:
     import tidalapi
 
-    # Attempt to import media models for v0.7+ compatibility
     try:
-        from tidalapi.media import Album, Playlist, Track
+        from tidalapi.media import Track
 
         TIDAL_MODELS_AVAILABLE = True
     except ImportError:
@@ -113,6 +112,7 @@ class Messages:
     ERROR_NO_YOUTUBE = "YouTube not configured. Run: `>tidalplay youtube <key>`"
     ERROR_TIMEOUT = "Selection timed out."
     ERROR_API_TIMEOUT = "API request timed out. Please try again."
+    ERROR_LAVALINK_LOAD = "Lavalink failed to load track. Do you have the Tidal plugin?"
 
     SUCCESS_PARTIAL_QUEUE = "Queued {queued}/{total} ({skipped} not found on Tidal)"
     SUCCESS_TOKENS_CLEARED = "Tokens cleared."
@@ -245,36 +245,32 @@ class TidalPlayer(commands.Cog):
             if self.session.check_login():
                 log.info("Tidal session loaded")
         except Exception as e:
-            log.warning(f"Tidal session load failed (possibly expired): {e}")
+            log.warning(f"Tidal session load failed: {e}")
 
     async def _initialize_spotify(self, creds: Dict[str, Any]) -> None:
         if not SPOTIFY_AVAILABLE:
             return
-
         cid, csec = creds.get("spotify_client_id"), creds.get("spotify_client_secret")
         if not (cid and csec):
             return
-
         try:
             self.sp = spotipy.Spotify(
                 client_credentials_manager=SpotifyClientCredentials(cid, csec)
             )
             log.info("Spotify configured")
-        except Exception:
+        except:
             self.sp = None
 
     async def _initialize_youtube(self, creds: Dict[str, Any]) -> None:
         if not YOUTUBE_API_AVAILABLE:
             return
-
         key = creds.get("youtube_api_key")
         if not key:
             return
-
         try:
             self.yt = build("youtube", "v3", developerKey=key)
             log.info("YouTube configured")
-        except Exception:
+        except:
             self.yt = None
 
     async def _auto_refresh_tokens(self):
@@ -295,7 +291,6 @@ class TidalPlayer(commands.Cog):
                             if self.session.expiry_time
                             else None
                         )
-                        log.info("Tidal tokens auto-refreshed")
                     except Exception as e:
                         log.error(f"Token refresh failed: {e}")
 
@@ -314,10 +309,7 @@ class TidalPlayer(commands.Cog):
 
     def _format_duration(self, seconds: int) -> str:
         m, s = divmod(seconds, 60)
-        if m >= 60:
-            h, m = divmod(m, 60)
-            return f"{h}:{m:02d}:{s:02d}"
-        return f"{m:02d}:{s:02d}"
+        return f"{h}:{m:02d}:{s:02d}" if m >= 60 else f"{m:02d}:{s:02d}"
 
     def _filter_tracks(self, tracks: List[Any]) -> List[Any]:
         if not tracks:
@@ -331,36 +323,30 @@ class TidalPlayer(commands.Cog):
         ]
 
     def _extract_tracks_from_result(self, result: Any) -> List[Any]:
-        # Handle v0.7+ SearchResult object
         if hasattr(result, "tracks"):
             t = result.tracks
             return (
                 t.items if hasattr(t, "items") else (t if isinstance(t, list) else [])
             )
-
-        # Handle dictionary
         if isinstance(result, dict):
             t = result.get("tracks", [])
             return (
                 t.items if hasattr(t, "items") else (t if isinstance(t, list) else [])
             )
-
         return result if isinstance(result, list) else []
 
     async def _get_player(self, ctx: commands.Context) -> Optional[Any]:
         if not LAVALINK_AVAILABLE:
             return None
-
         try:
             return lavalink.get_player(ctx.guild.id)
         except:
             pass
-
         if ctx.author.voice and ctx.author.voice.channel:
             try:
                 await lavalink.connect(ctx.author.voice.channel)
                 return lavalink.get_player(ctx.guild.id)
-            except Exception:
+            except:
                 pass
         return None
 
@@ -368,7 +354,7 @@ class TidalPlayer(commands.Cog):
     async def _search_tidal(self, query: str, guild_id: int) -> List[Any]:
         async with self.api_semaphore:
             try:
-                # Force "Track" model search for v0.7+ if available
+                # Force Track model to avoid empty/invalid results in v0.7
                 if TIDAL_MODELS_AVAILABLE and "Track" in globals():
                     search_func = lambda: self.session.search(query, models=[Track])
                 else:
@@ -380,18 +366,14 @@ class TidalPlayer(commands.Cog):
                 if await self.config.guild_from_id(guild_id).filter_remixes():
                     tracks = self._filter_tracks(tracks)
 
+                log.info(f"Search for '{query}' returned {len(tracks)} tracks")
                 return tracks
             except Exception as e:
                 log.error(f"Search failed: {e}")
-                # Fallback to generic search if strict model search fails
-                try:
-                    search_func = lambda: self.session.search(query)
-                    result = await self.bot.loop.run_in_executor(None, search_func)
-                    return self._extract_tracks_from_result(result)
-                except:
-                    raise APIError(f"Search failed: {e}")
+                raise APIError(f"Search failed: {e}")
 
     async def _get_track_url(self, track: Any) -> Optional[str]:
+        # Return web URL primarily
         if hasattr(track, "id"):
             return f"https://tidal.com/browse/track/{track.id}"
         if isinstance(track, dict) and "id" in track:
@@ -420,6 +402,7 @@ class TidalPlayer(commands.Cog):
             url = await self._get_track_url(tidal_track)
 
             if not url:
+                await ctx.send(f"Error: Could not generate URL for {meta['title']}")
                 return False
 
             player = await self._get_player(ctx)
@@ -429,10 +412,14 @@ class TidalPlayer(commands.Cog):
 
             try:
                 results = await player.load_tracks(url)
-            except Exception:
+            except Exception as e:
+                log.error(f"Lavalink load error: {e}")
+                await ctx.send(f"Lavalink Error: {e}")
                 return False
 
             if not results or not results.tracks:
+                log.warning(f"Lavalink found no matches for: {url}")
+                await ctx.send(Messages.ERROR_LAVALINK_LOAD)
                 return False
 
             track = results.tracks[0]
@@ -457,13 +444,13 @@ class TidalPlayer(commands.Cog):
 
         except Exception as e:
             log.error(f"Queue error: {e}", exc_info=True)
+            await ctx.send(f"Playback Error: {e}")
             return False
 
     async def _send_now_playing(self, ctx: commands.Context, meta: TrackMeta) -> None:
         desc = f"**{meta['title']}**\n{meta['artist']}"
         if meta.get("album"):
             desc += f"\n_{meta['album']}_"
-
         embed = discord.Embed(
             title=Messages.STATUS_PLAYING, description=desc, color=discord.Color.blue()
         )
@@ -504,7 +491,7 @@ class TidalPlayer(commands.Cog):
                 for i in range(len(top_tracks)):
                     await msg.add_reaction(REACTION_NUMBERS[i])
                 await msg.add_reaction(CANCEL_EMOJI)
-            except discord.HTTPException:
+            except:
                 pass
 
         asyncio.create_task(add_reactions())
@@ -521,12 +508,10 @@ class TidalPlayer(commands.Cog):
             reaction, _ = await self.bot.wait_for(
                 "reaction_add", timeout=INTERACTIVE_TIMEOUT, check=check
             )
-
             await msg.delete()
             if str(reaction.emoji) == CANCEL_EMOJI:
                 return None
             return top_tracks[REACTION_NUMBERS.index(str(reaction.emoji))]
-
         except asyncio.TimeoutError:
             try:
                 await msg.delete()
@@ -544,10 +529,9 @@ class TidalPlayer(commands.Cog):
         color: discord.Color = discord.Color.blue(),
     ) -> None:
         if not items:
-            await ctx.send(
+            return await ctx.send(
                 Messages.ERROR_NO_TRACKS_IN_CONTENT.format(content_type="list")
             )
-            return
 
         pmsg = await ctx.send(
             Messages.PROGRESS_QUEUEING.format(name=truncate(name, 50), count=len(items))
@@ -722,8 +706,11 @@ class TidalPlayer(commands.Cog):
                 if sel:
                     await self._play(ctx, sel)
             else:
-                await self._play(ctx, tracks[0])
-        except Exception:
+                success = await self._play(ctx, tracks[0])
+                if not success:
+                    await ctx.send("Failed to play track (Lavalink Rejected URL).")
+        except Exception as e:
+            log.error(f"tplay critical failure: {e}")
             await ctx.send(Messages.ERROR_NO_TRACKS_FOUND)
 
     @commands.command(name="tstop")
@@ -736,11 +723,10 @@ class TidalPlayer(commands.Cog):
     async def tfilter(self, ctx: commands.Context) -> None:
         """Toggle filtering of Remix/Sped-up/TikTok versions."""
         curr = await self.config.guild(ctx.guild).filter_remixes()
-        new_val = not curr
-        await self.config.guild(ctx.guild).filter_remixes.set(new_val)
+        await self.config.guild(ctx.guild).filter_remixes.set(not curr)
         await ctx.send(
             Messages.SUCCESS_FILTER_ENABLED
-            if new_val
+            if not curr
             else Messages.SUCCESS_FILTER_DISABLED
         )
 
@@ -748,11 +734,10 @@ class TidalPlayer(commands.Cog):
     async def tinteractive(self, ctx: commands.Context) -> None:
         """Toggle interactive search mode (select from 1-5)."""
         curr = await self.config.guild(ctx.guild).interactive_search()
-        new_val = not curr
-        await self.config.guild(ctx.guild).interactive_search.set(new_val)
+        await self.config.guild(ctx.guild).interactive_search.set(not curr)
         await ctx.send(
             Messages.SUCCESS_INTERACTIVE_ENABLED
-            if new_val
+            if not curr
             else Messages.SUCCESS_INTERACTIVE_DISABLED
         )
 
