@@ -1,6 +1,6 @@
 """
 TidalPlayer - Tidal music integration for Red Discord Bot
-Strict High-Quality Mode (No YouTube Fallback)
+Features: High-Res Audio, Album Art, Spotify/YT Importing, Debug Tools
 """
 
 import asyncio
@@ -94,6 +94,7 @@ class TrackMeta(TypedDict):
     album: Optional[str]
     duration: int
     quality: str
+    image: Optional[str]
 
 
 class Messages:
@@ -240,17 +241,33 @@ class TidalPlayer(commands.Cog):
                         pass
 
     def _extract_meta(self, track: Any) -> TrackMeta:
-        return TrackMeta(
-            title=getattr(track, "name", "Unknown") or "Unknown",
-            artist=getattr(track.artist, "name", "Unknown")
+        meta = {
+            "title": getattr(track, "name", "Unknown") or "Unknown",
+            "artist": getattr(track.artist, "name", "Unknown")
             if hasattr(track, "artist")
             else "Unknown",
-            album=getattr(track.album, "name", None)
+            "album": getattr(track.album, "name", None)
             if hasattr(track, "album")
             else None,
-            duration=int(getattr(track, "duration", 0) or 0),
-            quality=getattr(track, "audio_quality", "LOSSLESS") or "LOSSLESS",
-        )
+            "duration": int(getattr(track, "duration", 0) or 0),
+            "quality": getattr(track, "audio_quality", "LOSSLESS") or "LOSSLESS",
+            "image": None,
+        }
+
+        # Album Art Logic
+        try:
+            if (
+                hasattr(track, "album")
+                and hasattr(track.album, "cover")
+                and track.album.cover
+            ):
+                # Tidal cover IDs format: a-b-c -> a/b/c
+                uuid = track.album.cover.replace("-", "/")
+                meta["image"] = f"https://resources.tidal.com/images/{uuid}/640x640.jpg"
+        except:
+            pass
+
+        return meta
 
     def _format_duration(self, seconds: int) -> str:
         m, s = divmod(seconds, 60)
@@ -358,7 +375,7 @@ class TidalPlayer(commands.Cog):
             except Exception as e:
                 log.error(f"Lavalink load failed: {e}")
 
-        # If strict mode fails, we stop here. No YouTube fallback.
+        # If strict mode fails, we stop here.
         if not loaded_track:
             await ctx.send(Messages.ERROR_LAVALINK_FAILED)
             return False
@@ -394,6 +411,9 @@ class TidalPlayer(commands.Cog):
             inline=True,
         )
         embed.set_footer(text=f"Duration: {self._format_duration(meta['duration'])}")
+
+        if meta.get("image"):
+            embed.set_thumbnail(url=meta["image"])
 
         await ctx.send(embed=embed)
 
@@ -690,6 +710,43 @@ class TidalPlayer(commands.Cog):
             if not curr
             else Messages.SUCCESS_INTERACTIVE_DISABLED
         )
+
+    @commands.is_owner()
+    @commands.command(name="tdebug")
+    async def tdebug(self, ctx: commands.Context) -> None:
+        """Check Tidal connection status and versions."""
+        tidal_status = "❌ Not Connected"
+        if self.session:
+            if self.session.check_login():
+                tidal_status = f"✅ Logged In"
+            else:
+                tidal_status = "⚠️ Session Invalid/Expired"
+
+        lavalink_status = "❌ Not Loaded"
+        if LAVALINK_AVAILABLE:
+            try:
+                player = lavalink.get_player(ctx.guild.id)
+                lavalink_status = f"✅ Loaded (Connected: {player.is_connected})"
+            except:
+                lavalink_status = "⚠️ Loaded but no player found"
+
+        # Check Versions safely
+        try:
+            import pkg_resources
+
+            tidal_ver = pkg_resources.get_distribution("tidalapi").version
+        except:
+            tidal_ver = "Unknown"
+
+        msg = (
+            f"**TidalPlayer Debug**\n"
+            f"**TidalAPI Version:** `{tidal_ver}`\n"
+            f"**Tidal Status:** {tidal_status}\n"
+            f"**Lavalink Status:** {lavalink_status}\n"
+            f"**YouTube API:** {'✅' if self.yt else '❌'}\n"
+            f"**Spotify API:** {'✅' if self.sp else '❌'}"
+        )
+        await ctx.send(msg)
 
     @commands.is_owner()
     @commands.command(name="tidalsetup")
