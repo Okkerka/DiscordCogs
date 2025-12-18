@@ -52,10 +52,6 @@ except ImportError:
 
 log = logging.getLogger("red.tidalplayer")
 
-# =============================================================================
-# CONSTANTS & CONFIG
-# =============================================================================
-
 COG_IDENTIFIER = 160819386
 MAX_CACHE_SIZE = 500
 API_SEMAPHORE_LIMIT = 5
@@ -88,10 +84,6 @@ TIDAL_MIX_PATTERN = re.compile(r"tidal\.com/(?:browse/)?mix/([a-f0-9]+)")
 
 SPOTIFY_PLAYLIST_PATTERN = re.compile(r"open\.spotify\.com/playlist/([a-zA-Z0-9]+)")
 YOUTUBE_PLAYLIST_PATTERN = re.compile(r"youtube\.com/.*[?&]list=([a-zA-Z0-9_-]+)")
-
-# =============================================================================
-# TYPES & MESSAGES
-# =============================================================================
 
 
 class TrackMeta(TypedDict):
@@ -143,11 +135,6 @@ class APIError(TidalPlayerError):
     pass
 
 
-# =============================================================================
-# UTILITIES
-# =============================================================================
-
-
 def async_retry(
     max_attempts: int = SEARCH_RETRY_ATTEMPTS,
     base_delay: float = RETRY_BASE_DELAY,
@@ -173,11 +160,6 @@ def async_retry(
 
 def truncate(text: str, limit: int) -> str:
     return text[: limit - 3] + "..." if len(text) > limit else text
-
-
-# =============================================================================
-# MAIN COG
-# =============================================================================
 
 
 class TidalPlayer(commands.Cog):
@@ -308,8 +290,6 @@ class TidalPlayer(commands.Cog):
                     except Exception as e:
                         log.error(f"Token refresh failed: {e}")
 
-    # ... HELPERS ...
-
     def _extract_meta(self, track: Any) -> TrackMeta:
         return TrackMeta(
             title=getattr(track, "name", "Unknown") or "Unknown",
@@ -352,10 +332,6 @@ class TidalPlayer(commands.Cog):
             return result
         return []
 
-    # =========================================================================
-    # CORE PLAYBACK LOGIC
-    # =========================================================================
-
     async def _get_player(self, ctx: commands.Context) -> Optional[Any]:
         if not LAVALINK_AVAILABLE:
             return None
@@ -387,7 +363,7 @@ class TidalPlayer(commands.Cog):
                             return self._filter_tracks(tracks)
                         return tracks
                 except Exception as e:
-                    log.debug(f"Strategy 1 (Models) failed: {e}")
+                    log.info(f"Strategy 1 (Models) failed: {e}")
 
             try:
                 result = await self.bot.loop.run_in_executor(
@@ -399,7 +375,7 @@ class TidalPlayer(commands.Cog):
                         return self._filter_tracks(tracks)
                     return tracks
             except Exception as e:
-                log.debug(f"Strategy 2 (String) failed: {e}")
+                log.info(f"Strategy 2 (String) failed: {e}")
 
             try:
                 result = await self.bot.loop.run_in_executor(
@@ -518,7 +494,6 @@ class TidalPlayer(commands.Cog):
         except Exception:
             return False
 
-    # UNIFIED LIST PROCESSOR
     async def _process_track_list(
         self,
         ctx: commands.Context,
@@ -592,6 +567,61 @@ class TidalPlayer(commands.Cog):
             await pmsg.edit(content=Messages.ERROR_FETCH_FAILED)
         finally:
             await self.config.guild(ctx.guild).cancel_queue.set(False)
+
+    async def _interactive_select(
+        self, ctx: commands.Context, tracks: List[Any]
+    ) -> Optional[Any]:
+        if not tracks:
+            return None
+
+        top_tracks = tracks[:5]
+        description = []
+        for i, track in enumerate(top_tracks, 1):
+            artist = (
+                getattr(track.artist, "name", "Unknown")
+                if hasattr(track, "artist")
+                else "Unknown"
+            )
+            description.append(f"**{i}.** {track.name} - {artist}")
+
+        embed = discord.Embed(
+            title="Select Track",
+            description="\n".join(description),
+            color=discord.Color.blue(),
+        )
+        embed.set_footer(text=f"React with 1-5 to select, or {CANCEL_EMOJI} to cancel")
+
+        msg = await ctx.send(embed=embed)
+
+        for i in range(len(top_tracks)):
+            await msg.add_reaction(REACTION_NUMBERS[i])
+        await msg.add_reaction(CANCEL_EMOJI)
+
+        def check(reaction, user):
+            return (
+                user == ctx.author
+                and str(reaction.emoji)
+                in REACTION_NUMBERS[: len(top_tracks)] + (CANCEL_EMOJI,)
+                and reaction.message.id == msg.id
+            )
+
+        try:
+            reaction, _ = await self.bot.wait_for(
+                "reaction_add", timeout=INTERACTIVE_TIMEOUT, check=check
+            )
+
+            if str(reaction.emoji) == CANCEL_EMOJI:
+                await msg.delete()
+                return None
+
+            index = REACTION_NUMBERS.index(str(reaction.emoji))
+            await msg.delete()
+            return top_tracks[index]
+
+        except asyncio.TimeoutError:
+            await msg.delete()
+            await ctx.send(Messages.ERROR_TIMEOUT)
+            return None
 
     # ... HANDLERS ...
 
