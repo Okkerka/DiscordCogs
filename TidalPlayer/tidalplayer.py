@@ -290,14 +290,11 @@ class TidalPlayer(commands.Cog):
         while True:
             await asyncio.sleep(3600)  # Check every hour
             if self.session and self.session.check_login():
-                # If expiry is within next 2 hours, refresh
                 if (
                     self.session.expiry_time
                     and datetime.now() + timedelta(hours=2) > self.session.expiry_time
                 ):
                     try:
-                        # Attempt refresh (tidalapi handles this internally usually, but force load updates config)
-                        # We just save the new tokens if they changed
                         await self.config.token_type.set(self.session.token_type)
                         await self.config.access_token.set(self.session.access_token)
                         await self.config.refresh_token.set(self.session.refresh_token)
@@ -368,9 +365,19 @@ class TidalPlayer(commands.Cog):
     async def _search_tidal(self, query: str, guild_id: int) -> List[Any]:
         async with self.api_semaphore:
             try:
-                result = await self.bot.loop.run_in_executor(
-                    None, self.session.search, query
-                )
+                # FIX: Explicitly search for tracks to avoid empty results for ambiguous queries
+                # Attempt to import Track model for specific filtering (Newer tidalapi)
+                try:
+                    from tidalapi.media import Track
+
+                    result = await self.bot.loop.run_in_executor(
+                        None, lambda: self.session.search(query, models=[Track])
+                    )
+                except (ImportError, TypeError, AttributeError):
+                    # Fallback for older versions or if models arg is not supported
+                    result = await self.bot.loop.run_in_executor(
+                        None, lambda: self.session.search(query, "track")
+                    )
 
                 # Handle both Dictionary (old) and Object (new) return types
                 if hasattr(result, "tracks"):
