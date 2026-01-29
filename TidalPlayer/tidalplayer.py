@@ -277,20 +277,22 @@ class TidalHandler:
         # 1. Try v0.7+ method (may require active session/login)
         try:
             return await self.bot.loop.run_in_executor(None, track.get_url)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug(f"Direct get_url failed: {e}")
 
         # 2. Try Fallback/Legacy method (manual session ID)
         try:
             return await self.bot.loop.run_in_executor(
                 None, lambda: self.session.track.get_url(track.id)
             )
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug(f"Legacy session.track.get_url failed: {e}")
 
         # 3. Last Resort: Web URL (Lavalink needs plugin for this)
         if hasattr(track, "id"):
-            return f"https://tidal.com/browse/track/{track.id}"
+            url = f"https://tidal.com/browse/track/{track.id}"
+            log.debug(f"Falling back to web URL: {url}")
+            return url
 
         return None
 
