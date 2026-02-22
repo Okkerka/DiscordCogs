@@ -54,6 +54,7 @@ API_SEMAPHORE_LIMIT = 5
 INTERACTIVE_TIMEOUT = 30
 BATCH_UPDATE_INTERVAL = 10
 LOGIN_CACHE_TTL = 300.0  # 5 minutes
+PROGRESS_EDIT_RATELIMIT = 1.5  # minimum seconds between progress message edits
 
 REACTION_NUMBERS = ("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣")
 CANCEL_EMOJI = "❌"
@@ -256,7 +257,11 @@ class TidalHandler:
                     await self.config.expiry_time.set(
                         int(expiry_time.timestamp()) if expiry_time else None
                     )
-                    self.invalidate_login_cache()
+                    # Set cache to True directly — we just saved fresh tokens,
+                    # no need to force a check_login() HTTP call on next command.
+                    now = asyncio.get_running_loop().time()
+                    self._login_cache = True
+                    self._login_cache_time = now
             except Exception as e:
                 log.error(f"Token refresh failed: {e}")
 
@@ -702,17 +707,17 @@ class TidalPlayer(commands.Cog):
     async def _edit_progress_message(
         self, msg: discord.Message, embed: discord.Embed
     ) -> None:
-        loop = asyncio.get_running_loop()
-        now = loop.time()
-        delay = 1.0 - (now - self._last_progress_edit.get(msg.id, 0.0))
-        if delay > 0:
-            try:
-                await asyncio.sleep(delay)
-            except asyncio.CancelledError:
-                return
+        """
+        Edit the progress message, respecting Discord rate limits.
+        Skips the edit if called too soon — never sleeps to avoid blocking
+        the playlist loop (old sleep caused up to +Ns overhead for N updates).
+        """
+        now = asyncio.get_running_loop().time()
+        if now - self._last_progress_edit.get(msg.id, 0.0) < PROGRESS_EDIT_RATELIMIT:
+            return
         try:
             await msg.edit(embed=embed)
-            self._last_progress_edit[msg.id] = loop.time()
+            self._last_progress_edit[msg.id] = asyncio.get_running_loop().time()
         except Exception:
             pass
 
@@ -733,6 +738,15 @@ class TidalPlayer(commands.Cog):
             await ctx.send("Already processing a playlist in this server.")
             return
 
+        # Hoist both reads before entering the lock+loop.
+        # filter_remixes was previously read on every Spotify/YT track (N config reads).
+        # Player is checked once — in-loop we use is_connected (attribute, no network).
+        filter_remixes = await self.config.guild(ctx.guild).filter_remixes()
+        player = await self._get_player(ctx)
+        if not player:
+            await ctx.send(Messages.ERROR_NO_PLAYER)
+            return
+
         cancel_event = self._get_cancel_event(ctx.guild.id)
 
         async with lock:
@@ -746,7 +760,8 @@ class TidalPlayer(commands.Cog):
                 for i, item in enumerate(items, 1):
                     if cancel_event.is_set():
                         break
-                    if not await self._get_player(ctx):
+                    # Lightweight in-memory attribute check — no network call
+                    if not getattr(player, "is_connected", True):
                         break
 
                     query = item_processor(item)
@@ -757,7 +772,6 @@ class TidalPlayer(commands.Cog):
                             ctx, query, show_embed=False
                         )
                     elif query:
-                        filter_remixes = await self.config.guild(ctx.guild).filter_remixes()
                         tracks = await self.tidal.search(query, filter_remixes=filter_remixes)
                         if tracks:
                             success = await self._load_and_queue_track(
@@ -790,7 +804,12 @@ class TidalPlayer(commands.Cog):
                     description=f"Source: {truncate(name, 100)}",
                     color=color,
                 )
-                await self._edit_progress_message(pmsg, final_embed)
+                # Force-send the final update regardless of rate limit
+                try:
+                    await pmsg.edit(embed=final_embed)
+                    self._last_progress_edit[pmsg.id] = asyncio.get_running_loop().time()
+                except Exception:
+                    pass
 
             except Exception as e:
                 log.error(f"Queue processing error: {e}")
