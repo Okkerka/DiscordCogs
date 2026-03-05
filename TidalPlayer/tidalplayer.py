@@ -52,23 +52,12 @@ log = logging.getLogger("red.tidalplayer")
 COG_IDENTIFIER = 160819386
 API_SEMAPHORE_LIMIT = 5
 INTERACTIVE_TIMEOUT = 30
-BATCH_UPDATE_INTERVAL = 5
+BATCH_UPDATE_INTERVAL = 10
 LOGIN_CACHE_TTL = 300.0
-PROGRESS_EDIT_RATELIMIT = 1.0
+PROGRESS_EDIT_RATELIMIT = 1.5
 
 REACTION_NUMBERS = ("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣")
 CANCEL_EMOJI = "❌"
-
-PROGRESS_BAR_FILLED = "█"
-PROGRESS_BAR_EMPTY = "░"
-PROGRESS_BAR_LENGTH = 20
-
-LOADING_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
-
-COLOR_TIDAL = 0x00B2FF
-COLOR_SPOTIFY = 0x1DB954
-COLOR_YOUTUBE = 0xFF0000
-COLOR_MIX = 0x9B59B6
 
 QUALITY_LABELS = {
     "HI_RES": "HI-RES (MQA)",
@@ -114,6 +103,7 @@ class Messages:
     ERROR_STILL_LOADING = "⏳ TidalPlayer is still initializing, please wait a moment."
 
     STATUS_PLAYING = "Playing from Tidal"
+    PROGRESS_QUEUEING = "Queueing {name} ({count} tracks)..."
     STATUS_STOPPING = "Stopping playlist queueing..."
 
     SUCCESS_TIDAL_SETUP = "Tidal setup complete!"
@@ -124,6 +114,7 @@ class Messages:
     SUCCESS_INTERACTIVE_ENABLED = "Interactive search enabled."
     SUCCESS_INTERACTIVE_DISABLED = "Interactive search disabled."
     SUCCESS_TOKENS_CLEARED = "Tokens cleared."
+    SUCCESS_PARTIAL_QUEUE = "Queued {queued}/{total} ({skipped} skipped)"
 
     ERROR_TIMEOUT = "Selection timed out."
     ERROR_FETCH_FAILED = "Could not fetch playlist."
@@ -438,7 +429,7 @@ class TidalPlayer(commands.Cog):
 
     __slots__ = (
         "bot", "config", "tidal", "sp", "yt", "_tasks", "_guild_locks",
-        "_cancel_events", "_last_progress_edit", "_initialized", "_frame_counter"
+        "_cancel_events", "_last_progress_edit", "_initialized"
     )
 
     def __init__(self, bot: Red):
@@ -469,7 +460,6 @@ class TidalPlayer(commands.Cog):
         self._cancel_events: Dict[int, asyncio.Event] = {}
         self._last_progress_edit: Dict[int, float] = {}
         self._initialized: bool = False
-        self._frame_counter: Dict[int, int] = {}
 
         self._create_task(self._initialize_apis())
 
@@ -598,17 +588,6 @@ class TidalPlayer(commands.Cog):
         m, s = divmod(seconds, 60)
         return f"{m // 60}:{m % 60:02d}:{s:02d}" if m >= 60 else f"{m:02d}:{s:02d}"
 
-    def _create_progress_bar(self, current: int, total: int) -> str:
-        """Generate visual progress bar."""
-        if total == 0:
-            return f"`{PROGRESS_BAR_EMPTY * PROGRESS_BAR_LENGTH}` 0%"
-        
-        percentage = current / total
-        filled = int(PROGRESS_BAR_LENGTH * percentage)
-        bar = PROGRESS_BAR_FILLED * filled + PROGRESS_BAR_EMPTY * (PROGRESS_BAR_LENGTH - filled)
-        
-        return f"`{bar}` {int(percentage * 100)}%"
-
     async def _get_player(self, ctx: commands.Context) -> Optional[Any]:
         """Get or create Lavalink player for guild."""
         if not LAVALINK_AVAILABLE:
@@ -666,27 +645,25 @@ class TidalPlayer(commands.Cog):
         return True
 
     async def _send_now_playing(self, ctx: commands.Context, meta: TrackMeta) -> None:
-        """Send optimized now playing embed with clean layout."""
-        desc = f"**{meta['title']}**\n{meta['artist']}"
+        """Send now playing embed with track metadata."""
+        desc_parts = [f"**{meta['title']}**", meta['artist']]
         if meta.get("album"):
-            desc += f" · {meta['album']}"
-        
+            desc_parts.append(f"_{meta['album']}_")
+
         embed = discord.Embed(
-            title="Playing from Tidal",
-            description=desc,
-            color=COLOR_TIDAL,
+            title=Messages.STATUS_PLAYING,
+            description="\n".join(desc_parts),
+            color=discord.Color.blue(),
         )
-        
-        quality_label = QUALITY_LABELS.get(meta["quality"], "LOSSLESS")
         embed.add_field(
-            name="Stream Info",
-            value=f"{quality_label} · {self._format_duration(meta['duration'])}",
-            inline=False
+            name="Quality",
+            value=QUALITY_LABELS.get(meta["quality"], "LOSSLESS"),
+            inline=True,
         )
-        
+        embed.set_footer(text=f"Duration: {self._format_duration(meta['duration'])}")
         if meta.get("image"):
-            embed.set_image(url=meta["image"])
-        
+            embed.set_thumbnail(url=meta["image"])
+
         await ctx.send(embed=embed)
 
     async def _interactive_select(
@@ -705,7 +682,7 @@ class TidalPlayer(commands.Cog):
         embed = discord.Embed(
             title="Select Track",
             description="\n".join(desc),
-            color=COLOR_TIDAL,
+            color=discord.Color.blue(),
         )
         embed.set_footer(text=f"React with 1-{len(top)} or {CANCEL_EMOJI}")
         msg = await ctx.send(embed=embed)
@@ -759,43 +736,13 @@ class TidalPlayer(commands.Cog):
         except Exception:
             pass
 
-    async def _create_progress_embed(
-        self, 
-        name: str, 
-        queued: int, 
-        skipped: int, 
-        total: int,
-        color: int,
-        frame: int = 0
-    ) -> discord.Embed:
-        """Create clean progress embed with animated bar."""
-        spinner = LOADING_FRAMES[frame % len(LOADING_FRAMES)]
-        processed = queued + skipped
-        progress_bar = self._create_progress_bar(processed, total)
-        
-        embed = discord.Embed(
-            title=f"{spinner} Queueing · {truncate(name, 50)}",
-            description=progress_bar,
-            color=color,
-        )
-        
-        stats = f"Queued: **{queued}** · Skipped: **{skipped}** · Remaining: **{total - processed}**"
-        if processed > 0:
-            success_rate = (queued / processed) * 100
-            stats += f"\nSuccess Rate: **{success_rate:.1f}%**"
-        
-        embed.add_field(name="Progress", value=stats, inline=False)
-        embed.set_footer(text=f"{processed}/{total} tracks processed")
-        
-        return embed
-
     async def _process_track_list(
         self,
         ctx: commands.Context,
         items: List[Any],
         name: str,
         item_processor: Callable[[Any], Any],
-        color: int = COLOR_TIDAL,
+        color: discord.Color = discord.Color.blue(),
     ) -> None:
         """Process and queue a list of tracks with progress updates."""
         if not items:
@@ -814,11 +761,11 @@ class TidalPlayer(commands.Cog):
             return
 
         cancel_event = self._get_cancel_event(ctx.guild.id)
-        self._frame_counter[ctx.guild.id] = 0
 
         async with lock:
-            initial_embed = await self._create_progress_embed(name, 0, 0, len(items), color, 0)
-            pmsg = await ctx.send(embed=initial_embed)
+            pmsg = await ctx.send(
+                Messages.PROGRESS_QUEUEING.format(name=truncate(name, 50), count=len(items))
+            )
             queued, skipped, last_up = 0, 0, 0
             total = len(items)
 
@@ -845,26 +792,26 @@ class TidalPlayer(commands.Cog):
                     skipped += not success
 
                     if i - last_up >= BATCH_UPDATE_INTERVAL or i == total:
-                        self._frame_counter[ctx.guild.id] += 1
-                        embed = await self._create_progress_embed(
-                            name, queued, skipped, total, color, 
-                            self._frame_counter[ctx.guild.id]
+                        embed = discord.Embed(
+                            title=Messages.PROGRESS_QUEUEING.format(
+                                name=truncate(name, 50), count=total
+                            ),
+                            description=Messages.SUCCESS_PARTIAL_QUEUE.format(
+                                queued=queued, total=total, skipped=skipped
+                            ),
+                            color=color,
                         )
                         await self._edit_progress_message(pmsg, embed)
                         last_up = i
                         await asyncio.sleep(0)
 
                 final_embed = discord.Embed(
-                    title=f"Queueing Complete · {truncate(name, 50)}",
-                    description=f"Queued **{queued}** of **{total}** tracks ({skipped} skipped)",
+                    title=Messages.SUCCESS_PARTIAL_QUEUE.format(
+                        queued=queued, total=total, skipped=skipped
+                    ),
+                    description=f"Source: {truncate(name, 100)}",
                     color=color,
                 )
-                if queued > 0:
-                    final_embed.add_field(
-                        name="Success Rate",
-                        value=f"**{(queued / total) * 100:.1f}%**",
-                        inline=False
-                    )
                 try:
                     await pmsg.edit(embed=final_embed)
                     self._last_progress_edit[pmsg.id] = asyncio.get_running_loop().time()
@@ -880,7 +827,6 @@ class TidalPlayer(commands.Cog):
             finally:
                 cancel_event.clear()
                 self._last_progress_edit.pop(pmsg.id, None)
-                self._frame_counter.pop(ctx.guild.id, None)
 
     async def _check_ready(self, ctx: commands.Context) -> bool:
         """Verify all dependencies are ready."""
@@ -947,7 +893,7 @@ class TidalPlayer(commands.Cog):
         if mix:
             items = await self.tidal.get_items(mix)
             await self._process_track_list(
-                ctx, items, f"Mix: {mid}", lambda t: t, COLOR_MIX
+                ctx, items, f"Mix: {mid}", lambda t: t, discord.Color.purple()
             )
         else:
             await ctx.send(Messages.ERROR_CONTENT_UNAVAILABLE)
@@ -976,9 +922,9 @@ class TidalPlayer(commands.Cog):
                 await self._process_track_list(
                     ctx,
                     pl["tracks"]["items"],
-                    pl["name"],
+                    "Spotify",
                     lambda i: f"{i['track']['name']} {i['track']['artists'][0]['name']}",
-                    COLOR_SPOTIFY,
+                    discord.Color.green(),
                 )
                 return
             except asyncio.TimeoutError:
@@ -1002,9 +948,9 @@ class TidalPlayer(commands.Cog):
                 await self._process_track_list(
                     ctx,
                     resp.get("items", []),
-                    "YouTube Playlist",
+                    "YouTube",
                     lambda i: i["snippet"]["title"],
-                    COLOR_YOUTUBE,
+                    discord.Color.red(),
                 )
                 return
             except asyncio.TimeoutError:
@@ -1061,34 +1007,35 @@ class TidalPlayer(commands.Cog):
     @commands.command(name="tdebug")
     async def tdebug(self, ctx: commands.Context) -> None:
         """Check Tidal connection status and versions."""
-        tidal_status = "Not Connected"
+        tidal_status = "❌ Not Connected"
         if await self.tidal.is_logged_in():
-            tidal_status = "Logged In"
+            tidal_status = "✅ Logged In"
         elif self.tidal.session:
-            tidal_status = "Session Invalid/Expired"
+            tidal_status = "⚠️ Session Invalid/Expired"
 
-        lavalink_status = "Not Loaded"
+        lavalink_status = "❌ Not Loaded"
         if LAVALINK_AVAILABLE:
             try:
                 player = lavalink.get_player(ctx.guild.id)
-                lavalink_status = f"Loaded (Connected: {player.is_connected})"
+                lavalink_status = f"✅ Loaded (Connected: {player.is_connected})"
             except Exception:
-                lavalink_status = "Loaded but no player found"
+                lavalink_status = "⚠️ Loaded but no player found"
 
         try:
             tidal_ver = importlib.metadata.version("tidalapi")
         except Exception:
             tidal_ver = "Unknown"
 
-        embed = discord.Embed(title="TidalPlayer Debug", color=COLOR_TIDAL)
-        embed.add_field(name="TidalAPI Version", value=f"`{tidal_ver}`", inline=False)
-        embed.add_field(name="Initialized", value="Yes" if self._initialized else "Loading...", inline=True)
-        embed.add_field(name="Tidal Status", value=tidal_status, inline=True)
-        embed.add_field(name="Lavalink Status", value=lavalink_status, inline=False)
-        embed.add_field(name="YouTube API", value="Configured" if self.yt else "Not configured", inline=True)
-        embed.add_field(name="Spotify API", value="Configured" if self.sp else "Not configured", inline=True)
-        
-        await ctx.send(embed=embed)
+        msg = (
+            f"**TidalPlayer Debug**\n"
+            f"**TidalAPI Version:** `{tidal_ver}`\n"
+            f"**Initialized:** {'✅' if self._initialized else '⏳ Loading...'}\n"
+            f"**Tidal Status:** {tidal_status}\n"
+            f"**Lavalink Status:** {lavalink_status}\n"
+            f"**YouTube API:** {'✅' if self.yt else '❌'}\n"
+            f"**Spotify API:** {'✅' if self.sp else '❌'}"
+        )
+        await ctx.send(msg)
 
     @commands.is_owner()
     @commands.command(name="tidalsetup")
@@ -1107,12 +1054,12 @@ class TidalPlayer(commands.Cog):
             l, f = await self._run_blocking_io(session.login_oauth, timeout=60.0)
             e = discord.Embed(
                 title="Tidal OAuth",
-                description=f"[Click to authenticate]({l.verification_uri_complete})",
-                color=COLOR_TIDAL,
+                description=f"[Click]({l.verification_uri_complete})",
+                color=0x00B2FF,
             )
             try:
                 await ctx.author.send(embed=e)
-                await ctx.send("Check your DMs for authentication link.")
+                await ctx.send("Check DMs.")
             except discord.Forbidden:
                 await ctx.send(embed=e)
 
