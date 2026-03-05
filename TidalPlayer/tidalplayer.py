@@ -53,8 +53,8 @@ COG_IDENTIFIER = 160819386
 API_SEMAPHORE_LIMIT = 5
 INTERACTIVE_TIMEOUT = 30
 BATCH_UPDATE_INTERVAL = 10
-LOGIN_CACHE_TTL = 300.0  # 5 minutes
-PROGRESS_EDIT_RATELIMIT = 1.5  # minimum seconds between progress message edits
+LOGIN_CACHE_TTL = 300.0
+PROGRESS_EDIT_RATELIMIT = 1.5
 
 REACTION_NUMBERS = ("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣")
 CANCEL_EMOJI = "❌"
@@ -123,11 +123,17 @@ class Messages:
 
 
 def truncate(text: str, limit: int) -> str:
-    return text[: limit - 3] + "..." if len(text) > limit else text
+    """Optimized truncation using slicing."""
+    return f"{text[:limit-3]}..." if len(text) > limit else text
 
 
 class TidalHandler:
     """Handles low-level Tidal API interactions safely."""
+
+    __slots__ = (
+        "bot", "config", "session", "_refresh_task", "api_semaphore",
+        "_login_cache", "_login_cache_time"
+    )
 
     def __init__(self, bot: Red, config: Config):
         self.bot = bot
@@ -135,23 +141,18 @@ class TidalHandler:
         self.session: Optional[Any] = tidalapi.Session() if TIDALAPI_AVAILABLE else None
         self._refresh_task: Optional[asyncio.Task] = None
         self.api_semaphore = asyncio.Semaphore(API_SEMAPHORE_LIMIT)
-
-        # Login cache — avoids network call on every command invocation
         self._login_cache: Optional[bool] = None
         self._login_cache_time: float = 0.0
 
     async def _run_blocking(self, func: Callable[[], Any], timeout: float = 10.0) -> Any:
+        """Execute blocking I/O in executor with timeout."""
         return await asyncio.wait_for(
             asyncio.get_running_loop().run_in_executor(None, func),
             timeout=timeout,
         )
 
     async def initialize(self, creds: Dict[str, Any]) -> None:
-        """
-        Load session from stored credentials.
-        Accepts pre-fetched creds to avoid a second config read.
-        Skips check_login() on startup — trusts load_oauth_session() success.
-        """
+        """Load session from stored credentials."""
         if not self.session or not creds.get("access_token"):
             return
 
@@ -172,8 +173,6 @@ class TidalHandler:
 
             await self._run_blocking(_load, timeout=15.0)
 
-            # load_oauth_session() succeeded — treat as logged in.
-            # Avoids an extra check_login() HTTP round-trip at startup.
             now = asyncio.get_running_loop().time()
             self._login_cache = True
             self._login_cache_time = now
@@ -184,22 +183,23 @@ class TidalHandler:
             log.warning(f"Failed to load Tidal session: {e}")
 
     def start_refresh_loop(self) -> None:
-        """Start the hourly token refresh loop. Call after initialize()."""
+        """Start the hourly token refresh loop."""
         if self._refresh_task:
             self._refresh_task.cancel()
-        self._refresh_task = asyncio.get_running_loop().create_task(
-            self._auto_refresh_tokens()
-        )
+        self._refresh_task = asyncio.create_task(self._auto_refresh_tokens())
 
     def unload(self) -> None:
+        """Clean up resources."""
         if self._refresh_task:
             self._refresh_task.cancel()
 
     def invalidate_login_cache(self) -> None:
+        """Force re-check of login status on next call."""
         self._login_cache = None
         self._login_cache_time = 0.0
 
     async def is_logged_in(self) -> bool:
+        """Check if Tidal session is valid (cached for performance)."""
         if not self.session:
             return False
 
@@ -226,7 +226,7 @@ class TidalHandler:
             return False
 
     async def _auto_refresh_tokens(self) -> None:
-        # No wait_until_ready() needed — only accesses Config, not Discord state
+        """Background task to refresh tokens hourly."""
         while True:
             await asyncio.sleep(3600)
             try:
@@ -251,14 +251,14 @@ class TidalHandler:
 
                 if expiry_time and datetime.now() + timedelta(hours=2) > expiry_time:
                     log.info("Refreshing Tidal tokens...")
-                    await self.config.token_type.set(token_type)
-                    await self.config.access_token.set(access)
-                    await self.config.refresh_token.set(refresh)
-                    await self.config.expiry_time.set(
-                        int(expiry_time.timestamp()) if expiry_time else None
+                    await asyncio.gather(
+                        self.config.token_type.set(token_type),
+                        self.config.access_token.set(access),
+                        self.config.refresh_token.set(refresh),
+                        self.config.expiry_time.set(
+                            int(expiry_time.timestamp()) if expiry_time else None
+                        ),
                     )
-                    # Set cache to True directly — we just saved fresh tokens,
-                    # no need to force a check_login() HTTP call on next command.
                     now = asyncio.get_running_loop().time()
                     self._login_cache = True
                     self._login_cache_time = now
@@ -266,6 +266,7 @@ class TidalHandler:
                 log.error(f"Token refresh failed: {e}")
 
     async def search(self, query: str, filter_remixes: bool = False) -> List[Any]:
+        """Search Tidal for tracks matching query."""
         if not self.session:
             return []
         async with self.api_semaphore:
@@ -277,9 +278,7 @@ class TidalHandler:
 
                 result = await self._run_blocking(run_search, timeout=10.0)
                 tracks = self._extract_tracks(result)
-                if filter_remixes:
-                    tracks = self._filter_tracks(tracks)
-                return tracks
+                return self._filter_tracks(tracks) if filter_remixes else tracks
             except asyncio.TimeoutError:
                 log.warning(f"Tidal search timeout for '{query}'")
                 return []
@@ -288,6 +287,7 @@ class TidalHandler:
                 return []
 
     async def get_track(self, track_id: str) -> Optional[Any]:
+        """Fetch a single track by ID."""
         if not self.session:
             return None
         async with self.api_semaphore:
@@ -303,6 +303,7 @@ class TidalHandler:
                 return None
 
     async def get_album(self, album_id: str) -> Optional[Any]:
+        """Fetch an album by ID."""
         if not self.session:
             return None
         async with self.api_semaphore:
@@ -314,6 +315,7 @@ class TidalHandler:
                 return None
 
     async def get_playlist(self, playlist_id: str) -> Optional[Any]:
+        """Fetch a playlist by ID."""
         if not self.session:
             return None
         async with self.api_semaphore:
@@ -325,6 +327,7 @@ class TidalHandler:
                 return None
 
     async def get_mix(self, mix_id: str) -> Optional[Any]:
+        """Fetch a Tidal mix by ID."""
         if not self.session:
             return None
         async with self.api_semaphore:
@@ -390,6 +393,7 @@ class TidalHandler:
         return None
 
     def _extract_tracks(self, result: Any) -> List[Any]:
+        """Extract track list from search result."""
         if hasattr(result, "tracks"):
             t = result.tracks
             if isinstance(t, list):
@@ -407,6 +411,7 @@ class TidalHandler:
         return result if isinstance(result, list) else []
 
     def _filter_tracks(self, tracks: List[Any]) -> List[Any]:
+        """Filter out remixes and TikTok versions."""
         if not tracks:
             return []
         return [
@@ -421,6 +426,11 @@ class TidalHandler:
 
 class TidalPlayer(commands.Cog):
     """Play music from Tidal with full metadata support in native queue."""
+
+    __slots__ = (
+        "bot", "config", "tidal", "sp", "yt", "_tasks", "_guild_locks",
+        "_cancel_events", "_last_progress_edit", "_initialized"
+    )
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -454,28 +464,33 @@ class TidalPlayer(commands.Cog):
         self._create_task(self._initialize_apis())
 
     def _create_task(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task:
-        task = self.bot.loop.create_task(coro)
+        """Create and track a background task."""
+        task = asyncio.create_task(coro)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return task
 
     def _get_guild_lock(self, guild_id: int) -> asyncio.Lock:
+        """Get or create a lock for guild operations."""
         if guild_id not in self._guild_locks:
             self._guild_locks[guild_id] = asyncio.Lock()
         return self._guild_locks[guild_id]
 
     def _get_cancel_event(self, guild_id: int) -> asyncio.Event:
+        """Get or create a cancel event for guild operations."""
         if guild_id not in self._cancel_events:
             self._cancel_events[guild_id] = asyncio.Event()
         return self._cancel_events[guild_id]
 
     async def _run_blocking_io(self, func: Callable[[], Any], timeout: float = 10.0) -> Any:
+        """Execute blocking I/O in executor with timeout."""
         return await asyncio.wait_for(
             asyncio.get_running_loop().run_in_executor(None, func),
             timeout=timeout,
         )
 
     def cog_unload(self) -> None:
+        """Clean up resources on cog unload."""
         for ev in self._cancel_events.values():
             ev.set()
         for task in list(self._tasks):
@@ -486,11 +501,7 @@ class TidalPlayer(commands.Cog):
         log.info("TidalPlayer cog unloaded")
 
     async def _initialize_apis(self) -> None:
-        """
-        Initialize all external APIs in parallel.
-        Does NOT wait for Discord ready — Tidal/Spotify/YouTube don't need it.
-        Startup time = max(tidal, spotify, youtube) instead of their sum.
-        """
+        """Initialize all external APIs in parallel."""
         creds = await self.config.all()
 
         results = await asyncio.gather(
@@ -509,6 +520,7 @@ class TidalPlayer(commands.Cog):
         log.info("TidalPlayer fully initialized")
 
     async def _initialize_spotify(self, creds: Dict[str, Any]) -> None:
+        """Initialize Spotify API client."""
         if not SPOTIFY_AVAILABLE:
             return
         cid = creds.get("spotify_client_id")
@@ -526,6 +538,7 @@ class TidalPlayer(commands.Cog):
                 log.error(f"Spotify init failed: {e}")
 
     async def _initialize_youtube(self, creds: Dict[str, Any]) -> None:
+        """Initialize YouTube API client."""
         if not YOUTUBE_API_AVAILABLE:
             return
         key = creds.get("youtube_api_key")
@@ -543,6 +556,7 @@ class TidalPlayer(commands.Cog):
     # --- Core Logic ---
 
     def _extract_meta(self, track: Any) -> TrackMeta:
+        """Extract metadata from Tidal track object."""
         name = getattr(track, "name", "Unknown") or "Unknown"
         artist_obj = getattr(track, "artist", None)
         artist = getattr(artist_obj, "name", "Unknown") if artist_obj else "Unknown"
@@ -570,10 +584,12 @@ class TidalPlayer(commands.Cog):
         return meta
 
     def _format_duration(self, seconds: int) -> str:
+        """Format duration in HH:MM:SS or MM:SS."""
         m, s = divmod(seconds, 60)
         return f"{m // 60}:{m % 60:02d}:{s:02d}" if m >= 60 else f"{m:02d}:{s:02d}"
 
     async def _get_player(self, ctx: commands.Context) -> Optional[Any]:
+        """Get or create Lavalink player for guild."""
         if not LAVALINK_AVAILABLE:
             return None
         try:
@@ -591,6 +607,7 @@ class TidalPlayer(commands.Cog):
     async def _load_and_queue_track(
         self, ctx: commands.Context, tidal_track: Any, show_embed: bool = True
     ) -> bool:
+        """Load a Tidal track into Lavalink and queue it."""
         meta = self._extract_meta(tidal_track)
         player = await self._get_player(ctx)
 
@@ -628,13 +645,14 @@ class TidalPlayer(commands.Cog):
         return True
 
     async def _send_now_playing(self, ctx: commands.Context, meta: TrackMeta) -> None:
-        desc = f"**{meta['title']}**\n{meta['artist']}"
+        """Send now playing embed with track metadata."""
+        desc_parts = [f"**{meta['title']}**", meta['artist']]
         if meta.get("album"):
-            desc += f"\n_{meta['album']}_"
+            desc_parts.append(f"_{meta['album']}_")
 
         embed = discord.Embed(
             title=Messages.STATUS_PLAYING,
-            description=desc,
+            description="\n".join(desc_parts),
             color=discord.Color.blue(),
         )
         embed.add_field(
@@ -651,15 +669,15 @@ class TidalPlayer(commands.Cog):
     async def _interactive_select(
         self, ctx: commands.Context, tracks: List[Any]
     ) -> Optional[Any]:
+        """Show interactive track selection menu."""
         if not tracks:
             return None
+        
         top = tracks[:5]
-        desc: List[str] = []
-        for i, t in enumerate(top):
-            artist = (
-                getattr(t.artist, "name", "Unknown") if hasattr(t, "artist") else "Unknown"
-            )
-            desc.append(f"**{i + 1}.** {t.name} - {artist}")
+        desc = [
+            f"**{i + 1}.** {t.name} - {getattr(t.artist, 'name', 'Unknown') if hasattr(t, 'artist') else 'Unknown'}"
+            for i, t in enumerate(top)
+        ]
 
         embed = discord.Embed(
             title="Select Track",
@@ -697,27 +715,24 @@ class TidalPlayer(commands.Cog):
             return None
 
     async def _add_reactions(self, msg: discord.Message, count: int) -> None:
+        """Add reaction buttons to message."""
         try:
-            for i in range(count):
-                await msg.add_reaction(REACTION_NUMBERS[i])
-            await msg.add_reaction(CANCEL_EMOJI)
+            reactions = list(REACTION_NUMBERS[:count]) + [CANCEL_EMOJI]
+            for emoji in reactions:
+                await msg.add_reaction(emoji)
         except Exception:
             pass
 
     async def _edit_progress_message(
         self, msg: discord.Message, embed: discord.Embed
     ) -> None:
-        """
-        Edit the progress message, respecting Discord rate limits.
-        Skips the edit if called too soon — never sleeps to avoid blocking
-        the playlist loop (old sleep caused up to +Ns overhead for N updates).
-        """
+        """Edit progress message with rate limiting."""
         now = asyncio.get_running_loop().time()
         if now - self._last_progress_edit.get(msg.id, 0.0) < PROGRESS_EDIT_RATELIMIT:
             return
         try:
             await msg.edit(embed=embed)
-            self._last_progress_edit[msg.id] = asyncio.get_running_loop().time()
+            self._last_progress_edit[msg.id] = now
         except Exception:
             pass
 
@@ -729,6 +744,7 @@ class TidalPlayer(commands.Cog):
         item_processor: Callable[[Any], Any],
         color: discord.Color = discord.Color.blue(),
     ) -> None:
+        """Process and queue a list of tracks with progress updates."""
         if not items:
             await ctx.send(Messages.ERROR_NO_TRACKS_FOUND)
             return
@@ -738,9 +754,6 @@ class TidalPlayer(commands.Cog):
             await ctx.send("Already processing a playlist in this server.")
             return
 
-        # Hoist both reads before entering the lock+loop.
-        # filter_remixes was previously read on every Spotify/YT track (N config reads).
-        # Player is checked once — in-loop we use is_connected (attribute, no network).
         filter_remixes = await self.config.guild(ctx.guild).filter_remixes()
         player = await self._get_player(ctx)
         if not player:
@@ -758,10 +771,7 @@ class TidalPlayer(commands.Cog):
 
             try:
                 for i, item in enumerate(items, 1):
-                    if cancel_event.is_set():
-                        break
-                    # Lightweight in-memory attribute check — no network call
-                    if not getattr(player, "is_connected", True):
+                    if cancel_event.is_set() or not getattr(player, "is_connected", True):
                         break
 
                     query = item_processor(item)
@@ -778,10 +788,8 @@ class TidalPlayer(commands.Cog):
                                 ctx, tracks[0], show_embed=False
                             )
 
-                    if success:
-                        queued += 1
-                    else:
-                        skipped += 1
+                    queued += success
+                    skipped += not success
 
                     if i - last_up >= BATCH_UPDATE_INTERVAL or i == total:
                         embed = discord.Embed(
@@ -804,7 +812,6 @@ class TidalPlayer(commands.Cog):
                     description=f"Source: {truncate(name, 100)}",
                     color=color,
                 )
-                # Force-send the final update regardless of rate limit
                 try:
                     await pmsg.edit(embed=final_embed)
                     self._last_progress_edit[pmsg.id] = asyncio.get_running_loop().time()
@@ -822,6 +829,7 @@ class TidalPlayer(commands.Cog):
                 self._last_progress_edit.pop(pmsg.id, None)
 
     async def _check_ready(self, ctx: commands.Context) -> bool:
+        """Verify all dependencies are ready."""
         if not self._initialized:
             await ctx.send(Messages.ERROR_STILL_LOADING)
             return False
@@ -842,6 +850,7 @@ class TidalPlayer(commands.Cog):
     # --- Command Handlers ---
 
     async def _handle_tidal_url(self, ctx: commands.Context, url: str) -> None:
+        """Route Tidal URL to appropriate handler."""
         for k, p in TIDAL_URL_PATTERNS.items():
             if m := p.search(url):
                 func = getattr(self, f"_handle_{k}", None)
@@ -853,6 +862,7 @@ class TidalPlayer(commands.Cog):
         )
 
     async def _handle_track(self, ctx: commands.Context, tid: str) -> None:
+        """Handle single track URL."""
         t = await self.tidal.get_track(tid)
         if t:
             await self._load_and_queue_track(ctx, t, show_embed=True)
@@ -860,6 +870,7 @@ class TidalPlayer(commands.Cog):
             await ctx.send(Messages.ERROR_NO_TRACKS_FOUND)
 
     async def _handle_album(self, ctx: commands.Context, aid: str) -> None:
+        """Handle album URL."""
         alb = await self.tidal.get_album(aid)
         if alb:
             tracks = await self.tidal.get_items(alb)
@@ -868,6 +879,7 @@ class TidalPlayer(commands.Cog):
             await ctx.send(Messages.ERROR_CONTENT_UNAVAILABLE)
 
     async def _handle_playlist(self, ctx: commands.Context, pid: str) -> None:
+        """Handle playlist URL."""
         pl = await self.tidal.get_playlist(pid)
         if pl:
             tracks = await self.tidal.get_items(pl)
@@ -876,6 +888,7 @@ class TidalPlayer(commands.Cog):
             await ctx.send(Messages.ERROR_CONTENT_UNAVAILABLE)
 
     async def _handle_mix(self, ctx: commands.Context, mid: str) -> None:
+        """Handle Tidal mix URL."""
         mix = await self.tidal.get_mix(mid)
         if mix:
             items = await self.tidal.get_items(mix)
@@ -965,12 +978,14 @@ class TidalPlayer(commands.Cog):
 
     @commands.command(name="tstop")
     async def tstop(self, ctx: commands.Context) -> None:
+        """Stop current playlist queueing operation."""
         cancel_event = self._get_cancel_event(ctx.guild.id)
         cancel_event.set()
         await ctx.send(Messages.STATUS_STOPPING)
 
     @commands.command(name="tfilter")
     async def tfilter(self, ctx: commands.Context) -> None:
+        """Toggle remix/TikTok filtering."""
         curr = await self.config.guild(ctx.guild).filter_remixes()
         await self.config.guild(ctx.guild).filter_remixes.set(not curr)
         await ctx.send(
@@ -979,6 +994,7 @@ class TidalPlayer(commands.Cog):
 
     @commands.command(name="tinteractive")
     async def tinteractive(self, ctx: commands.Context) -> None:
+        """Toggle interactive search mode."""
         curr = await self.config.guild(ctx.guild).interactive_search()
         await self.config.guild(ctx.guild).interactive_search.set(not curr)
         await ctx.send(
@@ -1024,6 +1040,7 @@ class TidalPlayer(commands.Cog):
     @commands.is_owner()
     @commands.command(name="tidalsetup")
     async def tidalsetup(self, ctx: commands.Context) -> None:
+        """Set up Tidal OAuth authentication."""
         if not TIDALAPI_AVAILABLE:
             await ctx.send(Messages.ERROR_NO_TIDALAPI)
             return
@@ -1058,11 +1075,13 @@ class TidalPlayer(commands.Cog):
                 except Exception:
                     expiry_time = None
 
-                await self.config.token_type.set(session.token_type)
-                await self.config.access_token.set(session.access_token)
-                await self.config.refresh_token.set(session.refresh_token)
-                await self.config.expiry_time.set(
-                    int(expiry_time.timestamp()) if expiry_time else None
+                await asyncio.gather(
+                    self.config.token_type.set(session.token_type),
+                    self.config.access_token.set(session.access_token),
+                    self.config.refresh_token.set(session.refresh_token),
+                    self.config.expiry_time.set(
+                        int(expiry_time.timestamp()) if expiry_time else None
+                    ),
                 )
                 self.tidal.invalidate_login_cache()
                 await ctx.send(Messages.SUCCESS_TIDAL_SETUP)
@@ -1074,24 +1093,30 @@ class TidalPlayer(commands.Cog):
     @commands.is_owner()
     @commands.group(name="tidalplay")
     async def tidalplay(self, ctx: commands.Context) -> None:
+        """TidalPlayer configuration commands."""
         if ctx.invoked_subcommand is None:
             await ctx.send_help(ctx.command)
 
     @tidalplay.command(name="spotify")
     async def tidalplay_spotify(self, ctx: commands.Context, cid: str, csec: str) -> None:
-        await self.config.spotify_client_id.set(cid)
-        await self.config.spotify_client_secret.set(csec)
+        """Configure Spotify API credentials."""
+        await asyncio.gather(
+            self.config.spotify_client_id.set(cid),
+            self.config.spotify_client_secret.set(csec),
+        )
         await self._initialize_spotify(await self.config.all())
         await ctx.send(Messages.SUCCESS_SPOTIFY_CONFIGURED)
 
     @tidalplay.command(name="youtube")
     async def tidalplay_youtube(self, ctx: commands.Context, key: str) -> None:
+        """Configure YouTube API key."""
         await self.config.youtube_api_key.set(key)
         await self._initialize_youtube(await self.config.all())
         await ctx.send(Messages.SUCCESS_YOUTUBE_CONFIGURED)
 
     @tidalplay.command(name="cleartokens")
     async def tidalplay_cleartokens(self, ctx: commands.Context) -> None:
+        """Clear all stored tokens and credentials."""
         await self.config.clear_all()
         self.tidal.invalidate_login_cache()
         await ctx.send(Messages.SUCCESS_TOKENS_CLEARED)
