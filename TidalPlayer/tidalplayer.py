@@ -60,6 +60,11 @@ PROGRESS_EDIT_RATELIMIT = 1.5
 LOGIN_CHECK_TIMEOUT = 10.0
 LOGIN_CHECK_RETRIES = 2
 
+EMOJI_OK = "\u2705"
+EMOJI_NO = "\u274c"
+EMOJI_WARN = "\u26a0\ufe0f"
+EMOJI_LOADING = "\u23f3"
+
 REACTION_NUMBERS = ("1\ufe0f\u20e3", "2\ufe0f\u20e3", "3\ufe0f\u20e3", "4\ufe0f\u20e3", "5\ufe0f\u20e3")
 CANCEL_EMOJI = "\u274c"
 
@@ -301,7 +306,7 @@ class TidalHandler:
         async with self.api_semaphore:
             try:
                 def run_search():
-                    # Use module-level TidalTrack ref — no globals() hack
+                    # Use module-level TidalTrack ref - no globals() hack
                     if TIDAL_MODELS_AVAILABLE and TidalTrack is not None:
                         return self.session.search(query, models=[TidalTrack])
                     return self.session.search(query)
@@ -408,7 +413,7 @@ class TidalHandler:
         track_id = getattr(track, "id", None)
 
         async with self.api_semaphore:
-            # Method 1: tidalapi >=0.7 — get_stream().get_urls() returns List[str]
+            # Method 1: tidalapi >=0.7 - get_stream().get_urls() returns List[str]
             try:
                 def _get_urls() -> List[str]:
                     stream = track.get_stream()
@@ -515,7 +520,7 @@ class TidalPlayer(commands.Cog):
 
     # Red best practice: cog_load is the correct async init hook, not __init__ task hacks
     async def cog_load(self) -> None:
-        """Called by Red after __init__ — safe place for async setup."""
+        """Called by Red after __init__ - safe place for async setup."""
         await self._initialize_apis()
 
     def _create_task(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task:
@@ -629,7 +634,7 @@ class TidalPlayer(commands.Cog):
             "image": None,
         }
 
-        # Use Album.image() — the documented tidalapi 0.8.x API method
+        # Use Album.image() - the documented tidalapi 0.8.x API method
         try:
             if album_obj and hasattr(album_obj, "image"):
                 meta["image"] = album_obj.image(dimensions=640)
@@ -1075,33 +1080,37 @@ class TidalPlayer(commands.Cog):
     @commands.command(name="tdebug")
     async def tdebug(self, ctx: commands.Context) -> None:
         """Check Tidal connection status and versions."""
-        tidal_status = "\u274c Not Connected"
+        tidal_status = f"{EMOJI_NO} Not Connected"
         if await self.tidal.is_logged_in():
-            tidal_status = "\u2705 Logged In"
+            tidal_status = f"{EMOJI_OK} Logged In"
         elif self.tidal.session:
-            tidal_status = "\u26a0\ufe0f Session Invalid/Expired"
+            tidal_status = f"{EMOJI_WARN} Session Invalid/Expired"
 
-        lavalink_status = "\u274c Not Loaded"
+        lavalink_status = f"{EMOJI_NO} Not Loaded"
         if LAVALINK_AVAILABLE:
             try:
                 player = lavalink.get_player(ctx.guild.id)
-                lavalink_status = f"\u2705 Loaded (Connected: {player.is_connected})"
+                lavalink_status = f"{EMOJI_OK} Loaded (Connected: {player.is_connected})"
             except Exception:
-                lavalink_status = "\u26a0\ufe0f Loaded but no player found"
+                lavalink_status = f"{EMOJI_WARN} Loaded but no player found"
 
         try:
             tidal_ver = importlib.metadata.version("tidalapi")
         except Exception:
             tidal_ver = "Unknown"
 
+        initialized_icon = EMOJI_OK if self._initialized else EMOJI_LOADING
+        yt_icon = EMOJI_OK if self.yt else EMOJI_NO
+        sp_icon = EMOJI_OK if self.sp else EMOJI_NO
+
         msg = (
             f"**TidalPlayer Debug**\n"
             f"**TidalAPI Version:** `{tidal_ver}`\n"
-            f"**Initialized:** {'\u2705' if self._initialized else '\u23f3 Loading...'}\n"
+            f"**Initialized:** {initialized_icon}\n"
             f"**Tidal Status:** {tidal_status}\n"
             f"**Lavalink Status:** {lavalink_status}\n"
-            f"**YouTube API:** {'\u2705' if self.yt else '\u274c'}\n"
-            f"**Spotify API:** {'\u2705' if self.sp else '\u274c'}"
+            f"**YouTube API:** {yt_icon}\n"
+            f"**Spotify API:** {sp_icon}"
         )
         await ctx.send(msg)
 
