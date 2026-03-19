@@ -55,9 +55,11 @@ INTERACTIVE_TIMEOUT = 30
 BATCH_UPDATE_INTERVAL = 10
 LOGIN_CACHE_TTL = 300.0
 PROGRESS_EDIT_RATELIMIT = 1.5
+LOGIN_CHECK_TIMEOUT = 10.0
+LOGIN_CHECK_RETRIES = 2
 
-REACTION_NUMBERS = ("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣")
-CANCEL_EMOJI = "❌"
+REACTION_NUMBERS = ("1\ufe0f\u20e3", "2\ufe0f\u20e3", "3\ufe0f\u20e3", "4\ufe0f\u20e3", "5\ufe0f\u20e3")
+CANCEL_EMOJI = "\u274c"
 
 QUALITY_LABELS = {
     "HI_RES": "HI-RES (MQA)",
@@ -100,7 +102,7 @@ class Messages:
     ERROR_INVALID_URL = "Invalid {platform} {content_type} URL"
     ERROR_CONTENT_UNAVAILABLE = "Content unavailable (private/region-locked)"
     ERROR_LAVALINK_FAILED = "Playback failed: Could not retrieve Tidal stream."
-    ERROR_STILL_LOADING = "⏳ TidalPlayer is still initializing, please wait a moment."
+    ERROR_STILL_LOADING = "\u23f3 TidalPlayer is still initializing, please wait a moment."
 
     STATUS_PLAYING = "Playing from Tidal"
     PROGRESS_QUEUEING = "Queueing {name} ({count} tracks)..."
@@ -199,7 +201,7 @@ class TidalHandler:
         self._login_cache_time = 0.0
 
     async def is_logged_in(self) -> bool:
-        """Check if Tidal session is valid (cached for performance)."""
+        """Check if Tidal session is valid (cached, with retry on timeout)."""
         if not self.session:
             return False
 
@@ -210,20 +212,26 @@ class TidalHandler:
         ):
             return self._login_cache
 
-        try:
-            result = bool(
-                await self._run_blocking(self.session.check_login, timeout=5.0)
-            )
-            self._login_cache = result
-            self._login_cache_time = now
-            return result
-        except asyncio.TimeoutError:
-            log.warning("Timed out checking Tidal login status")
-            return self._login_cache if self._login_cache is not None else False
-        except Exception:
-            self._login_cache = False
-            self._login_cache_time = now
-            return False
+        for attempt in range(LOGIN_CHECK_RETRIES):
+            try:
+                result = bool(
+                    await self._run_blocking(self.session.check_login, timeout=LOGIN_CHECK_TIMEOUT)
+                )
+                self._login_cache = result
+                self._login_cache_time = asyncio.get_running_loop().time()
+                return result
+            except asyncio.TimeoutError:
+                log.warning(
+                    f"Timed out checking Tidal login status (attempt {attempt + 1}/{LOGIN_CHECK_RETRIES})"
+                )
+                if attempt < LOGIN_CHECK_RETRIES - 1:
+                    await asyncio.sleep(2)
+            except Exception:
+                self._login_cache = False
+                self._login_cache_time = asyncio.get_running_loop().time()
+                return False
+
+        return self._login_cache if self._login_cache is not None else False
 
     async def _auto_refresh_tokens(self) -> None:
         """Background task to refresh tokens hourly."""
@@ -233,24 +241,42 @@ class TidalHandler:
                 if not await self.is_logged_in():
                     continue
 
-                def _get_state():
-                    return (
-                        self.session.expiry_time,
-                        self.session.token_type,
-                        self.session.access_token,
-                        self.session.refresh_token,
-                    )
+                def _get_expiry():
+                    return self.session.expiry_time
 
                 try:
-                    expiry_time, token_type, access, refresh = await self._run_blocking(
-                        _get_state, timeout=5.0
-                    )
+                    expiry_time = await self._run_blocking(_get_expiry, timeout=5.0)
                 except Exception as e:
                     log.warning(f"Token refresh state read failed: {e}")
                     continue
 
                 if expiry_time and datetime.now() + timedelta(hours=2) > expiry_time:
                     log.info("Refreshing Tidal tokens...")
+
+                    # Trigger actual session token refresh if supported
+                    try:
+                        if hasattr(self.session, "request") and hasattr(self.session.request, "refresh_token"):
+                            await self._run_blocking(self.session.request.refresh_token, timeout=15.0)
+                            log.info("Tidal session token refreshed via request.refresh_token")
+                    except Exception as e:
+                        log.warning(f"Session token refresh call failed: {e}")
+
+                    def _get_state():
+                        return (
+                            self.session.expiry_time,
+                            self.session.token_type,
+                            self.session.access_token,
+                            self.session.refresh_token,
+                        )
+
+                    try:
+                        expiry_time, token_type, access, refresh = await self._run_blocking(
+                            _get_state, timeout=5.0
+                        )
+                    except Exception as e:
+                        log.warning(f"Token state read after refresh failed: {e}")
+                        continue
+
                     await asyncio.gather(
                         self.config.token_type.set(token_type),
                         self.config.access_token.set(access),
@@ -259,9 +285,8 @@ class TidalHandler:
                             int(expiry_time.timestamp()) if expiry_time else None
                         ),
                     )
-                    now = asyncio.get_running_loop().time()
                     self._login_cache = True
-                    self._login_cache_time = now
+                    self._login_cache_time = asyncio.get_running_loop().time()
             except Exception as e:
                 log.error(f"Token refresh failed: {e}")
 
@@ -367,29 +392,51 @@ class TidalHandler:
         return items
 
     async def get_stream_url(self, track: Any) -> Optional[str]:
-        """Try to get the direct audio stream URL from Tidal."""
+        """
+        Get the direct audio stream URL from Tidal.
+
+        Tries in order:
+          1. tidalapi >=0.7: track.get_stream().get_urls()[0]
+          2. Legacy fallback: track.get_url()
+          3. Web URL fallback: tidal.com/browse/track/<id>
+        """
+        track_id = getattr(track, "id", None)
+
+        # --- Method 1: tidalapi >=0.7 stream API ---
         async with self.api_semaphore:
             try:
-                return await self._run_blocking(track.get_url, timeout=10.0)
-            except asyncio.TimeoutError:
-                log.debug(f"Direct get_url timeout for track {getattr(track, 'id', None)}")
-            except Exception as e:
-                log.debug(f"Direct get_url failed: {e}")
+                def _get_stream_urls():
+                    stream = track.get_stream()
+                    return stream.get_urls()
 
+                urls = await self._run_blocking(_get_stream_urls, timeout=15.0)
+                if urls:
+                    log.debug(f"Got stream URL via get_stream().get_urls() for track {track_id}")
+                    return urls[0]
+            except asyncio.TimeoutError:
+                log.debug(f"get_stream().get_urls() timed out for track {track_id}")
+            except AttributeError:
+                log.debug(f"get_stream() not available on track {track_id}, trying legacy")
+            except Exception as e:
+                log.debug(f"get_stream().get_urls() failed for track {track_id}: {e}")
+
+            # --- Method 2: Legacy get_url() ---
             try:
-                if self.session and hasattr(track, "id"):
-                    return await self._run_blocking(
-                        lambda: self.session.track.get_url(track.id), timeout=10.0
-                    )
+                url = await self._run_blocking(track.get_url, timeout=10.0)
+                if url:
+                    log.debug(f"Got stream URL via legacy get_url() for track {track_id}")
+                    return url
             except asyncio.TimeoutError:
-                log.debug(f"Legacy get_url timeout for track {getattr(track, 'id', None)}")
+                log.debug(f"Legacy get_url() timed out for track {track_id}")
             except Exception as e:
-                log.debug(f"Legacy session.track.get_url failed: {e}")
+                log.debug(f"Legacy get_url() failed for track {track_id}: {e}")
 
-        if hasattr(track, "id"):
-            url = f"https://tidal.com/browse/track/{track.id}"
-            log.debug(f"Falling back to web URL: {url}")
+        # --- Method 3: Web URL fallback (Lavalink may be able to resolve) ---
+        if track_id:
+            url = f"https://tidal.com/browse/track/{track_id}"
+            log.debug(f"Falling back to web URL for track {track_id}: {url}")
             return url
+
         return None
 
     def _extract_tracks(self, result: Any) -> List[Any]:
@@ -672,7 +719,7 @@ class TidalPlayer(commands.Cog):
         """Show interactive track selection menu."""
         if not tracks:
             return None
-        
+
         top = tracks[:5]
         desc = [
             f"**{i + 1}.** {t.name} - {getattr(t.artist, 'name', 'Unknown') if hasattr(t, 'artist') else 'Unknown'}"
@@ -777,7 +824,7 @@ class TidalPlayer(commands.Cog):
                     query = item_processor(item)
                     success = False
 
-                    if query and (hasattr(query, "id") or hasattr(query, "get_url")):
+                    if query and (hasattr(query, "id") or hasattr(query, "get_url") or hasattr(query, "get_stream")):
                         success = await self._load_and_queue_track(
                             ctx, query, show_embed=False
                         )
@@ -1007,19 +1054,19 @@ class TidalPlayer(commands.Cog):
     @commands.command(name="tdebug")
     async def tdebug(self, ctx: commands.Context) -> None:
         """Check Tidal connection status and versions."""
-        tidal_status = "❌ Not Connected"
+        tidal_status = "\u274c Not Connected"
         if await self.tidal.is_logged_in():
-            tidal_status = "✅ Logged In"
+            tidal_status = "\u2705 Logged In"
         elif self.tidal.session:
-            tidal_status = "⚠️ Session Invalid/Expired"
+            tidal_status = "\u26a0\ufe0f Session Invalid/Expired"
 
-        lavalink_status = "❌ Not Loaded"
+        lavalink_status = "\u274c Not Loaded"
         if LAVALINK_AVAILABLE:
             try:
                 player = lavalink.get_player(ctx.guild.id)
-                lavalink_status = f"✅ Loaded (Connected: {player.is_connected})"
+                lavalink_status = f"\u2705 Loaded (Connected: {player.is_connected})"
             except Exception:
-                lavalink_status = "⚠️ Loaded but no player found"
+                lavalink_status = "\u26a0\ufe0f Loaded but no player found"
 
         try:
             tidal_ver = importlib.metadata.version("tidalapi")
@@ -1029,11 +1076,11 @@ class TidalPlayer(commands.Cog):
         msg = (
             f"**TidalPlayer Debug**\n"
             f"**TidalAPI Version:** `{tidal_ver}`\n"
-            f"**Initialized:** {'✅' if self._initialized else '⏳ Loading...'}\n"
+            f"**Initialized:** {'\u2705' if self._initialized else '\u23f3 Loading...'}\n"
             f"**Tidal Status:** {tidal_status}\n"
             f"**Lavalink Status:** {lavalink_status}\n"
-            f"**YouTube API:** {'✅' if self.yt else '❌'}\n"
-            f"**Spotify API:** {'✅' if self.sp else '❌'}"
+            f"**YouTube API:** {'\u2705' if self.yt else '\u274c'}\n"
+            f"**Spotify API:** {'\u2705' if self.sp else '\u274c'}"
         )
         await ctx.send(msg)
 
