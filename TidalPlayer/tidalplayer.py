@@ -27,9 +27,11 @@ try:
         from tidalapi.media import Track as TidalTrack
         TIDAL_MODELS_AVAILABLE = True
     except ImportError:
+        TidalTrack = None
         TIDAL_MODELS_AVAILABLE = False
     TIDALAPI_AVAILABLE = True
 except ImportError:
+    TidalTrack = None
     TIDALAPI_AVAILABLE = False
     TIDAL_MODELS_AVAILABLE = False
 
@@ -61,9 +63,9 @@ LOGIN_CHECK_RETRIES = 2
 REACTION_NUMBERS = ("1\ufe0f\u20e3", "2\ufe0f\u20e3", "3\ufe0f\u20e3", "4\ufe0f\u20e3", "5\ufe0f\u20e3")
 CANCEL_EMOJI = "\u274c"
 
+# MQA (HI_RES) removed in tidalapi 0.8.0
 QUALITY_LABELS = {
-    "HI_RES": "HI-RES (MQA)",
-    "HI_RES_LOSSLESS": "HI-RES LOSSLESS",
+    "HI_RES_LOSSLESS": "HI-RES LOSSLESS (FLAC)",
     "LOSSLESS": "LOSSLESS (FLAC)",
     "HIGH": "HIGH (320kbps)",
     "LOW": "LOW (96kbps)",
@@ -241,11 +243,10 @@ class TidalHandler:
                 if not await self.is_logged_in():
                     continue
 
-                def _get_expiry():
-                    return self.session.expiry_time
-
                 try:
-                    expiry_time = await self._run_blocking(_get_expiry, timeout=5.0)
+                    expiry_time = await self._run_blocking(
+                        lambda: self.session.expiry_time, timeout=5.0
+                    )
                 except Exception as e:
                     log.warning(f"Token refresh state read failed: {e}")
                     continue
@@ -253,23 +254,26 @@ class TidalHandler:
                 if expiry_time and datetime.now() + timedelta(hours=2) > expiry_time:
                     log.info("Refreshing Tidal tokens...")
 
-                    # Trigger actual session token refresh if supported
                     try:
-                        if hasattr(self.session, "request") and hasattr(self.session.request, "refresh_token"):
-                            await self._run_blocking(self.session.request.refresh_token, timeout=15.0)
+                        if (
+                            hasattr(self.session, "request")
+                            and hasattr(self.session.request, "refresh_token")
+                        ):
+                            await self._run_blocking(
+                                self.session.request.refresh_token, timeout=15.0
+                            )
                             log.info("Tidal session token refreshed via request.refresh_token")
                     except Exception as e:
                         log.warning(f"Session token refresh call failed: {e}")
 
-                    def _get_state():
-                        return (
-                            self.session.expiry_time,
-                            self.session.token_type,
-                            self.session.access_token,
-                            self.session.refresh_token,
-                        )
-
                     try:
+                        def _get_state():
+                            return (
+                                self.session.expiry_time,
+                                self.session.token_type,
+                                self.session.access_token,
+                                self.session.refresh_token,
+                            )
                         expiry_time, token_type, access, refresh = await self._run_blocking(
                             _get_state, timeout=5.0
                         )
@@ -297,7 +301,8 @@ class TidalHandler:
         async with self.api_semaphore:
             try:
                 def run_search():
-                    if TIDAL_MODELS_AVAILABLE and "TidalTrack" in globals():
+                    # Use module-level TidalTrack ref — no globals() hack
+                    if TIDAL_MODELS_AVAILABLE and TidalTrack is not None:
                         return self.session.search(query, models=[TidalTrack])
                     return self.session.search(query)
 
@@ -396,31 +401,32 @@ class TidalHandler:
         Get the direct audio stream URL from Tidal.
 
         Tries in order:
-          1. tidalapi >=0.7: track.get_stream().get_urls()[0]
+          1. tidalapi >=0.7: track.get_stream().get_urls() -> List[str]
           2. Legacy fallback: track.get_url()
           3. Web URL fallback: tidal.com/browse/track/<id>
         """
         track_id = getattr(track, "id", None)
 
-        # --- Method 1: tidalapi >=0.7 stream API ---
         async with self.api_semaphore:
+            # Method 1: tidalapi >=0.7 — get_stream().get_urls() returns List[str]
             try:
-                def _get_stream_urls():
+                def _get_urls() -> List[str]:
                     stream = track.get_stream()
-                    return stream.get_urls()
+                    urls: List[str] = stream.get_urls()
+                    return urls
 
-                urls = await self._run_blocking(_get_stream_urls, timeout=15.0)
+                urls = await self._run_blocking(_get_urls, timeout=15.0)
                 if urls:
                     log.debug(f"Got stream URL via get_stream().get_urls() for track {track_id}")
                     return urls[0]
             except asyncio.TimeoutError:
                 log.debug(f"get_stream().get_urls() timed out for track {track_id}")
             except AttributeError:
-                log.debug(f"get_stream() not available on track {track_id}, trying legacy")
+                log.debug(f"get_stream() unavailable on track {track_id}, trying legacy")
             except Exception as e:
                 log.debug(f"get_stream().get_urls() failed for track {track_id}: {e}")
 
-            # --- Method 2: Legacy get_url() ---
+            # Method 2: legacy get_url() (pre-0.7)
             try:
                 url = await self._run_blocking(track.get_url, timeout=10.0)
                 if url:
@@ -431,12 +437,11 @@ class TidalHandler:
             except Exception as e:
                 log.debug(f"Legacy get_url() failed for track {track_id}: {e}")
 
-        # --- Method 3: Web URL fallback (Lavalink may be able to resolve) ---
+        # Method 3: web URL last resort
         if track_id:
             url = f"https://tidal.com/browse/track/{track_id}"
             log.debug(f"Falling back to web URL for track {track_id}: {url}")
             return url
-
         return None
 
     def _extract_tracks(self, result: Any) -> List[Any]:
@@ -508,7 +513,10 @@ class TidalPlayer(commands.Cog):
         self._last_progress_edit: Dict[int, float] = {}
         self._initialized: bool = False
 
-        self._create_task(self._initialize_apis())
+    # Red best practice: cog_load is the correct async init hook, not __init__ task hacks
+    async def cog_load(self) -> None:
+        """Called by Red after __init__ — safe place for async setup."""
+        await self._initialize_apis()
 
     def _create_task(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task:
         """Create and track a background task."""
@@ -621,8 +629,12 @@ class TidalPlayer(commands.Cog):
             "image": None,
         }
 
+        # Use Album.image() — the documented tidalapi 0.8.x API method
         try:
-            if album_obj and hasattr(album_obj, "cover") and album_obj.cover:
+            if album_obj and hasattr(album_obj, "image"):
+                meta["image"] = album_obj.image(dimensions=640)
+            elif album_obj and hasattr(album_obj, "cover") and album_obj.cover:
+                # Legacy fallback for older tidalapi builds
                 uuid = album_obj.cover.replace("-", "/")
                 meta["image"] = f"https://resources.tidal.com/images/{uuid}/640x640.jpg"
         except Exception:
@@ -693,7 +705,7 @@ class TidalPlayer(commands.Cog):
 
     async def _send_now_playing(self, ctx: commands.Context, meta: TrackMeta) -> None:
         """Send now playing embed with track metadata."""
-        desc_parts = [f"**{meta['title']}**", meta['artist']]
+        desc_parts = [f"**{meta['title']}**", meta["artist"]]
         if meta.get("album"):
             desc_parts.append(f"_{meta['album']}_")
 
@@ -704,7 +716,7 @@ class TidalPlayer(commands.Cog):
         )
         embed.add_field(
             name="Quality",
-            value=QUALITY_LABELS.get(meta["quality"], "LOSSLESS"),
+            value=QUALITY_LABELS.get(meta["quality"], meta["quality"]),
             inline=True,
         )
         embed.set_footer(text=f"Duration: {self._format_duration(meta['duration'])}")
@@ -824,7 +836,11 @@ class TidalPlayer(commands.Cog):
                     query = item_processor(item)
                     success = False
 
-                    if query and (hasattr(query, "id") or hasattr(query, "get_url") or hasattr(query, "get_stream")):
+                    if query and (
+                        hasattr(query, "id")
+                        or hasattr(query, "get_url")
+                        or hasattr(query, "get_stream")
+                    ):
                         success = await self._load_and_queue_track(
                             ctx, query, show_embed=False
                         )
@@ -947,6 +963,7 @@ class TidalPlayer(commands.Cog):
 
     # --- Commands ---
 
+    @commands.guild_only()
     @commands.cooldown(1, 5, commands.BucketType.user)
     @commands.command(name="tplay")
     async def tplay(self, ctx: commands.Context, *, query: str) -> None:
@@ -1023,6 +1040,7 @@ class TidalPlayer(commands.Cog):
         else:
             await self._load_and_queue_track(ctx, tracks[0], show_embed=True)
 
+    @commands.guild_only()
     @commands.command(name="tstop")
     async def tstop(self, ctx: commands.Context) -> None:
         """Stop current playlist queueing operation."""
@@ -1030,6 +1048,7 @@ class TidalPlayer(commands.Cog):
         cancel_event.set()
         await ctx.send(Messages.STATUS_STOPPING)
 
+    @commands.guild_only()
     @commands.command(name="tfilter")
     async def tfilter(self, ctx: commands.Context) -> None:
         """Toggle remix/TikTok filtering."""
@@ -1039,6 +1058,7 @@ class TidalPlayer(commands.Cog):
             Messages.SUCCESS_FILTER_ENABLED if not curr else Messages.SUCCESS_FILTER_DISABLED
         )
 
+    @commands.guild_only()
     @commands.command(name="tinteractive")
     async def tinteractive(self, ctx: commands.Context) -> None:
         """Toggle interactive search mode."""
@@ -1050,6 +1070,7 @@ class TidalPlayer(commands.Cog):
             else Messages.SUCCESS_INTERACTIVE_DISABLED
         )
 
+    @commands.guild_only()
     @commands.is_owner()
     @commands.command(name="tdebug")
     async def tdebug(self, ctx: commands.Context) -> None:
@@ -1098,20 +1119,20 @@ class TidalPlayer(commands.Cog):
             return
 
         try:
-            l, f = await self._run_blocking_io(session.login_oauth, timeout=60.0)
+            login, future = await self._run_blocking_io(session.login_oauth, timeout=60.0)
             e = discord.Embed(
                 title="Tidal OAuth",
-                description=f"[Click]({l.verification_uri_complete})",
+                description=f"[Click here to authenticate]({login.verification_uri_complete})",
                 color=0x00B2FF,
             )
             try:
                 await ctx.author.send(embed=e)
-                await ctx.send("Check DMs.")
+                await ctx.send("Check DMs for the authentication link.")
             except discord.Forbidden:
                 await ctx.send(embed=e)
 
             try:
-                await self._run_blocking_io(lambda: f.result(300), timeout=305.0)
+                await self._run_blocking_io(lambda: future.result(300), timeout=305.0)
             except asyncio.TimeoutError:
                 await ctx.send("OAuth flow timed out.")
                 return
