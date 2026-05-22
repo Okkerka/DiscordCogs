@@ -8,7 +8,7 @@ import importlib.metadata
 import logging
 import re
 from datetime import datetime, timedelta
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Set, TypedDict
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Set, Tuple, TypedDict
 
 import discord
 from redbot.core import Config, commands
@@ -59,6 +59,8 @@ LOGIN_CACHE_TTL = 300.0
 PROGRESS_EDIT_RATELIMIT = 1.5
 LOGIN_CHECK_TIMEOUT = 10.0
 LOGIN_CHECK_RETRIES = 2
+PAGINATION_LIMIT = 100
+MAX_ITEMS = 1000
 
 EMOJI_OK = "\u2705"
 EMOJI_NO = "\u274c"
@@ -89,6 +91,7 @@ TIDAL_URL_PATTERNS = {
 
 SPOTIFY_PLAYLIST_PATTERN = re.compile(r"open\.spotify\.com/playlist/([a-zA-Z0-9]+)")
 YOUTUBE_PLAYLIST_PATTERN = re.compile(r"youtube\.com/.*[?&]list=([a-zA-Z0-9_-]+)")
+ISRC_PATTERN = re.compile(r"^isrc:([A-Z]{2}[A-Z0-9]{3}\d{7})$", re.IGNORECASE)
 
 
 class TrackMeta(TypedDict):
@@ -98,6 +101,8 @@ class TrackMeta(TypedDict):
     duration: int
     quality: str
     image: Optional[str]
+    share_url: Optional[str]
+    audio_resolution: Optional[str]
 
 
 class Messages:
@@ -306,7 +311,6 @@ class TidalHandler:
         async with self.api_semaphore:
             try:
                 def run_search():
-                    # Use module-level TidalTrack ref - no globals() hack
                     if TIDAL_MODELS_AVAILABLE and TidalTrack is not None:
                         return self.session.search(query, models=[TidalTrack])
                     return self.session.search(query)
@@ -320,6 +324,22 @@ class TidalHandler:
             except Exception as e:
                 log.error(f"Search failed for '{query}': {e}")
                 return []
+
+    async def get_track_by_isrc(self, isrc: str) -> Optional[Any]:
+        """Fetch a track by ISRC code (tidalapi 0.8.0+)."""
+        if not self.session:
+            return None
+        async with self.api_semaphore:
+            try:
+                def _fetch():
+                    if hasattr(self.session, "get_tracks_by_isrc"):
+                        results = self.session.get_tracks_by_isrc(isrc)
+                        return results[0] if results else None
+                    return None
+                return await self._run_blocking(_fetch, timeout=10.0)
+            except Exception as e:
+                log.debug(f"ISRC lookup failed for {isrc}: {e}")
+                return None
 
     async def get_track(self, track_id: str) -> Optional[Any]:
         """Fetch a single track by ID."""
@@ -376,19 +396,31 @@ class TidalHandler:
                 return None
 
     async def get_items(self, container: Any) -> List[Any]:
-        """Safely fetch items/tracks from a container (Album/Playlist)."""
+        """
+        Paginate items/tracks from a container (Album/Playlist) using
+        limit/offset params (tidalapi 0.8.0+), with a fallback to legacy fetch.
+        Caps at MAX_ITEMS tracks total.
+        """
+        # Try paginated fetch first (tidalapi 0.8.0+)
+        if hasattr(container, "items") and callable(container.items):
+            try:
+                return await self._paginate_items(container)
+            except Exception as e:
+                log.warning(f"Paginated fetch failed, falling back to legacy: {e}")
+
+        # Legacy fallback
         def _fetch():
             if hasattr(container, "tracks"):
                 val = container.tracks
-                return val() if callable(val) else val
+                return list(val() if callable(val) else val)
             if hasattr(container, "items"):
                 val = container.items
-                return val() if callable(val) else val
+                return list(val() if callable(val) else val)
             return []
 
         async with self.api_semaphore:
             try:
-                items = await self._run_blocking(_fetch, timeout=20.0)
+                items = await self._run_blocking(_fetch, timeout=30.0)
             except asyncio.TimeoutError:
                 log.error("Timed out extracting items from Tidal container")
                 return []
@@ -396,10 +428,67 @@ class TidalHandler:
                 log.error(f"Failed to extract items: {e}")
                 return []
 
-        if len(items) > 1000:
-            log.warning(f"Truncating Tidal container from {len(items)} to 1000 items")
-            return list(items)[:1000]
+        if len(items) > MAX_ITEMS:
+            log.warning(f"Truncating Tidal container from {len(items)} to {MAX_ITEMS} items")
+            return items[:MAX_ITEMS]
         return items
+
+    async def _paginate_items(self, container: Any) -> List[Any]:
+        """Paginate through container items using limit/offset (tidalapi 0.8.0+)."""
+        all_items: List[Any] = []
+        offset = 0
+
+        while len(all_items) < MAX_ITEMS:
+            chunk: List[Any] = []
+            async with self.api_semaphore:
+                try:
+                    # sparse_album=True skips nested album hydration per-track (perf win)
+                    def _fetch(o=offset):
+                        try:
+                            return list(container.items(
+                                limit=PAGINATION_LIMIT, offset=o, sparse_album=True
+                            ))
+                        except TypeError:
+                            # sparse_album not supported on this container type
+                            return list(container.items(limit=PAGINATION_LIMIT, offset=o))
+
+                    chunk = await self._run_blocking(_fetch, timeout=25.0)
+                except asyncio.TimeoutError:
+                    log.error(f"Pagination timeout at offset {offset}")
+                    break
+                except Exception as e:
+                    log.error(f"Pagination error at offset {offset}: {e}")
+                    break
+
+            if not chunk:
+                break
+
+            all_items.extend(chunk)
+            if len(chunk) < PAGINATION_LIMIT:
+                break
+            offset += PAGINATION_LIMIT
+            await asyncio.sleep(0)
+
+        return all_items[:MAX_ITEMS]
+
+    async def get_audio_resolution(self, album_obj: Any) -> Optional[Tuple[int, int]]:
+        """
+        Get (bit_depth, sample_rate) from album via get_audio_resolution()
+        (tidalapi 0.7.5+). Returns None if unavailable.
+        """
+        if not album_obj or not hasattr(album_obj, "get_audio_resolution"):
+            return None
+        try:
+            res = await self._run_blocking(album_obj.get_audio_resolution, timeout=5.0)
+            if res:
+                entry = res[0] if isinstance(res, (list, tuple)) and len(res) > 0 else res
+                if hasattr(entry, "__iter__") and not isinstance(entry, str):
+                    parts = list(entry)
+                    if len(parts) >= 2:
+                        return int(parts[0]), int(parts[1])
+        except Exception:
+            pass
+        return None
 
     async def get_stream_url(self, track: Any) -> Optional[str]:
         """
@@ -518,7 +607,6 @@ class TidalPlayer(commands.Cog):
         self._last_progress_edit: Dict[int, float] = {}
         self._initialized: bool = False
 
-    # Red best practice: cog_load is the correct async init hook, not __init__ task hacks
     async def cog_load(self) -> None:
         """Called by Red after __init__ - safe place for async setup."""
         await self._initialize_apis()
@@ -615,15 +703,29 @@ class TidalPlayer(commands.Cog):
 
     # --- Core Logic ---
 
-    def _extract_meta(self, track: Any) -> TrackMeta:
-        """Extract metadata from Tidal track object."""
-        name = getattr(track, "name", "Unknown") or "Unknown"
+    async def _extract_meta(self, track: Any) -> TrackMeta:
+        """
+        Extract metadata from Tidal track object.
+        Uses full_name (tidalapi 0.7.2+) for feat. artist support,
+        share_url (0.8.0+) for direct link, and get_audio_resolution (0.7.5+)
+        for bit depth / sample rate on Hi-Res tracks.
+        """
+        # Prefer full_name (includes feat. artists) over plain name (tidalapi 0.7.2+)
+        full_name = getattr(track, "full_name", None)
+        name = full_name or getattr(track, "name", "Unknown") or "Unknown"
+
         artist_obj = getattr(track, "artist", None)
         artist = getattr(artist_obj, "name", "Unknown") if artist_obj else "Unknown"
         album_obj = getattr(track, "album", None)
         album = getattr(album_obj, "name", None) if album_obj else None
         duration = int(getattr(track, "duration", 0) or 0)
         quality = getattr(track, "audio_quality", "LOSSLESS") or "LOSSLESS"
+
+        # share_url (tidalapi 0.8.0+) - direct "Open in TIDAL" link
+        track_id = getattr(track, "id", None)
+        share_url = getattr(track, "share_url", None) or getattr(track, "listen_url", None)
+        if not share_url and track_id:
+            share_url = f"https://tidal.com/browse/track/{track_id}"
 
         meta: TrackMeta = {
             "title": name,
@@ -632,18 +734,27 @@ class TidalPlayer(commands.Cog):
             "duration": duration,
             "quality": quality,
             "image": None,
+            "share_url": share_url,
+            "audio_resolution": None,
         }
 
-        # Use Album.image() - the documented tidalapi 0.8.x API method
+        # Album art: use album.image() (tidalapi 0.8.x documented API)
         try:
             if album_obj and hasattr(album_obj, "image"):
                 meta["image"] = album_obj.image(dimensions=640)
             elif album_obj and hasattr(album_obj, "cover") and album_obj.cover:
-                # Legacy fallback for older tidalapi builds
                 uuid = album_obj.cover.replace("-", "/")
                 meta["image"] = f"https://resources.tidal.com/images/{uuid}/640x640.jpg"
         except Exception:
             pass
+
+        # Audio resolution for Hi-Res tracks (tidalapi 0.7.5+)
+        if quality == "HI_RES_LOSSLESS" and album_obj:
+            res = await self.tidal.get_audio_resolution(album_obj)
+            if res:
+                bit_depth, sample_rate = res
+                khz = sample_rate // 1000 if sample_rate >= 1000 else sample_rate
+                meta["audio_resolution"] = f"HI-RES LOSSLESS ({bit_depth}-bit / {khz}kHz)"
 
         return meta
 
@@ -672,7 +783,7 @@ class TidalPlayer(commands.Cog):
         self, ctx: commands.Context, tidal_track: Any, show_embed: bool = True
     ) -> bool:
         """Load a Tidal track into Lavalink and queue it."""
-        meta = self._extract_meta(tidal_track)
+        meta = await self._extract_meta(tidal_track)
         player = await self._get_player(ctx)
 
         if not player:
@@ -719,14 +830,25 @@ class TidalPlayer(commands.Cog):
             description="\n".join(desc_parts),
             color=discord.Color.blue(),
         )
-        embed.add_field(
-            name="Quality",
-            value=QUALITY_LABELS.get(meta["quality"], meta["quality"]),
-            inline=True,
+
+        # Show actual audio resolution if available (Hi-Res), otherwise fall back to label
+        quality_display = (
+            meta.get("audio_resolution")
+            or QUALITY_LABELS.get(meta["quality"], meta["quality"])
         )
+        embed.add_field(name="Quality", value=quality_display, inline=True)
         embed.set_footer(text=f"Duration: {self._format_duration(meta['duration'])}")
+
         if meta.get("image"):
             embed.set_thumbnail(url=meta["image"])
+
+        # "Open in TIDAL" button field (tidalapi 0.8.0+ share_url)
+        if meta.get("share_url"):
+            embed.add_field(
+                name="Open in TIDAL",
+                value=f"[Listen]({meta['share_url']})",
+                inline=True,
+            )
 
         await ctx.send(embed=embed)
 
@@ -739,7 +861,8 @@ class TidalPlayer(commands.Cog):
 
         top = tracks[:5]
         desc = [
-            f"**{i + 1}.** {t.name} - {getattr(t.artist, 'name', 'Unknown') if hasattr(t, 'artist') else 'Unknown'}"
+            f"**{i + 1}.** {getattr(t, 'full_name', None) or t.name} - "
+            f"{getattr(t.artist, 'name', 'Unknown') if hasattr(t, 'artist') else 'Unknown'}"
             for i, t in enumerate(top)
         ]
 
@@ -972,12 +1095,30 @@ class TidalPlayer(commands.Cog):
     @commands.cooldown(1, 5, commands.BucketType.user)
     @commands.command(name="tplay")
     async def tplay(self, ctx: commands.Context, *, query: str) -> None:
-        """Play a track, album, playlist, or search query."""
+        """
+        Play a track, album, playlist, or search query.
+
+        Supports:
+        - Tidal URLs (track, album, playlist, mix)
+        - Spotify playlist URLs
+        - YouTube playlist URLs
+        - ISRC lookup: `isrc:USRC12345678`
+        - Plain text search
+        """
         if not await self._check_ready(ctx):
             return
 
         if "tidal.com" in query:
             await self._handle_tidal_url(ctx, query)
+            return
+
+        # ISRC direct lookup (tidalapi 0.8.0+)
+        if isrc_match := ISRC_PATTERN.match(query.strip()):
+            track = await self.tidal.get_track_by_isrc(isrc_match.group(1).upper())
+            if track:
+                await self._load_and_queue_track(ctx, track, show_embed=True)
+            else:
+                await ctx.send(Messages.ERROR_NO_TRACKS_FOUND)
             return
 
         if m := SPOTIFY_PLAYLIST_PATTERN.search(query):
@@ -1099,6 +1240,13 @@ class TidalPlayer(commands.Cog):
         except Exception:
             tidal_ver = "Unknown"
 
+        # Check for ISRC / pagination support
+        isrc_support = (
+            EMOJI_OK
+            if (self.tidal.session and hasattr(self.tidal.session, "get_tracks_by_isrc"))
+            else EMOJI_NO
+        )
+
         initialized_icon = EMOJI_OK if self._initialized else EMOJI_LOADING
         yt_icon = EMOJI_OK if self.yt else EMOJI_NO
         sp_icon = EMOJI_OK if self.sp else EMOJI_NO
@@ -1110,7 +1258,9 @@ class TidalPlayer(commands.Cog):
             f"**Tidal Status:** {tidal_status}\n"
             f"**Lavalink Status:** {lavalink_status}\n"
             f"**YouTube API:** {yt_icon}\n"
-            f"**Spotify API:** {sp_icon}"
+            f"**Spotify API:** {sp_icon}\n"
+            f"**ISRC Lookup:** {isrc_support}\n"
+            f"**Pagination:** {EMOJI_OK} (limit={PAGINATION_LIMIT}, max={MAX_ITEMS})"
         )
         await ctx.send(msg)
 
