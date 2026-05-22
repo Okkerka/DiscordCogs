@@ -80,10 +80,10 @@ QUEUE_PAGE_SIZE = 10
 TPL_LIST_PAGE_SIZE = 15
 SEARCH_BATCH_SIZE = 5
 
-EMOJI_OK = "\u2705"
-EMOJI_NO = "\u274c"
-EMOJI_WARN = "\u26a0\ufe0f"
-EMOJI_LOADING = "\u23f3"
+EMOJI_OK = ""
+EMOJI_NO = ""
+EMOJI_WARN = ""
+EMOJI_LOADING = ""
 
 COLOR_BLUE = discord.Color.blue()
 COLOR_GREEN = discord.Color.green()
