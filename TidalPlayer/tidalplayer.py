@@ -1365,11 +1365,224 @@ class TidalPlayer(commands.Cog):
                 await ctx.send(embed=_error_embed(Messages.ERROR_NO_TRACKS_FOUND))
             return
 
-        # Spotify single track
+        # P41: build search_q once, no repeated dict access
         if m := SPOTIFY_TRACK_PATTERN.search(query):
             if not (SPOTIFY_AVAILABLE and self.sp):
                 await ctx.send(embed=_error_embed(Messages.ERROR_NO_SPOTIFY))
                 return
             try:
                 sp_track = await TidalHandler._run_blocking(lambda: self.sp.track(m.group(1)), timeout=15.0)
-                search_q = f"{sp_track['name']} {sp_tra
+                track_name = sp_track.get("name", "")
+                artists = sp_track.get("artists", [])
+                artist_name = artists[0].get("name", "") if artists else ""
+                search_q = f"{track_name} {artist_name}".strip()
+                tracks = await self.tidal.search(search_q)
+                if tracks:
+                    await self._load_and_queue_track(ctx, tracks[0])
+                else:
+                    await ctx.send(embed=_error_embed(Messages.ERROR_NO_TRACKS_FOUND))
+            except Exception as e:
+                log.error(f"Spotify track lookup failed: {e}")
+                await ctx.send(embed=_error_embed(Messages.ERROR_FETCH_FAILED))
+            return
+
+        # P42: Spotify playlist — early return
+        if m := SPOTIFY_PLAYLIST_PATTERN.search(query):
+            if not (SPOTIFY_AVAILABLE and self.sp):
+                await ctx.send(embed=_error_embed(Messages.ERROR_NO_SPOTIFY))
+                return
+            try:
+                sp_items = await self._fetch_all_spotify_tracks(m.group(1))
+                def _sp_processor(item):
+                    t = item.get("track", {})
+                    name = t.get("name", "")
+                    artists = t.get("artists", [])
+                    artist = artists[0].get("name", "") if artists else ""
+                    # try ISRC first for accuracy
+                    isrc = (t.get("external_ids") or {}).get("isrc")
+                    if isrc:
+                        return f"isrc:{isrc}"
+                    return f"{name} {artist}".strip() if name else None
+                pl_name = "Spotify Playlist"
+                try:
+                    pl_info = await TidalHandler._run_blocking(
+                        lambda: self.sp.playlist(m.group(1), fields="name"), timeout=10.0
+                    )
+                    pl_name = pl_info.get("name", pl_name)
+                except Exception:
+                    pass
+                await self._process_track_list(ctx, sp_items, pl_name, _sp_processor, COLOR_GREEN)
+            except Exception as e:
+                log.error(f"Spotify playlist lookup failed: {e}")
+                await ctx.send(embed=_error_embed(Messages.ERROR_FETCH_FAILED))
+            return
+
+        # Spotify album — early return
+        if m := SPOTIFY_ALBUM_PATTERN.search(query):
+            if not (SPOTIFY_AVAILABLE and self.sp):
+                await ctx.send(embed=_error_embed(Messages.ERROR_NO_SPOTIFY))
+                return
+            try:
+                sp_items, alb_name = await self._fetch_all_spotify_album_tracks(m.group(1))
+                def _sp_alb_processor(item):
+                    name = item.get("name", "")
+                    artists = item.get("artists", [])
+                    artist = artists[0].get("name", "") if artists else ""
+                    isrc = (item.get("external_ids") or {}).get("isrc")
+                    if isrc:
+                        return f"isrc:{isrc}"
+                    return f"{name} {artist}".strip() if name else None
+                await self._process_track_list(ctx, sp_items, alb_name, _sp_alb_processor, COLOR_GREEN)
+            except Exception as e:
+                log.error(f"Spotify album lookup failed: {e}")
+                await ctx.send(embed=_error_embed(Messages.ERROR_FETCH_FAILED))
+            return
+
+        # YouTube playlist — early return
+        if m := YOUTUBE_PLAYLIST_PATTERN.search(query):
+            if not (YOUTUBE_API_AVAILABLE and self.yt):
+                await ctx.send(embed=_error_embed(Messages.ERROR_NO_YOUTUBE))
+                return
+            try:
+                yt_items = await self._fetch_all_youtube_tracks(m.group(1))
+                def _yt_processor(item):
+                    title = item.get("snippet", {}).get("title", "")
+                    return title if title.lower() not in YOUTUBE_SKIP_TITLES else None
+                await self._process_track_list(ctx, yt_items, "YouTube Playlist", _yt_processor, COLOR_RED)
+            except Exception as e:
+                log.error(f"YouTube playlist lookup failed: {e}")
+                await ctx.send(embed=_error_embed(Messages.ERROR_FETCH_FAILED))
+            return
+
+        # Plain text search
+        filter_remixes = await self.config.guild(ctx.guild).filter_remixes()
+        interactive = await self.config.guild(ctx.guild).interactive_search()
+        tracks = await self.tidal.search(query, filter_remixes=filter_remixes)
+        if not tracks:
+            await ctx.send(embed=_error_embed(Messages.ERROR_NO_TRACKS_FOUND))
+            return
+        if interactive:
+            track = await self._interactive_select(ctx, tracks)
+        else:
+            track = tracks[0]
+        if track:
+            await self._load_and_queue_track(ctx, track)
+
+    @commands.guild_only()
+    @commands.cooldown(1, 5, commands.BucketType.user)
+    @commands.hybrid_command(name="tsearch")
+    async def tsearch(self, ctx: commands.Context, *, query: str) -> None:
+        """Search Tidal and display the top results."""
+        if not await self._check_ready(ctx):
+            return
+        filter_remixes = await self.config.guild(ctx.guild).filter_remixes()
+        tracks = await self.tidal.search(query, filter_remixes=filter_remixes)
+        if not tracks:
+            await ctx.send(embed=_error_embed(Messages.ERROR_NO_TRACKS_FOUND))
+            return
+        # P43: single embed with numbered list, not multiple messages
+        lines = []
+        for i, t in enumerate(tracks[:10], 1):
+            name = getattr(t, "full_name", None) or getattr(t, "name", "Unknown")
+            artist_obj = getattr(t, "artist", None)
+            artist = getattr(artist_obj, "name", "Unknown") if artist_obj else "Unknown"
+            dur = self._format_duration(int(getattr(t, "duration", 0) or 0))
+            lines.append(f"**{i}.** {name} — {artist} `[{dur}]`")
+        embed = discord.Embed(
+            title=f"Tidal Search: {truncate(query, 50)}",
+            description="\n".join(lines),
+            color=COLOR_BLUE,
+        )
+        await ctx.send(embed=embed)
+
+    @commands.guild_only()
+    @commands.hybrid_command(name="tnp")
+    async def tnp(self, ctx: commands.Context) -> None:
+        """Show what's currently playing."""
+        if not await self._check_ready(ctx):
+            return
+        # P44: read from cached meta instead of querying player twice
+        meta = self._current_meta.get(ctx.guild.id)
+        if not meta:
+            await ctx.send(embed=_error_embed(Messages.ERROR_NOT_PLAYING))
+            return
+        await self._send_now_playing(ctx, meta)
+
+    @commands.guild_only()
+    @commands.hybrid_command(name="tskip")
+    async def tskip(self, ctx: commands.Context) -> None:
+        """Skip the current track."""
+        if not await self._check_ready(ctx):
+            return
+        player = await self._get_player(ctx)
+        if not player:
+            await ctx.send(embed=_error_embed(Messages.ERROR_NO_PLAYER))
+            return
+        # P45: early return if nothing is playing
+        if not getattr(player, "current", None):
+            await ctx.send(embed=_error_embed(Messages.ERROR_NOT_PLAYING))
+            return
+        await player.skip()
+        await ctx.send(embed=_success_embed("Skipped."))
+
+    @commands.guild_only()
+    @commands.hybrid_command(name="tprev")
+    async def tprev(self, ctx: commands.Context) -> None:
+        """Play the previous track."""
+        if not await self._check_ready(ctx):
+            return
+        player = await self._get_player(ctx)
+        if not player:
+            await ctx.send(embed=_error_embed(Messages.ERROR_NO_PLAYER))
+            return
+        # P46: guard — previous() only exists on some lavalink versions
+        if not hasattr(player, "previous") and not hasattr(player, "play_previous"):
+            await ctx.send(embed=_error_embed("Previous track is not supported by your Lavalink version."))
+            return
+        try:
+            if hasattr(player, "play_previous"):
+                await player.play_previous()
+            else:
+                await player.previous()
+            await ctx.send(embed=_success_embed("Playing previous track."))
+        except Exception as e:
+            await ctx.send(embed=_error_embed(f"Could not go to previous track: {e}"))
+
+    @commands.guild_only()
+    @commands.cooldown(1, 3, commands.BucketType.user)
+    @commands.hybrid_command(name="tqueue")
+    async def tqueue(self, ctx: commands.Context, page: int = 1) -> None:
+        """Show the current queue."""
+        if not await self._check_ready(ctx):
+            return
+        player = await self._get_player(ctx)
+        if not player:
+            await ctx.send(embed=_error_embed(Messages.ERROR_NO_PLAYER))
+            return
+
+        queue = getattr(player, "queue", None)
+        # P47: avoid list() copy — use islice directly on queue
+        queue_len = len(queue) if queue else 0
+        if not queue_len:
+            await ctx.send(embed=_error_embed(Messages.ERROR_NO_QUEUE))
+            return
+
+        total_pages = max(1, -(-queue_len // QUEUE_PAGE_SIZE))
+        page = max(1, min(page, total_pages))
+        start = (page - 1) * QUEUE_PAGE_SIZE
+
+        # P27: list comprehension instead of for-append
+        lines = [
+            f"**{start + j + 1}.** {truncate(getattr(t, 'title', 'Unknown'), 60)} "
+            f"— {truncate(getattr(t, 'author', 'Unknown'), 40)}"
+            for j, t in enumerate(islice(queue, start, start + QUEUE_PAGE_SIZE))
+        ]
+
+        current = getattr(player, "current", None)
+        current_line = ""
+        if current:
+            current_line = (
+                f"**Now playing:** {truncate(getattr(current, 'title', 'Unknown'), 60)}\n\n"
+            )
+
+        embed 
