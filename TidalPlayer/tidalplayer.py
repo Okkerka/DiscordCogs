@@ -260,7 +260,7 @@ class TrackSelectView(discord.ui.View):
 
 
 class TidalHandler:
-    __slots__ = ("bot", "config", "session", "_refresh_task", "api_semaphore", "_login_cache", "_login_cache_time")
+    __slots__ = ("bot", "config", "session", "_refresh_task", "api_semaphore", "_login_cache", "_login_cache_time", "_cache")
 
     def __init__(self, bot: Red, config: Config):
         self.bot = bot
@@ -270,6 +270,26 @@ class TidalHandler:
         self.api_semaphore = asyncio.Semaphore(API_SEMAPHORE_LIMIT)
         self._login_cache: Optional[bool] = None
         self._login_cache_time: float = 0.0
+        self._cache: Dict[str, Dict[str, Tuple[Any, float]]] = {}
+
+    def _get_cached(self, category: str, key: str) -> Optional[Any]:
+        if category not in self._cache:
+            return None
+        if key not in self._cache[category]:
+            return None
+        value, expiry = self._cache[category][key]
+        if asyncio.get_running_loop().time() > expiry:
+            del self._cache[category][key]
+            return None
+        return value
+
+    def _set_cached(self, category: str, key: str, value: Any, ttl: float) -> None:
+        if category not in self._cache:
+            self._cache[category] = {}
+        if len(self._cache[category]) >= 500:
+            oldest_key = next(iter(self._cache[category]))
+            del self._cache[category][oldest_key]
+        self._cache[category][key] = (value, asyncio.get_running_loop().time() + ttl)
 
     @staticmethod
     async def _run_blocking(func: Callable[[], Any], timeout: float = 10.0) -> Any:
@@ -387,6 +407,10 @@ class TidalHandler:
     async def search(self, query: str, filter_remixes: bool = False) -> List[Any]:
         if not self.session:
             return []
+        cache_key = f"{query}:{filter_remixes}"
+        cached = self._get_cached("search", cache_key)
+        if cached is not None:
+            return cached
         async with self.api_semaphore:
             try:
                 def run_search():
@@ -395,7 +419,9 @@ class TidalHandler:
                     return self.session.search(query)
                 result = await self._run_with_backoff(run_search, timeout=10.0)
                 tracks = self._extract_tracks(result)
-                return self._filter_tracks(tracks) if filter_remixes else tracks
+                filtered = self._filter_tracks(tracks) if filter_remixes else tracks
+                self._set_cached("search", cache_key, filtered, 600.0)
+                return filtered
             except asyncio.TimeoutError:
                 log.warning(f"Tidal search timeout for '{query}'")
                 return []
@@ -406,6 +432,9 @@ class TidalHandler:
     async def get_track_by_isrc(self, isrc: str) -> Optional[Any]:
         if not self.session:
             return None
+        cached = self._get_cached("isrc", isrc)
+        if cached is not None:
+            return cached
         async with self.api_semaphore:
             try:
                 def _fetch():
@@ -413,7 +442,10 @@ class TidalHandler:
                         results = self.session.get_tracks_by_isrc(isrc)
                         return results[0] if results else None
                     return None
-                return await self._run_with_backoff(_fetch, timeout=10.0)
+                res = await self._run_with_backoff(_fetch, timeout=10.0)
+                if res:
+                    self._set_cached("isrc", isrc, res, 3600.0)
+                return res
             except Exception as e:
                 log.debug(f"ISRC lookup failed for {isrc}: {e}")
                 return None
@@ -421,9 +453,15 @@ class TidalHandler:
     async def get_track(self, track_id: str) -> Optional[Any]:
         if not self.session:
             return None
+        cached = self._get_cached("track", track_id)
+        if cached is not None:
+            return cached
         async with self.api_semaphore:
             try:
-                return await self._run_with_backoff(lambda: self.session.track(track_id), timeout=10.0)
+                res = await self._run_with_backoff(lambda: self.session.track(track_id), timeout=10.0)
+                if res:
+                    self._set_cached("track", track_id, res, 3600.0)
+                return res
             except asyncio.TimeoutError:
                 log.warning(f"Tidal get_track timeout for id {track_id}")
                 return None
@@ -434,9 +472,15 @@ class TidalHandler:
     async def get_video(self, video_id: str) -> Optional[Any]:
         if not self.session or not hasattr(self.session, "video"):
             return None
+        cached = self._get_cached("video", video_id)
+        if cached is not None:
+            return cached
         async with self.api_semaphore:
             try:
-                return await self._run_with_backoff(lambda: self.session.video(video_id), timeout=10.0)
+                res = await self._run_with_backoff(lambda: self.session.video(video_id), timeout=10.0)
+                if res:
+                    self._set_cached("video", video_id, res, 3600.0)
+                return res
             except Exception as e:
                 log.debug(f"Failed to fetch video {video_id}: {e}")
                 return None
@@ -444,39 +488,55 @@ class TidalHandler:
     async def get_album(self, album_id: str) -> Optional[Any]:
         if not self.session:
             return None
+        cached = self._get_cached("album", album_id)
+        if cached is not None:
+            return cached
         async with self.api_semaphore:
             try:
-                return await self._run_with_backoff(lambda: self.session.album(album_id), timeout=10.0)
+                res = await self._run_with_backoff(lambda: self.session.album(album_id), timeout=10.0)
+                if res:
+                    self._set_cached("album", album_id, res, 1800.0)
+                return res
             except Exception:
                 return None
 
     async def get_playlist(self, playlist_id: str) -> Optional[Any]:
         if not self.session:
             return None
+        cached = self._get_cached("playlist", playlist_id)
+        if cached is not None:
+            return cached
         async with self.api_semaphore:
             try:
-                return await self._run_with_backoff(lambda: self.session.playlist(playlist_id), timeout=10.0)
+                res = await self._run_with_backoff(lambda: self.session.playlist(playlist_id), timeout=10.0)
+                if res:
+                    self._set_cached("playlist", playlist_id, res, 300.0)
+                return res
             except Exception:
                 return None
 
     async def get_mix(self, mix_id: str) -> Optional[Any]:
         if not self.session:
             return None
+        cached = self._get_cached("mix", mix_id)
+        if cached is not None:
+            return cached
+        res = None
         if hasattr(self.session, "mix_v2"):
             async with self.api_semaphore:
                 try:
-                    result = await self._run_with_backoff(lambda: self.session.mix_v2(mix_id), timeout=10.0)
-                    if result:
-                        return result
+                    res = await self._run_with_backoff(lambda: self.session.mix_v2(mix_id), timeout=10.0)
                 except Exception:
                     pass
-        if hasattr(self.session, "mix"):
+        if not res and hasattr(self.session, "mix"):
             async with self.api_semaphore:
                 try:
-                    return await self._run_with_backoff(lambda: self.session.mix(mix_id), timeout=10.0)
+                    res = await self._run_with_backoff(lambda: self.session.mix(mix_id), timeout=10.0)
                 except Exception:
                     pass
-        return None
+        if res:
+            self._set_cached("mix", mix_id, res, 300.0)
+        return res
 
     async def get_similar_albums(self, album: Any) -> List[Any]:
         if not album or not hasattr(album, "similar"):
@@ -970,6 +1030,41 @@ class TidalPlayer(commands.Cog):
             await asyncio.sleep(0)
         return all_items[:MAX_ITEMS]
 
+    async def _resolve_and_extract(self, item: Any, item_processor: Callable[[Any], Any], filter_remixes: bool) -> Optional[Tuple[Any, str, TrackMeta]]:
+        try:
+            query = item_processor(item)
+            if not query:
+                return None
+            track = None
+            if _is_tidal_track(query):
+                track = query
+            else:
+                if isinstance(query, str) and ISRC_PATTERN.match(query):
+                    isrc = ISRC_PATTERN.match(query).group(1).upper()
+                    track = await self.tidal.get_track_by_isrc(isrc)
+                if not track:
+                    results = await self.tidal.search(query, filter_remixes=filter_remixes)
+                    if results:
+                        track = results[0]
+            if not track:
+                return None
+
+            meta_coro = self._extract_meta(track, skip_audio_res=True)
+            stream_url_coro = self.tidal.get_stream_url(track)
+            meta, stream_url = await asyncio.gather(meta_coro, stream_url_coro, return_exceptions=True)
+
+            if isinstance(meta, Exception) or isinstance(stream_url, Exception) or not stream_url:
+                if isinstance(stream_url, Exception):
+                    log.error(f"Error getting stream URL: {stream_url}")
+                if isinstance(meta, Exception):
+                    log.error(f"Error extracting metadata: {meta}")
+                return None
+
+            return track, stream_url, meta
+        except Exception as e:
+            log.error(f"Failed to resolve track concurrently: {e}")
+            return None
+
     async def _process_track_list(self, ctx: commands.Context, items: List[Any], name: str, item_processor: Callable[[Any], Any], color: discord.Color = discord.Color.blue(), thumbnail_url: Optional[str] = None) -> None:
         if not items:
             await ctx.send(embed=_error_embed(Messages.ERROR_NO_TRACKS_FOUND))
@@ -985,6 +1080,7 @@ class TidalPlayer(commands.Cog):
         cancel_event = self._get_cancel_event(ctx.guild.id)
         trunc_name = truncate(name, 50)
         total = len(items)
+        CHUNK_SIZE = 5
         async with lock:
             pmsg = None
             initial_embed = discord.Embed(title=Messages.PROGRESS_QUEUEING.format(name=trunc_name, count=total), color=color)
@@ -993,7 +1089,7 @@ class TidalPlayer(commands.Cog):
             pmsg = await ctx.send(embed=initial_embed)
             queued, skipped, last_up = 0, 0, 0
             try:
-                for i, item in enumerate(items, 1):
+                for chunk_start in range(0, total, CHUNK_SIZE):
                     if cancel_event.is_set():
                         break
                     if not getattr(player, "is_connected", True):
@@ -1009,23 +1105,50 @@ class TidalPlayer(commands.Cog):
                         if not reconnected:
                             log.warning("Could not reconnect to VC, stopping queue")
                             break
-                    query = item_processor(item)
-                    success = False
-                    if query and _is_tidal_track(query):
-                        success = await self._load_and_queue_track(ctx, query, show_embed=False, skip_audio_res=True)
-                    elif query:
-                        results = await self.tidal.search(query, filter_remixes=filter_remixes)
-                        if results:
-                            success = await self._load_and_queue_track(ctx, results[0], show_embed=False, skip_audio_res=True)
-                    queued += success
-                    skipped += not success
-                    if i - last_up >= BATCH_UPDATE_INTERVAL or i == total:
+
+                    chunk_items = items[chunk_start:chunk_start + CHUNK_SIZE]
+                    tasks = [
+                        self._resolve_and_extract(item, item_processor, filter_remixes)
+                        for item in chunk_items
+                    ]
+                    resolved_chunk = await asyncio.gather(*tasks)
+
+                    for res in resolved_chunk:
+                        if cancel_event.is_set():
+                            break
+                        if not res:
+                            skipped += 1
+                            continue
+
+                        track, stream_url, meta = res
+                        loaded_track = None
+                        try:
+                            results = await player.load_tracks(stream_url)
+                            if results and results.tracks:
+                                loaded_track = results.tracks[0]
+                        except Exception as e:
+                            log.error(f"Lavalink load failed: {e}")
+
+                        if loaded_track:
+                            loaded_track.title = truncate(meta["title"], 100)
+                            loaded_track.author = f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
+                            player.add(ctx.author, loaded_track)
+                            if not player.current:
+                                await player.play()
+                            self._current_meta[ctx.guild.id] = meta
+                            queued += 1
+                        else:
+                            skipped += 1
+
+                    current_count = min(chunk_start + CHUNK_SIZE, total)
+                    if current_count - last_up >= BATCH_UPDATE_INTERVAL or current_count == total:
                         upd = discord.Embed(title=Messages.PROGRESS_QUEUEING.format(name=trunc_name, count=total), description=Messages.SUCCESS_PARTIAL_QUEUE.format(queued=queued, total=total, skipped=skipped), color=color)
                         if thumbnail_url:
                             upd.set_thumbnail(url=thumbnail_url)
                         await self._edit_progress_message(pmsg, upd)
-                        last_up = i
-                        await asyncio.sleep(0)
+                        last_up = current_count
+                    await asyncio.sleep(0.1)
+
                 final = discord.Embed(title=Messages.SUCCESS_PARTIAL_QUEUE.format(queued=queued, total=total, skipped=skipped), description=f"Source: {truncate(name, 100)}", color=color)
                 if thumbnail_url:
                     final.set_thumbnail(url=thumbnail_url)
