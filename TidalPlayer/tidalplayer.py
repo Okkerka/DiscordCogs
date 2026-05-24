@@ -260,7 +260,7 @@ class TrackSelectView(discord.ui.View):
 
 
 class TidalHandler:
-    __slots__ = ("bot", "config", "session", "_refresh_task", "api_semaphore", "_login_cache", "_login_cache_time", "_cache")
+    __slots__ = ("bot", "config", "session", "_refresh_task", "api_semaphore", "_login_cache", "_login_cache_time", "_cache", "_refresh_lock")
 
     def __init__(self, bot: Red, config: Config):
         self.bot = bot
@@ -271,6 +271,7 @@ class TidalHandler:
         self._login_cache: Optional[bool] = None
         self._login_cache_time: float = 0.0
         self._cache: Dict[str, Dict[str, Tuple[Any, float]]] = {}
+        self._refresh_lock = asyncio.Lock()
 
     def _get_cached(self, category: str, key: str) -> Optional[Any]:
         if category not in self._cache:
@@ -304,6 +305,32 @@ class TidalHandler:
             except Exception as e:
                 last_exc = e
                 status = getattr(e, "status", None) or getattr(e, "status_code", None)
+                if status is None and hasattr(e, "response") and e.response is not None:
+                    status = getattr(e.response, "status_code", None)
+
+                # Detect 401 Unauthorized
+                is_unauthorized = False
+                if status == 401:
+                    is_unauthorized = True
+                else:
+                    err_str = str(e).lower()
+                    if "401" in err_str or "unauthorized" in err_str:
+                        is_unauthorized = True
+
+                if is_unauthorized:
+                    log.warning("Encountered 401 Unauthorized from Tidal API. Attempting token refresh...")
+                    refreshed = await self.refresh_tokens()
+                    if refreshed:
+                        log.info("Token refresh succeeded after 401. Retrying API request...")
+                        try:
+                            return await self._run_blocking(func, timeout=timeout)
+                        except Exception as retry_exc:
+                            last_exc = retry_exc
+                            raise retry_exc
+                    else:
+                        log.error("Token refresh failed after 401. Session is invalid.")
+                        raise
+
                 if status == 429:
                     is_ratelimit = True
                 else:
@@ -334,6 +361,42 @@ class TidalHandler:
             log.warning("Timed out loading Tidal session from stored credentials")
         except Exception as e:
             log.warning(f"Failed to load Tidal session: {e}")
+
+    async def refresh_tokens(self) -> bool:
+        """Manually/explicitly refresh Tidal tokens. Returns True if successful, False otherwise."""
+        if not self.session:
+            return False
+        async with self._refresh_lock:
+            # Recheck expiry inside the lock to see if another concurrent request already refreshed it
+            try:
+                expiry_time = await self._run_blocking(lambda: self.session.expiry_time, timeout=5.0)
+                if expiry_time and datetime.now() + timedelta(hours=2) <= expiry_time:
+                    return True
+            except Exception:
+                pass
+
+            log.info("Refreshing Tidal tokens...")
+            try:
+                if hasattr(self.session, "request") and hasattr(self.session.request, "refresh_token"):
+                    await self._run_blocking(self.session.request.refresh_token, timeout=15.0)
+                    log.info("Token refreshed via request.refresh_token")
+                def _get_state():
+                    return (self.session.expiry_time, self.session.token_type, self.session.access_token, self.session.refresh_token)
+                expiry_time, token_type, access, refresh = await self._run_blocking(_get_state, timeout=5.0)
+                await asyncio.gather(
+                    self.config.token_type.set(token_type),
+                    self.config.access_token.set(access),
+                    self.config.refresh_token.set(refresh),
+                    self.config.expiry_time.set(int(expiry_time.timestamp()) if expiry_time else None)
+                )
+                self._login_cache = True
+                self._login_cache_time = asyncio.get_running_loop().time()
+                return True
+            except Exception as e:
+                log.error(f"Token refresh failed: {e}")
+                self._login_cache = False
+                self._login_cache_time = asyncio.get_running_loop().time()
+                return False
 
     def start_refresh_loop(self) -> None:
         if self._refresh_task:
@@ -388,21 +451,9 @@ class TidalHandler:
                 expiry_time = await self._run_blocking(lambda: self.session.expiry_time, timeout=5.0)
                 if not expiry_time or datetime.now() + timedelta(hours=2) <= expiry_time:
                     continue
-                log.info("Refreshing Tidal tokens...")
-                try:
-                    if hasattr(self.session, "request") and hasattr(self.session.request, "refresh_token"):
-                        await self._run_blocking(self.session.request.refresh_token, timeout=15.0)
-                        log.info("Token refreshed via request.refresh_token")
-                except Exception as e:
-                    log.warning(f"Token refresh call failed: {e}")
-                def _get_state():
-                    return (self.session.expiry_time, self.session.token_type, self.session.access_token, self.session.refresh_token)
-                expiry_time, token_type, access, refresh = await self._run_blocking(_get_state, timeout=5.0)
-                await asyncio.gather(self.config.token_type.set(token_type), self.config.access_token.set(access), self.config.refresh_token.set(refresh), self.config.expiry_time.set(int(expiry_time.timestamp()) if expiry_time else None))
-                self._login_cache = True
-                self._login_cache_time = asyncio.get_running_loop().time()
+                await self.refresh_tokens()
             except Exception as e:
-                log.error(f"Token refresh failed: {e}")
+                log.error(f"Auto token refresh failed: {e}")
 
     async def search(self, query: str, filter_remixes: bool = False) -> List[Any]:
         if not self.session:
