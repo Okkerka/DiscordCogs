@@ -4,6 +4,7 @@ import asyncio
 from typing import Optional, Union, List
 from datetime import datetime, timedelta
 import logging
+import re
 
 log = logging.getLogger("red.moderation")
 
@@ -59,9 +60,11 @@ class Moderation(commands.Cog):
         """Load all data into memory on startup."""
         await self.bot.wait_until_ready()
         try:
+            all_data = await self.config.all_guilds()
             for guild in self.bot.guilds:
-                blocked = await self.config.guild(guild).blocked_users()
-                mods = await self.config.guild(guild).moderators()
+                guild_data = all_data.get(guild.id, {})
+                blocked = guild_data.get("blocked_users", [])
+                mods = guild_data.get("moderators", [])
                 self._blocked_cache[guild.id] = set(blocked)
                 self._moderator_cache[guild.id] = set(mods)
             self._cache_ready = True
@@ -126,8 +129,10 @@ class Moderation(commands.Cog):
                 tasks = []
                 now = datetime.utcnow()
                 
+                all_guilds_data = await self.config.all_guilds()
                 for guild in self.bot.guilds:
-                    tempbans = await self.config.guild(guild).tempbans()
+                    guild_data = all_guilds_data.get(guild.id, {})
+                    tempbans = guild_data.get("tempbans")
                     if not tempbans:
                         continue
                     
@@ -719,30 +724,94 @@ class Moderation(commands.Cog):
     @commands.guild_only()
     @mod_or_permissions(manage_messages=True)
     @commands.bot_has_permissions(manage_messages=True, read_message_history=True)
-    async def purge(self, ctx, amount: int, member: Optional[discord.Member] = None):
-        """Delete multiple messages at once. Optionally from a specific user."""
+    async def purge(self, ctx, amount: int, filter_type: Optional[str] = None, *, filter_arg: Optional[str] = None):
+        """
+        Delete multiple messages at once with advanced filters.
+        
+        Examples:
+        - purge 50 (Delete last 50 messages, safety-excludes pins)
+        - purge 50 pins (Delete last 50 messages, including pins)
+        - purge 50 @User (Delete last 50 messages from @User)
+        - purge 50 bots (Delete last 50 bot messages)
+        - purge 50 humans (Delete last 50 messages from regular users)
+        - purge 50 embeds (Delete last 50 messages containing embeds/files)
+        - purge 50 contains hello (Delete last 50 messages containing "hello")
+        """
         if amount < 1 or amount > 1000:
             await ctx.send("❌ Amount must be between 1 and 1000.")
             return
 
+        include_pinned = False
+        member = None
+        mode = "all"
+
+        if filter_type:
+            ft_lower = filter_type.lower()
+            if ft_lower in ("pins", "pinned"):
+                include_pinned = True
+            elif ft_lower == "bots":
+                mode = "bots"
+            elif ft_lower in ("humans", "human"):
+                mode = "humans"
+            elif ft_lower in ("embeds", "files", "embed", "file"):
+                mode = "embeds"
+            elif ft_lower == "contains":
+                if not filter_arg:
+                    return await ctx.send("❌ Please specify the text to filter by. (e.g. `purge 50 contains spam`)")
+                mode = "contains"
+            else:
+                try:
+                    member = await commands.MemberConverter().convert(ctx, filter_type)
+                    mode = "member"
+                except commands.BadArgument:
+                    return await ctx.send(f"❌ Unknown filter: `{filter_type}`. Available: `bots`, `humans`, `embeds`, `contains`, `pins`, or `@User`.")
+
         try:
-
             def check(m):
-                return m.author == member if member else True
+                if m.pinned and not include_pinned:
+                    return False
+                if m.id == ctx.message.id:
+                    return False
+                if mode == "bots":
+                    return m.author.bot
+                elif mode == "humans":
+                    return not m.author.bot
+                elif mode == "embeds":
+                    return bool(m.embeds or m.attachments)
+                elif mode == "contains":
+                    return filter_arg.lower() in m.content.lower()
+                elif mode == "member":
+                    return m.author.id == member.id
+                return True
 
-            deleted = await ctx.channel.purge(limit=amount + 1, check=check)
-            count = len(deleted) - 1
+            deleted = await ctx.channel.purge(limit=amount, check=check)
+            count = len(deleted)
+            
+            try:
+                await ctx.message.delete()
+            except discord.HTTPException:
+                pass
 
-            target_text = f" from **{member}**" if member else ""
+            target_text = ""
+            if mode == "member":
+                target_text = f" from **{member}**"
+            elif mode == "bots":
+                target_text = " from **Bots**"
+            elif mode == "humans":
+                target_text = " from **Humans**"
+            elif mode == "embeds":
+                target_text = " containing **embeds/files**"
+            elif mode == "contains":
+                target_text = f" containing **\"{filter_arg}\"**"
+
             success_embed = discord.Embed(
                 title="Messages Purged",
-                description=f"Deleted {count} message(s){target_text}.",
+                description=f"Deleted **{count}** message(s){target_text}.",
                 color=0x57F287,
             )
             msg = await ctx.send(embed=success_embed)
             await msg.delete(delay=5)
             
-            # Log to modlog
             await self._log_action(
                 ctx.guild,
                 "Messages Purged",
@@ -846,10 +915,23 @@ class Moderation(commands.Cog):
     @mod_or_permissions(manage_channels=True)
     @commands.bot_has_permissions(manage_channels=True)
     async def slowmode(
-        self, ctx, seconds: int, channel: Optional[discord.TextChannel] = None
+        self, ctx, duration: str, channel: Optional[discord.TextChannel] = None
     ):
-        """Set slowmode for a channel (0-21600 seconds, 0 to disable)."""
+        """
+        Set slowmode for a channel.
+        
+        Accepts seconds (e.g. 120) or duration strings (e.g. 5m, 1h). Use 0 to disable.
+        """
         channel = channel or ctx.channel
+
+        if duration.isdigit():
+            seconds = int(duration)
+        else:
+            try:
+                delta = self._parse_duration(duration)
+                seconds = int(delta.total_seconds())
+            except ValueError:
+                return await ctx.send("❌ Invalid duration. Use seconds (e.g. `120`) or formats like `5m`, `1h`.")
 
         if not 0 <= seconds <= 21600:
             await ctx.send("❌ Slowmode must be between 0 and 21600 seconds (6 hours).")
@@ -1064,8 +1146,11 @@ class Moderation(commands.Cog):
     @commands.command()
     @commands.guild_only()
     @mod_or_permissions(moderate_members=True)
-    async def warnings(self, ctx, member: discord.Member):
-        """View all warnings for a member."""
+    async def warnings(self, ctx, member: discord.Member, page: int = 1):
+        """View warnings for a member (10 per page)."""
+        if page < 1:
+            return await ctx.send("❌ Page number must be positive.")
+            
         all_warnings = await self.config.guild(ctx.guild).warnings()
         user_warnings = all_warnings.get(str(member.id), [])
 
@@ -1078,20 +1163,30 @@ class Moderation(commands.Cog):
             await ctx.send(embed=embed)
             return
 
+        total_warnings = len(user_warnings)
+        total_pages = (total_warnings + 9) // 10
+        if page > total_pages:
+            return await ctx.send(f"❌ Invalid page. Total pages: **{total_pages}**.")
+
+        start = (page - 1) * 10
+        end = start + 10
+        page_warnings = user_warnings[start:end]
+
         embed = discord.Embed(title=f"Warnings for {member}", color=0xFEE75C)
 
-        for i, warning in enumerate(user_warnings[-10:], 1):  # Show last 10
+        for i, warning in enumerate(page_warnings, 1):
             mod = ctx.guild.get_member(warning["moderator"])
             mod_name = mod.mention if mod else f"Unknown (ID: {warning['moderator']})"
             timestamp = datetime.fromisoformat(warning["timestamp"])
+            warn_idx = start + i
 
             embed.add_field(
-                name=f"Warning #{len(user_warnings) - 10 + i if len(user_warnings) > 10 else i}",
+                name=f"Warning #{warn_idx}",
                 value=f"**Reason:** {warning['reason']}\n**Moderator:** {mod_name}\n**Date:** <t:{int(timestamp.timestamp())}:R>",
                 inline=False,
             )
 
-        embed.set_footer(text=f"Total warnings: {len(user_warnings)} | Showing last 10")
+        embed.set_footer(text=f"Total warnings: {total_warnings} | Page {page}/{total_pages}")
         await ctx.send(embed=embed)
 
     @commands.command()
@@ -1121,6 +1216,43 @@ class Moderation(commands.Cog):
                 )
             else:
                 await ctx.send("❌ No warnings to clear for that member.")
+
+    @commands.command(aliases=["delwarn", "removewarning", "deletewarning"])
+    @commands.guild_only()
+    @commands.admin_or_permissions(administrator=True)
+    async def removewarn(self, ctx, member: discord.Member, warn_number: int):
+        """Remove a specific warning from a member by its index (1-based)."""
+        async with self.config.guild(ctx.guild).warnings() as warnings:
+            user_id_str = str(member.id)
+            if user_id_str not in warnings or not warnings[user_id_str]:
+                return await ctx.send(f"❌ {member} has no active warnings.")
+            
+            user_warnings = warnings[user_id_str]
+            total = len(user_warnings)
+            
+            if warn_number < 1 or warn_number > total:
+                return await ctx.send(f"❌ Invalid warning number. Please specify a number between 1 and {total}.")
+            
+            removed = user_warnings.pop(warn_number - 1)
+            
+            if not user_warnings:
+                del warnings[user_id_str]
+                
+            success_embed = discord.Embed(
+                title="Warning Removed",
+                description=f"Removed warning **#{warn_number}** for **{member}**.\n**Original Reason:** {removed['reason']}",
+                color=0x57F287,
+            )
+            await ctx.send(embed=success_embed)
+            
+            await self._log_action(
+                ctx.guild,
+                "Warning Removed",
+                f"**User:** {member.mention} ({member.id})\n**Warning Removed:** #{warn_number}\n**Original Reason:** {removed['reason']}",
+                0x57F287,
+                member,
+                ctx.author
+            )
 
     # ================= Message Blocking =================
     @commands.group(name="msgblock", invoke_without_command=True)
@@ -1205,25 +1337,45 @@ class Moderation(commands.Cog):
 
     # ================= Utility Functions =================
     def _parse_duration(self, duration: str) -> timedelta:
-        """Parse duration string into timedelta object."""
-        time_units = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
-
-        if len(duration) < 2:
-            raise ValueError("Duration too short")
-
-        unit = duration[-1].lower()
-        if unit not in time_units:
-            raise ValueError("Invalid time unit")
-
-        try:
-            amount = int(duration[:-1])
-        except ValueError:
-            raise ValueError("Invalid duration format")
-
-        if amount <= 0:
-            raise ValueError("Duration must be positive")
-
-        return timedelta(seconds=amount * time_units[unit])
+        """Parse duration string (e.g. 1d12h30m) into a timedelta object."""
+        if not duration or not isinstance(duration, str):
+            raise ValueError("Empty duration")
+        
+        duration = duration.strip()
+        duration_re = re.compile(r"(?i)\s*(\d+)\s*([wdhms]?)")
+        
+        total_seconds = 0
+        idx = 0
+        
+        for m in duration_re.finditer(duration):
+            if m.start() != idx:
+                raise ValueError("Invalid duration format")
+            
+            num = int(m.group(1))
+            unit = (m.group(2) or "s").lower()
+            
+            if unit == "w":
+                total_seconds += num * 604800
+            elif unit == "d":
+                total_seconds += num * 86400
+            elif unit == "h":
+                total_seconds += num * 3600
+            elif unit == "m":
+                total_seconds += num * 60
+            elif unit == "s":
+                total_seconds += num
+            else:
+                raise ValueError("Invalid unit")
+            
+            idx = m.end()
+            
+        if idx != len(duration):
+            raise ValueError("Invalid trailing characters")
+            
+        if total_seconds <= 0:
+            raise ValueError("Zero duration")
+            
+        return timedelta(seconds=total_seconds)
 
 
 async def setup(bot):
