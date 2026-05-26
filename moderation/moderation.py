@@ -555,8 +555,14 @@ class Moderation(commands.Cog):
     @commands.guild_only()
     @mod_or_permissions(ban_members=True)
     @commands.bot_has_permissions(ban_members=True)
-    async def massban(self, ctx, *user_ids: int):
-        """Mass ban multiple users by their IDs (parallelized for speed)."""
+    async def massban(self, ctx, *, user_ids_input: str):
+        """
+        Mass ban multiple users by their IDs (parallelized for speed).
+        
+        Supports space-separated, comma-separated, or newline-separated ID lists.
+        """
+        user_ids = [int(uid) for uid in re.findall(r"\d+", user_ids_input)]
+
         if not user_ids:
             await ctx.send("❌ Please provide at least one user ID.")
             return
