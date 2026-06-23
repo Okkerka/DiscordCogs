@@ -146,6 +146,13 @@ class BossAlerts(commands.Cog):
             except Exception:
                 pass
 
+    async def _delete_message_after(self, delay: float, message: discord.Message) -> None:
+        await asyncio.sleep(delay)
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
     async def _scheduler_loop(self, boss_key: str) -> None:
         await self.bot.wait_until_ready()
         boss_label = self._get_label(boss_key)
@@ -197,12 +204,19 @@ class BossAlerts(commands.Cog):
             if not isinstance(channel, discord.TextChannel):
                 continue
 
-            role_mention = f"<@&{role_id}> " if isinstance(role_id, int) else ""
+            role = guild.get_role(role_id) if isinstance(role_id, int) else None
+            role_mention = f"{role.mention} " if role is not None else ""
+            allowed_mentions = discord.AllowedMentions(roles=[role] if role is not None else [])
 
             try:
-                await channel.send(
-                    f"{role_mention}{boss_label} spawns <t:{spawn_ts}:R> (<t:{spawn_ts}:t>)."
+                msg = await channel.send(
+                    f"{role_mention}{boss_label} spawns <t:{spawn_ts}:R> (<t:{spawn_ts}:t>).",
+                    allowed_mentions=allowed_mentions,
                 )
+                # Delete 5 minutes after the spawn time
+                delete_after = (spawn_ts + ALERT_OFFSET_SECONDS) - time.time()
+                if delete_after > 0:
+                    asyncio.create_task(self._delete_message_after(delete_after, msg))
             except discord.Forbidden:
                 log.warning(
                     "Missing send permission in guild=%s channel=%s",
