@@ -1,0 +1,11 @@
+{
+  "name": "BossAlerts",
+  "short": "Scheduled ping alerts for Interluminary Parasol and Doom of Caeranthil boss spawns.",
+  "description": "Registers channels (and optionally roles) to receive a ping 5 minutes before each scheduled boss spawn for Interluminary Parasol and Doom of Caeranthil (World Serpent).",
+  "version": "1.0.0",
+  "author": ["Okkerka"],
+  "min_bot_version": "3.5.0",
+  "hidden": false,
+  "disabled": false,
+  "type": "COG"
+}
