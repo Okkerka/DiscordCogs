@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 import discord
@@ -11,7 +12,7 @@ from redbot.core.bot import Red
 
 log = logging.getLogger("red.bossalerts")
 
-PARASOL_TIMESTAMPS: list[int] = [
+PARASOL_REFERENCE_TIMESTAMPS: list[int] = [
     1777953600,
     1777959000,
     1777964400,
@@ -30,7 +31,7 @@ PARASOL_TIMESTAMPS: list[int] = [
     1778034600,
 ]
 
-DOOM_TIMESTAMPS: list[int] = [
+DOOM_REFERENCE_TIMESTAMPS: list[int] = [
     1777957200,
     1777964400,
     1777971600,
@@ -46,10 +47,17 @@ DOOM_TIMESTAMPS: list[int] = [
 ]
 
 ALERT_OFFSET_SECONDS: int = 300
+SECONDS_PER_DAY: int = 86400
+BROADCAST_SEND_DELAY: float = 0.1
+
+
+def _timestamp_to_utc_seconds_of_day(timestamp: int) -> int:
+    dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    return (dt.hour * 3600) + (dt.minute * 60) + dt.second
 
 
 class BossAlerts(commands.Cog):
-    """Scheduled boss alerts."""
+    """Scheduled boss alerts based on official reference timestamps."""
 
     def __init__(self, bot: Red) -> None:
         self.bot = bot
@@ -79,12 +87,12 @@ class BossAlerts(commands.Cog):
             task.cancel()
         self._scheduler_tasks.clear()
 
-    def _get_timestamps(self, boss_key: str) -> list[int]:
+    def _get_reference_timestamps(self, boss_key: str) -> list[int]:
         match boss_key:
             case "parasol":
-                return PARASOL_TIMESTAMPS
+                return PARASOL_REFERENCE_TIMESTAMPS
             case "doom":
-                return DOOM_TIMESTAMPS
+                return DOOM_REFERENCE_TIMESTAMPS
             case _:
                 raise ValueError(f"Unsupported boss key: {boss_key}")
 
@@ -97,33 +105,59 @@ class BossAlerts(commands.Cog):
             case _:
                 raise ValueError(f"Unsupported boss key: {boss_key}")
 
+    def _get_daily_schedule_seconds(self, boss_key: str) -> list[int]:
+        reference_timestamps = self._get_reference_timestamps(boss_key)
+        seconds_of_day = sorted(
+            {_timestamp_to_utc_seconds_of_day(ts) for ts in reference_timestamps}
+        )
+        return seconds_of_day
+
+    def _get_next_spawn_timestamp(self, boss_key: str) -> int:
+        now = int(time.time())
+        now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
+        today_midnight = int(
+            datetime(
+                year=now_dt.year,
+                month=now_dt.month,
+                day=now_dt.day,
+                tzinfo=timezone.utc,
+            ).timestamp()
+        )
+
+        daily_schedule_seconds = self._get_daily_schedule_seconds(boss_key)
+
+        for seconds_of_day in daily_schedule_seconds:
+            candidate_spawn = today_midnight + seconds_of_day
+            if candidate_spawn - ALERT_OFFSET_SECONDS > now:
+                return candidate_spawn
+
+        return today_midnight + SECONDS_PER_DAY + daily_schedule_seconds[0]
+
     async def _scheduler_loop(self, boss_key: str) -> None:
         await self.bot.wait_until_ready()
-
-        timestamps = self._get_timestamps(boss_key)
         boss_label = self._get_label(boss_key)
 
         while True:
-            now = time.time()
-            upcoming_spawns = [
-                spawn_ts
-                for spawn_ts in timestamps
-                if (spawn_ts - ALERT_OFFSET_SECONDS) > now
-            ]
+            try:
+                next_spawn_ts = self._get_next_spawn_timestamp(boss_key)
+                alert_ts = next_spawn_ts - ALERT_OFFSET_SECONDS
+                sleep_for = alert_ts - time.time()
 
-            if not upcoming_spawns:
-                log.info("%s: no remaining scheduled spawns", boss_key)
+                if sleep_for > 0:
+                    await asyncio.sleep(sleep_for)
+
+                await self._broadcast_alert(boss_key, boss_label, next_spawn_ts)
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
                 return
-
-            next_spawn_ts = min(upcoming_spawns)
-            alert_ts = next_spawn_ts - ALERT_OFFSET_SECONDS
-            sleep_for = alert_ts - now
-
-            if sleep_for > 0:
-                await asyncio.sleep(sleep_for)
-
-            await self._broadcast_alert(boss_key, boss_label, next_spawn_ts)
-            await asyncio.sleep(1)
+            except Exception as exc:
+                log.error(
+                    "Unexpected error in %s scheduler loop: %s",
+                    boss_key,
+                    exc,
+                    exc_info=True,
+                )
+                await asyncio.sleep(60)
 
     async def _broadcast_alert(
         self,
@@ -170,6 +204,16 @@ class BossAlerts(commands.Cog):
                     exc,
                 )
 
+            await asyncio.sleep(BROADCAST_SEND_DELAY)
+
+    @commands.Cog.listener()
+    async def on_guild_remove(self, guild: discord.Guild) -> None:
+        await self.config.guild(guild).parasol_channel.set(None)
+        await self.config.guild(guild).parasol_role.set(None)
+        await self.config.guild(guild).doom_channel.set(None)
+        await self.config.guild(guild).doom_role.set(None)
+        log.info("Cleaned up boss alert config for removed guild %s", guild.id)
+
     async def _set_alert_target(
         self,
         ctx: commands.Context,
@@ -193,22 +237,21 @@ class BossAlerts(commands.Cog):
                 await guild_config.parasol_channel.set(target_channel.id)
                 await guild_config.parasol_role.set(role.id if role else None)
                 label = "Interluminary Parasol"
-                timestamps = PARASOL_TIMESTAMPS
             case "doom":
                 await guild_config.doom_channel.set(target_channel.id)
                 await guild_config.doom_role.set(role.id if role else None)
                 label = "Doom of Caeranthil"
-                timestamps = DOOM_TIMESTAMPS
             case _:
                 raise ValueError(f"Unsupported boss key: {boss_key}")
 
+        next_spawn_ts = self._get_next_spawn_timestamp(boss_key)
+        next_minutes = int((next_spawn_ts - time.time()) / 60)
         role_text = f" Role: {role.mention}." if role is not None else ""
-        schedule_text = " | ".join(f"<t:{ts}:t>" for ts in timestamps)
 
         await ctx.send(
             f"{label} alerts set in {target_channel.mention}.{role_text}\n"
             f"Alerts fire 5 minutes before each spawn.\n"
-            f"Spawns: {schedule_text}"
+            f"Next spawn: <t:{next_spawn_ts}:F> ({next_minutes} min)."
         )
 
     async def _clear_alert_target(self, ctx: commands.Context, boss_key: str) -> None:
@@ -253,8 +296,48 @@ class BossAlerts(commands.Cog):
 
         channel_text = f"<#{channel_id}>" if isinstance(channel_id, int) else "not set"
         role_text = f"<@&{role_id}>" if isinstance(role_id, int) else "not set"
+        next_spawn_ts = self._get_next_spawn_timestamp(boss_key)
+        next_minutes = int((next_spawn_ts - time.time()) / 60)
 
-        await ctx.send(f"{label} alerts -> channel: {channel_text} | role: {role_text}")
+        await ctx.send(
+            f"{label} alerts -> channel: {channel_text} | role: {role_text}\n"
+            f"Next spawn: <t:{next_spawn_ts}:F> ({next_minutes} min)."
+        )
+
+    async def _show_next(self, ctx: commands.Context, boss_key: str) -> None:
+        next_spawn_ts = self._get_next_spawn_timestamp(boss_key)
+        now = time.time()
+        minutes_remaining = int((next_spawn_ts - now) / 60)
+        label = self._get_label(boss_key)
+
+        await ctx.send(
+            f"Next {label} spawn: <t:{next_spawn_ts}:F> (<t:{next_spawn_ts}:R>)\n"
+            f"Minutes remaining: {minutes_remaining}"
+        )
+
+    async def _sync_scheduler(self, ctx: commands.Context, boss_key: str) -> None:
+        label = self._get_label(boss_key)
+        task = self._scheduler_tasks.get(boss_key)
+
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        self._scheduler_tasks[boss_key] = asyncio.create_task(
+            self._scheduler_loop(boss_key)
+        )
+
+        next_spawn_ts = self._get_next_spawn_timestamp(boss_key)
+        minutes_remaining = int((next_spawn_ts - time.time()) / 60)
+
+        await ctx.send(
+            f"{label} scheduler synced.\n"
+            f"Next spawn: <t:{next_spawn_ts}:F> (<t:{next_spawn_ts}:R>)\n"
+            f"Minutes remaining: {minutes_remaining}"
+        )
 
     @commands.group(name="parasol")
     @commands.guild_only()
@@ -289,6 +372,19 @@ class BossAlerts(commands.Cog):
     async def parasol_ping_status(self, ctx: commands.Context) -> None:
         await self._show_status(ctx, "parasol")
 
+    @parasol.command(name="next")
+    @commands.guild_only()
+    async def parasol_next(self, ctx: commands.Context) -> None:
+        """Show next Parasol spawn and minutes remaining."""
+        await self._show_next(ctx, "parasol")
+
+    @parasol.command(name="sync")
+    @commands.guild_only()
+    @commands.admin_or_permissions(manage_guild=True)
+    async def parasol_sync(self, ctx: commands.Context) -> None:
+        """Force sync the Parasol scheduler to official timestamps."""
+        await self._sync_scheduler(ctx, "parasol")
+
     @commands.group(name="doom")
     @commands.guild_only()
     async def doom(self, ctx: commands.Context) -> None:
@@ -322,12 +418,27 @@ class BossAlerts(commands.Cog):
     async def doom_ping_status(self, ctx: commands.Context) -> None:
         await self._show_status(ctx, "doom")
 
+    @doom.command(name="next")
+    @commands.guild_only()
+    async def doom_next(self, ctx: commands.Context) -> None:
+        """Show next Doom spawn and minutes remaining."""
+        await self._show_next(ctx, "doom")
+
+    @doom.command(name="sync")
+    @commands.guild_only()
+    @commands.admin_or_permissions(manage_guild=True)
+    async def doom_sync(self, ctx: commands.Context) -> None:
+        """Force sync the Doom scheduler to official timestamps."""
+        await self._sync_scheduler(ctx, "doom")
+
     @parasol_ping_add.error
     @parasol_ping_remove.error
     @parasol_ping_status.error
     @doom_ping_add.error
     @doom_ping_remove.error
     @doom_ping_status.error
+    @parasol_sync.error
+    @doom_sync.error
     async def bossalerts_command_error(
         self,
         ctx: commands.Context,
