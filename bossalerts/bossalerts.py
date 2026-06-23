@@ -360,7 +360,7 @@ class BossAlerts(commands.Cog):
                 lines.append(f"<t:{ts}:F> (<t:{ts}:R>)")
 
         response = await ctx.send(
-            f"**{label} daily schedule** (next 24 hours):\\n" + "\\n".join(lines)
+            f"**{label} daily schedule** (next 24 hours):\n" + "\n".join(lines)
         )
         asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
 
