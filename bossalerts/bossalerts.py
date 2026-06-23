@@ -49,6 +49,7 @@ DOOM_REFERENCE_TIMESTAMPS: list[int] = [
 ALERT_OFFSET_SECONDS: int = 300
 SECONDS_PER_DAY: int = 86400
 BROADCAST_SEND_DELAY: float = 0.1
+AUTO_DELETE_DELAY: int = 30
 
 
 def _timestamp_to_utc_seconds_of_day(timestamp: int) -> int:
@@ -132,6 +133,18 @@ class BossAlerts(commands.Cog):
                 return candidate_spawn
 
         return today_midnight + SECONDS_PER_DAY + daily_schedule_seconds[0]
+
+    async def _delete_messages_after(
+        self,
+        delay: int,
+        *messages: discord.Message,
+    ) -> None:
+        await asyncio.sleep(delay)
+        for msg in messages:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
 
     async def _scheduler_loop(self, boss_key: str) -> None:
         await self.bot.wait_until_ready()
@@ -222,12 +235,14 @@ class BossAlerts(commands.Cog):
         role: Optional[discord.Role],
     ) -> None:
         if ctx.guild is None:
-            await ctx.send("This command can only be used in a server.")
+            response = await ctx.send("This command can only be used in a server.")
+            asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
             return
 
         target_channel = channel or ctx.channel
         if not isinstance(target_channel, discord.TextChannel):
-            await ctx.send("Target channel must be a text channel.")
+            response = await ctx.send("Target channel must be a text channel.")
+            asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
             return
 
         guild_config = self.config.guild(ctx.guild)
@@ -248,15 +263,17 @@ class BossAlerts(commands.Cog):
         next_minutes = int((next_spawn_ts - time.time()) / 60)
         role_text = f" Role: {role.mention}." if role is not None else ""
 
-        await ctx.send(
+        response = await ctx.send(
             f"{label} alerts set in {target_channel.mention}.{role_text}\n"
             f"Alerts fire 5 minutes before each spawn.\n"
             f"Next spawn: <t:{next_spawn_ts}:F> ({next_minutes} min)."
         )
+        asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
 
     async def _clear_alert_target(self, ctx: commands.Context, boss_key: str) -> None:
         if ctx.guild is None:
-            await ctx.send("This command can only be used in a server.")
+            response = await ctx.send("This command can only be used in a server.")
+            asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
             return
 
         guild_config = self.config.guild(ctx.guild)
@@ -273,11 +290,13 @@ class BossAlerts(commands.Cog):
             case _:
                 raise ValueError(f"Unsupported boss key: {boss_key}")
 
-        await ctx.send(f"{label} alerts disabled.")
+        response = await ctx.send(f"{label} alerts disabled.")
+        asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
 
     async def _show_status(self, ctx: commands.Context, boss_key: str) -> None:
         if ctx.guild is None:
-            await ctx.send("This command can only be used in a server.")
+            response = await ctx.send("This command can only be used in a server.")
+            asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
             return
 
         guild_config = self.config.guild(ctx.guild)
@@ -299,21 +318,51 @@ class BossAlerts(commands.Cog):
         next_spawn_ts = self._get_next_spawn_timestamp(boss_key)
         next_minutes = int((next_spawn_ts - time.time()) / 60)
 
-        await ctx.send(
+        response = await ctx.send(
             f"{label} alerts -> channel: {channel_text} | role: {role_text}\n"
             f"Next spawn: <t:{next_spawn_ts}:F> ({next_minutes} min)."
         )
+        asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
 
     async def _show_next(self, ctx: commands.Context, boss_key: str) -> None:
         next_spawn_ts = self._get_next_spawn_timestamp(boss_key)
-        now = time.time()
-        minutes_remaining = int((next_spawn_ts - now) / 60)
         label = self._get_label(boss_key)
 
-        await ctx.send(
-            f"Next {label} spawn: <t:{next_spawn_ts}:F> (<t:{next_spawn_ts}:R>)\n"
-            f"Minutes remaining: {minutes_remaining}"
+        response = await ctx.send(
+            f"Next {label} spawn: <t:{next_spawn_ts}:F> (<t:{next_spawn_ts}:R>)."
         )
+        asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
+
+    async def _show_list(self, ctx: commands.Context, boss_key: str) -> None:
+        label = self._get_label(boss_key)
+        daily_seconds = self._get_daily_schedule_seconds(boss_key)
+        now = int(time.time())
+        now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
+        today_midnight = int(
+            datetime(
+                year=now_dt.year,
+                month=now_dt.month,
+                day=now_dt.day,
+                tzinfo=timezone.utc,
+            ).timestamp()
+        )
+
+        lines = []
+        for seconds in daily_seconds:
+            ts = today_midnight + seconds
+            if ts > now:
+                lines.append(f"<t:{ts}:F> (<t:{ts}:R>)")
+
+        if not lines:
+            tomorrow_midnight = today_midnight + SECONDS_PER_DAY
+            for seconds in daily_seconds:
+                ts = tomorrow_midnight + seconds
+                lines.append(f"<t:{ts}:F> (<t:{ts}:R>)")
+
+        response = await ctx.send(
+            f"**{label} daily schedule** (next 24 hours):\\n" + "\\n".join(lines)
+        )
+        asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
 
     async def _sync_scheduler(self, ctx: commands.Context, boss_key: str) -> None:
         label = self._get_label(boss_key)
@@ -333,11 +382,12 @@ class BossAlerts(commands.Cog):
         next_spawn_ts = self._get_next_spawn_timestamp(boss_key)
         minutes_remaining = int((next_spawn_ts - time.time()) / 60)
 
-        await ctx.send(
+        response = await ctx.send(
             f"{label} scheduler synced.\n"
             f"Next spawn: <t:{next_spawn_ts}:F> (<t:{next_spawn_ts}:R>)\n"
             f"Minutes remaining: {minutes_remaining}"
         )
+        asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
 
     @commands.group(name="parasol")
     @commands.guild_only()
@@ -375,14 +425,20 @@ class BossAlerts(commands.Cog):
     @parasol.command(name="next")
     @commands.guild_only()
     async def parasol_next(self, ctx: commands.Context) -> None:
-        """Show next Parasol spawn and minutes remaining."""
+        """Show next Parasol spawn."""
         await self._show_next(ctx, "parasol")
+
+    @parasol.command(name="list")
+    @commands.guild_only()
+    async def parasol_list(self, ctx: commands.Context) -> None:
+        """Show all upcoming Parasol spawns."""
+        await self._show_list(ctx, "parasol")
 
     @parasol.command(name="sync")
     @commands.guild_only()
     @commands.admin_or_permissions(manage_guild=True)
     async def parasol_sync(self, ctx: commands.Context) -> None:
-        """Force sync the Parasol scheduler to official timestamps."""
+        """Force sync the Parasol scheduler."""
         await self._sync_scheduler(ctx, "parasol")
 
     @commands.group(name="doom")
@@ -421,14 +477,20 @@ class BossAlerts(commands.Cog):
     @doom.command(name="next")
     @commands.guild_only()
     async def doom_next(self, ctx: commands.Context) -> None:
-        """Show next Doom spawn and minutes remaining."""
+        """Show next Doom spawn."""
         await self._show_next(ctx, "doom")
+
+    @doom.command(name="list")
+    @commands.guild_only()
+    async def doom_list(self, ctx: commands.Context) -> None:
+        """Show all upcoming Doom spawns."""
+        await self._show_list(ctx, "doom")
 
     @doom.command(name="sync")
     @commands.guild_only()
     @commands.admin_or_permissions(manage_guild=True)
     async def doom_sync(self, ctx: commands.Context) -> None:
-        """Force sync the Doom scheduler to official timestamps."""
+        """Force sync the Doom scheduler."""
         await self._sync_scheduler(ctx, "doom")
 
     @parasol_ping_add.error
@@ -445,12 +507,15 @@ class BossAlerts(commands.Cog):
         error: commands.CommandError,
     ) -> None:
         if isinstance(error, commands.MissingPermissions):
-            await ctx.send("You need Manage Server to use this command.")
+            response = await ctx.send("You need Manage Server to use this command.")
+            asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
             return
         if isinstance(error, commands.BadArgument):
-            await ctx.send("Invalid channel or role.")
+            response = await ctx.send("Invalid channel or role.")
+            asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
             return
         if isinstance(error, commands.TooManyArguments):
-            await ctx.send("Too many arguments.")
+            response = await ctx.send("Too many arguments.")
+            asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
             return
         raise error
