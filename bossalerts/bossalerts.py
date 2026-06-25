@@ -13,40 +13,19 @@ from redbot.core.bot import Red
 log = logging.getLogger("red.bossalerts")
 
 PARASOL_REFERENCE_TIMESTAMPS: list[int] = [
-    1777953600,
-    1777959000,
-    1777964400,
-    1777969800,
-    1777975200,
-    1777980600,
-    1777986000,
-    1777991400,
-    1777996800,
-    1778002200,
-    1778007600,
-    1778013000,
-    1778018400,
-    1778023800,
-    1778029200,
-    1778034600,
+    1777953600, 1777959000, 1777964400, 1777969800,
+    1777975200, 1777980600, 1777986000, 1777991400,
+    1777996800, 1778002200, 1778007600, 1778013000,
+    1778018400, 1778023800, 1778029200, 1778034600,
 ]
 
 DOOM_REFERENCE_TIMESTAMPS: list[int] = [
-    1777957200,
-    1777964400,
-    1777971600,
-    1777978800,
-    1777986000,
-    1777993200,
-    1778000400,
-    1778007600,
-    1778014800,
-    1778022000,
-    1778029200,
-    1778036400,
+    1777957200, 1777964400, 1777971600, 1777978800,
+    1777986000, 1777993200, 1778000400, 1778007600,
+    1778014800, 1778022000, 1778029200, 1778036400,
 ]
 
-ALERT_OFFSET_SECONDS: int = 300
+DEFAULT_ALERT_OFFSET_SECONDS: int = 300
 SECONDS_PER_DAY: int = 86400
 BROADCAST_SEND_DELAY: float = 0.1
 AUTO_DELETE_DELAY: int = 30
@@ -70,8 +49,12 @@ class BossAlerts(commands.Cog):
         self.config.register_guild(
             parasol_channel=None,
             parasol_role=None,
+            parasol_enabled=True,
+            parasol_offset=DEFAULT_ALERT_OFFSET_SECONDS,
             doom_channel=None,
             doom_role=None,
+            doom_enabled=True,
+            doom_offset=DEFAULT_ALERT_OFFSET_SECONDS,
         )
         self._scheduler_tasks: dict[str, asyncio.Task[None]] = {}
 
@@ -113,7 +96,12 @@ class BossAlerts(commands.Cog):
         )
         return seconds_of_day
 
-    def _get_next_spawn_timestamp(self, boss_key: str) -> int:
+    def _get_guild_offset(self, boss_key: str, guild_config: dict) -> int:
+        offset_key = f"{boss_key}_offset"
+        offset = guild_config.get(offset_key)
+        return int(offset) if isinstance(offset, int) else DEFAULT_ALERT_OFFSET_SECONDS
+
+    def _get_next_spawn_timestamp(self, boss_key: str, offset: int) -> int:
         now = int(time.time())
         now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
         today_midnight = int(
@@ -129,7 +117,7 @@ class BossAlerts(commands.Cog):
 
         for seconds_of_day in daily_schedule_seconds:
             candidate_spawn = today_midnight + seconds_of_day
-            if candidate_spawn - ALERT_OFFSET_SECONDS > now:
+            if candidate_spawn - offset > now:
                 return candidate_spawn
 
         return today_midnight + SECONDS_PER_DAY + daily_schedule_seconds[0]
@@ -159,8 +147,16 @@ class BossAlerts(commands.Cog):
 
         while True:
             try:
-                next_spawn_ts = self._get_next_spawn_timestamp(boss_key)
-                alert_ts = next_spawn_ts - ALERT_OFFSET_SECONDS
+                all_guilds = await self.config.all_guilds()
+                offset = DEFAULT_ALERT_OFFSET_SECONDS
+                for _guild_id, guild_config in all_guilds.items():
+                    candidate = self._get_guild_offset(boss_key, guild_config)
+                    if candidate != DEFAULT_ALERT_OFFSET_SECONDS:
+                        offset = candidate
+                        break
+
+                next_spawn_ts = self._get_next_spawn_timestamp(boss_key, offset)
+                alert_ts = next_spawn_ts - offset
                 sleep_for = alert_ts - time.time()
 
                 if sleep_for > 0:
@@ -187,11 +183,17 @@ class BossAlerts(commands.Cog):
     ) -> None:
         channel_key = f"{boss_key}_channel"
         role_key = f"{boss_key}_role"
+        enabled_key = f"{boss_key}_enabled"
+        offset_key = f"{boss_key}_offset"
 
         all_guilds = await self.config.all_guilds()
         for guild_id, guild_config in all_guilds.items():
+            if not guild_config.get(enabled_key, True):
+                continue
+
             channel_id = guild_config.get(channel_key)
             role_id = guild_config.get(role_key)
+            offset = self._get_guild_offset(boss_key, guild_config)
 
             if not isinstance(channel_id, int):
                 continue
@@ -213,8 +215,7 @@ class BossAlerts(commands.Cog):
                     f"{role_mention}{boss_label} spawns <t:{spawn_ts}:R> (<t:{spawn_ts}:t>).",
                     allowed_mentions=allowed_mentions,
                 )
-                # Delete 5 minutes after the spawn time
-                delete_after = (spawn_ts + ALERT_OFFSET_SECONDS) - time.time()
+                delete_after = (spawn_ts + offset) - time.time()
                 if delete_after > 0:
                     asyncio.create_task(self._delete_message_after(delete_after, msg))
             except discord.Forbidden:
@@ -237,9 +238,30 @@ class BossAlerts(commands.Cog):
     async def on_guild_remove(self, guild: discord.Guild) -> None:
         await self.config.guild(guild).parasol_channel.set(None)
         await self.config.guild(guild).parasol_role.set(None)
+        await self.config.guild(guild).parasol_enabled.set(True)
+        await self.config.guild(guild).parasol_offset.set(DEFAULT_ALERT_OFFSET_SECONDS)
         await self.config.guild(guild).doom_channel.set(None)
         await self.config.guild(guild).doom_role.set(None)
+        await self.config.guild(guild).doom_enabled.set(True)
+        await self.config.guild(guild).doom_offset.set(DEFAULT_ALERT_OFFSET_SECONDS)
         log.info("Cleaned up boss alert config for removed guild %s", guild.id)
+
+    @commands.Cog.listener()
+    async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel) -> None:
+        if not isinstance(channel, discord.TextChannel):
+            return
+
+        for boss_key in ("parasol", "doom"):
+            channel_key = f"{boss_key}_channel"
+            config = self.config.guild(channel.guild)
+            current_channel_id = await getattr(config, channel_key)()
+            if current_channel_id == channel.id:
+                await getattr(config, channel_key).set(None)
+                log.info(
+                    "Auto-cleared %s channel for guild %s after channel deletion",
+                    boss_key,
+                    channel.guild.id,
+                )
 
     async def _set_alert_target(
         self,
@@ -273,15 +295,36 @@ class BossAlerts(commands.Cog):
             case _:
                 raise ValueError(f"Unsupported boss key: {boss_key}")
 
-        next_spawn_ts = self._get_next_spawn_timestamp(boss_key)
+        offset = await getattr(guild_config, f"{boss_key}_offset")()
+        next_spawn_ts = self._get_next_spawn_timestamp(boss_key, offset)
         next_minutes = int((next_spawn_ts - time.time()) / 60)
         role_text = f" Role: {role.mention}." if role is not None else ""
 
         response = await ctx.send(
             f"{label} alerts set in {target_channel.mention}.{role_text}\n"
-            f"Alerts fire 5 minutes before each spawn.\n"
+            f"Alerts fire {offset // 60} minutes before each spawn.\n"
             f"Next spawn: <t:{next_spawn_ts}:F> ({next_minutes} min)."
         )
+        asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
+
+    async def _toggle_alert(
+        self,
+        ctx: commands.Context,
+        boss_key: str,
+        state: bool,
+    ) -> None:
+        if ctx.guild is None:
+            response = await ctx.send("This command can only be used in a server.")
+            asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
+            return
+
+        guild_config = self.config.guild(ctx.guild)
+        enabled_key = f"{boss_key}_enabled"
+        await getattr(guild_config, enabled_key).set(state)
+
+        label = self._get_label(boss_key)
+        status_text = "enabled" if state else "disabled"
+        response = await ctx.send(f"{label} alerts {status_text}.")
         asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
 
     async def _clear_alert_target(self, ctx: commands.Context, boss_key: str) -> None:
@@ -296,15 +339,19 @@ class BossAlerts(commands.Cog):
             case "parasol":
                 await guild_config.parasol_channel.set(None)
                 await guild_config.parasol_role.set(None)
+                await guild_config.parasol_enabled.set(True)
+                await guild_config.parasol_offset.set(DEFAULT_ALERT_OFFSET_SECONDS)
                 label = "Interluminary Parasol"
             case "doom":
                 await guild_config.doom_channel.set(None)
                 await guild_config.doom_role.set(None)
+                await guild_config.doom_enabled.set(True)
+                await guild_config.doom_offset.set(DEFAULT_ALERT_OFFSET_SECONDS)
                 label = "Doom of Caeranthil"
             case _:
                 raise ValueError(f"Unsupported boss key: {boss_key}")
 
-        response = await ctx.send(f"{label} alerts disabled.")
+        response = await ctx.send(f"{label} alerts cleared.")
         asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
 
     async def _show_status(self, ctx: commands.Context, boss_key: str) -> None:
@@ -319,27 +366,39 @@ class BossAlerts(commands.Cog):
             case "parasol":
                 channel_id = await guild_config.parasol_channel()
                 role_id = await guild_config.parasol_role()
+                enabled = await guild_config.parasol_enabled()
+                offset = await guild_config.parasol_offset()
                 label = "Parasol"
             case "doom":
                 channel_id = await guild_config.doom_channel()
                 role_id = await guild_config.doom_role()
+                enabled = await guild_config.doom_enabled()
+                offset = await guild_config.doom_offset()
                 label = "Doom"
             case _:
                 raise ValueError(f"Unsupported boss key: {boss_key}")
 
         channel_text = f"<#{channel_id}>" if isinstance(channel_id, int) else "not set"
         role_text = f"<@&{role_id}>" if isinstance(role_id, int) else "not set"
-        next_spawn_ts = self._get_next_spawn_timestamp(boss_key)
+        enabled_text = "on" if enabled else "off"
+        next_spawn_ts = self._get_next_spawn_timestamp(boss_key, offset)
         next_minutes = int((next_spawn_ts - time.time()) / 60)
 
         response = await ctx.send(
-            f"{label} alerts -> channel: {channel_text} | role: {role_text}\n"
+            f"{label} alerts: {enabled_text}\n"
+            f"Channel: {channel_text} | Role: {role_text}\n"
+            f"Offset: {offset // 60} minutes before spawn\n"
             f"Next spawn: <t:{next_spawn_ts}:F> ({next_minutes} min)."
         )
         asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
 
     async def _show_next(self, ctx: commands.Context, boss_key: str) -> None:
-        next_spawn_ts = self._get_next_spawn_timestamp(boss_key)
+        guild_config = self.config.guild(ctx.guild) if ctx.guild else None
+        offset = DEFAULT_ALERT_OFFSET_SECONDS
+        if guild_config is not None:
+            offset = await getattr(guild_config, f"{boss_key}_offset")()
+
+        next_spawn_ts = self._get_next_spawn_timestamp(boss_key, offset)
         label = self._get_label(boss_key)
 
         response = await ctx.send(
@@ -393,7 +452,12 @@ class BossAlerts(commands.Cog):
             self._scheduler_loop(boss_key)
         )
 
-        next_spawn_ts = self._get_next_spawn_timestamp(boss_key)
+        offset = await getattr(
+            self.config.guild(ctx.guild) if ctx.guild else self.config,
+            f"{boss_key}_offset",
+            lambda: DEFAULT_ALERT_OFFSET_SECONDS,
+        )()
+        next_spawn_ts = self._get_next_spawn_timestamp(boss_key, offset)
         minutes_remaining = int((next_spawn_ts - time.time()) / 60)
 
         response = await ctx.send(
@@ -411,7 +475,7 @@ class BossAlerts(commands.Cog):
     @parasol.group(name="ping")
     @commands.guild_only()
     async def parasol_ping(self, ctx: commands.Context) -> None:
-        """Parasol ping commands."""
+        """Parasol ping configuration."""
 
     @parasol_ping.command(name="add")
     @commands.guild_only()
@@ -435,6 +499,18 @@ class BossAlerts(commands.Cog):
     @commands.admin_or_permissions(manage_guild=True)
     async def parasol_ping_status(self, ctx: commands.Context) -> None:
         await self._show_status(ctx, "parasol")
+
+    @parasol_ping.command(name="on")
+    @commands.guild_only()
+    @commands.admin_or_permissions(manage_guild=True)
+    async def parasol_ping_on(self, ctx: commands.Context) -> None:
+        await self._toggle_alert(ctx, "parasol", True)
+
+    @parasol_ping.command(name="off")
+    @commands.guild_only()
+    @commands.admin_or_permissions(manage_guild=True)
+    async def parasol_ping_off(self, ctx: commands.Context) -> None:
+        await self._toggle_alert(ctx, "parasol", False)
 
     @parasol.command(name="next")
     @commands.guild_only()
@@ -463,7 +539,7 @@ class BossAlerts(commands.Cog):
     @doom.group(name="ping")
     @commands.guild_only()
     async def doom_ping(self, ctx: commands.Context) -> None:
-        """Doom ping commands."""
+        """Doom ping configuration."""
 
     @doom_ping.command(name="add")
     @commands.guild_only()
@@ -488,6 +564,18 @@ class BossAlerts(commands.Cog):
     async def doom_ping_status(self, ctx: commands.Context) -> None:
         await self._show_status(ctx, "doom")
 
+    @doom_ping.command(name="on")
+    @commands.guild_only()
+    @commands.admin_or_permissions(manage_guild=True)
+    async def doom_ping_on(self, ctx: commands.Context) -> None:
+        await self._toggle_alert(ctx, "doom", True)
+
+    @doom_ping.command(name="off")
+    @commands.guild_only()
+    @commands.admin_or_permissions(manage_guild=True)
+    async def doom_ping_off(self, ctx: commands.Context) -> None:
+        await self._toggle_alert(ctx, "doom", False)
+
     @doom.command(name="next")
     @commands.guild_only()
     async def doom_next(self, ctx: commands.Context) -> None:
@@ -510,9 +598,13 @@ class BossAlerts(commands.Cog):
     @parasol_ping_add.error
     @parasol_ping_remove.error
     @parasol_ping_status.error
+    @parasol_ping_on.error
+    @parasol_ping_off.error
     @doom_ping_add.error
     @doom_ping_remove.error
     @doom_ping_status.error
+    @doom_ping_on.error
+    @doom_ping_off.error
     @parasol_sync.error
     @doom_sync.error
     async def bossalerts_command_error(
