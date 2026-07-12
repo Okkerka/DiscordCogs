@@ -59,7 +59,7 @@ def success_embed(message: str) -> discord.Embed:
     return discord.Embed(description=message, color=COLOR_GREEN)
 
 
-def make_now_playing_embed(meta: TrackMeta) -> discord.Embed:
+def make_now_playing_embed(meta: TrackMeta, autoplay_enabled: bool) -> discord.Embed:
     description = [f"**{meta['title']}**", meta["artist"]]
     if meta.get("album"):
         description.append(f"_{meta['album']}_")
@@ -78,8 +78,7 @@ def make_now_playing_embed(meta: TrackMeta) -> discord.Embed:
     else:
         embed.add_field(name="Open in TIDAL", value="Unavailable", inline=True)
 
-    autoplay_value = "On" if meta.get("autoplay_enabled") else "Off"
-    embed.add_field(name="Autoplay", value=autoplay_value, inline=True)
+    embed.add_field(name="Autoplay", value="On" if autoplay_enabled else "Off", inline=True)
 
     embed.set_footer(text=f"Duration: {format_duration(meta['duration'])}")
 

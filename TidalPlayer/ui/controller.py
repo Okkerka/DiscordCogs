@@ -62,7 +62,7 @@ class PlayerControllerView(discord.ui.View):
         await interaction.response.send_message("Join the bot's voice channel to use playback controls.", ephemeral=True)
         return False
 
-    @discord.ui.button(label="Autoplay: Off", style=discord.ButtonStyle.secondary, custom_id="tidalplayer:autoplay", row=0)
+    @discord.ui.button(label="Autoplay", style=discord.ButtonStyle.secondary, custom_id="tidalplayer:autoplay", row=0)
     async def autoplay(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await self.cog.controller_toggle_autoplay(interaction)
 
@@ -70,7 +70,7 @@ class PlayerControllerView(discord.ui.View):
     async def pause(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await self.cog.controller_toggle_pause(interaction)
 
-    @discord.ui.button(label="Pause", style=discord.ButtonStyle.danger, custom_id="tidalplayer:stop", row=0)
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, custom_id="tidalplayer:stop", row=0)
     async def stop(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await self.cog.controller_stop(interaction)
 

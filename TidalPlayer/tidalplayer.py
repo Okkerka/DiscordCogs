@@ -1,4 +1,4 @@
-"""
+﻿"""
 TidalPlayer - Tidal music integration for Red Discord Bot
 Features: Hi-Res Audio, Album Art, Spotify/YT Importing, MixV2, Video URLs,
           Hybrid Slash Commands, Similar Albums, UserPlaylist Mgmt, Rich UI
@@ -1177,9 +1177,9 @@ class TidalPlayer(commands.Cog):
         for number, track in enumerate(tracks[start:start + 5], start=start + 1):
             title = getattr(track, "full_name", None) or getattr(track, "name", "Unknown")
             artist = getattr(getattr(track, "artist", None), "name", "Unknown")
-            lines.append(f"**{number}.** {truncate(str(title), 70)} â€” {truncate(str(artist), 45)}")
+            lines.append(f"**{number}.** {truncate(str(title), 70)} Ã¢â‚¬â€ {truncate(str(artist), 45)}")
         pages = max(1, (len(tracks) + 4) // 5)
-        return discord.Embed(title="Similar songs", description="\n".join(lines) or "No related tracks were found.", color=COLOR_PURPLE).set_footer(text=f"Page {page + 1}/{pages} â€¢ Select a track to add it to the queue")
+        return discord.Embed(title="Similar songs", description="\n".join(lines) or "No related tracks were found.", color=COLOR_PURPLE).set_footer(text=f"Page {page + 1}/{pages} Ã¢â‚¬Â¢ Select a track to add it to the queue")
 
     async def open_similar_songs(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
@@ -1263,7 +1263,7 @@ class TidalPlayer(commands.Cog):
                 if child.custom_id == "tidalplayer:autoplay":
                     child.label = f"Autoplay: {'On' if enabled else 'Off'}"
                 elif child.custom_id == "tidalplayer:pause":
-                    child.emoji = "â–¶ï¸" if paused else "â¸ï¸"
+                    child.emoji = "Ã¢â€“Â¶Ã¯Â¸Â" if paused else "Ã¢ÂÂ¸Ã¯Â¸Â"
         if interaction is not None and not interaction.response.is_done():
             await interaction.response.edit_message(embed=embed, view=view)
             if interaction.message is not None:
