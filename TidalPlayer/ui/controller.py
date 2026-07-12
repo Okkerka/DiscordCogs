@@ -68,11 +68,11 @@ class PlayerControllerView(discord.ui.View):
     async def autoplay(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await self.cog.controller_toggle_autoplay(interaction)
 
-    @discord.ui.button(emoji="â¸", style=discord.ButtonStyle.primary, custom_id="tidalplayer:pause", row=0)
+    @discord.ui.button(label="Pause", style=discord.ButtonStyle.primary, custom_id="tidalplayer:pause", row=0)
     async def pause(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await self.cog.controller_toggle_pause(interaction)
 
-    @discord.ui.button(emoji="â¹", style=discord.ButtonStyle.danger, custom_id="tidalplayer:stop", row=0)
+    @discord.ui.button(label="Pause", style=discord.ButtonStyle.danger, custom_id="tidalplayer:stop", row=0)
     async def stop(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await self.cog.controller_stop(interaction)
 
