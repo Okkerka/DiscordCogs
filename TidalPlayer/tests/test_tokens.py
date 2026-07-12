@@ -190,5 +190,5 @@ class TestTokenService:
         assert snap is not None
         asyncio.run(service.replace(snap))
         asyncio.run(service.replace(snap))
-        loop.run_until_complete(service.replace(snap))
+        asyncio.run(service.replace(snap))
         assert service.generation == 3
