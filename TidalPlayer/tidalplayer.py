@@ -1295,6 +1295,10 @@ class TidalPlayer(commands.Cog):
                 cancel_event.clear()
 
     async def _check_ready(self, ctx: commands.Context) -> bool:
+        if not LAVALINK_AVAILABLE:
+            await ctx.send(embed=_error_embed("Audio playback is currently unavailable."))
+            return False
+
         if not self._initialized:
             await ctx.send(embed=_error_embed(Messages.ERROR_STILL_LOADING))
             return False
