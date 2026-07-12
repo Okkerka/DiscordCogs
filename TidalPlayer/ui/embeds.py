@@ -72,9 +72,10 @@ def make_now_playing_embed(meta: TrackMeta) -> discord.Embed:
         color=COLOR_BLUE,
     )
     quality = meta.get("audio_resolution") or QUALITY_LABELS.get(meta["quality"], meta["quality"])
-    embed.add_field(name="Quality", value=quality, inline=True)
+    audio_value = f"`{quality}`"
     if meta.get("share_url"):
-        embed.add_field(name="Open in TIDAL", value=f"[Listen]({meta['share_url']})", inline=True)
+        audio_value += f" â€¢ [Listen on TIDAL]({meta['share_url']})"
+    embed.add_field(name="Audio", value=audio_value, inline=False)
     embed.set_footer(text=f"Duration: {format_duration(meta['duration'])}")
     if meta.get("image"):
         embed.set_thumbnail(url=meta["image"])
