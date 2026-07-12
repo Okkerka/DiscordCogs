@@ -7,8 +7,6 @@ import discord
 from ..domain.models import TrackMeta
 from ..domain.normalization import QUALITY_LABELS, format_duration
 
-EMOJI_OK: Final = "✅"
-EMOJI_NO: Final = "❌"
 
 COLOR_BLUE = discord.Color.blue()
 COLOR_GREEN = discord.Color.green()
@@ -56,11 +54,11 @@ class Messages:
 
 
 def error_embed(message: str) -> discord.Embed:
-    return discord.Embed(description=f"{EMOJI_NO} {message}", color=COLOR_RED)
+    return discord.Embed(description=message, color=COLOR_RED)
 
 
 def success_embed(message: str) -> discord.Embed:
-    return discord.Embed(description=f"{EMOJI_OK} {message}", color=COLOR_GREEN)
+    return discord.Embed(description=message, color=COLOR_GREEN)
 
 
 def make_now_playing_embed(meta: TrackMeta) -> discord.Embed:
