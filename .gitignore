@@ -3,3 +3,4 @@ tidalplaylist/__init__.py
 tidalplaylist/info.json
 tidalplaylist/tidalplaylist.py
 *.pyc
+Apply-TidalPlayerFixes.ps1
