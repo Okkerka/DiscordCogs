@@ -117,19 +117,19 @@ class TestTokenRepository:
         return TokenRepository(_FakeConfigGroup(_COMPLETE))
 
     def test_load_returns_none_when_empty(self, repo: TokenRepository) -> None:
-        snap = asyncio.get_event_loop().run_until_complete(repo.load())
+        snap = asyncio.run(repo.load())
         assert snap is None
 
     def test_load_returns_snapshot_when_complete(self, repo_with_data: TokenRepository) -> None:
-        snap = asyncio.get_event_loop().run_until_complete(repo_with_data.load())
+        snap = asyncio.run(repo_with_data.load())
         assert snap is not None
         assert snap.access_token == "acc"
 
     def test_replace_persists_all_fields(self, repo: TokenRepository) -> None:
         snap = TokenSnapshot.from_mapping(_COMPLETE)
         assert snap is not None
-        asyncio.get_event_loop().run_until_complete(repo.replace(snap))
-        loaded = asyncio.get_event_loop().run_until_complete(repo.load())
+        asyncio.run(repo.replace(snap))
+        loaded = asyncio.run(repo.load())
         assert loaded is not None
         assert loaded.as_mapping() == _COMPLETE
 
@@ -140,11 +140,11 @@ class TestTokenRepository:
             TokenSnapshot(**_COMPLETE), access_token="  "
         )
         with pytest.raises(ValueError):
-            asyncio.get_event_loop().run_until_complete(repo.replace(incomplete))
+            asyncio.run(repo.replace(incomplete))
 
     def test_clear_sets_all_fields_to_none(self, repo_with_data: TokenRepository) -> None:
-        asyncio.get_event_loop().run_until_complete(repo_with_data.clear())
-        loaded = asyncio.get_event_loop().run_until_complete(repo_with_data.load())
+        asyncio.run(repo_with_data.clear())
+        loaded = asyncio.run(repo_with_data.load())
         assert loaded is None
 
 
@@ -167,29 +167,28 @@ class TestTokenService:
     def test_replace_increments_generation(self, service: TokenService) -> None:
         snap = TokenSnapshot.from_mapping(_COMPLETE)
         assert snap is not None
-        asyncio.get_event_loop().run_until_complete(service.replace(snap))
+        asyncio.run(service.replace(snap))
         assert service.generation == 1
 
     def test_logout_increments_generation(self, service_with_data: TokenService) -> None:
         gen_before = service_with_data.generation
-        asyncio.get_event_loop().run_until_complete(service_with_data.logout())
+        asyncio.run(service_with_data.logout())
         assert service_with_data.generation == gen_before + 1
 
     def test_logout_clears_persisted_data(self, service_with_data: TokenService) -> None:
-        asyncio.get_event_loop().run_until_complete(service_with_data.logout())
-        snap = asyncio.get_event_loop().run_until_complete(service_with_data.restore())
+        asyncio.run(service_with_data.logout())
+        snap = asyncio.run(service_with_data.restore())
         assert snap is None
 
     def test_restore_returns_snapshot_when_present(self, service_with_data: TokenService) -> None:
-        snap = asyncio.get_event_loop().run_until_complete(service_with_data.restore())
+        snap = asyncio.run(service_with_data.restore())
         assert snap is not None
         assert snap.access_token == "acc"
 
     def test_multiple_replaces_accumulate_generation(self, service: TokenService) -> None:
         snap = TokenSnapshot.from_mapping(_COMPLETE)
         assert snap is not None
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(service.replace(snap))
-        loop.run_until_complete(service.replace(snap))
-        loop.run_until_complete(service.replace(snap))
+        asyncio.run(service.replace(snap))
+        asyncio.run(service.replace(snap))
+        asyncio.run(service.replace(snap))
         assert service.generation == 3
