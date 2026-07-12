@@ -32,11 +32,16 @@ from .ui.embeds import (
     COLOR_BLUE, COLOR_GREEN, COLOR_PURPLE, COLOR_RED, COLOR_TEAL, Messages,
     error_embed as _error_embed, make_now_playing_embed, success_embed as _success_embed,
 )
+from .providers.audio import RedAudioGateway
+from .providers.errors import PlaybackUnavailable
+from .providers.tokens import TokenRepository, TokenService, TokenSnapshot
+from .providers.urls import MalformedProviderURL, ProviderKind, parse_provider_url
 
 try:
     import lavalink
     LAVALINK_AVAILABLE = True
 except ImportError:
+    lavalink = None
     LAVALINK_AVAILABLE = False
 
 try:
@@ -758,7 +763,7 @@ class TidalPlayer(commands.Cog):
 
     __slots__ = (
         "bot", "config", "tidal", "sp", "yt", "_tasks", "_guild_locks",
-        "_cancel_events", "_last_progress_edit", "_initialized", "_current_meta",
+        "_cancel_events", "_last_progress_edit", "_initialized", "_current_meta", "audio", "tokens",
     )
 
     def __init__(self, bot: Red):
@@ -767,6 +772,8 @@ class TidalPlayer(commands.Cog):
         self.config.register_global(**GLOBAL_DEFAULTS)
         self.config.register_guild(**GUILD_DEFAULTS)
         self.tidal = TidalHandler(bot, self.config)
+        self.tokens = TokenService(TokenRepository(self.config))
+        self.audio = RedAudioGateway(lavalink if LAVALINK_AVAILABLE else None)
         self.sp: Optional[Any] = None
         self.yt: Optional[Any] = None
         self._tasks: Set[asyncio.Task] = set()
@@ -861,7 +868,8 @@ class TidalPlayer(commands.Cog):
 
     async def _initialize_apis(self) -> None:
         t0 = asyncio.get_running_loop().time()
-        creds = await self.config.all()
+        snapshot = await self.tokens.restore()
+        creds = snapshot.as_mapping() if snapshot else {}
         results = await asyncio.gather(
             self.tidal.initialize(creds),
             self._initialize_spotify(),
@@ -958,18 +966,15 @@ class TidalPlayer(commands.Cog):
         return format_duration(seconds)
 
     async def _get_player(self, ctx: commands.Context, connect: bool = False) -> Optional[Any]:
-        if not LAVALINK_AVAILABLE:
+        if not self.audio.available or not ctx.guild:
             return None
         try:
-            return lavalink.get_player(ctx.guild.id)
-        except Exception:
-            pass
-        if connect and ctx.author.voice and ctx.author.voice.channel:
-            try:
-                await lavalink.connect(ctx.author.voice.channel)
-                return lavalink.get_player(ctx.guild.id)
-            except Exception as e:
-                log.debug(f"Failed to connect to VC: {e}")
+            voice_channel = None
+            if connect and getattr(ctx.author, "voice", None):
+                voice_channel = getattr(ctx.author.voice, "channel", None)
+            return await self.audio.get_player(ctx.guild.id, voice_channel)
+        except PlaybackUnavailable:
+            return None
         return None
 
     async def _ensure_player(self, ctx: commands.Context) -> Optional[Any]:
@@ -1298,7 +1303,7 @@ class TidalPlayer(commands.Cog):
         if not await self.tidal.is_logged_in():
             await ctx.send(embed=_error_embed(Messages.ERROR_NOT_AUTHENTICATED))
             return False
-        if not LAVALINK_AVAILABLE:
+        if not self.audio.available:
             await ctx.send(embed=_error_embed(Messages.ERROR_NO_AUDIO_COG))
             return False
         return True
@@ -1379,6 +1384,31 @@ class TidalPlayer(commands.Cog):
         """Play a Tidal track, album, playlist, mix, Spotify link, YouTube playlist, or search query."""
         if not await self._check_ready(ctx):
             return
+        try:
+            provider_url = parse_provider_url(query)
+        except MalformedProviderURL:
+            await ctx.send(embed=_error_embed(Messages.ERROR_INVALID_URL.format(platform="provider", content_type="link")))
+            return
+        if provider_url is not None:
+            if provider_url.provider is ProviderKind.TIDAL:
+                handlers = {
+                    "track": self._handle_track,
+                    "video": self._handle_video,
+                    "album": self._handle_album,
+                    "playlist": self._handle_playlist,
+                    "mix": self._handle_mix,
+                }
+                await handlers[provider_url.content_type](ctx, provider_url.identifier)
+            elif provider_url.provider is ProviderKind.SPOTIFY:
+                handlers = {
+                    "playlist": self._handle_spotify_playlist,
+                    "album": self._handle_spotify_album,
+                    "track": self._handle_spotify_track,
+                }
+                await handlers[provider_url.content_type](ctx, query)
+            else:
+                await self._handle_youtube_playlist(ctx, query)
+            return
         if ISRC_PATTERN.match(query):
             isrc = ISRC_PATTERN.match(query).group(1).upper()
             track = await self.tidal.get_track_by_isrc(isrc)
@@ -1386,21 +1416,6 @@ class TidalPlayer(commands.Cog):
                 await self._load_and_queue_track(ctx, track)
             else:
                 await ctx.send(embed=_error_embed(Messages.ERROR_NO_TRACKS_FOUND))
-            return
-        if _TIDAL_URL_RE.search(query):
-            await self._handle_tidal_url(ctx, query)
-            return
-        if _SPOTIFY_PLAYLIST_RE.search(query):
-            await self._handle_spotify_playlist(ctx, query)
-            return
-        if _SPOTIFY_ALBUM_RE.search(query):
-            await self._handle_spotify_album(ctx, query)
-            return
-        if _SPOTIFY_TRACK_RE.search(query):
-            await self._handle_spotify_track(ctx, query)
-            return
-        if _YOUTUBE_PLAYLIST_RE.search(query):
-            await self._handle_youtube_playlist(ctx, query)
             return
         filter_remixes, interactive = await asyncio.gather(
             self.config.guild(ctx.guild).filter_remixes(),
@@ -1723,12 +1738,13 @@ class TidalPlayer(commands.Cog):
                     self.tidal.session.refresh_token,
                 )
             expiry_time, token_type, access, refresh = await self.tidal._run_blocking(_get_state, timeout=5.0)
-            await asyncio.gather(
-                self.config.token_type.set(token_type),
-                self.config.access_token.set(access),
-                self.config.refresh_token.set(refresh),
-                self.config.expiry_time.set(int(expiry_time.timestamp()) if expiry_time else None),
+            snapshot = TokenSnapshot(
+                token_type=token_type,
+                access_token=access,
+                refresh_token=refresh,
+                expiry_time=int(expiry_time.timestamp()) if expiry_time else 0,
             )
+            await self.tokens.replace(snapshot)
             self.tidal.invalidate_login_cache()
             await ctx.send(embed=_success_embed("Tidal authentication successful!"))
         except asyncio.TimeoutError:
@@ -1741,12 +1757,7 @@ class TidalPlayer(commands.Cog):
     @commands.is_owner()
     async def tidalsetup_logout(self, ctx: commands.Context):
         """Clear stored Tidal tokens."""
-        await asyncio.gather(
-            self.config.token_type.set(None),
-            self.config.access_token.set(None),
-            self.config.refresh_token.set(None),
-            self.config.expiry_time.set(None),
-        )
+        await self.tokens.logout()
         self.tidal.invalidate_login_cache()
         await ctx.send(embed=_success_embed(Messages.SUCCESS_TOKENS_CLEARED))
 
