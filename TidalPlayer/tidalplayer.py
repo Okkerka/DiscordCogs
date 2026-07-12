@@ -6,17 +6,32 @@ Features: Hi-Res Audio, Album Art, Spotify/YT Importing, MixV2, Video URLs,
 
 import asyncio
 import logging
-import re
 from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from itertools import islice
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple, TypedDict
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import discord
 from redbot.core import Config, app_commands, commands
 from redbot.core.bot import Red
 from redbot.core.utils.menus import SimpleMenu
+
+from .config_schema import COG_IDENTIFIER, GLOBAL_DEFAULTS, GUILD_DEFAULTS, SCHEMA_VERSION
+from .domain.models import PageResult as _PageResult
+from .domain.models import TrackMeta
+from .domain.normalization import (
+    FILTER_REGEX, ISRC_PATTERN, SPOTIFY_ALBUM_PATTERN, SPOTIFY_ALBUM_RE as _SPOTIFY_ALBUM_RE,
+    SPOTIFY_PLAYLIST_PATTERN, SPOTIFY_PLAYLIST_RE as _SPOTIFY_PLAYLIST_RE,
+    SPOTIFY_TRACK_PATTERN, SPOTIFY_TRACK_RE as _SPOTIFY_TRACK_RE, TIDAL_URL_PATTERNS,
+    TIDAL_URL_RE as _TIDAL_URL_RE, YOUTUBE_PLAYLIST_PATTERN,
+    YOUTUBE_PLAYLIST_RE as _YOUTUBE_PLAYLIST_RE, YOUTUBE_SKIP_TITLES, ensure_aware as _ensure_aware,
+    format_duration, make_tidal_url, truncate, utc_now as _utc_now,
+)
+from .ui.embeds import (
+    COLOR_BLUE, COLOR_GREEN, COLOR_PURPLE, COLOR_RED, COLOR_TEAL, Messages,
+    error_embed as _error_embed, make_now_playing_embed, success_embed as _success_embed,
+)
 
 try:
     import lavalink
@@ -53,7 +68,6 @@ except ImportError:
 
 log = logging.getLogger("red.tidalplayer")
 
-COG_IDENTIFIER = 160819386
 API_SEMAPHORE_LIMIT = 5
 INTERACTIVE_TIMEOUT = 30
 BATCH_UPDATE_INTERVAL = 10
@@ -72,55 +86,6 @@ QUEUE_PAGE_SIZE = 10
 TPL_LIST_PAGE_SIZE = 15
 SEARCH_BATCH_SIZE = 5
 
-EMOJI_OK = "\u2705"
-EMOJI_NO = "\u274c"
-
-COLOR_BLUE = discord.Color.blue()
-COLOR_GREEN = discord.Color.green()
-COLOR_RED = discord.Color.red()
-COLOR_BLURPLE = discord.Color.blurple()
-COLOR_TEAL = discord.Color.teal()
-COLOR_PURPLE = discord.Color.purple()
-
-QUALITY_LABELS = {
-    "HI_RES_LOSSLESS": "HI-RES LOSSLESS (FLAC)",
-    "LOSSLESS": "LOSSLESS (FLAC)",
-    "HIGH": "HIGH (320kbps)",
-    "LOW": "LOW (96kbps)",
-}
-
-FILTER_KEYWORDS = frozenset(
-    {"sped up", "slowed", "tiktok", "reverb", "8d audio", "bass boosted",
-     "reverbed", "slowed down", "nightcore", "daycore"}
-)
-FILTER_REGEX = re.compile(
-    "|".join(re.escape(kw) for kw in FILTER_KEYWORDS),
-    re.IGNORECASE,
-)
-
-YOUTUBE_SKIP_TITLES = frozenset(
-    {"[deleted video]", "private video", "[private video]"}
-)
-
-TIDAL_URL_PATTERNS = {
-    "track": re.compile(r"tidal\.com/(?:browse/)?track/(\d+)"),
-    "video": re.compile(r"tidal\.com/(?:browse/)?video/(\d+)"),
-    "album": re.compile(r"tidal\.com/(?:browse/)?album/(\d+)"),
-    "playlist": re.compile(r"tidal\.com/(?:browse/)?playlist/([a-f0-9-]+)"),
-    "mix": re.compile(r"tidal\.com/(?:browse/)?mix/([a-f0-9A-Z_-]+)"),
-}
-
-SPOTIFY_PLAYLIST_PATTERN = re.compile(r"open\.spotify\.com/playlist/([a-zA-Z0-9]+)")
-SPOTIFY_TRACK_PATTERN = re.compile(r"open\.spotify\.com/track/([a-zA-Z0-9]+)")
-SPOTIFY_ALBUM_PATTERN = re.compile(r"open\.spotify\.com/album/([a-zA-Z0-9]+)")
-YOUTUBE_PLAYLIST_PATTERN = re.compile(r"youtube\.com/.*[?&]list=([a-zA-Z0-9_-]+)")
-ISRC_PATTERN = re.compile(r"^isrc:([A-Z]{2}[A-Z0-9]{3}\d{7})$", re.IGNORECASE)
-
-_TIDAL_URL_RE = re.compile(r"tidal\.com/")
-_SPOTIFY_PLAYLIST_RE = re.compile(r"open\.spotify\.com/playlist/")
-_SPOTIFY_ALBUM_RE = re.compile(r"open\.spotify\.com/album/")
-_SPOTIFY_TRACK_RE = re.compile(r"open\.spotify\.com/track/")
-_YOUTUBE_PLAYLIST_RE = re.compile(r"youtube\.com/.*[?&]list=")
 
 _CACHE_CAPS: Dict[str, int] = {
     "search": 200,
@@ -133,73 +98,6 @@ _CACHE_CAPS: Dict[str, int] = {
 }
 
 
-class TrackMeta(TypedDict):
-    title: str
-    artist: str
-    album: Optional[str]
-    duration: int
-    quality: str
-    image: Optional[str]
-    share_url: Optional[str]
-    audio_resolution: Optional[str]
-    track_id: Optional[int]
-
-
-class _PageResult(NamedTuple):
-    items: List[Any]
-    sparse_supported: Optional[bool]
-
-
-class Messages:
-    ERROR_NO_TIDALAPI = "tidalapi not installed. Run: `[p]pipinstall tidalapi`"
-    ERROR_NOT_AUTHENTICATED = (
-        "Not authenticated with Tidal. The bot owner must complete the OAuth flow "
-        "(device code auth) before playback is available."
-    )
-    ERROR_NO_AUDIO_COG = "Audio cog not loaded. Run: `[p]load audio`"
-    ERROR_NO_PLAYER = "No active player. Join a voice channel first."
-    ERROR_NO_TRACKS_FOUND = "No tracks found."
-    ERROR_INVALID_URL = "Invalid {platform} {content_type} URL"
-    ERROR_CONTENT_UNAVAILABLE = "Content unavailable (private/region-locked)"
-    ERROR_LAVALINK_FAILED = "Playback failed: Could not retrieve Tidal stream."
-    ERROR_STILL_LOADING = "\u23f3 TidalPlayer is still initializing, please wait a moment."
-    ERROR_NOT_PLAYING = "Nothing is currently playing."
-    STATUS_PLAYING = "Playing from Tidal"
-    PROGRESS_QUEUEING = "Queueing {name} ({count} tracks)..."
-    STATUS_STOPPING = "Stopping playlist queueing..."
-    SUCCESS_SPOTIFY_CONFIGURED = "Spotify configured."
-    SUCCESS_YOUTUBE_CONFIGURED = "YouTube configured."
-    SUCCESS_FILTER_ENABLED = "Remix/TikTok filter enabled."
-    SUCCESS_FILTER_DISABLED = "Remix/TikTok filter disabled."
-    SUCCESS_INTERACTIVE_ENABLED = "Interactive search enabled."
-    SUCCESS_INTERACTIVE_DISABLED = "Interactive search disabled."
-    SUCCESS_TOKENS_CLEARED = "Tokens cleared."
-    SUCCESS_PARTIAL_QUEUE = "Queued {queued}/{total} ({skipped} skipped)"
-    ERROR_TIMEOUT = "Selection timed out."
-    ERROR_FETCH_FAILED = "Could not fetch playlist."
-    ERROR_NO_SPOTIFY = (
-        "Spotify not configured. Set credentials with: "
-        "`[p]set api spotify client_id,<id> client_secret,<secret>`"
-    )
-    ERROR_NO_YOUTUBE = (
-        "YouTube not configured. Set credentials with: "
-        "`[p]set api youtube api_key,<key>`"
-    )
-    ERROR_NOT_USER_PLAYLIST = "That playlist is not a user-owned playlist. Use `[p]tpl list` to see your playlists."
-    ERROR_PLAYLIST_WRITE_FAILED = "Playlist operation failed."
-    ERROR_NO_QUEUE = "The queue is empty."
-
-
-def truncate(text: str, limit: int) -> str:
-    if len(text) > limit:
-        return text[:limit - 3] + "..."
-    return text
-
-
-def make_tidal_url(content_type: str, content_id: Any) -> str:
-    return f"https://listen.tidal.com/{content_type}/{content_id}"
-
-
 def _is_tidal_track(obj: Any) -> bool:
     if TIDAL_MODELS_AVAILABLE and TidalTrack is not None:
         return isinstance(obj, TidalTrack)
@@ -208,14 +106,6 @@ def _is_tidal_track(obj: Any) -> bool:
         and hasattr(obj, "duration")
         and (hasattr(obj, "get_stream") or hasattr(obj, "get_url"))
     )
-
-
-def _error_embed(message: str) -> discord.Embed:
-    return discord.Embed(description=f"{EMOJI_NO} {message}", color=COLOR_RED)
-
-
-def _success_embed(message: str) -> discord.Embed:
-    return discord.Embed(description=f"{EMOJI_OK} {message}", color=COLOR_GREEN)
 
 
 def _spotify_item_to_query(item: dict) -> str:
@@ -233,16 +123,6 @@ def _spotify_album_item_to_query(item: dict) -> str:
         return f"isrc:{isrc}"
     artists = " ".join(a["name"] for a in item.get("artists", []))
     return f"{item.get('name', '')} {artists}".strip()
-
-
-def _utc_now() -> datetime:
-    return datetime.now(tz=timezone.utc)
-
-
-def _ensure_aware(dt: datetime) -> datetime:
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt
 
 
 class TrackSelectView(discord.ui.View):
@@ -884,12 +764,8 @@ class TidalPlayer(commands.Cog):
     def __init__(self, bot: Red):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=COG_IDENTIFIER, force_registration=True)
-        self.config.register_global(
-            token_type=None, access_token=None, refresh_token=None,
-            expiry_time=None,
-            _schema_version=3,
-        )
-        self.config.register_guild(filter_remixes=True, interactive_search=False)
+        self.config.register_global(**GLOBAL_DEFAULTS)
+        self.config.register_guild(**GUILD_DEFAULTS)
         self.tidal = TidalHandler(bot, self.config)
         self.sp: Optional[Any] = None
         self.yt: Optional[Any] = None
@@ -907,11 +783,11 @@ class TidalPlayer(commands.Cog):
     async def _migrate_config(self) -> None:
         try:
             version = await self.config._schema_version()
-            if version is None or version < 3:
+            if version is None or version < SCHEMA_VERSION:
                 await self.config.clear_raw("spotify_client_id")
                 await self.config.clear_raw("spotify_client_secret")
                 await self.config.clear_raw("youtube_api_key")
-                await self.config._schema_version.set(3)
+                await self.config._schema_version.set(SCHEMA_VERSION)
                 log.info("TidalPlayer: config migrated to schema v3 (cleared legacy API keys)")
         except Exception as e:
             log.warning(f"Config migration check failed (non-fatal): {e}")
@@ -1079,11 +955,7 @@ class TidalPlayer(commands.Cog):
         return meta
 
     def _format_duration(self, seconds: int) -> str:
-        m, s = divmod(seconds, 60)
-        h, m = divmod(m, 60)
-        if h:
-            return f"{h}:{m:02d}:{s:02d}"
-        return f"{m:02d}:{s:02d}"
+        return format_duration(seconds)
 
     async def _get_player(self, ctx: commands.Context, connect: bool = False) -> Optional[Any]:
         if not LAVALINK_AVAILABLE:
@@ -1191,20 +1063,7 @@ class TidalPlayer(commands.Cog):
         return True
 
     def _build_now_playing_embed(self, meta: TrackMeta) -> discord.Embed:
-        desc_parts = [f"**{meta['title']}**", meta["artist"]]
-        if meta.get("album"):
-            desc_parts.append(f"_{meta['album']}_")
-        embed = discord.Embed(
-            title=Messages.STATUS_PLAYING, description="\n".join(desc_parts), color=COLOR_BLUE
-        )
-        quality_display = meta.get("audio_resolution") or QUALITY_LABELS.get(meta["quality"], meta["quality"])
-        embed.add_field(name="Quality", value=quality_display, inline=True)
-        if meta.get("share_url"):
-            embed.add_field(name="Open in TIDAL", value=f"[Listen]({meta['share_url']})", inline=True)
-        embed.set_footer(text=f"Duration: {self._format_duration(meta['duration'])}")
-        if meta.get("image"):
-            embed.set_thumbnail(url=meta["image"])
-        return embed
+        return make_now_playing_embed(meta)
 
     async def _send_now_playing(self, ctx: commands.Context, meta: TrackMeta) -> None:
         await ctx.send(embed=self._build_now_playing_embed(meta))

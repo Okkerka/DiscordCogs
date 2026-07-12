@@ -11,7 +11,6 @@ No Discord connection, no credentials, no network I/O.
 """
 from __future__ import annotations
 
-import asyncio
 import importlib
 import inspect
 import os

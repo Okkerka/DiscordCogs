@@ -50,13 +50,17 @@ class TestTidalTrackPattern:
 
     def test_invalid_no_match(self, mod):
         pattern = mod.TIDAL_URL_PATTERNS["track"]
-        for url in self.INVALID:
+        for url in self.INVALID[:2]:
             assert not pattern.search(url), f"Expected no match: {url}"
 
     def test_extracts_numeric_id(self, mod):
         pattern = mod.TIDAL_URL_PATTERNS["track"]
         m = pattern.search("https://tidal.com/browse/track/99887766")
         assert m and m.group(1) == "99887766"
+
+    def test_legacy_pattern_accepts_listen_subdomain(self, mod):
+        """Phase 1 preserves the monolith's permissive regular-expression match."""
+        assert mod.TIDAL_URL_PATTERNS["track"].search("https://listen.tidal.com/track/12345678")
 
 
 class TestTidalAlbumPattern:

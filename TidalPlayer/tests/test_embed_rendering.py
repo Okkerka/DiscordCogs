@@ -12,9 +12,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import pytest
-
-
 def _make_meta(
     *,
     title: str = "Good 4 U",

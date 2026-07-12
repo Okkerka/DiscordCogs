@@ -11,7 +11,6 @@ No live Discord connection or credentials required.
 """
 from __future__ import annotations
 
-import asyncio
 import importlib
 import inspect
 import sys
@@ -141,7 +140,7 @@ class TestCheckReady:
         mod = sys.modules[MODULE_NAME]
         with (
             patch.object(mod, "TIDALAPI_AVAILABLE", True),
-            patch.object(cog.tidal, "is_logged_in", AsyncMock(return_value=False)),
+            patch.object(type(cog.tidal), "is_logged_in", AsyncMock(return_value=False)),
         ):
             result = await cog._check_ready(ctx)
         assert result is False
@@ -154,7 +153,7 @@ class TestCheckReady:
         mod = sys.modules[MODULE_NAME]
         with (
             patch.object(mod, "TIDALAPI_AVAILABLE", True),
-            patch.object(cog.tidal, "is_logged_in", AsyncMock(return_value=True)),
+            patch.object(type(cog.tidal), "is_logged_in", AsyncMock(return_value=True)),
             patch.object(mod, "LAVALINK_AVAILABLE", False),
         ):
             result = await cog._check_ready(ctx)

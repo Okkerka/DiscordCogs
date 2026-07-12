@@ -13,7 +13,7 @@ import asyncio
 import sys
 import types
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -177,37 +177,26 @@ def _make_redbot_stub(fake_config: FakeConfig) -> types.ModuleType:
     # Patch Config factory to return our fake
     redbot.core.Config = FakeConfig
 
-    class _FakeCommand:
-        def __init__(self, func: Any) -> None:
-            self._func = func
-            self.__doc__ = func.__doc__
-
-        def error(self, func: Any) -> Any:
-            return func
-
-        def command(self, *args: Any, **kwargs: Any) -> Any:
-            def decorator(f: Any) -> "_FakeCommand":
-                return _FakeCommand(f)
-            return decorator
-
     class _FakeCommands:
         @staticmethod
         def hybrid_command(*args: Any, **kwargs: Any):
-            def decorator(f: Any) -> _FakeCommand:
-                cmd = _FakeCommand(f)
-                cmd.name = kwargs.get("name", f.__name__)
-                cmd.qualified_name = cmd.name
-                return cmd
+            def decorator(f: Any) -> Any:
+                f.name = kwargs.get("name", f.__name__)
+                f.qualified_name = f.name
+                return f
             return decorator
 
         @staticmethod
         def group(*args: Any, **kwargs: Any):
-            def decorator(f: Any) -> _FakeCommand:
-                cmd = _FakeCommand(f)
-                cmd.name = kwargs.get("name", f.__name__)
-                cmd.qualified_name = cmd.name
-                cmd.command = _FakeCommands.group()
-                return cmd
+            def decorator(f: Any) -> Any:
+                f.name = kwargs.get("name", f.__name__)
+                f.qualified_name = f.name
+
+                def command(*_args: Any, **_kwargs: Any):
+                    return lambda child: child
+
+                f.command = command
+                return f
             return decorator
 
         @staticmethod
