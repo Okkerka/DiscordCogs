@@ -33,6 +33,7 @@ from .ui.embeds import (
     error_embed as _error_embed, make_now_playing_embed, success_embed as _success_embed,
 )
 from .providers.audio import RedAudioGateway
+from .providers.config_repository import ConfigRepository
 from .providers.errors import PlaybackUnavailable
 from .providers.tokens import TokenRepository, TokenService, TokenSnapshot
 from .providers.urls import MalformedProviderURL, ProviderKind, parse_provider_url
@@ -772,7 +773,7 @@ class TidalPlayer(commands.Cog):
         self.config.register_global(**GLOBAL_DEFAULTS)
         self.config.register_guild(**GUILD_DEFAULTS)
         self.tidal = TidalHandler(bot, self.config)
-        self.tokens = TokenService(TokenRepository(self.config))
+        self.tokens = TokenService(TokenRepository(ConfigRepository(self.config)))
         self.audio = RedAudioGateway(lavalink if LAVALINK_AVAILABLE else None)
         self.sp: Optional[Any] = None
         self.yt: Optional[Any] = None
@@ -975,7 +976,6 @@ class TidalPlayer(commands.Cog):
             return await self.audio.get_player(ctx.guild.id, voice_channel)
         except PlaybackUnavailable:
             return None
-        return None
 
     async def _ensure_player(self, ctx: commands.Context) -> Optional[Any]:
         player = await self._get_player(ctx, connect=True)
@@ -1220,6 +1220,9 @@ class TidalPlayer(commands.Cog):
         color: discord.Color = discord.Color.blue(),
         thumbnail_url: Optional[str] = None,
     ) -> None:
+        if ctx.guild is None:
+            await ctx.send(embed=_error_embed("This command can only be used in a server."))
+            return
         if not items:
             await ctx.send(embed=_error_embed(Messages.ERROR_NO_TRACKS_FOUND))
             return

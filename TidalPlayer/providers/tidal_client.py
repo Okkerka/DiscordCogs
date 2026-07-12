@@ -181,7 +181,7 @@ class TidalClient:
     # ------------------------------------------------------------------
 
     async def _run_in_executor(self, fn: Any) -> Any:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, fn)
 
     def _track_model(self) -> Any:
@@ -191,6 +191,8 @@ class TidalClient:
 
     @staticmethod
     def _extract_tracks(raw: Any) -> list[Any]:
-        if isinstance(raw, dict):
-            return raw.get("tracks", [])
-        return []
+        tracks = raw.get("tracks", []) if isinstance(raw, dict) else getattr(raw, "tracks", [])
+        if isinstance(tracks, list):
+            return tracks
+        items = getattr(tracks, "items", None)
+        return items if isinstance(items, list) else []

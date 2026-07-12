@@ -101,7 +101,7 @@ class SpotifyAdapter:
         """Return a single-element list for a Spotify track ID."""
         client = await self._build_client()
         try:
-            item = await asyncio.get_event_loop().run_in_executor(
+            item = await asyncio.get_running_loop().run_in_executor(
                 None, lambda: client.track(spotify_id)
             )
         except ProviderFailure:
@@ -118,7 +118,7 @@ class SpotifyAdapter:
     async def fetch_album_candidates(self, spotify_id: str) -> list[NormalizedCandidate]:
         """Return candidates for all tracks in a Spotify album."""
         client = await self._build_client()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             album = await loop.run_in_executor(None, lambda: client.album(spotify_id))
         except ProviderFailure:
@@ -138,7 +138,7 @@ class SpotifyAdapter:
     async def fetch_playlist_candidates(self, spotify_id: str) -> list[NormalizedCandidate]:
         """Return candidates for up to _MAX_PLAYLIST_FETCH tracks in a Spotify playlist."""
         client = await self._build_client()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         candidates: list[NormalizedCandidate] = []
         offset = 0
         while offset < _MAX_PLAYLIST_FETCH:

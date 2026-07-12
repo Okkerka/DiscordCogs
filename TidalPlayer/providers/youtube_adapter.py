@@ -86,7 +86,7 @@ class YouTubeAdapter:
     async def fetch_playlist_candidates(self, playlist_id: str) -> list[NormalizedCandidate]:
         """Return up to _MAX_PLAYLIST_FETCH candidates from a YouTube playlist."""
         client = await self._build_client()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         candidates: list[NormalizedCandidate] = []
         page_token: str | None = None
         fetched = 0
