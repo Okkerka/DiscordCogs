@@ -20,4 +20,5 @@ GLOBAL_DEFAULTS: Final = {
 GUILD_DEFAULTS: Final = {
     "filter_remixes": True,
     "interactive_search": False,
+    "autoplay_enabled": False,
 }
