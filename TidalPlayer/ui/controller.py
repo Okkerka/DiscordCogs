@@ -1,4 +1,4 @@
-"""Shared same-voice-channel controller and related-track browser."""
+﻿"""Shared same-voice-channel controller and related-track browser."""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
@@ -6,7 +6,6 @@ import discord
 
 if TYPE_CHECKING:
     from ..tidalplayer import TidalPlayer
-
 
 class SimilarSongsView(discord.ui.View):
     def __init__(self, cog: "TidalPlayer", author_id: int, tracks: list[Any], page: int = 0) -> None:
@@ -51,7 +50,6 @@ class SimilarSongsView(discord.ui.View):
     @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary, row=1)
     async def next(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.edit_message(embed=self.cog.similar_songs_embed(self.tracks, self.page + 1), view=SimilarSongsView(self.cog, self.author_id, self.tracks, self.page + 1))
-
 
 class PlayerControllerView(discord.ui.View):
     def __init__(self, cog: "TidalPlayer") -> None:
