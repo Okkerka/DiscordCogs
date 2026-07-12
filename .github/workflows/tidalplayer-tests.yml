@@ -1,0 +1,34 @@
+name: TidalPlayer tests
+
+on:
+  pull_request:
+    paths:
+      - "TidalPlayer/**"
+      - ".github/workflows/tidalplayer-tests.yml"
+  push:
+    branches:
+      - test/perplexity-write
+    paths:
+      - "TidalPlayer/**"
+      - ".github/workflows/tidalplayer-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: TidalPlayer/tests/requirements-dev.txt
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r TidalPlayer/tests/requirements-dev.txt
+      - name: Compile cog sources
+        run: python -m compileall -q TidalPlayer
+      - name: Run unit tests
+        run: python -m pytest -q TidalPlayer/tests

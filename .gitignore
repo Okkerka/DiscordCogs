@@ -5,3 +5,4 @@ tidalplaylist/tidalplaylist.py
 *.pyc
 Apply-TidalPlayerFixes.ps1
 *.ps1
+TidalPlayer/.pytest_cache/
