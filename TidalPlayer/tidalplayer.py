@@ -1,4 +1,4 @@
-﻿"""
+"""
 TidalPlayer - Tidal music integration for Red Discord Bot
 Features: Hi-Res Audio, Album Art, Spotify/YT Importing, MixV2, Video URLs,
           Hybrid Slash Commands, Similar Albums, UserPlaylist Mgmt, Rich UI
@@ -1146,7 +1146,7 @@ class TidalPlayer(commands.Cog):
         embed.add_field(name="Autoplay", value="On" if enabled else "Off", inline=True)
         next_meta = self._autoplay_next_meta.get(guild_id)
         if enabled and next_meta is not None:
-            embed.add_field(name="Up next", value=f"{next_meta['title']} ├óΓé¼ΓÇ¥ {next_meta['artist']}", inline=False)
+            embed.add_field(name="Up next", value=f"{next_meta['title']} â€” {next_meta['artist']}", inline=False)
         return embed
 
     async def _refresh_controller(self, guild_id: int, interaction: discord.Interaction | None = None) -> None:
