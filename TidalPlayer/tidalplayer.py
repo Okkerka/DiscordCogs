@@ -473,6 +473,32 @@ class TidalHandler:
                 log.debug(f"Failed to fetch track {track_id}: {e}")
                 return None
 
+    async def get_track_radio(self, track_id: str) -> List[Any]:
+        """Fetch cached Tidal Track Radio candidates for a catalog track."""
+        if not self.session or not track_id:
+            return []
+        cache_key = f"radio:{track_id}"
+        cached = self._get_cached("mix", cache_key)
+        if cached is not None:
+            return cached
+        async with self.api_semaphore:
+            try:
+                def fetch() -> Any:
+                    if hasattr(self.session, "get_track_radio"):
+                        return self.session.get_track_radio(track_id)
+                    if hasattr(self.session, "track_radio"):
+                        return self.session.track_radio(track_id)
+                    track = self.session.track(track_id)
+                    radio = getattr(track, "radio", None)
+                    return radio() if callable(radio) else []
+                result = await self._run_with_backoff(fetch, timeout=15.0)
+                tracks = list(result) if result else []
+                self._set_cached("mix", cache_key, tracks, 300.0)
+                return tracks
+            except Exception as error:
+                log.debug("Tidal Track Radio failed for %s: %s", track_id, error)
+                return []
+
     async def get_video(self, video_id: str) -> Optional[Any]:
         if not self.session or not hasattr(self.session, "video"):
             return None
@@ -1094,8 +1120,29 @@ class TidalPlayer(commands.Cog):
             await self._send_now_playing(ctx, meta)
         return True
 
-    def _build_now_playing_embed(self, meta: TrackMeta) -> discord.Embed:
-        return make_now_playing_embed(meta)
+    async def _radio_candidates(self, guild_id: int, meta: TrackMeta) -> List[Any]:
+        track_id = str(meta.get("track_id") or "")
+        if not track_id:
+            return []
+        seen = set(self._recent_track_ids[guild_id])
+        seen.add(track_id)
+        return [
+            track for track in await self.tidal.get_track_radio(track_id)
+            if str(getattr(track, "id", "")) not in seen
+        ]
+
+    async def _controller_view(self, guild_id: int, paused: bool = False) -> PlayerControllerView:
+        meta = self._controller_meta.get(guild_id) or self._current_meta.get(guild_id)
+        recommendations = await self._radio_candidates(guild_id, meta) if meta else []
+        view = PlayerControllerView(self, recommendations)
+        for child in view.children:
+            if isinstance(child, discord.ui.Button) and child.custom_id == "tidalplayer:pause":
+                child.label = "Resume" if paused else "Pause"
+        return view
+
+    async def _build_now_playing_embed(self, guild_id: int, meta: TrackMeta) -> discord.Embed:
+        enabled = await self.config.guild_from_id(guild_id).autoplay_enabled()
+        return make_now_playing_embed(meta, enabled)
 
     async def _send_now_playing(self, ctx: commands.Context, meta: TrackMeta) -> None:
         if ctx.guild is None:
@@ -1110,13 +1157,7 @@ class TidalPlayer(commands.Cog):
             except (discord.HTTPException, discord.Forbidden, discord.NotFound):
                 pass
         embed = await self._controller_embed(guild_id)
-        if embed is None:
-            embed = self._build_now_playing_embed(meta)
-        view = PlayerControllerView(self)
-        enabled = await self.config.guild(ctx.guild).autoplay_enabled()
-        for child in view.children:
-            if isinstance(child, discord.ui.Button) and child.custom_id == "tidalplayer:autoplay":
-                child.label = f"Autoplay: {'On' if enabled else 'Off'}"
+        view = await self._controller_view(guild_id)
         self._controller_messages[guild_id] = await ctx.send(embed=embed, view=view)
 
     def _remember_track(self, guild_id: int, meta: TrackMeta) -> None:
@@ -1141,42 +1182,28 @@ class TidalPlayer(commands.Cog):
         meta = self._controller_meta.get(guild_id) or self._current_meta.get(guild_id)
         if meta is None:
             return None
-        embed = self._build_now_playing_embed(meta)
-        enabled = await self.config.guild_from_id(guild_id).autoplay_enabled()
-        embed.add_field(name="Autoplay", value="On" if enabled else "Off", inline=True)
-        next_meta = self._autoplay_next_meta.get(guild_id)
-        if enabled and next_meta is not None:
-            embed.add_field(name="Up next", value=f"{next_meta['title']} â€” {next_meta['artist']}", inline=False)
-        return embed
+        return await self._build_now_playing_embed(guild_id, meta)
 
     async def _refresh_controller(self, guild_id: int, interaction: discord.Interaction | None = None) -> None:
         embed = await self._controller_embed(guild_id)
         if embed is None:
             return
-        enabled = await self.config.guild_from_id(guild_id).autoplay_enabled()
         player = await self._get_player_for_guild(guild_id)
-        paused = bool(getattr(player, "paused", False)) if player is not None else False
-        view = PlayerControllerView(self)
-        for child in view.children:
-            if isinstance(child, discord.ui.Button):
-                if child.custom_id == "tidalplayer:autoplay":
-                    child.label = f"Autoplay: {'On' if enabled else 'Off'}"
-                elif child.custom_id == "tidalplayer:pause":
-                    child.label = "Resume" if paused else "Pause"
+        view = await self._controller_view(guild_id, bool(getattr(player, "paused", False)) if player else False)
         if interaction is not None and not interaction.response.is_done():
             await interaction.response.edit_message(embed=embed, view=view)
             if interaction.message is not None:
                 self._controller_messages[guild_id] = interaction.message
-            return
-        message = self._controller_messages.get(guild_id)
-        if message is not None:
+        elif (message := self._controller_messages.get(guild_id)) is not None:
             await message.edit(embed=embed, view=view)
 
     async def controller_toggle_autoplay(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
             return
         setting = self.config.guild(interaction.guild).autoplay_enabled
-        await setting.set(not await setting())
+        enabled = not await setting()
+        await setting.set(enabled)
+        log.info("Autoplay %s for guild %s", "enabled" if enabled else "disabled", interaction.guild.id)
         await self._refresh_controller(interaction.guild.id, interaction)
 
     async def controller_toggle_pause(self, interaction: discord.Interaction) -> None:
@@ -1186,8 +1213,7 @@ class TidalPlayer(commands.Cog):
         if player is None or not callable(getattr(player, "pause", None)):
             await interaction.response.send_message("No active player is available.", ephemeral=True)
             return
-        paused = bool(getattr(player, "paused", False))
-        result = player.pause(not paused)
+        result = player.pause(not bool(getattr(player, "paused", False)))
         if asyncio.iscoroutine(result):
             await result
         await self._refresh_controller(interaction.guild.id, interaction)
@@ -1196,8 +1222,7 @@ class TidalPlayer(commands.Cog):
         if interaction.guild is None:
             return
         guild_id = interaction.guild.id
-        task = self._autoplay_tasks.pop(guild_id, None)
-        if task is not None:
+        if (task := self._autoplay_tasks.pop(guild_id, None)) is not None:
             task.cancel()
         player = await self._get_player_for_guild(guild_id)
         if player is not None:
@@ -1210,26 +1235,46 @@ class TidalPlayer(commands.Cog):
                     await result
         self._current_meta.pop(guild_id, None)
         self._controller_meta.pop(guild_id, None)
-        self._autoplay_next_meta.pop(guild_id, None)
-        view = PlayerControllerView(self)
+        view = PlayerControllerView(self, [])
         for child in view.children:
             child.disabled = True
         await interaction.response.edit_message(embed=discord.Embed(title="Playback stopped", description="The queue was cleared.", color=COLOR_RED), view=view)
 
+    async def queue_recommendation(self, interaction: discord.Interaction, tidal_track: Any) -> bool:
+        if interaction.guild is None:
+            return False
+        player = await self._get_player_for_guild(interaction.guild.id)
+        if player is None:
+            return False
+        meta = await self._extract_meta(tidal_track, skip_audio_res=True)
+        stream_url = await self.tidal.get_stream_url(tidal_track)
+        if not stream_url:
+            return False
+        try:
+            results = await player.load_tracks(stream_url)
+            tracks = getattr(results, "tracks", None) or []
+            if not tracks:
+                return False
+            loaded = tracks[0]
+            loaded.title = truncate(meta["title"], 100)
+            loaded.author = f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
+            player.add(interaction.user, loaded)
+            if not player.current:
+                await player.play()
+            return True
+        except Exception as error:
+            log.warning("Could not queue suggested track: %s", error)
+            return False
+
     async def _autoplay_candidate(self, guild_id: int, meta: TrackMeta) -> Any | None:
-        query = f"{meta['title']} {meta['artist']}".strip()
-        results = await self.tidal.search(query, filter_remixes=False)
-        seen = set(self._recent_track_ids[guild_id])
-        current = str(meta.get("track_id") or "")
-        candidates = [track for track in results if str(getattr(track, "id", "")) not in seen and str(getattr(track, "id", "")) != current]
-        return select_best_tidal_track(query, candidates, minimum_score=65.0) if candidates else None
+        candidates = await self._radio_candidates(guild_id, meta)
+        return candidates[0] if candidates else None
 
     async def _run_autoplay(self, guild_id: int, player: Any) -> None:
         try:
             await asyncio.sleep(0.5)
             async with self._guild_locks[guild_id]:
                 if not await self.config.guild_from_id(guild_id).autoplay_enabled():
-                    self._current_meta.pop(guild_id, None)
                     return
                 queue = getattr(player, "queue", None)
                 if queue is not None and len(queue):
@@ -1239,29 +1284,10 @@ class TidalPlayer(commands.Cog):
                     return
                 track = await self._autoplay_candidate(guild_id, meta)
                 if track is None:
-                    self._current_meta.pop(guild_id, None)
+                    log.info("Autoplay found no Track Radio candidate for guild %s", guild_id)
                     return
-                next_meta = await self._extract_meta(track, skip_audio_res=True)
-                self._autoplay_next_meta[guild_id] = next_meta
-                await self._refresh_controller(guild_id)
-                stream_url = await self.tidal.get_stream_url(track)
-                if not stream_url:
-                    return
-                results = await player.load_tracks(stream_url)
-                loaded_tracks = getattr(results, "tracks", None) or []
-                if not loaded_tracks:
-                    return
-                loaded = loaded_tracks[0]
-                loaded.title = truncate(next_meta["title"], 100)
-                loaded.author = f"{next_meta['artist']} - {next_meta['album']}" if next_meta.get("album") else next_meta["artist"]
-                guild = self.bot.get_guild(guild_id)
-                player.add(guild.me if guild is not None else None, loaded)
-                await player.play()
-                self._current_meta[guild_id] = next_meta
-                self._controller_meta[guild_id] = next_meta
-                self._remember_track(guild_id, next_meta)
-                self._autoplay_next_meta.pop(guild_id, None)
-                await self._refresh_controller(guild_id)
+                if not await self.queue_autoplay_track(guild_id, player, track):
+                    log.warning("Autoplay could not queue its Track Radio candidate for guild %s", guild_id)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1269,9 +1295,32 @@ class TidalPlayer(commands.Cog):
         finally:
             self._autoplay_tasks.pop(guild_id, None)
 
+    async def queue_autoplay_track(self, guild_id: int, player: Any, tidal_track: Any) -> bool:
+        meta = await self._extract_meta(tidal_track, skip_audio_res=True)
+        stream_url = await self.tidal.get_stream_url(tidal_track)
+        if not stream_url:
+            return False
+        results = await player.load_tracks(stream_url)
+        tracks = getattr(results, "tracks", None) or []
+        if not tracks:
+            return False
+        loaded = tracks[0]
+        loaded.title = truncate(meta["title"], 100)
+        loaded.author = f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
+        guild = self.bot.get_guild(guild_id)
+        player.add(guild.me if guild is not None else None, loaded)
+        await player.play()
+        self._current_meta[guild_id] = meta
+        self._controller_meta[guild_id] = meta
+        self._remember_track(guild_id, meta)
+        await self._refresh_controller(guild_id)
+        log.info("Autoplay queued Track Radio candidate for guild %s", guild_id)
+        return True
+
     def _schedule_autoplay(self, guild_id: int, player: Any) -> None:
         task = self._autoplay_tasks.get(guild_id)
         if task is None or task.done():
+            log.info("Scheduling autoplay for guild %s", guild_id)
             self._autoplay_tasks[guild_id] = asyncio.create_task(self._run_autoplay(guild_id, player), name=f"tidalplayer-autoplay-{guild_id}")
 
     async def _interactive_select(self, ctx: commands.Context, tracks: List[Any]) -> Optional[Any]:
