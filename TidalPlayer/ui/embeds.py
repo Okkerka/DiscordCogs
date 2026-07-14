@@ -61,20 +61,15 @@ def success_embed(message: str) -> discord.Embed:
     return discord.Embed(description=message, color=COLOR_GREEN)
 
 
-def make_now_playing_embed(meta: TrackMeta) -> discord.Embed:
-    """Render the canonical compact now-playing embed without altering its contract."""
+def make_now_playing_embed(meta: TrackMeta, autoplay_enabled: bool) -> discord.Embed:
     description = [f"**{meta['title']}**", meta["artist"]]
     if meta.get("album"):
         description.append(f"_{meta['album']}_")
-    embed = discord.Embed(
-        title=Messages.STATUS_PLAYING,
-        description="\n".join(description),
-        color=COLOR_BLUE,
-    )
+    embed = discord.Embed(title=Messages.STATUS_PLAYING, description="\n".join(description), color=COLOR_BLUE)
     quality = meta.get("audio_resolution") or QUALITY_LABELS.get(meta["quality"], meta["quality"])
     embed.add_field(name="Quality", value=quality, inline=True)
-    if meta.get("share_url"):
-        embed.add_field(name="Open in TIDAL", value=f"[Listen]({meta['share_url']})", inline=True)
+    embed.add_field(name="Open in TIDAL", value=f"[Listen]({meta['share_url']})" if meta.get("share_url") else "Unavailable", inline=True)
+    embed.add_field(name="Autoplay", value="On" if autoplay_enabled else "Off", inline=False)
     embed.set_footer(text=f"Duration: {format_duration(meta['duration'])}")
     if meta.get("image"):
         embed.set_thumbnail(url=meta["image"])
