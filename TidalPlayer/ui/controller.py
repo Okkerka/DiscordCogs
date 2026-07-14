@@ -39,14 +39,14 @@ class PlayerControllerView(discord.ui.View):
 
     def _add_suggestions(self) -> None:
         if not self.recommendations:
-            select = discord.ui.Select(placeholder="No suggestions available", options=[discord.SelectOption(label="No suggestions available", value="none")], disabled=True, row=1)
+            select = discord.ui.Select(placeholder="No suggestions available", options=[discord.SelectOption(label="No suggestions available", value="none")], disabled=True, row=1, custom_id="tidalplayer:suggestions")
         else:
             options = []
             for index, track in enumerate(self.recommendations):
                 title = str(getattr(track, "full_name", None) or getattr(track, "name", "Unknown"))
                 artist = str(getattr(getattr(track, "artist", None), "name", "Unknown"))
                 options.append(discord.SelectOption(label=_short(title), description=_short(artist), value=str(index)))
-            select = discord.ui.Select(placeholder="Suggested songs", options=options, row=1)
+            select = discord.ui.Select(placeholder="Suggested songs", options=options, row=1, custom_id="tidalplayer:suggestions")
         select.callback = self._choose_suggestion
         self.add_item(select)
 
@@ -55,6 +55,13 @@ class PlayerControllerView(discord.ui.View):
         if not select.values or select.values[0] == "none":
             await interaction.response.defer()
             return
-        track = self.recommendations[int(select.values[0])]
+        index = int(select.values[0])
+        if index >= len(self.recommendations):
+            await interaction.response.send_message(
+                "These suggestions expired. Play a track again to refresh them.",
+                ephemeral=True,
+            )
+            return
+        track = self.recommendations[index]
         queued = await self.cog.queue_recommendation(interaction, track)
         await interaction.response.send_message("Added to the queue." if queued else "Could not queue that suggestion.", ephemeral=True)
