@@ -1071,18 +1071,19 @@ class TidalPlayer(commands.Cog):
     def _format_duration(self, seconds: int) -> str:
         return format_duration(seconds)
 
-    def _format_track_embed(self, meta: TrackMeta, title: str = "Track") -> discord.Embed:
-        artist = meta.get("artist") or "Unknown"
-        album = meta.get("album") or "Unknown"
+    def _format_track_embed(self, meta: TrackMeta, title: str = "Track queued") -> discord.Embed:
+        artist = str(meta.get("artist") or "Unknown")
+        album = truncate(str(meta.get("album") or "Unknown"), 100)
         length = self._format_duration(int(meta.get("duration", 0) or 0))
         track_title = truncate(str(meta.get("title") or "Unknown"), 100)
-        description = f"**{track_title}**\nby {artist}"
-        embed = discord.Embed(title=title, description=description, color=COLOR_BLUE)
-        embed.add_field(name="Album", value=truncate(str(album), 100), inline=True)
+        embed = discord.Embed(color=COLOR_BLUE)
+        embed.title = title
+        embed.description = f"**{track_title}**\nby {artist}"
+        embed.add_field(name="Album", value=album, inline=True)
         embed.add_field(name="Duration", value=length, inline=True)
-        url = meta.get("url")
-        if url:
-            embed.url = str(url)
+        share_url = meta.get("share_url") or meta.get("url")
+        if share_url:
+            embed.url = str(share_url)
         image = meta.get("image")
         if image:
             embed.set_thumbnail(url=str(image))
@@ -1217,7 +1218,7 @@ class TidalPlayer(commands.Cog):
                 self._tasks.add(task)
                 task.add_done_callback(self._tasks.discard)
             if show_embed:
-                await ctx.send(embed=self._format_track_embed(meta, title="Track queued"))
+                await ctx.send(embed=make_queue_embed(meta))
         return True
 
     async def _lastfm_similar_tracks(
@@ -1533,13 +1534,9 @@ class TidalPlayer(commands.Cog):
             loaded.title = truncate(meta["title"], 100)
             loaded.author = f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
             guild = self.bot.get_guild(guild_id)
-            queue = getattr(player, "queue", None)
+            had_current = bool(getattr(player, "current", None))
             player.add(guild.me if guild is not None else None, loaded)
-            try:
-                is_idle = not bool(getattr(player, "current", None)) and (len(queue) == 0 if queue is not None else True)
-            except Exception:
-                is_idle = not bool(getattr(player, "current", None))
-            if is_idle:
+            if not had_current:
                 await player.play()
                 self._current_meta[guild_id] = meta
                 self._controller_meta[guild_id] = meta
