@@ -1218,7 +1218,7 @@ class TidalPlayer(commands.Cog):
                 self._tasks.add(task)
                 task.add_done_callback(self._tasks.discard)
             if show_embed:
-                await ctx.send(embed=make_queue_embed(meta))
+                await ctx.send(embed=await self._build_now_playing_embed(ctx.guild.id, meta))
         return True
 
     async def _lastfm_similar_tracks(
