@@ -1072,22 +1072,7 @@ class TidalPlayer(commands.Cog):
         return format_duration(seconds)
 
     def _format_track_embed(self, meta: TrackMeta, title: str = "Track queued") -> discord.Embed:
-        artist = str(meta.get("artist") or "Unknown")
-        album = truncate(str(meta.get("album") or "Unknown"), 100)
-        length = self._format_duration(int(meta.get("duration", 0) or 0))
-        track_title = truncate(str(meta.get("title") or "Unknown"), 100)
-        embed = discord.Embed(color=COLOR_BLUE)
-        embed.title = title
-        embed.description = f"**{track_title}**\nby {artist}"
-        embed.add_field(name="Album", value=album, inline=True)
-        embed.add_field(name="Duration", value=length, inline=True)
-        share_url = meta.get("share_url") or meta.get("url")
-        if share_url:
-            embed.url = str(share_url)
-        image = meta.get("image")
-        if image:
-            embed.set_thumbnail(url=str(image))
-        return embed
+        return make_queue_embed(meta)
 
     async def _get_player(self, ctx: commands.Context, connect: bool = False) -> Optional[Any]:
         if not self.audio.available or not ctx.guild:
@@ -1338,6 +1323,7 @@ class TidalPlayer(commands.Cog):
         except discord.HTTPException:
             log.exception("Could not send controller message for guild %s", guild_id)
 
+
     def _remember_track(self, guild_id: int, meta: TrackMeta) -> None:
         track_id = str(meta.get("track_id") or "")
         if track_id:
@@ -1375,17 +1361,16 @@ class TidalPlayer(commands.Cog):
         paused = bool(getattr(player, "paused", False)) if player else False
         view = await self._controller_view(guild_id, paused)
         if interaction is not None and not interaction.response.is_done():
-            await interaction.response.edit_message(
-                content=None, embed=None, embeds=[], attachments=[], view=view,
-            )
+            await interaction.response.edit_message(view=view)
             if interaction.message is not None:
                 self._controller_messages[guild_id] = interaction.message
             self._controller_last_refresh[guild_id] = now
         elif (message := self._controller_messages.get(guild_id)) is not None:
             try:
-                await message.edit(content=None, embed=None, embeds=[], attachments=[], view=view)
+                await message.edit(view=view)
             except (discord.HTTPException, discord.Forbidden, discord.NotFound):
                 pass
+
 
     async def controller_toggle_autoplay(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
@@ -1551,6 +1536,7 @@ class TidalPlayer(commands.Cog):
         except Exception:
             log.exception("Autoplay could not queue Tidal track %s in guild %s", selected_id, guild_id)
             return False
+
 
     def _schedule_autoplay(self, guild_id: int, player: Any) -> None:
         task = self._autoplay_tasks.get(guild_id)
