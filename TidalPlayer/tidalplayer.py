@@ -1,4 +1,4 @@
-﻿"""
+"""
 TidalPlayer - Tidal music integration for Red Discord Bot
 Features: Hi-Res Audio, Album Art, Spotify/YT Importing, MixV2, Video URLs,
           Hybrid Slash Commands, Similar Albums, UserPlaylist Mgmt, Rich UI
@@ -1131,31 +1131,14 @@ class TidalPlayer(commands.Cog):
         ]
 
             async def _controller_view(
-        self,
-        guild_id: int,
-        paused: bool = False,
+        self, guild_id: int, paused: bool = False,
     ) -> PlayerControllerView:
-        meta = (
-            self._controller_meta.get(guild_id)
-            or self._current_meta.get(guild_id)
-        )
-
-        recommendations = (
-            await self._radio_candidates(guild_id, meta)
-            if meta
-            else []
-        )
-
-        autoplay_enabled = await self.config.guild_from_id(
-            guild_id
-        ).autoplay_enabled()
-
+        meta = self._controller_meta.get(guild_id) or self._current_meta.get(guild_id)
+        recommendations = await self._radio_candidates(guild_id, meta) if meta else []
+        autoplay_enabled = await self.config.guild_from_id(guild_id).autoplay_enabled()
         return PlayerControllerView(
-            self,
-            meta=meta,
-            recommendations=recommendations,
-            autoplay_enabled=autoplay_enabled,
-            paused=paused,
+            self, meta=meta, recommendations=recommendations,
+            autoplay_enabled=autoplay_enabled, paused=paused,
         )
 
     async def _build_now_playing_embed(self, guild_id: int, meta: TrackMeta) -> discord.Embed:
@@ -1202,35 +1185,20 @@ class TidalPlayer(commands.Cog):
         return await self._build_now_playing_embed(guild_id, meta)
 
         async def _refresh_controller(
-        self,
-        guild_id: int,
-        interaction: discord.Interaction | None = None,
+        self, guild_id: int, interaction: discord.Interaction | None = None,
     ) -> None:
         player = await self._get_player_for_guild(guild_id)
         paused = bool(getattr(player, "paused", False)) if player else False
         view = await self._controller_view(guild_id, paused)
-
         if interaction is not None and not interaction.response.is_done():
             await interaction.response.edit_message(
-                content=None,
-                embed=None,
-                embeds=[],
-                attachments=[],
-                view=view,
+                content=None, embed=None, embeds=[], attachments=[], view=view,
             )
-
             if interaction.message is not None:
                 self._controller_messages[guild_id] = interaction.message
-
         elif (message := self._controller_messages.get(guild_id)) is not None:
             try:
-                await message.edit(
-                    content=None,
-                    embed=None,
-                    embeds=[],
-                    attachments=[],
-                    view=view,
-                )
+                await message.edit(content=None, embed=None, embeds=[], attachments=[], view=view)
             except (discord.HTTPException, discord.Forbidden, discord.NotFound):
                 pass
 
@@ -1258,36 +1226,24 @@ class TidalPlayer(commands.Cog):
         async def controller_stop(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
             return
-
         guild_id = interaction.guild.id
-
         if (task := self._autoplay_tasks.pop(guild_id, None)) is not None:
             task.cancel()
-
         player = await self._get_player_for_guild(guild_id)
-
         if player is not None:
             queue = getattr(player, "queue", None)
-
             if callable(getattr(queue, "clear", None)):
                 queue.clear()
-
             if callable(getattr(player, "stop", None)):
                 result = player.stop()
-
                 if asyncio.iscoroutine(result):
                     await result
-
         self._current_meta.pop(guild_id, None)
         self._controller_meta.pop(guild_id, None)
         self._controller_messages.pop(guild_id, None)
-
         await interaction.response.edit_message(
             content="## Playback stopped\nThe queue was cleared.",
-            embed=None,
-            embeds=[],
-            attachments=[],
-            view=None,
+            embed=None, embeds=[], attachments=[], view=None,
         )
 
     async def queue_recommendation(self, interaction: discord.Interaction, tidal_track: Any) -> bool:
@@ -1854,7 +1810,10 @@ class TidalPlayer(commands.Cog):
         if not meta:
             await ctx.send(embed=_error_embed(Messages.ERROR_NOT_PLAYING))
             return
-        await ctx.send(embed=self._build_now_playing_embed(meta))
+        player = await self._get_player_for_guild(ctx.guild.id)
+        await ctx.send(view=await self._controller_view(
+            ctx.guild.id, bool(getattr(player, "paused", False)) if player else False
+        ))
 
     @commands.hybrid_command(name="tqueue")
     async def tqueue(self, ctx: commands.Context):
