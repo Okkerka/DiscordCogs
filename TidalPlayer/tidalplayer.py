@@ -1181,6 +1181,14 @@ class TidalPlayer(commands.Cog):
                     loaded_track = results.tracks[0]
             except Exception as e:
                 log.error(f"Lavalink load failed: {e}")
+        if not loaded_track and stream_url:
+            try:
+                player = await self._get_player(ctx, connect=True)
+                results = await player.load_tracks(stream_url)
+                if results and results.tracks:
+                    loaded_track = results.tracks[0]
+            except Exception as e:
+                log.error("Lavalink reload attempt failed: %r", e)
         if not loaded_track:
             await ctx.send(embed=_error_embed(Messages.ERROR_LAVALINK_FAILED))
             return False
@@ -1197,7 +1205,10 @@ class TidalPlayer(commands.Cog):
             if not player.current:
                 await player.play()
             if show_embed:
-                await self._send_now_playing(ctx, meta)
+                try:
+                    await self._send_now_playing(ctx, meta)
+                except Exception:
+                    log.exception("Now playing controller failed for guild %s", ctx.guild.id)
         else:
             self._queued_meta[ctx.guild.id].append(meta)
             refresh = getattr(self, "_refresh_controller", None)
@@ -1309,16 +1320,22 @@ class TidalPlayer(commands.Cog):
         guild_id = ctx.guild.id
         self._controller_meta[guild_id] = meta
         self._remember_track(guild_id, meta)
-        fallback_text = self._controller_fallback_text(meta)
-        view = await self._controller_view(guild_id)
+        try:
+            view = await self._controller_view(guild_id)
+        except Exception:
+            log.exception("Could not build controller view for guild %s", guild_id)
+            return
         previous = self._controller_messages.get(guild_id)
         if previous is not None:
             try:
-                await previous.edit(content=fallback_text, view=view)
+                await previous.edit(view=view)
                 return
             except (discord.HTTPException, discord.Forbidden, discord.NotFound):
                 pass
-        self._controller_messages[guild_id] = await ctx.send(fallback_text, view=view)
+        try:
+            self._controller_messages[guild_id] = await ctx.send(view=view)
+        except discord.HTTPException:
+            log.exception("Could not send controller message for guild %s", guild_id)
 
     def _remember_track(self, guild_id: int, meta: TrackMeta) -> None:
         track_id = str(meta.get("track_id") or "")
