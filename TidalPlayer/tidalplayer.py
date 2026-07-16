@@ -474,7 +474,7 @@ class TidalHandler:
                 return None
 
     async def get_track_radio(self, track_id: str) -> List[Any]:
-        """Fetch cached Tidal Track Radio candidates for a catalog track."""
+        """Get Tidal Track Radio candidates, retaining sparse objects by ID."""
         if not self.session or not track_id:
             return []
         cache_key = f"radio:{track_id}"
@@ -486,19 +486,30 @@ class TidalHandler:
                 def fetch() -> Any:
                     if hasattr(self.session, "get_track_radio"):
                         return self.session.get_track_radio(track_id)
-                    if hasattr(self.session, "track_radio"):
-                        return self.session.track_radio(track_id)
                     track = self.session.track(track_id)
-                    radio = getattr(track, "radio", None)
-                    return radio() if callable(radio) else []
-                result = await self._run_with_backoff(fetch, timeout=15.0)
-                tracks = list(result) if result else []
-                self._set_cached("mix", cache_key, tracks, 300.0)
-                return tracks
+                    radio_method = getattr(track, "radio", None)
+                    if callable(radio_method):
+                        return radio_method()
+                    raise RuntimeError("Installed tidalapi exposes no Track Radio method")
+                result = await self._run_with_backoff(fetch, timeout=20.0)
             except Exception as error:
-                log.debug("Tidal Track Radio failed for %s: %s", track_id, error)
+                log.exception("Tidal Track Radio failed for track %s: %r", track_id, error)
                 return []
-
+        if isinstance(result, (list, tuple)):
+            tracks = list(result)
+        else:
+            tracks = list(
+                getattr(result, "tracks", None)
+                or getattr(result, "items", None)
+                or []
+            )
+        tracks = [track for track in tracks if getattr(track, "id", None)][:25]
+        if tracks:
+            self._set_cached("mix", cache_key, tracks, 300.0)
+            log.info("Tidal Track Radio returned %s candidate(s) for %s.", len(tracks), track_id)
+        else:
+            log.warning("Tidal Track Radio returned no usable tracks for %s.", track_id)
+        return tracks
     async def get_video(self, video_id: str) -> Optional[Any]:
         if not self.session or not hasattr(self.session, "video"):
             return None
@@ -747,32 +758,42 @@ class TidalHandler:
         return None
 
     async def get_stream_url(self, track: Any) -> Optional[str]:
+        """Resolve a full Tidal track and return a real stream URL, never a web URL."""
         track_id = getattr(track, "id", None)
+        if track_id:
+            full_track = await self.get_track(str(track_id))
+            if full_track is not None:
+                track = full_track
+            else:
+                log.warning("Could not resolve full Tidal track object for %s.", track_id)
         async with self.api_semaphore:
             try:
-                def _get_urls() -> List[str]:
+                def get_urls() -> List[str]:
                     stream = track.get_stream()
                     return stream.get_urls()
-                urls = await self._run_with_backoff(_get_urls, timeout=15.0)
+                urls = await self._run_with_backoff(get_urls, timeout=20.0)
                 if urls:
+                    log.info("Retrieved Tidal stream URL for track %s.", track_id)
                     return urls[0]
             except asyncio.TimeoutError:
-                log.debug(f"get_stream().get_urls() timed out for track {track_id}")
+                log.warning("Tidal stream request timed out for track %s.", track_id)
             except AttributeError:
-                pass
-            except Exception as e:
-                log.debug(f"get_stream().get_urls() failed for track {track_id}: {e}")
+                log.warning("Tidal track %s does not expose get_stream().", track_id)
+            except Exception as error:
+                log.warning("get_stream().get_urls() failed for Tidal track %s: %r", track_id, error)
         async with self.api_semaphore:
             try:
-                url = await self._run_with_backoff(track.get_url, timeout=10.0)
+                get_url = getattr(track, "get_url")
+                url = await self._run_with_backoff(get_url, timeout=15.0)
                 if url:
+                    log.info("Retrieved legacy Tidal stream URL for track %s.", track_id)
                     return url
-            except Exception as e:
-                log.debug(f"get_url() failed for track {track_id}: {e}")
-        if track_id:
-            return make_tidal_url("track", track_id)
+            except AttributeError:
+                log.warning("Tidal track %s does not expose get_url().", track_id)
+            except Exception as error:
+                log.warning("get_url() failed for Tidal track %s: %r", track_id, error)
+        log.error("No playable Tidal stream URL available for track %s.", track_id)
         return None
-
     def _extract_tracks(self, result: Any) -> List[Any]:
         if (t := getattr(result, "tracks", None)) is not None:
             return t if isinstance(t, list) else getattr(t, "items", [])
@@ -1122,14 +1143,35 @@ class TidalPlayer(commands.Cog):
     async def _radio_candidates(self, guild_id: int, meta: TrackMeta) -> List[Any]:
         track_id = str(meta.get("track_id") or "")
         if not track_id:
+            log.warning("Suggestions unavailable: current track has no Tidal ID.")
             return []
         seen = set(self._recent_track_ids[guild_id])
         seen.add(track_id)
-        return [
-            track for track in await self.tidal.get_track_radio(track_id)
-            if str(getattr(track, "id", "")) not in seen
-        ]
-
+        tracks = await self.tidal.get_track_radio(track_id)
+        if not tracks:
+            try:
+                source_track = await self.tidal.get_track(track_id)
+                artist_id = getattr(getattr(source_track, "artist", None), "id", None)
+                if artist_id and self.tidal.session is not None:
+                    def fetch_artist_radio() -> Any:
+                        method = getattr(self.tidal.session, "get_artist_radio", None)
+                        if not callable(method):
+                            raise RuntimeError("Installed tidalapi exposes no Artist Radio method")
+                        return method(artist_id)
+                    result = await self.tidal._run_with_backoff(fetch_artist_radio, timeout=20.0)
+                    tracks = list(result) if isinstance(result, (list, tuple)) else list(
+                        getattr(result, "tracks", None) or getattr(result, "items", None) or []
+                    )
+                    log.info("Artist Radio fallback returned %s candidate(s) for artist %s.", len(tracks), artist_id)
+            except Exception as error:
+                log.exception("Artist Radio fallback failed for Tidal track %s: %r", track_id, error)
+                tracks = []
+        candidates = [
+            track for track in tracks
+            if getattr(track, "id", None) and str(getattr(track, "id", "")) not in seen
+        ][:25]
+        log.info("Suggestions prepared for guild %s: %s candidate(s).", guild_id, len(candidates))
+        return candidates
     async def _controller_view(
         self, guild_id: int, paused: bool = False,
     ) -> PlayerControllerView:
