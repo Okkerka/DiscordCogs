@@ -137,18 +137,22 @@ class PlayerControllerView(discord.ui.LayoutView):
         await self.cog.controller_stop(interaction)
 
     async def _choose_suggestion(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
         select = next(
             item for item in self.walk_children()
             if isinstance(item, discord.ui.Select) and item.custom_id == "tidalplayer:v2:suggestions"
         )
         if not select.values or select.values[0] == "none":
-            await interaction.response.defer()
+            await interaction.followup.send("No suggestion was selected.", ephemeral=True)
             return
         index = int(select.values[0])
         if index >= len(self.recommendations):
-            await interaction.response.send_message("These suggestions expired. Play a track again to refresh them.", ephemeral=True)
+            await interaction.followup.send(
+                "These suggestions expired. Play a track again to refresh them.", ephemeral=True
+            )
             return
         queued = await self.cog.queue_recommendation(interaction, self.recommendations[index])
-        await interaction.response.send_message(
-            "Added to the queue." if queued else "Could not queue that suggestion.", ephemeral=True
+        await interaction.followup.send(
+            "Queued that suggested song." if queued else "Could not queue that suggestion.",
+            ephemeral=True,
         )

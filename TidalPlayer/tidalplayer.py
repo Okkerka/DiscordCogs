@@ -1333,79 +1333,117 @@ class TidalPlayer(commands.Cog):
     async def queue_recommendation(self, interaction: discord.Interaction, tidal_track: Any) -> bool:
         if interaction.guild is None:
             return False
-        player = await self._get_player_for_guild(interaction.guild.id)
+        guild_id = interaction.guild.id
+        player = await self._get_player_for_guild(guild_id)
         if player is None:
             return False
-        meta = await self._extract_meta(tidal_track, skip_audio_res=True)
-        stream_url = await self.tidal.get_stream_url(tidal_track)
-        if not stream_url:
+        selected_id = str(getattr(tidal_track, "id", "") or "")
+        current_id = str((self._current_meta.get(guild_id) or {}).get("track_id") or "")
+        if not selected_id or selected_id == current_id:
+            log.warning("Refused duplicate suggested track %s in guild %s", selected_id, guild_id)
             return False
         try:
+            meta = await self._extract_meta(tidal_track, skip_audio_res=True)
+            stream_url = await self.tidal.get_stream_url(tidal_track)
+            if not stream_url:
+                return False
             results = await player.load_tracks(stream_url)
             tracks = getattr(results, "tracks", None) or []
             if not tracks:
+                log.warning("Lavalink returned no tracks for suggested Tidal track %s", selected_id)
                 return False
             loaded = tracks[0]
             loaded.title = truncate(meta["title"], 100)
             loaded.author = f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
             player.add(interaction.user, loaded)
-            if not player.current:
-                await player.play()
+            log.info("Queued suggested Tidal track %s in guild %s", selected_id, guild_id)
             return True
-        except Exception as error:
-            log.warning("Could not queue suggested track: %s", error)
+        except Exception:
+            log.exception("Could not queue suggested Tidal track %s", selected_id)
             return False
 
     async def _autoplay_candidate(self, guild_id: int, meta: TrackMeta) -> Any | None:
-        candidates = await self._radio_candidates(guild_id, meta)
-        return candidates[0] if candidates else None
+        source_id = str(meta.get("track_id") or "")
+        source_title = str(meta.get("title") or "").casefold().strip()
+        source_artist = str(meta.get("artist") or "").casefold().strip()
+        for track in await self._radio_candidates(guild_id, meta):
+            track_id = str(getattr(track, "id", "") or "")
+            title = str(getattr(track, "name", "") or "").casefold().strip()
+            artist = str(getattr(getattr(track, "artist", None), "name", "") or "").casefold().strip()
+            if track_id == source_id or (title == source_title and artist == source_artist):
+                continue
+            return track
+        return None
 
     async def _run_autoplay(self, guild_id: int, player: Any) -> None:
+        """Queue the first playable, non-current Last.fm recommendation."""
         try:
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1.5)
             async with self._guild_locks[guild_id]:
                 if not await self.config.guild_from_id(guild_id).autoplay_enabled():
                     return
                 queue = getattr(player, "queue", None)
                 if queue is not None and len(queue):
+                    log.info("Autoplay skipped for guild %s: queue is no longer empty.", guild_id)
                     return
                 meta = self._current_meta.get(guild_id)
                 if meta is None:
+                    log.warning("Autoplay skipped for guild %s: current metadata is missing.", guild_id)
                     return
-                track = await self._autoplay_candidate(guild_id, meta)
-                if track is None:
-                    log.info("Autoplay found no Track Radio candidate for guild %s", guild_id)
+                current_id = str(meta.get("track_id") or "")
+                candidates = await self._radio_candidates(guild_id, meta)
+                if not candidates:
+                    log.info("Autoplay found no similar-song candidates for guild %s.", guild_id)
                     return
-                if not await self.queue_autoplay_track(guild_id, player, track):
-                    log.warning("Autoplay could not queue its Track Radio candidate for guild %s", guild_id)
+                for track in candidates:
+                    candidate_id = str(getattr(track, "id", "") or "")
+                    if not candidate_id or candidate_id == current_id:
+                        log.warning("Autoplay rejected current track %s as a candidate.", candidate_id)
+                        continue
+                    try:
+                        if await self.queue_autoplay_track(guild_id, player, track):
+                            log.info("Autoplay queued candidate %s for guild %s.", candidate_id, guild_id)
+                            return
+                    except Exception:
+                        log.exception("Autoplay candidate %s failed for guild %s.", candidate_id, guild_id)
+                log.warning("Autoplay could not load any of %s similar-song candidates for guild %s.", len(candidates), guild_id)
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("Autoplay failed for guild %s", guild_id)
         finally:
             self._autoplay_tasks.pop(guild_id, None)
-
     async def queue_autoplay_track(self, guild_id: int, player: Any, tidal_track: Any) -> bool:
-        meta = await self._extract_meta(tidal_track, skip_audio_res=True)
-        stream_url = await self.tidal.get_stream_url(tidal_track)
-        if not stream_url:
+        current_meta = self._current_meta.get(guild_id) or {}
+        selected_id = str(getattr(tidal_track, "id", "") or "")
+        if not selected_id or selected_id == str(current_meta.get("track_id") or ""):
+            log.warning("Autoplay refused duplicate source track %s in guild %s", selected_id, guild_id)
             return False
-        results = await player.load_tracks(stream_url)
-        tracks = getattr(results, "tracks", None) or []
-        if not tracks:
+        try:
+            meta = await self._extract_meta(tidal_track, skip_audio_res=True)
+            stream_url = await self.tidal.get_stream_url(tidal_track)
+            if not stream_url:
+                return False
+            results = await player.load_tracks(stream_url)
+            tracks = getattr(results, "tracks", None) or []
+            if not tracks:
+                log.warning("Lavalink returned no tracks for autoplay Tidal track %s", selected_id)
+                return False
+            loaded = tracks[0]
+            loaded.title = truncate(meta["title"], 100)
+            loaded.author = f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
+            guild = self.bot.get_guild(guild_id)
+            player.add(guild.me if guild is not None else None, loaded)
+            await player.play()
+            self._current_meta[guild_id] = meta
+            self._controller_meta[guild_id] = meta
+            self._remember_track(guild_id, meta)
+            await self._refresh_controller(guild_id)
+            log.info("Autoplay started Tidal track %s in guild %s", selected_id, guild_id)
+            return True
+        except Exception:
+            log.exception("Autoplay could not queue Tidal track %s in guild %s", selected_id, guild_id)
             return False
-        loaded = tracks[0]
-        loaded.title = truncate(meta["title"], 100)
-        loaded.author = f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
-        guild = self.bot.get_guild(guild_id)
-        player.add(guild.me if guild is not None else None, loaded)
-        await player.play()
-        self._current_meta[guild_id] = meta
-        self._controller_meta[guild_id] = meta
-        self._remember_track(guild_id, meta)
-        await self._refresh_controller(guild_id)
-        log.info("Autoplay queued Track Radio candidate for guild %s", guild_id)
-        return True
 
     def _schedule_autoplay(self, guild_id: int, player: Any) -> None:
         task = self._autoplay_tasks.get(guild_id)
