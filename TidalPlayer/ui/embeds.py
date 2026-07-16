@@ -74,3 +74,14 @@ def make_now_playing_embed(meta: TrackMeta, autoplay_enabled: bool) -> discord.E
     if meta.get("image"):
         embed.set_thumbnail(url=meta["image"])
     return embed
+
+def make_queue_embed(meta: TrackMeta) -> discord.Embed:
+    title = str(meta.get('title') or 'Unknown track')
+    artist = str(meta.get('artist') or 'Unknown artist')
+    album = str(meta.get('album') or 'Unknown album')
+    embed = discord.Embed(title='Song added to the queue', color=COLOR_PURPLE)
+    embed.description = f"**{title} - {artist}**\n{album}"
+    if meta.get('image'):
+        embed.set_thumbnail(url=meta['image'])
+    return embed
+
