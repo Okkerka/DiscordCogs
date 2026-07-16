@@ -1,4 +1,4 @@
-"""
+﻿"""
 TidalPlayer - Tidal music integration for Red Discord Bot
 Features: Hi-Res Audio, Album Art, Spotify/YT Importing, MixV2, Video URLs,
           Hybrid Slash Commands, Similar Albums, UserPlaylist Mgmt, Rich UI
@@ -898,26 +898,25 @@ class TidalPlayer(commands.Cog):
         self._last_progress_edit.pop(guild.id, None)
 
     @commands.Cog.listener()
-    async def on_wavelink_track_end(self, *args: Any, **kwargs: Any) -> None:
-        if args:
-            raw = args[0]
-            player = raw if hasattr(raw, "queue") else getattr(raw, "player", None)
-        else:
-            player = kwargs.get("player")
-        if player is None:
+    async def on_red_audio_queue_end(
+        self,
+        guild: discord.Guild,
+        track: Any,
+        requester: Any,
+    ) -> None:
+        """Start Tidal Track Radio when Red Audio finishes the queue."""
+        guild_id = guild.id
+
+        if guild_id not in self._current_meta:
             return
-        guild_id = (
-            getattr(player, "guild_id", None)
-            or getattr(getattr(player, "guild", None), "id", None)
-        )
-        if guild_id and guild_id in self._current_meta:
-            queue = getattr(player, "queue", None)
-            queue_empty = not queue or not len(queue)
-            if queue_empty:
-                if await self.config.guild_from_id(guild_id).autoplay_enabled():
-                    self._schedule_autoplay(guild_id, player)
-                else:
-                    self._current_meta.pop(guild_id, None)
+
+        if not await self.config.guild_from_id(guild_id).autoplay_enabled():
+            self._current_meta.pop(guild_id, None)
+            return
+
+        player = await self._get_player_for_guild(guild_id)
+        if player is not None:
+            self._schedule_autoplay(guild_id, player)
 
     async def _initialize_apis(self) -> None:
         t0 = asyncio.get_running_loop().time()
@@ -2028,3 +2027,4 @@ class TidalPlayer(commands.Cog):
 
 async def setup(bot: Red) -> None:
     await bot.add_cog(TidalPlayer(bot))
+

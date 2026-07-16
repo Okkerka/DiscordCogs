@@ -1,4 +1,4 @@
-"""Stable Red Config schema for TidalPlayer.
+﻿"""Stable Red Config schema for TidalPlayer.
 
 Keep these values separate from runtime code: persisted Config data outlives
 refactors, so changing them requires an explicit migration rather than a move.
@@ -22,3 +22,4 @@ GUILD_DEFAULTS: Final = {
     "interactive_search": False,
     "autoplay_enabled": True,
 }
+
