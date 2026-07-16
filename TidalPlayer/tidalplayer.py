@@ -94,7 +94,7 @@ VC_RECONNECT_RETRIES = 2
 VC_RECONNECT_DELAY = 3.0
 QUEUE_PAGE_SIZE = 10
 TPL_LIST_PAGE_SIZE = 15
-SEARCH_BATCH_SIZE = 10
+SEARCH_BATCH_SIZE = 8
 
 
 _CACHE_CAPS: Dict[str, int] = {
@@ -1055,6 +1055,18 @@ class TidalPlayer(commands.Cog):
                     meta["audio_resolution"] = f"HI-RES LOSSLESS ({bit_depth}-bit / {khz}kHz)"
         return meta
 
+    def _queued_count(self, player: Any) -> int:
+        queue = getattr(player, "queue", None)
+        if queue is None:
+            return 0
+        try:
+            return len(queue)
+        except Exception:
+            return 0
+
+    def _has_playback(self, player: Any) -> bool:
+        return bool(getattr(player, "current", None)) or self._queued_count(player) > 0
+
     def _format_duration(self, seconds: int) -> str:
         return format_duration(seconds)
 
@@ -1133,7 +1145,7 @@ class TidalPlayer(commands.Cog):
         ctx: commands.Context,
         tidal_track: Any,
         show_embed: bool = True,
-        skip_audio_res: bool = False,
+        skip_audio_res: bool = True,
     ) -> bool:
         if not ctx.guild:
             return False
@@ -1156,7 +1168,11 @@ class TidalPlayer(commands.Cog):
             return False
         loaded_track.title = truncate(meta["title"], 100)
         loaded_track.author = f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
-        was_idle = not self._has_playback(player)
+        queue = getattr(player, "queue", None)
+        try:
+            was_idle = not bool(getattr(player, "current", None)) and (len(queue) == 0 if queue is not None else True)
+        except Exception:
+            was_idle = not bool(getattr(player, "current", None))
         player.add(ctx.author, loaded_track)
         if was_idle:
             self._current_meta[ctx.guild.id] = meta
@@ -1166,6 +1182,11 @@ class TidalPlayer(commands.Cog):
                 await self._send_now_playing(ctx, meta)
         else:
             self._queued_meta[ctx.guild.id].append(meta)
+            refresh = getattr(self, "_refresh_controller", None)
+            if callable(refresh):
+                task = asyncio.create_task(refresh(ctx.guild.id))
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
             if show_embed:
                 await ctx.send(embed=self._format_track_embed(meta, title="Track queued"))
         return True
