@@ -94,10 +94,7 @@ VC_RECONNECT_RETRIES = 2
 VC_RECONNECT_DELAY = 3.0
 QUEUE_PAGE_SIZE = 10
 TPL_LIST_PAGE_SIZE = 15
-SEARCH_BATCH_SIZE = 5
-FASTPATH_QUEUE_LIMIT = 10
-FASTPATH_REC_LIMIT = 8
-FIRST_LOAD_TIMEOUT = 12.0
+SEARCH_BATCH_SIZE = 10
 
 
 _CACHE_CAPS: Dict[str, int] = {
@@ -820,6 +817,7 @@ class TidalPlayer(commands.Cog):
         "bot", "config", "tidal", "sp", "yt", "_tasks", "_guild_locks",
         "_cancel_events", "_last_progress_edit", "_initialized", "_current_meta", "audio", "tokens",
         "_controller_messages", "_controller_meta", "_recent_track_ids", "_autoplay_tasks", "_autoplay_next_meta",
+        "_controller_last_refresh",
     )
 
     def __init__(self, bot: Red):
@@ -842,7 +840,7 @@ class TidalPlayer(commands.Cog):
         self._recent_track_ids: Dict[int, Deque[str]] = defaultdict(lambda: deque(maxlen=50))
         self._autoplay_tasks: Dict[int, asyncio.Task[None]] = {}
         self._autoplay_next_meta: Dict[int, TrackMeta] = {}
-        self._queued_meta: Dict[int, Deque[TrackMeta]] = defaultdict(lambda: deque(maxlen=10))
+        self._controller_last_refresh: Dict[int, float] = {}
         self._initialized: bool = False
 
     async def cog_load(self) -> None:
@@ -879,7 +877,6 @@ class TidalPlayer(commands.Cog):
         self._controller_meta.clear()
         self._recent_track_ids.clear()
         self._autoplay_next_meta.clear()
-        self._queued_meta.clear()
         self._current_meta.clear()
         self._last_progress_edit.clear()
         log.info("TidalPlayer cog unloaded")
@@ -922,15 +919,8 @@ class TidalPlayer(commands.Cog):
         self._controller_meta.pop(guild.id, None)
         self._recent_track_ids.pop(guild.id, None)
         self._autoplay_next_meta.pop(guild.id, None)
-        self._queued_meta.pop(guild.id, None)
         self._current_meta.pop(guild.id, None)
         self._last_progress_edit.pop(guild.id, None)
-
-    @commands.Cog.listener()
-    async def on_red_audio_track_start(self, guild: discord.Guild, track: Any, requester: Any) -> None:
-        guild_id = guild.id
-        self._advance_queue_state(guild_id)
-        await self._refresh_controller(guild_id)
 
     @commands.Cog.listener()
     async def on_red_audio_queue_end(
@@ -950,8 +940,9 @@ class TidalPlayer(commands.Cog):
             return
 
         player = await self._get_player_for_guild(guild_id)
-        if player is not None and not self._has_playback(player):
+        if player is not None:
             self._schedule_autoplay(guild_id, player)
+
 
     async def check_ready(self, ctx: commands.Context) -> bool:
         if not self._initialized:
@@ -1067,45 +1058,6 @@ class TidalPlayer(commands.Cog):
     def _format_duration(self, seconds: int) -> str:
         return format_duration(seconds)
 
-    def _queued_count(self, player: Any) -> int:
-        queue = getattr(player, "queue", None)
-        if queue is None:
-            return 0
-        try:
-            return len(queue)
-        except Exception:
-            return 0
-
-    def _has_playback(self, player: Any) -> bool:
-        return bool(getattr(player, "current", None)) or self._queued_count(player) > 0
-
-    def _format_track_embed(self, meta: TrackMeta, title: str = "Track queued") -> discord.Embed:
-        embed = discord.Embed(
-            title=title,
-            description=f"**{meta.get('title', 'Unknown track')}** — {meta.get('artist', 'Unknown artist')}",
-            color=COLORPURPLE,
-        )
-        album = meta.get("album")
-        if album:
-            embed.add_field(name="Album", value=str(album), inline=False)
-        duration = meta.get("duration") or 0
-        if duration:
-            embed.add_field(name="Duration", value=formatduration(int(duration)), inline=True)
-        quality = meta.get("quality")
-        if quality:
-            embed.add_field(name="Quality", value=str(quality).replace("_", " "), inline=True)
-        cover = meta.get("image")
-        if cover:
-            embed.set_thumbnail(url=cover)
-        share = meta.get("share_url")
-        if share:
-            embed.add_field(name="Open in TIDAL", value=f"[Open track]({share})", inline=False)
-        return embed
-
-    def _maybe_fast_track(self, tidal_track: Any) -> bool:
-        track_id = str(getattr(tidal_track, "id", "") or "")
-        return bool(track_id)
-
     async def _get_player(self, ctx: commands.Context, connect: bool = False) -> Optional[Any]:
         if not self.audio.available or not ctx.guild:
             return None
@@ -1144,6 +1096,7 @@ class TidalPlayer(commands.Cog):
         cancel_event: asyncio.Event,
     ) -> Tuple[int, int]:
         queued = skipped = 0
+        started_playback = bool(getattr(player, "current", None))
         for res in resolved_chunk:
             if cancel_event.is_set():
                 break
@@ -1164,9 +1117,12 @@ class TidalPlayer(commands.Cog):
                     f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
                 )
                 player.add(ctx.author, loaded_track)
-                if not player.current:
+                if not started_playback and not getattr(player, "current", None):
                     await player.play()
-                self._current_meta[ctx.guild.id] = meta
+                    started_playback = True
+                    self._current_meta[ctx.guild.id] = meta
+                else:
+                    self._queued_meta[ctx.guild.id].append(meta)
                 queued += 1
             else:
                 skipped += 1
@@ -1184,40 +1140,594 @@ class TidalPlayer(commands.Cog):
         meta = await self._extract_meta(tidal_track, skip_audio_res=skip_audio_res)
         player = await self._get_player(ctx, connect=True)
         if not player:
-            await ctx.send(embed=errorembed(Messages.ERROR_NO_PLAYER))
+            await ctx.send(embed=_error_embed(Messages.ERROR_NO_PLAYER))
             return False
         stream_url = await self.tidal.get_stream_url(tidal_track)
-        if not stream_url:
-            await ctx.send(embed=errorembed("Playback failed: could not retrieve a TIDAL stream."))
+        loaded_track = None
+        if stream_url:
+            try:
+                results = await player.load_tracks(stream_url)
+                if results and results.tracks:
+                    loaded_track = results.tracks[0]
+            except Exception as e:
+                log.error(f"Lavalink load failed: {e}")
+        if not loaded_track:
+            await ctx.send(embed=_error_embed(Messages.ERROR_LAVALINK_FAILED))
+            return False
+        loaded_track.title = truncate(meta["title"], 100)
+        loaded_track.author = f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
+        was_idle = not self._has_playback(player)
+        player.add(ctx.author, loaded_track)
+        if was_idle:
+            self._current_meta[ctx.guild.id] = meta
+            if not player.current:
+                await player.play()
+            if show_embed:
+                await self._send_now_playing(ctx, meta)
+        else:
+            self._queued_meta[ctx.guild.id].append(meta)
+            if show_embed:
+                await ctx.send(embed=self._format_track_embed(meta, title="Track queued"))
+        return True
+
+    async def _lastfm_similar_tracks(
+        self, artist: str, title: str, limit: int = 25,
+    ) -> List[Tuple[str, str]]:
+        """Get similar track names from Last.fm's public read-only API."""
+        tokens = await self.bot.get_shared_api_tokens("lastfm")
+        api_key = tokens.get("api_key")
+        if not api_key or not artist or not title:
+            return []
+        params = urlencode({
+            "method": "track.getsimilar", "artist": artist, "track": title,
+            "limit": limit, "autocorrect": 1, "api_key": api_key, "format": "json",
+        })
+        url = f"https://ws.audioscrobbler.com/2.0/?{params}"
+        try:
+            def fetch() -> Dict[str, Any]:
+                import json
+                with urlopen(url, timeout=15) as response:
+                    return json.load(response)
+            payload = await self.tidal._run_blocking(fetch, timeout=20.0)
+            entries = payload.get("similartracks", {}).get("track", [])
+            if isinstance(entries, dict):
+                entries = [entries]
+            return [
+                (str(item.get("artist", {}).get("name", "")).strip(), str(item.get("name", "")).strip())
+                for item in entries
+                if item.get("artist", {}).get("name") and item.get("name")
+            ]
+        except Exception as error:
+            log.warning("Last.fm similar-track lookup failed for %s — %s: %r", artist, title, error)
+            return []
+
+    async def _radio_candidates(self, guild_id: int, meta: TrackMeta) -> List[Any]:
+        """Resolve Last.fm similar tracks to Tidal catalog tracks."""
+        current_id = str(meta.get("track_id") or "")
+        current_title = str(meta.get("title") or "").casefold().strip()
+        current_artist = str(meta.get("artist") or "").casefold().strip()
+        seen_ids = set(self._recent_track_ids[guild_id])
+        if current_id:
+            seen_ids.add(current_id)
+        pairs = await self._lastfm_similar_tracks(
+            str(meta.get("artist") or ""), str(meta.get("title") or ""), limit=25,
+        )
+        candidates: List[Any] = []
+        used_ids: Set[str] = set()
+        for artist, title in pairs:
+            results = await self.tidal.search(f"{artist} {title}", filter_remixes=False)
+            if not results:
+                continue
+            track = select_best_tidal_track(f"{artist} {title}", results) or results[0]
+            track_id = str(getattr(track, "id", "") or "")
+            found_title = str(getattr(track, "name", "") or "").casefold().strip()
+            found_artist = str(getattr(getattr(track, "artist", None), "name", "") or "").casefold().strip()
+            if not track_id or track_id in seen_ids or track_id in used_ids:
+                continue
+            if found_title == current_title and found_artist == current_artist:
+                continue
+            used_ids.add(track_id)
+            candidates.append(track)
+            if len(candidates) >= 25:
+                break
+        if candidates:
+            log.info("Last.fm produced %s Tidal suggestion(s) for guild %s.", len(candidates), guild_id)
+            return candidates
+        log.info("Last.fm returned no usable Tidal matches; using Tidal search fallback.")
+        fallback = await self.tidal.search(
+            f"{meta.get('artist', '')} {meta.get('title', '')}".strip(),
+            filter_remixes=False,
+        )
+        return [
+            track for track in fallback
+            if str(getattr(track, "id", "") or "") not in seen_ids
+        ][:25]
+    async def _controller_view(
+        self, guild_id: int, paused: bool = False,
+    ) -> PlayerControllerView:
+        meta = self._controller_meta.get(guild_id) or self._current_meta.get(guild_id)
+        recommendations = await self._radio_candidates(guild_id, meta) if meta else []
+        autoplay_enabled = await self.config.guild_from_id(guild_id).autoplay_enabled()
+        return PlayerControllerView(
+            self, meta=meta, recommendations=recommendations,
+            autoplay_enabled=autoplay_enabled, paused=paused,
+        )
+
+    async def _build_now_playing_embed(self, guild_id: int, meta: TrackMeta) -> discord.Embed:
+        enabled = await self.config.guild_from_id(guild_id).autoplay_enabled()
+        return make_now_playing_embed(meta, enabled)
+
+    async def _send_now_playing(self, ctx: commands.Context, meta: TrackMeta) -> None:
+        if ctx.guild is None:
+            return
+        guild_id = ctx.guild.id
+        self._controller_meta[guild_id] = meta
+        self._remember_track(guild_id, meta)
+        embed = await self._controller_embed(guild_id)
+        view = await self._controller_view(guild_id)
+        previous = self._controller_messages.get(guild_id)
+        if previous is not None:
+            try:
+                await previous.edit(content=None, embed=embed, view=view)
+                return
+            except (discord.HTTPException, discord.Forbidden, discord.NotFound):
+                pass
+        self._controller_messages[guild_id] = await ctx.send(embed=embed, view=view)
+
+    def _remember_track(self, guild_id: int, meta: TrackMeta) -> None:
+        track_id = str(meta.get("track_id") or "")
+        if track_id:
+            self._recent_track_ids[guild_id].append(track_id)
+
+    async def _get_player_for_guild(self, guild_id: int) -> Any | None:
+        try:
+            return await self.audio.get_player(guild_id)
+        except PlaybackUnavailable:
+            return None
+
+    async def can_control_player(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            return False
+        bot_voice = interaction.guild.me.voice if interaction.guild.me is not None else None
+        user_voice = interaction.user.voice
+        return bool(bot_voice and bot_voice.channel and user_voice and user_voice.channel and bot_voice.channel.id == user_voice.channel.id)
+
+    async def _controller_embed(self, guild_id: int) -> discord.Embed | None:
+        meta = self._controller_meta.get(guild_id) or self._current_meta.get(guild_id)
+        if meta is None:
+            return None
+        return await self._build_now_playing_embed(guild_id, meta)
+
+    async def _refresh_controller(
+        self, guild_id: int, interaction: discord.Interaction | None = None,
+    ) -> None:
+        now = asyncio.get_running_loop().time()
+        if interaction is None:
+            last = self._controller_last_refresh.get(guild_id, 0.0)
+            if now - last < CONTROLLER_REFRESH_COOLDOWN:
+                return
+            self._controller_last_refresh[guild_id] = now
+        player = await self._get_player_for_guild(guild_id)
+        paused = bool(getattr(player, "paused", False)) if player else False
+        embed = await self._controller_embed(guild_id)
+        view = await self._controller_view(guild_id, paused)
+        if interaction is not None and not interaction.response.is_done():
+            await interaction.response.edit_message(
+                content=None, embed=embed, embeds=[], attachments=[], view=view,
+            )
+            if interaction.message is not None:
+                self._controller_messages[guild_id] = interaction.message
+            self._controller_last_refresh[guild_id] = now
+        elif (message := self._controller_messages.get(guild_id)) is not None:
+            try:
+                await message.edit(content=None, embed=embed, embeds=[], attachments=[], view=view)
+            except (discord.HTTPException, discord.Forbidden, discord.NotFound):
+                pass
+
+    async def controller_toggle_autoplay(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            return
+        setting = self.config.guild(interaction.guild).autoplay_enabled
+        enabled = not await setting()
+        await setting.set(enabled)
+        log.info("Autoplay %s for guild %s", "enabled" if enabled else "disabled", interaction.guild.id)
+        await self._refresh_controller(interaction.guild.id, interaction)
+
+    async def controller_toggle_pause(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            return
+        player = await self._get_player_for_guild(interaction.guild.id)
+        if player is None or not callable(getattr(player, "pause", None)):
+            await interaction.response.send_message("No active player is available.", ephemeral=True)
+            return
+        result = player.pause(not bool(getattr(player, "paused", False)))
+        if asyncio.iscoroutine(result):
+            await result
+        await self._refresh_controller(interaction.guild.id, interaction)
+
+    async def controller_stop(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            return
+        guild_id = interaction.guild.id
+        if (task := self._autoplay_tasks.pop(guild_id, None)) is not None:
+            task.cancel()
+        player = await self._get_player_for_guild(guild_id)
+        if player is not None:
+            queue = getattr(player, "queue", None)
+            if callable(getattr(queue, "clear", None)):
+                queue.clear()
+            if callable(getattr(player, "stop", None)):
+                result = player.stop()
+                if asyncio.iscoroutine(result):
+                    await result
+        self._current_meta.pop(guild_id, None)
+        self._controller_meta.pop(guild_id, None)
+        self._controller_messages.pop(guild_id, None)
+        await interaction.response.edit_message(
+            content="## Playback stopped\nThe queue was cleared.",
+            embed=None, embeds=[], attachments=[], view=None,
+        )
+
+    async def queue_recommendation(self, interaction: discord.Interaction, tidal_track: Any) -> bool:
+        if interaction.guild is None:
+            return False
+        guild_id = interaction.guild.id
+        player = await self._get_player_for_guild(guild_id)
+        if player is None:
+            return False
+        selected_id = str(getattr(tidal_track, "id", "") or "")
+        current_id = str((self._current_meta.get(guild_id) or {}).get("track_id") or "")
+        if not selected_id or selected_id == current_id:
+            log.warning("Refused duplicate suggested track %s in guild %s", selected_id, guild_id)
             return False
         try:
+            meta = await self._extract_meta(tidal_track, skip_audio_res=True)
+            stream_url = await self.tidal.get_stream_url(tidal_track)
+            if not stream_url:
+                return False
             results = await player.load_tracks(stream_url)
             tracks = getattr(results, "tracks", None) or []
             if not tracks:
-                await ctx.send(embed=errorembed(Messages.ERROR_LAVALINK_FAILED))
+                log.warning("Lavalink returned no tracks for suggested Tidal track %s", selected_id)
                 return False
-            loaded_track = tracks[0]
-            loaded_track.title = truncate(meta["title"], 100)
-            loaded_track.author = f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
-            was_idle = not self._has_playback(player)
-            player.add(ctx.author, loaded_track)
-            if was_idle:
-                self.currentmeta[ctx.guild.id] = meta
-                if show_embed:
-                    await self.sendnowplaying(ctx, meta)
-                if not getattr(player, "current", None):
-                    await player.play()
-            else:
-                self.queuedmeta[ctx.guild.id].append(meta)
-                await self.refreshcontroller(ctx.guild.id)
-                if show_embed:
-                    await ctx.send(embed=self._format_track_embed(meta, title="Track queued"))
+            loaded = tracks[0]
+            loaded.title = truncate(meta["title"], 100)
+            loaded.author = f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
+            player.add(interaction.user, loaded)
+            log.info("Queued suggested Tidal track %s in guild %s", selected_id, guild_id)
             return True
-        except Exception as e:
-            log.error(f"Lavalink load failed: {e}")
-            await ctx.send(embed=errorembed(Messages.ERROR_LAVALINK_FAILED))
+        except Exception:
+            log.exception("Could not queue suggested Tidal track %s", selected_id)
             return False
 
+    async def _autoplay_candidate(self, guild_id: int, meta: TrackMeta) -> Any | None:
+        source_id = str(meta.get("track_id") or "")
+        source_title = str(meta.get("title") or "").casefold().strip()
+        source_artist = str(meta.get("artist") or "").casefold().strip()
+        for track in await self._radio_candidates(guild_id, meta):
+            track_id = str(getattr(track, "id", "") or "")
+            title = str(getattr(track, "name", "") or "").casefold().strip()
+            artist = str(getattr(getattr(track, "artist", None), "name", "") or "").casefold().strip()
+            if track_id == source_id or (title == source_title and artist == source_artist):
+                continue
+            return track
+        return None
+
+    async def _run_autoplay(self, guild_id: int, player: Any) -> None:
+        """Queue the first playable, non-current Last.fm recommendation."""
+        try:
+            await asyncio.sleep(1.5)
+            async with self._guild_locks[guild_id]:
+                if not await self.config.guild_from_id(guild_id).autoplay_enabled():
+                    return
+                queue = getattr(player, "queue", None)
+                if queue is not None and len(queue):
+                    log.info("Autoplay skipped for guild %s: queue is no longer empty.", guild_id)
+                    return
+                meta = self._current_meta.get(guild_id)
+                if meta is None:
+                    log.warning("Autoplay skipped for guild %s: current metadata is missing.", guild_id)
+                    return
+                current_id = str(meta.get("track_id") or "")
+                candidates = await self._radio_candidates(guild_id, meta)
+                if not candidates:
+                    log.info("Autoplay found no similar-song candidates for guild %s.", guild_id)
+                    return
+                for track in candidates:
+                    candidate_id = str(getattr(track, "id", "") or "")
+                    if not candidate_id or candidate_id == current_id:
+                        log.warning("Autoplay rejected current track %s as a candidate.", candidate_id)
+                        continue
+                    try:
+                        if await self.queue_autoplay_track(guild_id, player, track):
+                            log.info("Autoplay queued candidate %s for guild %s.", candidate_id, guild_id)
+                            return
+                    except Exception:
+                        log.exception("Autoplay candidate %s failed for guild %s.", candidate_id, guild_id)
+                log.warning("Autoplay could not load any of %s similar-song candidates for guild %s.", len(candidates), guild_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Autoplay failed for guild %s", guild_id)
+        finally:
+            self._autoplay_tasks.pop(guild_id, None)
+    async def queue_autoplay_track(self, guild_id: int, player: Any, tidal_track: Any) -> bool:
+        current_meta = self._current_meta.get(guild_id) or {}
+        selected_id = str(getattr(tidal_track, "id", "") or "")
+        if not selected_id or selected_id == str(current_meta.get("track_id") or ""):
+            log.warning("Autoplay refused duplicate source track %s in guild %s", selected_id, guild_id)
+            return False
+        try:
+            meta = await self._extract_meta(tidal_track, skip_audio_res=True)
+            stream_url = await self.tidal.get_stream_url(tidal_track)
+            if not stream_url:
+                return False
+            results = await player.load_tracks(stream_url)
+            tracks = getattr(results, "tracks", None) or []
+            if not tracks:
+                log.warning("Lavalink returned no tracks for autoplay Tidal track %s", selected_id)
+                return False
+            loaded = tracks[0]
+            loaded.title = truncate(meta["title"], 100)
+            loaded.author = f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
+            guild = self.bot.get_guild(guild_id)
+            player.add(guild.me if guild is not None else None, loaded)
+            await player.play()
+            self._current_meta[guild_id] = meta
+            self._controller_meta[guild_id] = meta
+            self._remember_track(guild_id, meta)
+            await self._refresh_controller(guild_id)
+            log.info("Autoplay started Tidal track %s in guild %s", selected_id, guild_id)
+            return True
+        except Exception:
+            log.exception("Autoplay could not queue Tidal track %s in guild %s", selected_id, guild_id)
+            return False
+
+    def _schedule_autoplay(self, guild_id: int, player: Any) -> None:
+        task = self._autoplay_tasks.get(guild_id)
+        if task is None or task.done():
+            log.info("Scheduling autoplay for guild %s", guild_id)
+            self._autoplay_tasks[guild_id] = asyncio.create_task(self._run_autoplay(guild_id, player), name=f"tidalplayer-autoplay-{guild_id}")
+
+    async def _interactive_select(self, ctx: commands.Context, tracks: List[Any]) -> Optional[Any]:
+        if not tracks:
+            return None
+        top = tracks[:5]
+        desc = []
+        for i, t in enumerate(top):
+            name = getattr(t, "full_name", None) or getattr(t, "name", "Unknown")
+            artist_obj = getattr(t, "artist", None)
+            artist = getattr(artist_obj, "name", "Unknown") if artist_obj else "Unknown"
+            album_obj = getattr(t, "album", None)
+            album = getattr(album_obj, "name", None) if album_obj else None
+            dur = self._format_duration(int(getattr(t, "duration", 0) or 0))
+            line = f"**{i + 1}.** {name} \u2014 {artist}"
+            if album:
+                line += f" *({album})*"
+            line += f" `[{dur}]`"
+            desc.append(line)
+        embed = discord.Embed(title="Select a Track", description="\n".join(desc), color=COLOR_BLUE)
+        view = TrackSelectView(top, ctx.author, timeout=float(INTERACTIVE_TIMEOUT))
+        msg = await ctx.send(embed=embed, view=view)
+        selected = await view.wait_for_selection()
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        if view._timed_out:
+            await ctx.send(embed=_error_embed(Messages.ERROR_TIMEOUT))
+        return selected
+
+    async def _edit_progress_message(self, msg: discord.Message, embed: discord.Embed) -> None:
+        guild_id = msg.guild.id if msg.guild else msg.id
+        now = asyncio.get_running_loop().time()
+        if now - self._last_progress_edit.get(guild_id, 0.0) < PROGRESS_EDIT_RATELIMIT:
+            return
+        try:
+            await msg.edit(embed=embed)
+            self._last_progress_edit[guild_id] = now
+        except Exception:
+            pass
+
+    async def _fetch_all_spotify_tracks(self, playlist_id: str) -> List[Any]:
+        all_items: List[Any] = []
+        offset = 0
+        while len(all_items) < MAX_ITEMS:
+            resp = await self.tidal._run_blocking(
+                lambda o=offset: self.sp.playlist_tracks(
+                    playlist_id, limit=100, offset=o,
+                    fields="items(track(name,artists(name),external_ids)),next",
+                ),
+                timeout=20.0,
+            )
+            all_items.extend(i for i in resp.get("items", []) if i.get("track"))
+            if not resp.get("next"):
+                break
+            offset += 100
+            await asyncio.sleep(0)
+        return all_items[:MAX_ITEMS]
+
+    async def _fetch_all_spotify_album_tracks(self, album_id: str) -> Tuple[List[Any], str]:
+        all_items: List[Any] = []
+        album_name = album_id
+        try:
+            alb = await self.tidal._run_blocking(lambda: self.sp.album(album_id), timeout=15.0)
+            album_name = alb.get("name", album_id)
+            tracks = alb.get("tracks", {})
+            all_items.extend(tracks.get("items", []))
+            next_url = tracks.get("next")
+            while next_url and len(all_items) < MAX_ITEMS:
+                resp = await self.tidal._run_blocking(
+                    lambda u=next_url: self.sp._get(u), timeout=20.0
+                )
+                all_items.extend(resp.get("items", []))
+                next_url = resp.get("next")
+                await asyncio.sleep(0)
+        except Exception as e:
+            log.error(f"Spotify album fetch error: {e}")
+        return all_items[:MAX_ITEMS], album_name
+
+    async def _fetch_all_youtube_tracks(self, playlist_id: str) -> List[Any]:
+        all_items: List[Any] = []
+        page_token: Optional[str] = None
+        while True:
+            kwargs: Dict[str, Any] = {"part": "snippet", "playlistId": playlist_id, "maxResults": 50}
+            if page_token:
+                kwargs["pageToken"] = page_token
+            resp = await self.tidal._run_blocking(
+                self.yt.playlistItems().list(**kwargs).execute, timeout=20.0
+            )
+            for item in resp.get("items", []):
+                if item.get("snippet", {}).get("title", "").lower() not in YOUTUBE_SKIP_TITLES:
+                    all_items.append(item)
+            page_token = resp.get("nextPageToken")
+            if not page_token or len(all_items) >= MAX_ITEMS:
+                break
+            await asyncio.sleep(0)
+        return all_items[:MAX_ITEMS]
+
+    async def _resolve_and_extract(
+        self,
+        item: Any,
+        item_processor: Callable[[Any], Any],
+        filter_remixes: bool,
+    ) -> Optional[Tuple[Any, str, TrackMeta]]:
+        try:
+            query = item_processor(item)
+            if not query:
+                return None
+            track = None
+            if _is_tidal_track(query):
+                track = query
+            else:
+                if isinstance(query, str) and ISRC_PATTERN.match(query):
+                    isrc = ISRC_PATTERN.match(query).group(1).upper()
+                    track = await self.tidal.get_track_by_isrc(isrc)
+                if not track:
+                    results = await self.tidal.search(query, filter_remixes=filter_remixes)
+                    if results:
+                        track = select_best_tidal_track(query, results) or results[0]
+            if not track:
+                return None
+            meta_result, stream_url_result = await asyncio.gather(
+                self._extract_meta(track, skip_audio_res=True),
+                self.tidal.get_stream_url(track),
+                return_exceptions=True,
+            )
+            if isinstance(meta_result, Exception):
+                log.error(f"Error extracting metadata: {meta_result}")
+                return None
+            if isinstance(stream_url_result, Exception):
+                log.error(f"Error getting stream URL: {stream_url_result}")
+                return None
+            if not stream_url_result:
+                return None
+            return track, stream_url_result, meta_result
+        except Exception as e:
+            log.error(f"Failed to resolve track concurrently: {e}")
+            return None
+
+    async def _process_track_list(
+        self,
+        ctx: commands.Context,
+        items: List[Any],
+        name: str,
+        item_processor: Callable[[Any], Any],
+        color: discord.Color = discord.Color.blue(),
+        thumbnail_url: Optional[str] = None,
+    ) -> None:
+        if not items:
+            await ctx.send(embed=_error_embed(Messages.ERROR_NO_TRACKS_FOUND))
+            return
+        lock = self._guild_locks[ctx.guild.id]
+        async with lock:
+            if not await self.check_ready(ctx):
+                return
+            filter_remixes = await self.config.guild(ctx.guild).filter_remixes()
+            player = await self._ensure_player(ctx)
+            if not player:
+                return
+            cancel_event = self._cancel_events[ctx.guild.id]
+            trunc_name = truncate(name, 50)
+            total = len(items)
+            initial_embed = discord.Embed(
+                title=Messages.PROGRESS_QUEUEING.format(name=trunc_name, count=total), color=color
+            )
+            if thumbnail_url:
+                initial_embed.set_thumbnail(url=thumbnail_url)
+            pmsg = await ctx.send(embed=initial_embed)
+            queued, skipped, last_up = 0, 0, 0
+            try:
+                for chunk_start in range(0, total, SEARCH_BATCH_SIZE):
+                    if cancel_event.is_set():
+                        break
+                    player = await self._ensure_vc_connected(ctx, player)
+                    if player is None:
+                        break
+                    chunk_items = items[chunk_start:chunk_start + SEARCH_BATCH_SIZE]
+                    tasks = [
+                        self._resolve_and_extract(item, item_processor, filter_remixes)
+                        for item in chunk_items
+                    ]
+                    resolved_chunk = await asyncio.gather(*tasks)
+                    chunk_queued, chunk_skipped = await self._queue_resolved_chunk(
+                        ctx, player, list(resolved_chunk), cancel_event
+                    )
+                    queued += chunk_queued
+                    skipped += chunk_skipped
+                    current_count = min(chunk_start + len(chunk_items), total)
+                    if current_count - last_up >= BATCH_UPDATE_INTERVAL or current_count == total:
+                        upd = discord.Embed(
+                            title=Messages.PROGRESS_QUEUEING.format(name=trunc_name, count=total),
+                            description=Messages.SUCCESS_PARTIAL_QUEUE.format(
+                                queued=queued, total=total, skipped=skipped
+                            ),
+                            color=color,
+                        )
+                        if thumbnail_url:
+                            upd.set_thumbnail(url=thumbnail_url)
+                        await self._edit_progress_message(pmsg, upd)
+                        last_up = current_count
+                    if PROGRESS_SLEEP_INTERVAL:
+                        await asyncio.sleep(PROGRESS_SLEEP_INTERVAL)
+                final = discord.Embed(
+                    title=Messages.SUCCESS_PARTIAL_QUEUE.format(queued=queued, total=total, skipped=skipped),
+                    description=f"Source: {truncate(name, 100)}",
+                    color=color,
+                )
+                if thumbnail_url:
+                    final.set_thumbnail(url=thumbnail_url)
+                try:
+                    await pmsg.edit(embed=final)
+                except Exception:
+                    pass
+            except Exception as e:
+                log.error(f"Queue processing error: {e}")
+                try:
+                    await pmsg.edit(embed=_error_embed(Messages.ERROR_FETCH_FAILED))
+                except Exception:
+                    pass
+            finally:
+                cancel_event.clear()
+
+    async def _check_ready(self, ctx: commands.Context) -> bool:
+        if not LAVALINK_AVAILABLE:
+            await ctx.send(embed=_error_embed("Audio playback is currently unavailable."))
+            return False
+
+        if not self._initialized:
+            await ctx.send(embed=_error_embed(Messages.ERROR_STILL_LOADING))
+            return False
+        if not TIDALAPI_AVAILABLE:
+            await ctx.send(embed=_error_embed(Messages.ERROR_NO_TIDALAPI))
+            return False
+        if not await self.tidal.is_logged_in():
+            await ctx.send(embed=_error_embed(Messages.ERROR_NOT_AUTHENTICATED))
+            return False
+        if not self.audio.available:
+            await ctx.send(embed=_error_embed(Messages.ERROR_NO_AUDIO_COG))
+            return False
+        return True
 
     async def _handle_tidal_url(self, ctx: commands.Context, url: str) -> None:
         for kind, pattern in TIDAL_URL_PATTERNS.items():
@@ -1688,4 +2198,3 @@ class TidalPlayer(commands.Cog):
 
 async def setup(bot: Red) -> None:
     await bot.add_cog(TidalPlayer(bot))
-
