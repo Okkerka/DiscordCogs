@@ -1,4 +1,4 @@
-"""
+﻿"""
 TidalPlayer - Tidal music integration for Red Discord Bot
 Features: Hi-Res Audio, Album Art, Spotify/YT Importing, MixV2, Video URLs,
           Hybrid Slash Commands, Similar Albums, UserPlaylist Mgmt, Rich UI
@@ -1130,7 +1130,7 @@ class TidalPlayer(commands.Cog):
             if str(getattr(track, "id", "")) not in seen
         ]
 
-            async def _controller_view(
+    async def _controller_view(
         self, guild_id: int, paused: bool = False,
     ) -> PlayerControllerView:
         meta = self._controller_meta.get(guild_id) or self._current_meta.get(guild_id)
@@ -1184,7 +1184,7 @@ class TidalPlayer(commands.Cog):
             return None
         return await self._build_now_playing_embed(guild_id, meta)
 
-        async def _refresh_controller(
+    async def _refresh_controller(
         self, guild_id: int, interaction: discord.Interaction | None = None,
     ) -> None:
         player = await self._get_player_for_guild(guild_id)
@@ -1223,7 +1223,7 @@ class TidalPlayer(commands.Cog):
             await result
         await self._refresh_controller(interaction.guild.id, interaction)
 
-        async def controller_stop(self, interaction: discord.Interaction) -> None:
+    async def controller_stop(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
             return
         guild_id = interaction.guild.id
