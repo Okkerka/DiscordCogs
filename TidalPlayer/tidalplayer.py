@@ -94,9 +94,12 @@ VC_RECONNECT_RETRIES = 2
 VC_RECONNECT_DELAY = 3.0
 QUEUE_PAGE_SIZE = 10
 TPL_LIST_PAGE_SIZE = 15
-SEARCH_BATCH_SIZE = 8
-CONTROLLER_REFRESH_COOLDOWN = 3.0   # seconds between background-only controller edits
-PROGRESS_SLEEP_INTERVAL = 0.0       # seconds to sleep between batch chunks (0 = no sleep)
+SEARCH_BATCH_SIZE = 16
+CONTROLLER_REFRESH_COOLDOWN = 2.0
+PROGRESS_SLEEP_INTERVAL = 0.0
+TOKEN_REFRESH_MIN_INTERVAL = 1800.0
+STREAM_URL_CACHE_TTL = 300.0
+LAVALINK_LOAD_TIMEOUT = 8.0
 
 
 _CACHE_CAPS: Dict[str, int] = {
@@ -107,6 +110,7 @@ _CACHE_CAPS: Dict[str, int] = {
     "playlist": 100,
     "mix": 50,
     "video": 100,
+    "stream_url": 500,
 }
 
 
@@ -207,7 +211,7 @@ class TrackSelectView(discord.ui.View):
 class TidalHandler:
     __slots__ = (
         "bot", "config", "session", "_refresh_task", "api_semaphore",
-        "_login_cache", "_login_cache_time", "_cache", "_refresh_lock", "_executor",
+        "_login_cache", "_login_cache_time", "_cache", "_refresh_lock", "_executor", "_last_refresh_ts",
     )
 
     def __init__(self, bot: Red, config: Config):
@@ -221,6 +225,7 @@ class TidalHandler:
         self._cache: Dict[str, OrderedDict] = {}
         self._refresh_lock = asyncio.Lock()
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tidal_io")
+        self._last_refresh_ts: float = 0.0
 
     def _get_cached(self, category: str, key: str) -> Optional[Any]:
         bucket = self._cache.get(category)
@@ -270,7 +275,7 @@ class TidalHandler:
                 is_unauthorized = status == 401 or "401" in str(e).lower() or "unauthorized" in str(e).lower()
                 if is_unauthorized:
                     log.warning("Encountered 401 Unauthorized from Tidal API. Attempting token refresh...")
-                    refreshed = await self.refresh_tokens()
+                    refreshed = await self.refresh_tokens(force=True)
                     if refreshed:
                         log.info("Token refresh succeeded after 401, retrying...")
                         continue
@@ -312,15 +317,18 @@ class TidalHandler:
         except Exception as e:
             log.warning(f"Failed to load Tidal session: {e}")
 
-    async def refresh_tokens(self) -> bool:
+    async def refresh_tokens(self, force: bool = False) -> bool:
         if not self.session:
             return False
         async with self._refresh_lock:
+            now = asyncio.get_running_loop().time()
+            if not force and self._last_refresh_ts and (now - self._last_refresh_ts) < TOKEN_REFRESH_MIN_INTERVAL:
+                return True
             try:
                 expiry_time = await self._run_blocking(lambda: self.session.expiry_time, timeout=5.0)
                 if expiry_time:
                     expiry_aware = _ensure_aware(expiry_time)
-                    if _utc_now() + timedelta(hours=2) <= expiry_aware:
+                    if _utc_now() + timedelta(minutes=30) <= expiry_aware:
                         return True
             except Exception:
                 pass
@@ -342,12 +350,13 @@ class TidalHandler:
                     self.config.expiry_time.set(int(expiry_time.timestamp()) if expiry_time else None),
                 )
                 self._login_cache = True
-                self._login_cache_time = asyncio.get_running_loop().time()
+                self._login_cache_time = now
+                self._last_refresh_ts = now
                 return True
             except Exception as e:
                 log.error(f"Token refresh failed: {e}")
                 self._login_cache = False
-                self._login_cache_time = asyncio.get_running_loop().time()
+                self._login_cache_time = now
                 return False
 
     def start_refresh_loop(self) -> None:
@@ -388,14 +397,17 @@ class TidalHandler:
 
     async def _auto_refresh_tokens(self) -> None:
         while True:
-            sleep_secs = 3600
+            sleep_secs = 1800
             try:
                 if await self.is_logged_in():
                     expiry_time = await self._run_blocking(lambda: self.session.expiry_time, timeout=5.0)
                     if expiry_time:
                         expiry_aware = _ensure_aware(expiry_time)
                         until_expiry = (expiry_aware - _utc_now()).total_seconds()
-                        sleep_secs = max(60, until_expiry - 7200)
+                        if until_expiry > 7200:
+                            sleep_secs = min(3600, max(1800, until_expiry - 3600))
+                        else:
+                            sleep_secs = 900
             except Exception:
                 pass
             await asyncio.sleep(sleep_secs)
@@ -403,11 +415,10 @@ class TidalHandler:
                 if not await self.is_logged_in():
                     continue
                 expiry_time = await self._run_blocking(lambda: self.session.expiry_time, timeout=5.0)
-                if not expiry_time:
-                    continue
-                expiry_aware = _ensure_aware(expiry_time)
-                if _utc_now() + timedelta(hours=2) <= expiry_aware:
-                    continue
+                if expiry_time:
+                    expiry_aware = _ensure_aware(expiry_time)
+                    if _utc_now() + timedelta(minutes=30) <= expiry_aware:
+                        continue
                 await self.refresh_tokens()
             except Exception as e:
                 log.error(f"Auto token refresh failed: {e}")
@@ -1124,7 +1135,7 @@ class TidalPlayer(commands.Cog):
             track, stream_url, meta = res
             loaded_track = None
             try:
-                results = await player.load_tracks(stream_url)
+                results = await asyncio.wait_for(player.load_tracks(stream_url), timeout=LAVALINK_LOAD_TIMEOUT)
                 if results and results.tracks:
                     loaded_track = results.tracks[0]
             except Exception as e:
@@ -1164,7 +1175,7 @@ class TidalPlayer(commands.Cog):
         loaded_track = None
         if stream_url:
             try:
-                results = await player.load_tracks(stream_url)
+                results = await asyncio.wait_for(player.load_tracks(stream_url), timeout=LAVALINK_LOAD_TIMEOUT)
                 if results and results.tracks:
                     loaded_track = results.tracks[0]
             except Exception as e:
@@ -1172,7 +1183,7 @@ class TidalPlayer(commands.Cog):
         if not loaded_track and stream_url:
             try:
                 player = await self._get_player(ctx, connect=True)
-                results = await player.load_tracks(stream_url)
+                results = await asyncio.wait_for(player.load_tracks(stream_url), timeout=LAVALINK_LOAD_TIMEOUT)
                 if results and results.tracks:
                     loaded_track = results.tracks[0]
             except Exception as e:
@@ -1190,30 +1201,18 @@ class TidalPlayer(commands.Cog):
         player.add(ctx.author, loaded_track)
         if was_idle:
             self._current_meta[ctx.guild.id] = meta
-            # Start playback only if Lavalink has not already started it (belt-and-suspenders).
-            if not getattr(player, "current", None):
-                try:
-                    await player.play()
-                except Exception:
-                    log.exception("player.play() failed for guild %s", ctx.guild.id)
+            if not player.current:
+                await player.play()
             if show_embed:
                 try:
                     await self._send_now_playing(ctx, meta)
                 except Exception:
                     log.exception("Now playing controller failed for guild %s", ctx.guild.id)
-            # Do NOT send a queued embed for the first track.
         else:
             self._queued_meta[ctx.guild.id].append(meta)
-            # Refresh the existing controller for state changes, but do not resend it.
-            task = asyncio.create_task(self._refresh_controller(ctx.guild.id))
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
+            # Skip controller refresh here for speed; queued confirmation is enough.
             if show_embed:
-                # Show a compact "added to queue" confirmation embed.
-                try:
-                    await ctx.send(embed=self._make_queued_embed(meta))
-                except discord.HTTPException:
-                    log.warning("Could not send queued embed for guild %s", ctx.guild.id)
+                await ctx.send(embed=await self._build_now_playing_embed(ctx.guild.id, meta))
         return True
 
     async def _lastfm_similar_tracks(
@@ -1299,14 +1298,13 @@ class TidalPlayer(commands.Cog):
             autoplay_enabled=autoplay_enabled, paused=paused,
         )
 
+    def _make_queued_embed(self, meta: TrackMeta) -> discord.Embed:
+        from .ui.embeds import make_queue_embed
+        return make_queue_embed(meta)
+
     async def _build_now_playing_embed(self, guild_id: int, meta: TrackMeta) -> discord.Embed:
         enabled = await self.config.guild_from_id(guild_id).autoplay_enabled()
         return make_now_playing_embed(meta, enabled)
-
-    def _make_queued_embed(self, meta: TrackMeta) -> discord.Embed:
-        """Return a compact embed confirming a track was added to the queue."""
-        from .ui.embeds import make_queue_embed
-        return make_queue_embed(meta)
 
     def _controller_fallback_text(self, meta: TrackMeta) -> str:
         title = truncate(str(meta.get("title") or "Unknown"), 100)
@@ -1326,12 +1324,11 @@ class TidalPlayer(commands.Cog):
         except Exception:
             log.exception("Could not build controller view for guild %s", guild_id)
             return
-        # Always send a fresh now-playing/controller panel for a new track.
-        # Delete the stale previous panel first so only one panel exists at a time.
-        previous = self._controller_messages.pop(guild_id, None)
+        previous = self._controller_messages.get(guild_id)
         if previous is not None:
             try:
-                await previous.delete()
+                await previous.edit(view=view)
+                return
             except (discord.HTTPException, discord.Forbidden, discord.NotFound):
                 pass
         try:
@@ -1485,8 +1482,8 @@ class TidalPlayer(commands.Cog):
                 if not await self.config.guild_from_id(guild_id).autoplay_enabled():
                     return
                 queue = getattr(player, "queue", None)
-                if queue is not None and len(queue) > 0:
-                    log.info("Autoplay skipped for guild %s: queue already has %d tracks.", guild_id, len(queue))
+                if queue is not None and len(queue):
+                    log.info("Autoplay skipped for guild %s: queue is no longer empty.", guild_id)
                     return
                 meta = self._current_meta.get(guild_id)
                 if meta is None:
@@ -1747,7 +1744,7 @@ class TidalPlayer(commands.Cog):
                     queued += chunk_queued
                     skipped += chunk_skipped
                     current_count = min(chunk_start + len(chunk_items), total)
-                    if current_count - last_up >= BATCH_UPDATE_INTERVAL or current_count == total:
+                    if current_count == total:
                         upd = discord.Embed(
                             title=Messages.PROGRESS_QUEUEING.format(name=trunc_name, count=total),
                             description=Messages.SUCCESS_PARTIAL_QUEUE.format(
@@ -2037,28 +2034,15 @@ class TidalPlayer(commands.Cog):
 
     @commands.hybrid_command(name="tnowplaying")
     async def tnowplaying(self, ctx: commands.Context):
-        """Resend the now-playing controller panel."""
-        if ctx.guild is None:
-            return
-        guild_id = ctx.guild.id
-        meta = self._current_meta.get(guild_id)
+        """Show what's currently playing."""
+        meta = self._current_meta.get(ctx.guild.id) if ctx.guild else None
         if not meta:
             await ctx.send(embed=_error_embed(Messages.ERROR_NOT_PLAYING))
             return
-        # Delete the previous controller panel before resending.
-        previous = self._controller_messages.pop(guild_id, None)
-        if previous is not None:
-            try:
-                await previous.delete()
-            except (discord.HTTPException, discord.Forbidden, discord.NotFound):
-                pass
-        player = await self._get_player_for_guild(guild_id)
-        paused = bool(getattr(player, "paused", False)) if player else False
-        try:
-            view = await self._controller_view(guild_id, paused)
-            self._controller_messages[guild_id] = await ctx.send(view=view)
-        except discord.HTTPException:
-            log.exception("Could not resend controller message for guild %s", guild_id)
+        player = await self._get_player_for_guild(ctx.guild.id)
+        await ctx.send(view=await self._controller_view(
+            ctx.guild.id, bool(getattr(player, "paused", False)) if player else False
+        ))
 
     @commands.hybrid_command(name="tqueue")
     async def tqueue(self, ctx: commands.Context):
