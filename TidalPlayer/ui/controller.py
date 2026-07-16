@@ -143,7 +143,7 @@ class PlayerControllerView(discord.ui.LayoutView):
         await self.cog.controller_stop(interaction)
 
     async def _choose_suggestion(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer()
         select = next(
             item for item in self.walk_children()
             if isinstance(item, discord.ui.Select) and item.custom_id == "tidalplayer:v2:suggestions"
@@ -159,5 +159,5 @@ class PlayerControllerView(discord.ui.LayoutView):
             return
         queued = await self.cog.queue_recommendation(interaction, self.recommendations[index])
         await interaction.followup.send(
-            "Queued that suggested song." if queued else "Could not queue that suggestion.",
+            "Queued that suggested song." if queued else "Could not queue that suggestion."
         )

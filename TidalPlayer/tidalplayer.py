@@ -924,6 +924,12 @@ class TidalPlayer(commands.Cog):
         self._last_progress_edit.pop(guild.id, None)
 
     @commands.Cog.listener()
+    async def on_red_audio_track_start(self, guild: discord.Guild, track: Any, requester: Any) -> None:
+        guild_id = guild.id
+        self._advance_queue_state(guild_id)
+        await self._refresh_controller(guild_id)
+
+    @commands.Cog.listener()
     async def on_red_audio_queue_end(
         self,
         guild: discord.Guild,
@@ -1222,6 +1228,14 @@ class TidalPlayer(commands.Cog):
             track for track in fallback
             if str(getattr(track, "id", "") or "") not in seen_ids
         ][:25]
+    def _advance_queue_state(self, guild_id: int) -> None:
+        queued = self._queued_meta.get(guild_id)
+        if queued:
+            meta = queued.popleft()
+            self._current_meta[guild_id] = meta
+            self._controller_meta[guild_id] = meta
+            self._remember_track(guild_id, meta)
+
     async def _controller_view(
         self, guild_id: int, paused: bool = False,
     ) -> PlayerControllerView:
@@ -1284,14 +1298,12 @@ class TidalPlayer(commands.Cog):
         paused = bool(getattr(player, "paused", False)) if player else False
         view = await self._controller_view(guild_id, paused)
         if interaction is not None and not interaction.response.is_done():
-            await interaction.response.edit_message(
-                content=None, embed=None, embeds=[], attachments=[], view=view,
-            )
+            await interaction.response.edit_message(view=view)
             if interaction.message is not None:
                 self._controller_messages[guild_id] = interaction.message
         elif (message := self._controller_messages.get(guild_id)) is not None:
             try:
-                await message.edit(content=None, embed=None, embeds=[], attachments=[], view=view)
+                await message.edit(view=view)
             except (discord.HTTPException, discord.Forbidden, discord.NotFound):
                 pass
 
