@@ -817,7 +817,7 @@ class TidalPlayer(commands.Cog):
         "bot", "config", "tidal", "sp", "yt", "_tasks", "_guild_locks",
         "_cancel_events", "_last_progress_edit", "_initialized", "_current_meta", "audio", "tokens",
         "_controller_messages", "_controller_meta", "_recent_track_ids", "_autoplay_tasks", "_autoplay_next_meta",
-        "_controller_last_refresh",
+        "_controller_last_refresh", "_queued_meta",
     )
 
     def __init__(self, bot: Red):
@@ -841,6 +841,7 @@ class TidalPlayer(commands.Cog):
         self._autoplay_tasks: Dict[int, asyncio.Task[None]] = {}
         self._autoplay_next_meta: Dict[int, TrackMeta] = {}
         self._controller_last_refresh: Dict[int, float] = {}
+        self._queued_meta: Dict[int, Deque[TrackMeta]] = defaultdict(lambda: deque(maxlen=25))
         self._initialized: bool = False
 
     async def cog_load(self) -> None:
@@ -1117,12 +1118,16 @@ class TidalPlayer(commands.Cog):
                 continue
             track, stream_url, meta = res
             loaded_track = None
-            try:
-                results = await player.load_tracks(stream_url)
-                if results and results.tracks:
-                    loaded_track = results.tracks[0]
-            except Exception as e:
-                log.error(f"Lavalink load failed: {e}")
+            for attempt in range(2):
+                try:
+                    results = await player.load_tracks(stream_url)
+                    if results and results.tracks:
+                        loaded_track = results.tracks[0]
+                        break
+                except Exception as e:
+                    log.error("Lavalink load failed: %r", e)
+                if attempt == 0:
+                    await asyncio.sleep(0.2)
             if loaded_track:
                 loaded_track.title = truncate(meta["title"], 100)
                 loaded_track.author = (
@@ -1134,7 +1139,9 @@ class TidalPlayer(commands.Cog):
                     started_playback = True
                     self._current_meta[ctx.guild.id] = meta
                 else:
-                    self._queued_meta[ctx.guild.id].append(meta)
+                    queued_meta = getattr(self, "_queued_meta", None)
+            if queued_meta is not None:
+                queued_meta[ctx.guild.id].append(meta)
                 queued += 1
             else:
                 skipped += 1
@@ -1157,12 +1164,16 @@ class TidalPlayer(commands.Cog):
         stream_url = await self.tidal.get_stream_url(tidal_track)
         loaded_track = None
         if stream_url:
-            try:
-                results = await player.load_tracks(stream_url)
-                if results and results.tracks:
-                    loaded_track = results.tracks[0]
-            except Exception as e:
-                log.error(f"Lavalink load failed: {e}")
+            for attempt in range(2):
+                try:
+                    results = await player.load_tracks(stream_url)
+                    if results and results.tracks:
+                        loaded_track = results.tracks[0]
+                        break
+                except Exception as e:
+                    log.error("Lavalink load failed: %r", e)
+                if attempt == 0:
+                    await asyncio.sleep(0.35)
         if not loaded_track:
             await ctx.send(embed=_error_embed(Messages.ERROR_LAVALINK_FAILED))
             return False
@@ -1181,7 +1192,9 @@ class TidalPlayer(commands.Cog):
             if show_embed:
                 await self._send_now_playing(ctx, meta)
         else:
-            self._queued_meta[ctx.guild.id].append(meta)
+            queued_meta = getattr(self, "_queued_meta", None)
+            if queued_meta is not None:
+                queued_meta[ctx.guild.id].append(meta)
             refresh = getattr(self, "_refresh_controller", None)
             if callable(refresh):
                 task = asyncio.create_task(refresh(ctx.guild.id))
