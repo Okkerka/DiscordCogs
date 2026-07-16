@@ -839,7 +839,7 @@ class TidalPlayer(commands.Cog):
         self._recent_track_ids: Dict[int, Deque[str]] = defaultdict(lambda: deque(maxlen=50))
         self._autoplay_tasks: Dict[int, asyncio.Task[None]] = {}
         self._autoplay_next_meta: Dict[int, TrackMeta] = {}
-        self._queued_meta: Dict[int, Deque[TrackMeta]] = defaultdict(deque)
+        self._queued_meta: Dict[int, Deque[TrackMeta]] = defaultdict(lambda: deque(maxlen=10))
         self._initialized: bool = False
 
     async def cog_load(self) -> None:
@@ -1048,6 +1048,25 @@ class TidalPlayer(commands.Cog):
 
     def _format_duration(self, seconds: int) -> str:
         return format_duration(seconds)
+
+    def _queued_count(self, player: Any) -> int:
+        queue = getattr(player, "queue", None)
+        if queue is None:
+            return 0
+        try:
+            return len(queue)
+        except Exception:
+            return 0
+
+    def _advance_queue_state(self, guild_id: int) -> None:
+        queued = self._queued_meta.get(guild_id)
+        if queued:
+            meta = queued.popleft()
+            self._current_meta[guild_id] = meta
+            self._controller_meta[guild_id] = meta
+            track_id = str(meta.get("track_id") or "")
+            if track_id:
+                self._recent_track_ids[guild_id].append(track_id)
 
     async def _get_player(self, ctx: commands.Context, connect: bool = False) -> Optional[Any]:
         if not self.audio.available or not ctx.guild:

@@ -34,7 +34,7 @@ class PlayerControllerView(discord.ui.LayoutView):
         super().__init__(timeout=None)
         self.cog = cog
         self.meta = meta or {}
-        self.recommendations = list(recommendations)[:25]
+        self.recommendations = list(recommendations)[:10]
         self.autoplay_enabled = autoplay_enabled
         self.paused = paused
         self.next_up = next_up or {}
@@ -157,7 +157,4 @@ class PlayerControllerView(discord.ui.LayoutView):
                 "These suggestions expired. Play a track again to refresh them."
             )
             return
-        queued = await self.cog.queue_recommendation(interaction, self.recommendations[index])
-        await interaction.followup.send(
-            "Queued that suggested song." if queued else "Could not queue that suggestion."
-        )
+        await self.cog.queue_recommendation(interaction, self.recommendations[index])
