@@ -1071,6 +1071,23 @@ class TidalPlayer(commands.Cog):
     def _format_duration(self, seconds: int) -> str:
         return format_duration(seconds)
 
+    def _format_track_embed(self, meta: TrackMeta, title: str = "Track") -> discord.Embed:
+        artist = meta.get("artist") or "Unknown"
+        album = meta.get("album") or "Unknown"
+        length = self._format_duration(int(meta.get("duration", 0) or 0))
+        track_title = truncate(str(meta.get("title") or "Unknown"), 100)
+        description = f"**{track_title}**\nby {artist}"
+        embed = discord.Embed(title=title, description=description, color=COLOR_BLUE)
+        embed.add_field(name="Album", value=truncate(str(album), 100), inline=True)
+        embed.add_field(name="Duration", value=length, inline=True)
+        url = meta.get("url")
+        if url:
+            embed.url = str(url)
+        image = meta.get("image")
+        if image:
+            embed.set_thumbnail(url=str(image))
+        return embed
+
     async def _get_player(self, ctx: commands.Context, connect: bool = False) -> Optional[Any]:
         if not self.audio.available or not ctx.guild:
             return None
@@ -1118,16 +1135,12 @@ class TidalPlayer(commands.Cog):
                 continue
             track, stream_url, meta = res
             loaded_track = None
-            for attempt in range(2):
-                try:
-                    results = await player.load_tracks(stream_url)
-                    if results and results.tracks:
-                        loaded_track = results.tracks[0]
-                        break
-                except Exception as e:
-                    log.error("Lavalink load failed: %r", e)
-                if attempt == 0:
-                    await asyncio.sleep(0.2)
+            try:
+                results = await player.load_tracks(stream_url)
+                if results and results.tracks:
+                    loaded_track = results.tracks[0]
+            except Exception as e:
+                log.error(f"Lavalink load failed: {e}")
             if loaded_track:
                 loaded_track.title = truncate(meta["title"], 100)
                 loaded_track.author = (
@@ -1139,9 +1152,7 @@ class TidalPlayer(commands.Cog):
                     started_playback = True
                     self._current_meta[ctx.guild.id] = meta
                 else:
-                    queued_meta = getattr(self, "_queued_meta", None)
-            if queued_meta is not None:
-                queued_meta[ctx.guild.id].append(meta)
+                    self._queued_meta[ctx.guild.id].append(meta)
                 queued += 1
             else:
                 skipped += 1
@@ -1164,16 +1175,12 @@ class TidalPlayer(commands.Cog):
         stream_url = await self.tidal.get_stream_url(tidal_track)
         loaded_track = None
         if stream_url:
-            for attempt in range(2):
-                try:
-                    results = await player.load_tracks(stream_url)
-                    if results and results.tracks:
-                        loaded_track = results.tracks[0]
-                        break
-                except Exception as e:
-                    log.error("Lavalink load failed: %r", e)
-                if attempt == 0:
-                    await asyncio.sleep(0.35)
+            try:
+                results = await player.load_tracks(stream_url)
+                if results and results.tracks:
+                    loaded_track = results.tracks[0]
+            except Exception as e:
+                log.error(f"Lavalink load failed: {e}")
         if not loaded_track:
             await ctx.send(embed=_error_embed(Messages.ERROR_LAVALINK_FAILED))
             return False
@@ -1192,9 +1199,7 @@ class TidalPlayer(commands.Cog):
             if show_embed:
                 await self._send_now_playing(ctx, meta)
         else:
-            queued_meta = getattr(self, "_queued_meta", None)
-            if queued_meta is not None:
-                queued_meta[ctx.guild.id].append(meta)
+            self._queued_meta[ctx.guild.id].append(meta)
             refresh = getattr(self, "_refresh_controller", None)
             if callable(refresh):
                 task = asyncio.create_task(refresh(ctx.guild.id))
