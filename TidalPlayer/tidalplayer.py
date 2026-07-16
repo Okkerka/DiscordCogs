@@ -839,6 +839,7 @@ class TidalPlayer(commands.Cog):
         self._recent_track_ids: Dict[int, Deque[str]] = defaultdict(lambda: deque(maxlen=50))
         self._autoplay_tasks: Dict[int, asyncio.Task[None]] = {}
         self._autoplay_next_meta: Dict[int, TrackMeta] = {}
+        self._queued_meta: Dict[int, Deque[TrackMeta]] = defaultdict(deque)
         self._initialized: bool = False
 
     async def cog_load(self) -> None:
@@ -875,6 +876,7 @@ class TidalPlayer(commands.Cog):
         self._controller_meta.clear()
         self._recent_track_ids.clear()
         self._autoplay_next_meta.clear()
+        self._queued_meta.clear()
         self._current_meta.clear()
         self._last_progress_edit.clear()
         log.info("TidalPlayer cog unloaded")
@@ -917,6 +919,7 @@ class TidalPlayer(commands.Cog):
         self._controller_meta.pop(guild.id, None)
         self._recent_track_ids.pop(guild.id, None)
         self._autoplay_next_meta.pop(guild.id, None)
+        self._queued_meta.pop(guild.id, None)
         self._current_meta.pop(guild.id, None)
         self._last_progress_edit.pop(guild.id, None)
 
@@ -1134,12 +1137,17 @@ class TidalPlayer(commands.Cog):
             return False
         loaded_track.title = truncate(meta["title"], 100)
         loaded_track.author = f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
+        was_idle = not getattr(player, "current", None)
         player.add(ctx.author, loaded_track)
-        if not player.current:
+        if was_idle:
+            self._current_meta[ctx.guild.id] = meta
+            if show_embed:
+                await self._send_now_playing(ctx, meta)
             await player.play()
-        self._current_meta[ctx.guild.id] = meta
-        if show_embed:
-            await self._send_now_playing(ctx, meta)
+        else:
+            self._queued_meta[ctx.guild.id].append(meta)
+            await self._refresh_controller(ctx.guild.id)
+            await ctx.send(embed=_success_embed(f"Track Enqueued\n**{meta['title']}** — {meta['artist']}"))
         return True
 
     async def _lastfm_similar_tracks(
@@ -1223,6 +1231,7 @@ class TidalPlayer(commands.Cog):
         return PlayerControllerView(
             self, meta=meta, recommendations=recommendations,
             autoplay_enabled=autoplay_enabled, paused=paused,
+            next_up=(self._queued_meta[guild_id][0] if self._queued_meta.get(guild_id) else None),
         )
 
     async def _build_now_playing_embed(self, guild_id: int, meta: TrackMeta) -> discord.Embed:
@@ -1356,6 +1365,8 @@ class TidalPlayer(commands.Cog):
             loaded.title = truncate(meta["title"], 100)
             loaded.author = f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
             player.add(interaction.user, loaded)
+            self._queued_meta[guild_id].append(meta)
+            await self._refresh_controller(guild_id)
             log.info("Queued suggested Tidal track %s in guild %s", selected_id, guild_id)
             return True
         except Exception:

@@ -29,6 +29,7 @@ class PlayerControllerView(discord.ui.LayoutView):
         recommendations: Sequence[Any] = (),
         autoplay_enabled: bool = False,
         paused: bool = False,
+        next_up: "TrackMeta | None" = None,
     ) -> None:
         super().__init__(timeout=None)
         self.cog = cog
@@ -36,6 +37,7 @@ class PlayerControllerView(discord.ui.LayoutView):
         self.recommendations = list(recommendations)[:25]
         self.autoplay_enabled = autoplay_enabled
         self.paused = paused
+        self.next_up = next_up or {}
         self._build_layout()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -67,6 +69,10 @@ class PlayerControllerView(discord.ui.LayoutView):
         )
         if tidal_url:
             info += f"\n[Open in TIDAL]({tidal_url})"
+        next_title = str(self.next_up.get("title") or "")
+        next_artist = str(self.next_up.get("artist") or "")
+        if next_title:
+            info += f"\n\n**Next up:** {next_title} — {next_artist or 'Unknown artist'}"
 
         container = discord.ui.Container(accent_colour=discord.Colour.blue())
         if image_url:
@@ -137,22 +143,21 @@ class PlayerControllerView(discord.ui.LayoutView):
         await self.cog.controller_stop(interaction)
 
     async def _choose_suggestion(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.response.defer(thinking=True)
         select = next(
             item for item in self.walk_children()
             if isinstance(item, discord.ui.Select) and item.custom_id == "tidalplayer:v2:suggestions"
         )
         if not select.values or select.values[0] == "none":
-            await interaction.followup.send("No suggestion was selected.", ephemeral=True)
+            await interaction.followup.send("No suggestion was selected.")
             return
         index = int(select.values[0])
         if index >= len(self.recommendations):
             await interaction.followup.send(
-                "These suggestions expired. Play a track again to refresh them.", ephemeral=True
+                "These suggestions expired. Play a track again to refresh them."
             )
             return
         queued = await self.cog.queue_recommendation(interaction, self.recommendations[index])
         await interaction.followup.send(
             "Queued that suggested song." if queued else "Could not queue that suggestion.",
-            ephemeral=True,
         )
