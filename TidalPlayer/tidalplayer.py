@@ -172,7 +172,7 @@ class TrackSelectView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author.id:
             await interaction.response.send_message("Not your selection.", ephemeral=True)
-            return False
+            return None
         return True
 
     def _disable_all(self) -> None:
@@ -319,7 +319,7 @@ class TidalHandler:
 
     async def refresh_tokens(self, force: bool = False) -> bool:
         if not self.session:
-            return False
+            return None
         async with self._refresh_lock:
             now = asyncio.get_running_loop().time()
             if not force and self._last_refresh_ts and (now - self._last_refresh_ts) < TOKEN_REFRESH_MIN_INTERVAL:
@@ -357,7 +357,7 @@ class TidalHandler:
                 log.error(f"Token refresh failed: {e}")
                 self._login_cache = False
                 self._login_cache_time = now
-                return False
+                return None
 
     def start_refresh_loop(self) -> None:
         if self._refresh_task:
@@ -375,7 +375,7 @@ class TidalHandler:
 
     async def is_logged_in(self) -> bool:
         if not self.session:
-            return False
+            return None
         now = asyncio.get_running_loop().time()
         if self._login_cache is not None and (now - self._login_cache_time) < LOGIN_CACHE_TTL:
             return self._login_cache
@@ -392,7 +392,7 @@ class TidalHandler:
             except Exception:
                 self._login_cache = False
                 self._login_cache_time = asyncio.get_running_loop().time()
-                return False
+                return None
         return self._login_cache if self._login_cache is not None else False
 
     async def _auto_refresh_tokens(self) -> None:
@@ -671,7 +671,7 @@ class TidalHandler:
 
     async def add_track_to_playlist(self, playlist: Any, track_id: int) -> bool:
         if not playlist or not hasattr(playlist, "add"):
-            return False
+            return None
         async with self.api_semaphore:
             try:
                 await self._run_with_backoff(lambda: playlist.add([track_id]), timeout=10.0)
@@ -1212,7 +1212,7 @@ class TidalPlayer(commands.Cog):
             self._queued_meta[ctx.guild.id].append(meta)
             # Skip controller refresh here for speed; queued confirmation is enough.
             if show_embed:
-                await ctx.send(embed=await self._build_now_playing_embed(ctx.guild.id, meta))
+                await ctx.send(embed=self._make_queued_embed(meta))
         return True
 
     async def _lastfm_similar_tracks(
@@ -1303,6 +1303,8 @@ class TidalPlayer(commands.Cog):
         return make_queue_embed(meta)
 
     async def _build_now_playing_embed(self, guild_id: int, meta: TrackMeta) -> discord.Embed:
+        # Legacy compact now-playing embed path kept only as a fallback.
+        # Main flow should use the controller panel instead.
         enabled = await self.config.guild_from_id(guild_id).autoplay_enabled()
         return make_now_playing_embed(meta, enabled)
 
@@ -1429,18 +1431,18 @@ class TidalPlayer(commands.Cog):
             embed=None, embeds=[], attachments=[], view=None,
         )
 
-    async def queue_recommendation(self, interaction: discord.Interaction, tidal_track: Any) -> bool:
+    async def queue_recommendation(self, interaction: discord.Interaction, tidal_track: Any) -> discord.Embed | None:
         if interaction.guild is None:
-            return False
+            return None
         guild_id = interaction.guild.id
         player = await self._get_player_for_guild(guild_id)
         if player is None:
-            return False
+            return None
         selected_id = str(getattr(tidal_track, "id", "") or "")
         current_id = str((self._current_meta.get(guild_id) or {}).get("track_id") or "")
         if not selected_id or selected_id == current_id:
             log.warning("Refused duplicate suggested track %s in guild %s", selected_id, guild_id)
-            return False
+            return None
         try:
             meta = await self._extract_meta(tidal_track, skip_audio_res=True)
             stream_url = await self.tidal.get_stream_url(tidal_track)

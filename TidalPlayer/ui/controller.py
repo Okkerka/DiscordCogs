@@ -157,7 +157,8 @@ class PlayerControllerView(discord.ui.LayoutView):
                 "These suggestions expired. Play a track again to refresh them."
             )
             return
-        queued = await self.cog.queue_recommendation(interaction, self.recommendations[index])
-        await interaction.followup.send(
-            "Queued that suggested song." if queued else "Could not queue that suggestion."
-        )
+        embed = await self.cog.queue_recommendation(interaction, self.recommendations[index])
+        if embed is not None:
+            await interaction.followup.send(embed=embed)
+        else:
+            await interaction.followup.send("Could not queue that suggestion.")
