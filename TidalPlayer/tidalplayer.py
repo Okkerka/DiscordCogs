@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from urllib.parse import urlencode
+from urllib.request import urlopen
 from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -1140,38 +1142,78 @@ class TidalPlayer(commands.Cog):
             await self._send_now_playing(ctx, meta)
         return True
 
-    async def _radio_candidates(self, guild_id: int, meta: TrackMeta) -> List[Any]:
-        track_id = str(meta.get("track_id") or "")
-        if not track_id:
-            log.warning("Suggestions unavailable: current track has no Tidal ID.")
+    async def _lastfm_similar_tracks(
+        self, artist: str, title: str, limit: int = 25,
+    ) -> List[Tuple[str, str]]:
+        """Get similar track names from Last.fm's public read-only API."""
+        tokens = await self.bot.get_shared_api_tokens("lastfm")
+        api_key = tokens.get("api_key")
+        if not api_key or not artist or not title:
             return []
-        seen = set(self._recent_track_ids[guild_id])
-        seen.add(track_id)
-        tracks = await self.tidal.get_track_radio(track_id)
-        if not tracks:
-            try:
-                source_track = await self.tidal.get_track(track_id)
-                artist_id = getattr(getattr(source_track, "artist", None), "id", None)
-                if artist_id and self.tidal.session is not None:
-                    def fetch_artist_radio() -> Any:
-                        method = getattr(self.tidal.session, "get_artist_radio", None)
-                        if not callable(method):
-                            raise RuntimeError("Installed tidalapi exposes no Artist Radio method")
-                        return method(artist_id)
-                    result = await self.tidal._run_with_backoff(fetch_artist_radio, timeout=20.0)
-                    tracks = list(result) if isinstance(result, (list, tuple)) else list(
-                        getattr(result, "tracks", None) or getattr(result, "items", None) or []
-                    )
-                    log.info("Artist Radio fallback returned %s candidate(s) for artist %s.", len(tracks), artist_id)
-            except Exception as error:
-                log.exception("Artist Radio fallback failed for Tidal track %s: %r", track_id, error)
-                tracks = []
-        candidates = [
-            track for track in tracks
-            if getattr(track, "id", None) and str(getattr(track, "id", "")) not in seen
+        params = urlencode({
+            "method": "track.getsimilar", "artist": artist, "track": title,
+            "limit": limit, "autocorrect": 1, "api_key": api_key, "format": "json",
+        })
+        url = f"https://ws.audioscrobbler.com/2.0/?{params}"
+        try:
+            def fetch() -> Dict[str, Any]:
+                import json
+                with urlopen(url, timeout=15) as response:
+                    return json.load(response)
+            payload = await self.tidal._run_blocking(fetch, timeout=20.0)
+            entries = payload.get("similartracks", {}).get("track", [])
+            if isinstance(entries, dict):
+                entries = [entries]
+            return [
+                (str(item.get("artist", {}).get("name", "")).strip(), str(item.get("name", "")).strip())
+                for item in entries
+                if item.get("artist", {}).get("name") and item.get("name")
+            ]
+        except Exception as error:
+            log.warning("Last.fm similar-track lookup failed for %s — %s: %r", artist, title, error)
+            return []
+
+    async def _radio_candidates(self, guild_id: int, meta: TrackMeta) -> List[Any]:
+        """Resolve Last.fm similar tracks to Tidal catalog tracks."""
+        current_id = str(meta.get("track_id") or "")
+        current_title = str(meta.get("title") or "").casefold().strip()
+        current_artist = str(meta.get("artist") or "").casefold().strip()
+        seen_ids = set(self._recent_track_ids[guild_id])
+        if current_id:
+            seen_ids.add(current_id)
+        pairs = await self._lastfm_similar_tracks(
+            str(meta.get("artist") or ""), str(meta.get("title") or ""), limit=25,
+        )
+        candidates: List[Any] = []
+        used_ids: Set[str] = set()
+        for artist, title in pairs:
+            results = await self.tidal.search(f"{artist} {title}", filter_remixes=False)
+            if not results:
+                continue
+            track = select_best_tidal_track(f"{artist} {title}", results) or results[0]
+            track_id = str(getattr(track, "id", "") or "")
+            found_title = str(getattr(track, "name", "") or "").casefold().strip()
+            found_artist = str(getattr(getattr(track, "artist", None), "name", "") or "").casefold().strip()
+            if not track_id or track_id in seen_ids or track_id in used_ids:
+                continue
+            if found_title == current_title and found_artist == current_artist:
+                continue
+            used_ids.add(track_id)
+            candidates.append(track)
+            if len(candidates) >= 25:
+                break
+        if candidates:
+            log.info("Last.fm produced %s Tidal suggestion(s) for guild %s.", len(candidates), guild_id)
+            return candidates
+        log.info("Last.fm returned no usable Tidal matches; using Tidal search fallback.")
+        fallback = await self.tidal.search(
+            f"{meta.get('artist', '')} {meta.get('title', '')}".strip(),
+            filter_remixes=False,
+        )
+        return [
+            track for track in fallback
+            if str(getattr(track, "id", "") or "") not in seen_ids
         ][:25]
-        log.info("Suggestions prepared for guild %s: %s candidate(s).", guild_id, len(candidates))
-        return candidates
     async def _controller_view(
         self, guild_id: int, paused: bool = False,
     ) -> PlayerControllerView:
