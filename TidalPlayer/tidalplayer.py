@@ -953,6 +953,21 @@ class TidalPlayer(commands.Cog):
         if player is not None and not self._has_playback(player):
             self._schedule_autoplay(guild_id, player)
 
+    async def check_ready(self, ctx: commands.Context) -> bool:
+        if not self._initialized:
+            await ctx.send(embed=_error_embed(Messages.ERROR_STILL_LOADING))
+            return False
+        if not self.audio or not self.audio.available:
+            await ctx.send(embed=_error_embed(Messages.ERROR_NO_AUDIO_COG))
+            return False
+        if not await self.tidal.is_logged_in():
+            await ctx.send(embed=_error_embed(Messages.ERROR_NOT_AUTHENTICATED))
+            return False
+        return True
+
+    async def _check_ready(self, ctx: commands.Context) -> bool:
+        return await self.check_ready(ctx)
+
     async def _initialize_apis(self) -> None:
         t0 = asyncio.get_running_loop().time()
         snapshot = await self.tokens.restore()
@@ -1278,7 +1293,7 @@ class TidalPlayer(commands.Cog):
     @commands.hybrid_command(name="tplay")
     async def tplay(self, ctx: commands.Context, *, query: str):
         """Play a Tidal track, album, playlist, mix, Spotify link, YouTube playlist, or search query."""
-        if not await self._check_ready(ctx):
+        if not await self.check_ready(ctx):
             return
         try:
             provider_url = parse_provider_url(query)
@@ -1428,7 +1443,7 @@ class TidalPlayer(commands.Cog):
     @commands.hybrid_command(name="tsearch")
     async def tsearch(self, ctx: commands.Context, *, query: str):
         """Search Tidal and choose from top results."""
-        if not await self._check_ready(ctx):
+        if not await self.check_ready(ctx):
             return
         filter_remixes = await self.config.guild(ctx.guild).filter_remixes()
         results = await self.tidal.search(query, filter_remixes=filter_remixes)
@@ -1454,7 +1469,7 @@ class TidalPlayer(commands.Cog):
     @commands.hybrid_command(name="tqueue")
     async def tqueue(self, ctx: commands.Context):
         """Show the current queue."""
-        if not await self._check_ready(ctx):
+        if not await self.check_ready(ctx):
             return
         player = await self._get_player(ctx)
         if not player:
@@ -1516,7 +1531,7 @@ class TidalPlayer(commands.Cog):
     @tpl.command(name="list")
     async def tpl_list(self, ctx: commands.Context):
         """List your Tidal playlists."""
-        if not await self._check_ready(ctx):
+        if not await self.check_ready(ctx):
             return
         playlists = await self.tidal.get_user_playlists()
         if not playlists:
@@ -1543,7 +1558,7 @@ class TidalPlayer(commands.Cog):
     @tpl.command(name="create")
     async def tpl_create(self, ctx: commands.Context, *, name: str):
         """Create a new Tidal playlist."""
-        if not await self._check_ready(ctx):
+        if not await self.check_ready(ctx):
             return
         pl = await self.tidal.create_user_playlist(name)
         if pl:
@@ -1554,7 +1569,7 @@ class TidalPlayer(commands.Cog):
     @tpl.command(name="add")
     async def tpl_add(self, ctx: commands.Context, playlist_id: str, *, query: str):
         """Add a track (by search or ISRC) to one of your playlists."""
-        if not await self._check_ready(ctx):
+        if not await self.check_ready(ctx):
             return
         pl = await self.tidal.get_user_playlist_by_id(playlist_id)
         if not pl:
@@ -1585,7 +1600,7 @@ class TidalPlayer(commands.Cog):
     @tpl.command(name="remove")
     async def tpl_remove(self, ctx: commands.Context, playlist_id: str, track_id: int):
         """Remove a track by ID from one of your playlists."""
-        if not await self._check_ready(ctx):
+        if not await self.check_ready(ctx):
             return
         pl = await self.tidal.get_user_playlist_by_id(playlist_id)
         if not pl:
@@ -1600,7 +1615,7 @@ class TidalPlayer(commands.Cog):
     @tpl.command(name="play")
     async def tpl_play(self, ctx: commands.Context, playlist_id: str):
         """Queue one of your Tidal playlists."""
-        if not await self._check_ready(ctx):
+        if not await self.check_ready(ctx):
             return
         pl = await self.tidal.get_user_playlist_by_id(playlist_id)
         if not pl:
