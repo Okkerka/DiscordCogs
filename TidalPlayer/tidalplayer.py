@@ -1296,22 +1296,29 @@ class TidalPlayer(commands.Cog):
         enabled = await self.config.guild_from_id(guild_id).autoplay_enabled()
         return make_now_playing_embed(meta, enabled)
 
+    def _controller_fallback_text(self, meta: TrackMeta) -> str:
+        title = truncate(str(meta.get("title") or "Unknown"), 100)
+        artist = str(meta.get("artist") or "Unknown")
+        album = str(meta.get("album") or "Unknown")
+        duration = self._format_duration(int(meta.get("duration", 0) or 0))
+        return f"Now playing: **{title}**\nArtist: {artist}\nAlbum: {album}\nDuration: {duration}"
+
     async def _send_now_playing(self, ctx: commands.Context, meta: TrackMeta) -> None:
         if ctx.guild is None:
             return
         guild_id = ctx.guild.id
         self._controller_meta[guild_id] = meta
         self._remember_track(guild_id, meta)
-        embed = await self._controller_embed(guild_id)
+        fallback_text = self._controller_fallback_text(meta)
         view = await self._controller_view(guild_id)
         previous = self._controller_messages.get(guild_id)
         if previous is not None:
             try:
-                await previous.edit(content=None, embed=embed, view=view)
+                await previous.edit(content=fallback_text, view=view)
                 return
             except (discord.HTTPException, discord.Forbidden, discord.NotFound):
                 pass
-        self._controller_messages[guild_id] = await ctx.send(embed=embed, view=view)
+        self._controller_messages[guild_id] = await ctx.send(fallback_text, view=view)
 
     def _remember_track(self, guild_id: int, meta: TrackMeta) -> None:
         track_id = str(meta.get("track_id") or "")
@@ -1348,18 +1355,17 @@ class TidalPlayer(commands.Cog):
             self._controller_last_refresh[guild_id] = now
         player = await self._get_player_for_guild(guild_id)
         paused = bool(getattr(player, "paused", False)) if player else False
-        embed = await self._controller_embed(guild_id)
         view = await self._controller_view(guild_id, paused)
         if interaction is not None and not interaction.response.is_done():
             await interaction.response.edit_message(
-                content=None, embed=embed, embeds=[], attachments=[], view=view,
+                content=None, embed=None, embeds=[], attachments=[], view=view,
             )
             if interaction.message is not None:
                 self._controller_messages[guild_id] = interaction.message
             self._controller_last_refresh[guild_id] = now
         elif (message := self._controller_messages.get(guild_id)) is not None:
             try:
-                await message.edit(content=None, embed=embed, embeds=[], attachments=[], view=view)
+                await message.edit(content=None, embed=None, embeds=[], attachments=[], view=view)
             except (discord.HTTPException, discord.Forbidden, discord.NotFound):
                 pass
 
@@ -1510,13 +1516,23 @@ class TidalPlayer(commands.Cog):
             loaded.title = truncate(meta["title"], 100)
             loaded.author = f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
             guild = self.bot.get_guild(guild_id)
+            queue = getattr(player, "queue", None)
             player.add(guild.me if guild is not None else None, loaded)
-            await player.play()
-            self._current_meta[guild_id] = meta
-            self._controller_meta[guild_id] = meta
-            self._remember_track(guild_id, meta)
-            await self._refresh_controller(guild_id)
-            log.info("Autoplay started Tidal track %s in guild %s", selected_id, guild_id)
+            try:
+                is_idle = not bool(getattr(player, "current", None)) and (len(queue) == 0 if queue is not None else True)
+            except Exception:
+                is_idle = not bool(getattr(player, "current", None))
+            if is_idle:
+                await player.play()
+                self._current_meta[guild_id] = meta
+                self._controller_meta[guild_id] = meta
+                self._remember_track(guild_id, meta)
+                await self._refresh_controller(guild_id)
+                log.info("Autoplay started Tidal track %s in guild %s", selected_id, guild_id)
+            else:
+                self._queued_meta[guild_id].append(meta)
+                await self._refresh_controller(guild_id)
+                log.info("Autoplay queued Tidal track %s in guild %s", selected_id, guild_id)
             return True
         except Exception:
             log.exception("Autoplay could not queue Tidal track %s in guild %s", selected_id, guild_id)
