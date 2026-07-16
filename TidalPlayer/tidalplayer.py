@@ -1130,14 +1130,25 @@ class TidalPlayer(commands.Cog):
             if str(getattr(track, "id", "")) not in seen
         ]
 
-        async def _controller_view(
+            async def _controller_view(
         self,
         guild_id: int,
         paused: bool = False,
     ) -> PlayerControllerView:
-        meta = self._controller_meta.get(guild_id) or self._current_meta.get(guild_id)
-        recommendations = await self._radio_candidates(guild_id, meta) if meta else []
-        autoplay_enabled = await self.config.guild_from_id(guild_id).autoplay_enabled()
+        meta = (
+            self._controller_meta.get(guild_id)
+            or self._current_meta.get(guild_id)
+        )
+
+        recommendations = (
+            await self._radio_candidates(guild_id, meta)
+            if meta
+            else []
+        )
+
+        autoplay_enabled = await self.config.guild_from_id(
+            guild_id
+        ).autoplay_enabled()
 
         return PlayerControllerView(
             self,
