@@ -28,7 +28,7 @@ class Messages:
     ERROR_INVALID_URL = "Invalid {platform} {content_type} URL"
     ERROR_CONTENT_UNAVAILABLE = "Content unavailable (private/region-locked)"
     ERROR_LAVALINK_FAILED = "Playback failed: Could not retrieve Tidal stream."
-    ERROR_STILL_LOADING = "\u23f3 TidalPlayer is still initializing, please wait a moment."
+    ERROR_STILL_LOADING = "⏳ TidalPlayer is still initializing, please wait a moment."
     ERROR_NOT_PLAYING = "Nothing is currently playing."
     STATUS_PLAYING = "Playing from Tidal"
     PROGRESS_QUEUEING = "Queueing {name} ({count} tracks)..."
@@ -75,7 +75,6 @@ def make_now_playing_embed(meta: TrackMeta, autoplay_enabled: bool) -> discord.E
         embed.set_thumbnail(url=meta["image"])
     return embed
 
-
 def make_queue_embed(meta: TrackMeta) -> discord.Embed:
     """Compact embed shown when a track is added to the queue (not the first track)."""
     title = str(meta.get("title") or "Unknown track")
@@ -99,3 +98,4 @@ def make_queue_embed(meta: TrackMeta) -> discord.Embed:
     if meta.get("image"):
         embed.set_thumbnail(url=meta["image"])
     return embed
+
