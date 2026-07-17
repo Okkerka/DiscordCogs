@@ -61,34 +61,34 @@ def success_embed(message: str) -> discord.Embed:
     return discord.Embed(description=message, color=COLOR_GREEN)
 
 
-def make_now_playing_embed(meta: TrackMeta, autoplay_enabled: bool) -> discord.Embed:
+def make_now_playing_embed(meta: TrackMeta, autoplay_enabled: bool = False) -> discord.Embed:
     description = [f"**{meta['title']}**", meta["artist"]]
     if meta.get("album"):
         description.append(f"_{meta['album']}_")
     embed = discord.Embed(title=Messages.STATUS_PLAYING, description="\n".join(description), color=COLOR_BLUE)
     quality = meta.get("audio_resolution") or QUALITY_LABELS.get(meta["quality"], meta["quality"])
     embed.add_field(name="Quality", value=quality, inline=True)
-    embed.add_field(name="Open in TIDAL", value=f"[Listen]({meta['share_url']})" if meta.get("share_url") else "Unavailable", inline=True)
-    embed.add_field(name="Autoplay", value="On" if autoplay_enabled else "Off", inline=False)
+    if meta.get("share_url"):
+        embed.add_field(name="Open in TIDAL", value=f"[Listen]({meta['share_url']})", inline=True)
     embed.set_footer(text=f"Duration: {format_duration(meta['duration'])}")
     if meta.get("image"):
         embed.set_thumbnail(url=meta["image"])
     return embed
 
-def make_queue_embed(meta: TrackMeta) -> discord.Embed:
-    """Compact embed shown when a track is added to the queue (not the first track)."""
-    title = str(meta.get("title") or "Unknown track")
+def make_queue_embed(meta: TrackMeta, *, title: str = "Song added to the queue") -> discord.Embed:
+    """Compact embed shown when a track is added to the queue."""
+    track_title = str(meta.get("title") or "Unknown track")
     artist = str(meta.get("artist") or "Unknown artist")
     album = str(meta.get("album") or "")
     duration = format_duration(int(meta.get("duration") or 0))
     share_url = meta.get("share_url")
 
-    lines = [f"**{title}**", artist]
+    lines = [f"**{track_title}**", artist]
     if album:
         lines.append(f"_{album}_")
 
     embed = discord.Embed(
-        title="Song added to the queue",
+        title=title,
         description="\n".join(lines),
         color=COLOR_PURPLE,
     )
@@ -98,4 +98,3 @@ def make_queue_embed(meta: TrackMeta) -> discord.Embed:
     if meta.get("image"):
         embed.set_thumbnail(url=meta["image"])
     return embed
-
