@@ -1109,15 +1109,23 @@ class TidalPlayer(commands.Cog):
         return player
 
     async def _ensure_vc_connected(self, ctx: commands.Context, player: Any) -> Optional[Any]:
-        # Default False: if the attribute is missing we treat the player as NOT connected
-        # and attempt to reconnect, rather than assuming it's fine (old bug: default True
-        # caused fresh joins to be skipped, making player.play() fail silently).
-        if getattr(player, "is_connected", False):
+        # Red Audio/Lavalink players expose `channel` (the connected VoiceChannel object)
+        # rather than an `is_connected` bool. A truthy `channel` means the player is live.
+        # Falling back to `is_connected` covers other potential player implementations.
+        def _is_live(p: Any) -> bool:
+            if p is None:
+                return False
+            channel = getattr(p, "channel", None)
+            if channel is not None:
+                return True
+            return bool(getattr(p, "is_connected", False))
+
+        if _is_live(player):
             return player
         for attempt in range(VC_RECONNECT_RETRIES):
             await asyncio.sleep(VC_RECONNECT_DELAY)
             new_player = await self._get_player(ctx, connect=True)
-            if new_player and getattr(new_player, "is_connected", False):
+            if _is_live(new_player):
                 log.info("Reconnected to VC (attempt %d)", attempt + 1)
                 return new_player
         log.warning("Could not reconnect to VC, stopping queue")
