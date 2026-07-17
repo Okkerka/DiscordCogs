@@ -7,14 +7,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable
 from urllib.parse import urlencode
-from urllib.request import urlopen
 from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from itertools import islice
 from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 
+import aiohttp
 import discord
 from redbot.core import Config, app_commands, commands
 from redbot.core.bot import Red
@@ -114,6 +115,9 @@ SEARCH_BATCH_SIZE = 8
 CONTROLLER_REFRESH_COOLDOWN = 3.0   # seconds between background-only controller edits
 PROGRESS_SLEEP_INTERVAL = 2.0       # seconds to sleep between batch chunks (0 = no sleep)
 RECOMMENDATION_SEARCH_CONCURRENCY = 2  # Leave Tidal API capacity for playback requests.
+RECOMMENDATION_LOOKUP_CONCURRENCY = 2  # Reserve at least one Tidal API slot for foreground commands.
+LASTFM_REQUEST_TIMEOUT = 20.0
+RECENT_TRACK_HISTORY = 50
 LAVALINK_LOAD_TIMEOUT = 30.0
 LAVALINK_LOAD_MAX_ATTEMPTS = 2
 LAVALINK_LOAD_RETRY_DELAY = 1.0
@@ -227,7 +231,8 @@ class TrackSelectView(discord.ui.View):
 class TidalHandler:
     __slots__ = (
         "bot", "tokens", "session", "_refresh_task", "api_semaphore",
-        "_login_cache", "_login_cache_time", "_cache", "_refresh_lock", "_executor", "_executor_slots",
+        "_login_cache", "_login_cache_time", "_cache", "_inflight", "_refresh_lock", "_executor",
+        "_executor_slots",
     )
 
     def __init__(self, bot: Red, tokens: TokenService):
@@ -239,6 +244,7 @@ class TidalHandler:
         self._login_cache: Optional[bool] = None
         self._login_cache_time: float = 0.0
         self._cache: Dict[str, OrderedDict] = {}
+        self._inflight: Dict[Tuple[str, str], asyncio.Task[Any]] = {}
         self._refresh_lock = asyncio.Lock()
         self._executor = ThreadPoolExecutor(
             max_workers=TIDAL_EXECUTOR_WORKERS, thread_name_prefix="tidal_io"
@@ -275,6 +281,27 @@ class TidalHandler:
                 bucket.popitem(last=False)
         now = asyncio.get_running_loop().time()
         bucket[key] = (value, now + ttl)
+
+    async def _coalesce(
+        self,
+        category: str,
+        key: str,
+        operation: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        """Share one in-flight provider request between equivalent callers."""
+        inflight_key = (category, key)
+        task = self._inflight.get(inflight_key)
+        if task is None:
+            task = asyncio.create_task(operation(), name=f"tidalplayer-{category}")
+            self._inflight[inflight_key] = task
+
+            def _cleanup(completed: asyncio.Task[Any]) -> None:
+                if self._inflight.get(inflight_key) is completed:
+                    self._inflight.pop(inflight_key, None)
+
+            task.add_done_callback(_cleanup)
+        # Do not let cancellation of one Discord command cancel the shared request.
+        return await asyncio.shield(task)
 
     async def _run_blocking(self, func: Callable[[], Any], timeout: float = 10.0) -> Any:
         await self._executor_slots.acquire()
@@ -405,6 +432,9 @@ class TidalHandler:
     def unload(self) -> None:
         if self._refresh_task:
             self._refresh_task.cancel()
+        for task in self._inflight.values():
+            task.cancel()
+        self._inflight.clear()
         self._executor.shutdown(wait=False)
 
     async def logout(self) -> None:
@@ -414,6 +444,9 @@ class TidalHandler:
             self._login_cache = False
             self._login_cache_time = asyncio.get_running_loop().time()
             self._cache.clear()
+            for task in self._inflight.values():
+                task.cancel()
+            self._inflight.clear()
             self.session = tidalapi.Session() if TIDALAPI_AVAILABLE else None
 
     def invalidate_login_cache(self) -> None:
@@ -476,6 +509,16 @@ class TidalHandler:
         cached = self._get_cached("search", cache_key)
         if cached is not _CACHE_MISS:
             return cached
+
+        return await self._coalesce(
+            "search",
+            cache_key,
+            lambda: self._search_uncached(query, filter_remixes, cache_key),
+        )
+
+    async def _search_uncached(
+        self, query: str, filter_remixes: bool, cache_key: str,
+    ) -> List[Any]:
         async with self.api_semaphore:
             try:
                 def run_search():
@@ -500,6 +543,10 @@ class TidalHandler:
         cached = self._get_cached("isrc", isrc)
         if cached is not _CACHE_MISS:
             return cached
+
+        return await self._coalesce("isrc", isrc, lambda: self._get_track_by_isrc_uncached(isrc))
+
+    async def _get_track_by_isrc_uncached(self, isrc: str) -> Optional[Any]:
         async with self.api_semaphore:
             try:
                 def _fetch():
@@ -521,6 +568,10 @@ class TidalHandler:
         cached = self._get_cached("track", track_id)
         if cached is not _CACHE_MISS:
             return cached
+
+        return await self._coalesce("track", track_id, lambda: self._get_track_uncached(track_id))
+
+    async def _get_track_uncached(self, track_id: str) -> Optional[Any]:
         async with self.api_semaphore:
             try:
                 res = await self._run_with_backoff(lambda: self.session.track(track_id), timeout=10.0)
@@ -542,6 +593,12 @@ class TidalHandler:
         cached = self._get_cached("mix", cache_key)
         if cached is not _CACHE_MISS:
             return cached
+
+        return await self._coalesce(
+            "track-radio", cache_key, lambda: self._get_track_radio_uncached(track_id, cache_key)
+        )
+
+    async def _get_track_radio_uncached(self, track_id: str, cache_key: str) -> List[Any]:
         async with self.api_semaphore:
             try:
                 def fetch() -> Any:
@@ -879,9 +936,11 @@ class TidalPlayer(commands.Cog):
     __slots__ = (
         "bot", "config", "tidal", "sp", "yt", "_tasks", "_guild_locks",
         "_cancel_events", "_last_progress_edit", "_initialized", "_current_meta", "audio", "tokens",
-        "_controller_messages", "_playback_channels", "_controller_meta", "_recent_track_ids", "_autoplay_tasks",
+        "_controller_messages", "_playback_channels", "_controller_meta", "_recent_track_ids",
+        "_recent_track_signatures", "_autoplay_tasks",
         "_recommendation_cache", "_recommendation_tasks", "_recommendation_task_sources",
         "_controller_recommendation_tasks", "_controller_last_refresh", "_queued_meta",
+        "_recommendation_lookup_slots", "_lastfm_session",
     )
 
     def __init__(self, bot: Red):
@@ -902,14 +961,23 @@ class TidalPlayer(commands.Cog):
         self._controller_messages: Dict[int, discord.Message] = {}
         self._playback_channels: Dict[int, discord.abc.Messageable] = {}
         self._controller_meta: Dict[int, TrackMeta] = {}
-        self._recent_track_ids: Dict[int, Deque[str]] = defaultdict(lambda: deque(maxlen=50))
+        self._recent_track_ids: Dict[int, Deque[str]] = defaultdict(
+            lambda: deque(maxlen=RECENT_TRACK_HISTORY)
+        )
+        self._recent_track_signatures: Dict[int, Deque[str]] = defaultdict(
+            lambda: deque(maxlen=RECENT_TRACK_HISTORY)
+        )
         self._autoplay_tasks: Dict[int, asyncio.Task[None]] = {}
         self._recommendation_cache: Dict[int, Tuple[str, List[Any]]] = {}
         self._recommendation_tasks: Dict[int, asyncio.Task[List[Any]]] = {}
         self._recommendation_task_sources: Dict[int, str] = {}
         self._controller_recommendation_tasks: Dict[int, asyncio.Task[None]] = {}
         self._controller_last_refresh: Dict[int, float] = {}
-        self._queued_meta: Dict[int, Deque[TrackMeta]] = defaultdict(lambda: deque(maxlen=25))
+        # Metadata must cover every track currently in Red Audio's queue. A bounded
+        # deque silently desynchronises controller/autoplay state for large imports.
+        self._queued_meta: Dict[int, Deque[TrackMeta]] = defaultdict(deque)
+        self._recommendation_lookup_slots = asyncio.Semaphore(RECOMMENDATION_LOOKUP_CONCURRENCY)
+        self._lastfm_session: aiohttp.ClientSession | None = None
         self._initialized: bool = False
 
     async def cog_load(self) -> None:
@@ -934,6 +1002,7 @@ class TidalPlayer(commands.Cog):
             ev.set()
         for t in list(self._tasks):
             t.cancel()
+        self._close_lastfm_session()
         self.tidal.unload()
         self.sp = None
         self.yt = None
@@ -954,9 +1023,26 @@ class TidalPlayer(commands.Cog):
         self._playback_channels.clear()
         self._controller_meta.clear()
         self._recent_track_ids.clear()
+        self._recent_track_signatures.clear()
         self._current_meta.clear()
         self._last_progress_edit.clear()
+        self._controller_last_refresh.clear()
         log.info("TidalPlayer cog unloaded")
+
+    def _close_lastfm_session(self) -> None:
+        """Schedule close for the reusable Last.fm HTTP session during cog unload."""
+        session = self._lastfm_session
+        self._lastfm_session = None
+        if session is None or session.closed:
+            return
+        try:
+            task = asyncio.create_task(session.close())
+        except RuntimeError:
+            # Cog unload is normally called on the bot loop. Avoid masking unload
+            # if shutdown has already stopped that loop.
+            return
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     async def cog_command_error(self, ctx: commands.Context, error: Exception) -> None:
         if isinstance(error, commands.CommandInvokeError):
@@ -1008,8 +1094,10 @@ class TidalPlayer(commands.Cog):
         self._playback_channels.pop(guild.id, None)
         self._controller_meta.pop(guild.id, None)
         self._recent_track_ids.pop(guild.id, None)
+        self._recent_track_signatures.pop(guild.id, None)
         self._current_meta.pop(guild.id, None)
         self._last_progress_edit.pop(guild.id, None)
+        self._controller_last_refresh.pop(guild.id, None)
 
     @commands.Cog.listener()
     async def on_red_audio_queue_end(
@@ -1029,6 +1117,8 @@ class TidalPlayer(commands.Cog):
         if not await self.config.guild_from_id(guild_id).autoplay_enabled():
             self._current_meta.pop(guild_id, None)
             return
+
+        self._remember_track(guild_id, self._current_meta[guild_id])
 
         player = await self._get_player_for_guild(guild_id)
         if player is not None:
@@ -1226,6 +1316,41 @@ class TidalPlayer(commands.Cog):
         return bool(getattr(player, "current", None)) or self._queued_count(player) > 0
 
     @staticmethod
+    def _track_signature(title: Any, artist: Any) -> str:
+        """Return a stable song identity across Tidal album/version IDs."""
+        normalised_title = " ".join(str(title or "").casefold().split())
+        normalised_artist = " ".join(str(artist or "").casefold().split())
+        return f"{normalised_artist}\x00{normalised_title}" if normalised_title else ""
+
+    @classmethod
+    def _meta_track_signature(cls, meta: TrackMeta | None) -> str:
+        values = meta or {}
+        return cls._track_signature(values.get("title"), values.get("artist"))
+
+    @classmethod
+    def _tidal_track_signature(cls, track: Any) -> str:
+        return cls._track_signature(
+            getattr(track, "full_name", None) or getattr(track, "name", None),
+            getattr(getattr(track, "artist", None), "name", None),
+        )
+
+    def _is_recent_autoplay_track(self, guild_id: int, track: Any) -> bool:
+        track_id = str(getattr(track, "id", "") or "")
+        signature = self._tidal_track_signature(track)
+        return bool(
+            (track_id and track_id in self._recent_track_ids[guild_id])
+            or (signature and signature in self._recent_track_signatures[guild_id])
+        )
+
+    def _is_recent_autoplay_meta(self, guild_id: int, meta: TrackMeta) -> bool:
+        track_id = str(meta.get("track_id") or "")
+        signature = self._meta_track_signature(meta)
+        return bool(
+            (track_id and track_id in self._recent_track_ids[guild_id])
+            or (signature and signature in self._recent_track_signatures[guild_id])
+        )
+
+    @staticmethod
     def _lavalink_track_matches_meta(track: Any, meta: TrackMeta) -> bool:
         """Match the metadata we set on a Lavalink track without trusting IDs."""
         actual_title = str(getattr(track, "title", "") or "").casefold().strip()
@@ -1370,6 +1495,9 @@ class TidalPlayer(commands.Cog):
                         if was_idle:
                             await player.play()
                             self._current_meta[ctx.guild.id] = meta
+                            self._controller_meta[ctx.guild.id] = meta
+                            self._playback_channels[ctx.guild.id] = ctx.channel
+                            self._remember_track(ctx.guild.id, meta)
                         else:
                             self._queued_meta[ctx.guild.id].append(meta)
                     except Exception:
@@ -1468,11 +1596,15 @@ class TidalPlayer(commands.Cog):
         })
         url = f"https://ws.audioscrobbler.com/2.0/?{params}"
         try:
-            def fetch() -> Dict[str, Any]:
-                import json
-                with urlopen(url, timeout=15) as response:
-                    return json.load(response)
-            payload = await self.tidal._run_blocking(fetch, timeout=20.0)
+            session = self._lastfm_session
+            if session is None or session.closed:
+                session = aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=LASTFM_REQUEST_TIMEOUT)
+                )
+                self._lastfm_session = session
+            async with session.get(url) as response:
+                response.raise_for_status()
+                payload = await response.json(content_type=None)
             entries = payload.get("similartracks", {}).get("track", [])
             if isinstance(entries, dict):
                 entries = [entries]
@@ -1498,18 +1630,27 @@ class TidalPlayer(commands.Cog):
                 self._tasks.discard(task)
 
     async def _radio_candidates(self, guild_id: int, meta: TrackMeta) -> List[Any]:
-        """Resolve Last.fm similar tracks to Tidal catalog tracks."""
+        """Resolve Last.fm similar tracks without starving foreground Tidal work."""
+        async with self._recommendation_lookup_slots:
+            return await self._radio_candidates_limited(guild_id, meta)
+
+    async def _radio_candidates_limited(self, guild_id: int, meta: TrackMeta) -> List[Any]:
+        """Resolve one background recommendation workload to Tidal catalog tracks."""
         current_id = str(meta.get("track_id") or "")
         current_title = str(meta.get("title") or "").casefold().strip()
         current_artist = str(meta.get("artist") or "").casefold().strip()
         seen_ids = set(self._recent_track_ids[guild_id])
+        seen_signatures = set(self._recent_track_signatures[guild_id])
         if current_id:
             seen_ids.add(current_id)
+        if current_signature := self._meta_track_signature(meta):
+            seen_signatures.add(current_signature)
         pairs = await self._lastfm_similar_tracks(
             str(meta.get("artist") or ""), str(meta.get("title") or ""), limit=25,
         )
         candidates: List[Any] = []
         used_ids: Set[str] = set()
+        used_signatures: Set[str] = set()
         # Suggestions are background work. Keep spare Tidal API permits for an
         # interactive play/queue request instead of scheduling all 25 at once.
         for offset in range(0, len(pairs), RECOMMENDATION_SEARCH_CONCURRENCY):
@@ -1528,11 +1669,19 @@ class TidalPlayer(commands.Cog):
                 track_id = str(getattr(track, "id", "") or "")
                 found_title = str(getattr(track, "name", "") or "").casefold().strip()
                 found_artist = str(getattr(getattr(track, "artist", None), "name", "") or "").casefold().strip()
-                if not track_id or track_id in seen_ids or track_id in used_ids:
+                signature = self._tidal_track_signature(track)
+                if (
+                    not track_id
+                    or track_id in seen_ids
+                    or track_id in used_ids
+                    or (signature and (signature in seen_signatures or signature in used_signatures))
+                ):
                     continue
                 if found_title == current_title and found_artist == current_artist:
                     continue
                 used_ids.add(track_id)
+                if signature:
+                    used_signatures.add(signature)
                 candidates.append(track)
                 if len(candidates) >= 25:
                     break
@@ -1546,10 +1695,24 @@ class TidalPlayer(commands.Cog):
             f"{meta.get('artist', '')} {meta.get('title', '')}".strip(),
             filter_remixes=False,
         )
-        return [
-            track for track in fallback
-            if str(getattr(track, "id", "") or "") not in seen_ids
-        ][:25]
+        fallback_candidates: List[Any] = []
+        for track in fallback:
+            track_id = str(getattr(track, "id", "") or "")
+            signature = self._tidal_track_signature(track)
+            if (
+                not track_id
+                or track_id in seen_ids
+                or track_id in used_ids
+                or (signature and (signature in seen_signatures or signature in used_signatures))
+            ):
+                continue
+            used_ids.add(track_id)
+            if signature:
+                used_signatures.add(signature)
+            fallback_candidates.append(track)
+            if len(fallback_candidates) >= 25:
+                break
+        return fallback_candidates
 
     @staticmethod
     def _recommendation_source(meta: TrackMeta | None) -> str:
@@ -1730,8 +1893,13 @@ class TidalPlayer(commands.Cog):
 
     def _remember_track(self, guild_id: int, meta: TrackMeta) -> None:
         track_id = str(meta.get("track_id") or "")
-        if track_id:
-            self._recent_track_ids[guild_id].append(track_id)
+        recent_ids = self._recent_track_ids[guild_id]
+        if track_id and (not recent_ids or recent_ids[-1] != track_id):
+            recent_ids.append(track_id)
+        signature = self._meta_track_signature(meta)
+        recent_signatures = self._recent_track_signatures[guild_id]
+        if signature and (not recent_signatures or recent_signatures[-1] != signature):
+            recent_signatures.append(signature)
 
     async def _get_player_for_guild(self, guild_id: int) -> Any | None:
         try:
@@ -1981,6 +2149,7 @@ class TidalPlayer(commands.Cog):
         source_title = str(meta.get("title") or "").casefold().strip()
         source_artist = str(meta.get("artist") or "").casefold().strip()
         recent_ids = set(self._recent_track_ids.get(guild_id, []))
+        recent_signatures = set(self._recent_track_signatures.get(guild_id, []))
         for track in await self._radio_candidates(guild_id, meta):
             track_id = str(getattr(track, "id", "") or "")
             title = str(getattr(track, "name", "") or "").casefold().strip()
@@ -1988,6 +2157,8 @@ class TidalPlayer(commands.Cog):
             if track_id == source_id:
                 continue
             if track_id and track_id in recent_ids:
+                continue
+            if self._tidal_track_signature(track) in recent_signatures:
                 continue
             if title == source_title and artist == source_artist:
                 continue
@@ -2020,6 +2191,9 @@ class TidalPlayer(commands.Cog):
                     if self._queued_count(player):
                         log.info("Autoplay stopped for guild %s: a track was queued by a user.", guild_id)
                         return
+                    if self._is_recent_autoplay_track(guild_id, track):
+                        log.info("Autoplay skipped a recently played duplicate in guild %s.", guild_id)
+                        continue
                 candidate_id = str(getattr(track, "id", "") or "")
                 if not candidate_id or candidate_id == current_id:
                     log.warning("Autoplay rejected current track %s as a candidate.", candidate_id)
@@ -2051,7 +2225,11 @@ class TidalPlayer(commands.Cog):
     ) -> bool:
         selected_id = str(getattr(tidal_track, "id", "") or "")
         current_meta = self._current_meta.get(guild_id) or {}
-        if not selected_id or selected_id == str(current_meta.get("track_id") or ""):
+        if (
+            not selected_id
+            or selected_id == str(current_meta.get("track_id") or "")
+            or self._is_recent_autoplay_track(guild_id, tidal_track)
+        ):
             log.warning("Autoplay refused duplicate source track %s in guild %s", selected_id, guild_id)
             return False
         try:
@@ -2059,6 +2237,8 @@ class TidalPlayer(commands.Cog):
                 if not await self.config.guild_from_id(guild_id).autoplay_enabled():
                     return False
                 if self._queued_count(player):
+                    return False
+                if self._is_recent_autoplay_track(guild_id, tidal_track):
                     return False
                 if source_track_id is not None:
                     active_id = str((self._current_meta.get(guild_id) or {}).get("track_id") or "")
@@ -2078,6 +2258,9 @@ class TidalPlayer(commands.Cog):
                     return False
                 current_meta = self._current_meta.get(guild_id) or {}
                 if selected_id == str(current_meta.get("track_id") or ""):
+                    return False
+                if self._is_recent_autoplay_meta(guild_id, meta):
+                    log.info("Autoplay refused a recently played song in guild %s.", guild_id)
                     return False
                 if source_track_id is not None:
                     active_id = str(current_meta.get("track_id") or "")
