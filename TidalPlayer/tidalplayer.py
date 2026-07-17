@@ -1,3 +1,5 @@
+_CACHE_MISS = object()
+
 """
 TidalPlayer - Tidal music integration for Red Discord Bot
 Features: Hi-Res Audio, Album Art, Spotify/YT Importing, MixV2, Video URLs,
