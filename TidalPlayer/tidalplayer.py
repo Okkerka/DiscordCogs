@@ -121,6 +121,8 @@ RECENT_TRACK_HISTORY = 50
 LAVALINK_LOAD_TIMEOUT = 30.0
 LAVALINK_LOAD_MAX_ATTEMPTS = 2
 LAVALINK_LOAD_RETRY_DELAY = 1.0
+LAVALINK_NODE_READY_MAX_ATTEMPTS = 3
+LAVALINK_NODE_READY_RETRY_DELAY = 2.0
 
 
 _CACHE_CAPS: Dict[str, int] = {
@@ -880,6 +882,15 @@ class TidalHandler:
         return None
 
     async def get_stream_url(self, track: Any) -> Optional[str]:
+        """Return a current stream URL, sharing only concurrent lookups by track ID."""
+        track_id = str(getattr(track, "id", "") or "")
+        if not track_id:
+            return await self._get_stream_url_uncached(track)
+        return await self._coalesce(
+            "stream-url", track_id, lambda: self._get_stream_url_uncached(track)
+        )
+
+    async def _get_stream_url_uncached(self, track: Any) -> Optional[str]:
         """Resolve a full Tidal track and return a real stream URL, never a web URL."""
         track_id = getattr(track, "id", None)
         if track_id:
@@ -940,7 +951,7 @@ class TidalPlayer(commands.Cog):
         "_recent_track_signatures", "_autoplay_tasks",
         "_recommendation_cache", "_recommendation_tasks", "_recommendation_task_sources",
         "_controller_recommendation_tasks", "_controller_last_refresh", "_queued_meta",
-        "_recommendation_lookup_slots", "_lastfm_session",
+        "_recommendation_lookup_slots", "_lastfm_session", "_lavalink_load_tasks",
     )
 
     def __init__(self, bot: Red):
@@ -978,6 +989,7 @@ class TidalPlayer(commands.Cog):
         self._queued_meta: Dict[int, Deque[TrackMeta]] = defaultdict(deque)
         self._recommendation_lookup_slots = asyncio.Semaphore(RECOMMENDATION_LOOKUP_CONCURRENCY)
         self._lastfm_session: aiohttp.ClientSession | None = None
+        self._lavalink_load_tasks: Dict[Tuple[int, str], asyncio.Task[Any | None]] = {}
         self._initialized: bool = False
 
     async def cog_load(self) -> None:
@@ -1002,6 +1014,9 @@ class TidalPlayer(commands.Cog):
             ev.set()
         for t in list(self._tasks):
             t.cancel()
+        for task in self._lavalink_load_tasks.values():
+            task.cancel()
+        self._lavalink_load_tasks.clear()
         self._close_lastfm_session()
         self.tidal.unload()
         self.sp = None
@@ -1098,6 +1113,7 @@ class TidalPlayer(commands.Cog):
         self._current_meta.pop(guild.id, None)
         self._last_progress_edit.pop(guild.id, None)
         self._controller_last_refresh.pop(guild.id, None)
+        self._cancel_lavalink_loads(guild.id)
 
     @commands.Cog.listener()
     async def on_red_audio_queue_end(
@@ -1408,7 +1424,51 @@ class TidalPlayer(commands.Cog):
         log.warning("Could not reconnect to VC, stopping queue")
         return None
 
+    def _cancel_lavalink_loads(self, guild_id: int) -> None:
+        """Cancel outstanding REST loads when a guild's player is discarded."""
+        for key, task in tuple(self._lavalink_load_tasks.items()):
+            if key[0] == guild_id:
+                task.cancel()
+                self._lavalink_load_tasks.pop(key, None)
+
+    @staticmethod
+    def _is_lavalink_node_not_ready(error: RuntimeError) -> bool:
+        return "node not ready" in str(error).casefold()
+
     async def _load_lavalink_track(
+        self,
+        player: Any,
+        tidal_track: Any,
+        guild_id: int,
+        *,
+        initial_stream_url: str | None = None,
+    ) -> Any | None:
+        """Load one track, coalescing duplicate concurrent guild requests."""
+        track_id = str(getattr(tidal_track, "id", "") or "")
+        if not track_id:
+            return await self._load_lavalink_track_once(
+                player, tidal_track, guild_id, initial_stream_url=initial_stream_url
+            )
+
+        task_key = (guild_id, track_id)
+        task = self._lavalink_load_tasks.get(task_key)
+        if task is None:
+            task = asyncio.create_task(
+                self._load_lavalink_track_once(
+                    player, tidal_track, guild_id, initial_stream_url=initial_stream_url
+                ),
+                name=f"tidalplayer-lavalink-load-{guild_id}-{track_id}",
+            )
+            self._lavalink_load_tasks[task_key] = task
+
+            def _cleanup(completed: asyncio.Task[Any | None]) -> None:
+                if self._lavalink_load_tasks.get(task_key) is completed:
+                    self._lavalink_load_tasks.pop(task_key, None)
+
+            task.add_done_callback(_cleanup)
+        return await asyncio.shield(task)
+
+    async def _load_lavalink_track_once(
         self,
         player: Any,
         tidal_track: Any,
@@ -1419,7 +1479,9 @@ class TidalPlayer(commands.Cog):
         """Load one track with a fresh Tidal URL after a transient Lavalink timeout."""
         stream_url = initial_stream_url
         track_id = getattr(tidal_track, "id", None)
-        for attempt in range(1, LAVALINK_LOAD_MAX_ATTEMPTS + 1):
+        stream_attempt = 0
+        node_ready_attempt = 0
+        while stream_attempt < LAVALINK_LOAD_MAX_ATTEMPTS:
             if not stream_url:
                 stream_url = await self.tidal.get_stream_url(tidal_track)
             if not stream_url:
@@ -1429,13 +1491,38 @@ class TidalPlayer(commands.Cog):
                 results = await asyncio.wait_for(
                     player.load_tracks(stream_url), timeout=LAVALINK_LOAD_TIMEOUT
                 )
+            except RuntimeError as error:
+                if not self._is_lavalink_node_not_ready(error):
+                    log.exception("Lavalink failed loading Tidal track %s in guild %s", track_id, guild_id)
+                    return None
+                node_ready_attempt += 1
+                if node_ready_attempt >= LAVALINK_NODE_READY_MAX_ATTEMPTS:
+                    log.warning(
+                        "Lavalink node stayed unavailable while loading Tidal track %s in guild %s "
+                        "after %s readiness check(s)",
+                        track_id,
+                        guild_id,
+                        node_ready_attempt,
+                    )
+                    return None
+                log.warning(
+                    "Lavalink node is not ready for Tidal track %s in guild %s; "
+                    "waiting before retrying (%s/%s)",
+                    track_id,
+                    guild_id,
+                    node_ready_attempt,
+                    LAVALINK_NODE_READY_MAX_ATTEMPTS - 1,
+                )
+                await asyncio.sleep(LAVALINK_NODE_READY_RETRY_DELAY)
+                continue
             except asyncio.TimeoutError:
-                if attempt == LAVALINK_LOAD_MAX_ATTEMPTS:
+                stream_attempt += 1
+                if stream_attempt == LAVALINK_LOAD_MAX_ATTEMPTS:
                     log.warning(
                         "Lavalink timed out loading Tidal track %s in guild %s after %s attempt(s)",
                         track_id,
                         guild_id,
-                        attempt,
+                        stream_attempt,
                     )
                     return None
                 log.warning(
@@ -1444,6 +1531,7 @@ class TidalPlayer(commands.Cog):
                     guild_id,
                 )
                 stream_url = None
+                node_ready_attempt = 0
                 await asyncio.sleep(LAVALINK_LOAD_RETRY_DELAY)
                 continue
             except Exception:
@@ -2078,6 +2166,7 @@ class TidalPlayer(commands.Cog):
         async with self._guild_locks[guild_id]:
             if (task := self._autoplay_tasks.pop(guild_id, None)) is not None:
                 task.cancel()
+            self._cancel_lavalink_loads(guild_id)
             player = await self._get_player_for_guild(guild_id)
             if player is not None:
                 queue = getattr(player, "queue", None)
