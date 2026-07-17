@@ -374,6 +374,14 @@ class TidalHandler:
             self._refresh_task.cancel()
         self._executor.shutdown(wait=False)
 
+    async def clear_session(self) -> None:
+        """Discard in-memory OAuth state after the owner logs out."""
+        async with self._refresh_lock:
+            self._login_cache = False
+            self._login_cache_time = asyncio.get_running_loop().time()
+            self._cache.clear()
+            self.session = tidalapi.Session() if TIDALAPI_AVAILABLE else None
+
     def invalidate_login_cache(self) -> None:
         self._login_cache = None
         self._login_cache_time = 0.0
@@ -1226,10 +1234,8 @@ class TidalPlayer(commands.Cog):
         if show_embed:
             try:
                 queued_msg = await ctx.send(embed=self._make_queued_embed(meta))
-                asyncio.get_event_loop().call_later(
-                    180,
-                    lambda m=queued_msg: asyncio.ensure_future(_delete_message_safe(m)),
-                )
+                task = asyncio.create_task(self._delete_after(queued_msg, 180))
+                self._tasks.add(task)
             except discord.HTTPException:
                 log.warning("Could not send queued embed for guild %s", ctx.guild.id)
         return True
@@ -1242,6 +1248,7 @@ class TidalPlayer(commands.Cog):
         api_key = tokens.get("api_key")
         if not api_key or not artist or not title:
             return []
+
         params = urlencode({
             "method": "track.getsimilar", "artist": artist, "track": title,
             "limit": limit, "autocorrect": 1, "api_key": api_key, "format": "json",
@@ -1265,6 +1272,18 @@ class TidalPlayer(commands.Cog):
             log.warning("Last.fm similar-track lookup failed for %s — %s: %r", artist, title, error)
             return []
 
+    async def _delete_after(self, message: discord.Message, delay: float) -> None:
+        """Delete a temporary message without leaving a task behind on cog unload."""
+        try:
+            await asyncio.sleep(delay)
+            await _delete_message_safe(message)
+        except asyncio.CancelledError:
+            return
+        finally:
+            task = asyncio.current_task()
+            if task is not None:
+                self._tasks.discard(task)
+
     async def _radio_candidates(self, guild_id: int, meta: TrackMeta) -> List[Any]:
         """Resolve Last.fm similar tracks to Tidal catalog tracks."""
         current_id = str(meta.get("track_id") or "")
@@ -1278,8 +1297,16 @@ class TidalPlayer(commands.Cog):
         )
         candidates: List[Any] = []
         used_ids: Set[str] = set()
-        for artist, title in pairs:
-            results = await self.tidal.search(f"{artist} {title}", filter_remixes=False)
+        # Search concurrently, but only up to the provider's established request limit.
+        # This keeps controller creation responsive without bypassing TidalHandler's semaphore.
+        searches = await asyncio.gather(
+            *(self.tidal.search(f"{artist} {title}", filter_remixes=False) for artist, title in pairs),
+            return_exceptions=True,
+        )
+        for (artist, title), results in zip(pairs, searches):
+            if isinstance(results, Exception):
+                log.warning("Tidal suggestion lookup failed for %s - %s: %r", artist, title, results)
+                continue
             if not results:
                 continue
             track = select_best_tidal_track(f"{artist} {title}", results) or results[0]
@@ -2030,6 +2057,7 @@ class TidalPlayer(commands.Cog):
         await self._process_track_list(ctx, items, name, lambda t: t, COLOR_PURPLE)
 
     @commands.hybrid_command(name="tplay")
+    @commands.guild_only()
     async def tplay(self, ctx: commands.Context, *, query: str):
         """Play a Tidal track, album, playlist, mix, Spotify link, YouTube playlist, or search query."""
         if not await self.check_ready(ctx):
@@ -2180,6 +2208,7 @@ class TidalPlayer(commands.Cog):
             await ctx.send(embed=_error_embed(Messages.ERROR_FETCH_FAILED))
 
     @commands.hybrid_command(name="tsearch")
+    @commands.guild_only()
     async def tsearch(self, ctx: commands.Context, *, query: str):
         """Search Tidal and choose from top results."""
         if not await self.check_ready(ctx):
@@ -2194,6 +2223,7 @@ class TidalPlayer(commands.Cog):
             await self._load_and_queue_track(ctx, selected)
 
     @commands.hybrid_command(name="tnowplaying")
+    @commands.guild_only()
     async def tnowplaying(self, ctx: commands.Context):
         """Resend the now-playing controller panel."""
         if ctx.guild is None:
@@ -2219,6 +2249,7 @@ class TidalPlayer(commands.Cog):
             log.exception("Could not resend controller message for guild %s", guild_id)
 
     @commands.hybrid_command(name="tqueue")
+    @commands.guild_only()
     async def tqueue(self, ctx: commands.Context):
         """Show the current queue."""
         if not await self.check_ready(ctx):
@@ -2252,6 +2283,7 @@ class TidalPlayer(commands.Cog):
             await SimpleMenu(pages).start(ctx)
 
     @commands.hybrid_command(name="tstop")
+    @commands.guild_only()
     async def tstop(self, ctx: commands.Context):
         """Stop queueing the current playlist."""
         if ctx.guild:
@@ -2277,10 +2309,12 @@ class TidalPlayer(commands.Cog):
         await ctx.send(embed=_success_embed(msg))
 
     @commands.group(name="tpl")
+    @commands.is_owner()
     async def tpl(self, ctx: commands.Context):
         """Manage your Tidal playlists."""
 
     @tpl.command(name="list")
+    @commands.is_owner()
     async def tpl_list(self, ctx: commands.Context):
         """List your Tidal playlists."""
         if not await self.check_ready(ctx):
@@ -2308,6 +2342,7 @@ class TidalPlayer(commands.Cog):
             await SimpleMenu(pages).start(ctx)
 
     @tpl.command(name="create")
+    @commands.is_owner()
     async def tpl_create(self, ctx: commands.Context, *, name: str):
         """Create a new Tidal playlist."""
         if not await self.check_ready(ctx):
@@ -2319,6 +2354,7 @@ class TidalPlayer(commands.Cog):
             await ctx.send(embed=_error_embed(Messages.ERROR_PLAYLIST_WRITE_FAILED))
 
     @tpl.command(name="add")
+    @commands.is_owner()
     async def tpl_add(self, ctx: commands.Context, playlist_id: str, *, query: str):
         """Add a track (by search or ISRC) to one of your playlists."""
         if not await self.check_ready(ctx):
@@ -2350,6 +2386,7 @@ class TidalPlayer(commands.Cog):
             await ctx.send(embed=_error_embed(Messages.ERROR_PLAYLIST_WRITE_FAILED))
 
     @tpl.command(name="remove")
+    @commands.is_owner()
     async def tpl_remove(self, ctx: commands.Context, playlist_id: str, track_id: int):
         """Remove a track by ID from one of your playlists."""
         if not await self.check_ready(ctx):
@@ -2365,6 +2402,7 @@ class TidalPlayer(commands.Cog):
             await ctx.send(embed=_error_embed(Messages.ERROR_PLAYLIST_WRITE_FAILED))
 
     @tpl.command(name="play")
+    @commands.is_owner()
     async def tpl_play(self, ctx: commands.Context, playlist_id: str):
         """Queue one of your Tidal playlists."""
         if not await self.check_ready(ctx):
@@ -2424,7 +2462,7 @@ class TidalPlayer(commands.Cog):
     async def tidalsetup_logout(self, ctx: commands.Context):
         """Clear stored Tidal tokens."""
         await self.tokens.logout()
-        self.tidal.invalidate_login_cache()
+        await self.tidal.clear_session()
         await ctx.send(embed=_success_embed(Messages.SUCCESS_TOKENS_CLEARED))
 
     @tidalsetup.command(name="status")
