@@ -72,7 +72,7 @@ def test_oauth_field_names_present(mod):
     # These are the string literals used in tidalsetup_login and refresh_tokens.
     # They must never be renamed without a migration.
     expected_fields = {"token_type", "access_token", "refresh_token", "expiry_time"}
-    cog_source = open(mod.__file__).read()
+    cog_source = open(mod.__file__, encoding="utf-8").read()
     for field in expected_fields:
         assert field in cog_source, (
             f"OAuth field '{field}' missing from tidalplayer.py source — "

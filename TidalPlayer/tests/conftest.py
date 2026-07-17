@@ -42,6 +42,7 @@ class FakeGuildConfig:
     def __init__(self) -> None:
         self._filter_remixes = _ConfigValue(True)
         self._interactive_search = _ConfigValue(False)
+        self._autoplay_enabled = _ConfigValue(False)
 
     @property
     def filter_remixes(self) -> _ConfigValue:
@@ -50,6 +51,10 @@ class FakeGuildConfig:
     @property
     def interactive_search(self) -> _ConfigValue:
         return self._interactive_search
+
+    @property
+    def autoplay_enabled(self) -> _ConfigValue:
+        return self._autoplay_enabled
 
 
 class FakeConfig:
@@ -88,6 +93,9 @@ class FakeConfig:
         if gid not in self._guild_configs:
             self._guild_configs[gid] = FakeGuildConfig()
         return self._guild_configs[gid]
+
+    def guild_from_id(self, guild_id: int) -> FakeGuildConfig:
+        return self.guild(guild_id)
 
     async def all(self) -> dict[str, Any]:
         return {
@@ -153,6 +161,7 @@ def _make_discord_stub() -> types.ModuleType:
 
     discord.ui = types.ModuleType("discord.ui")
     discord.ui.View = _View
+    discord.ui.LayoutView = _View
     discord.ui.Button = MagicMock()
 
     class _Interaction:
@@ -208,6 +217,10 @@ def _make_redbot_stub(fake_config: FakeConfig) -> types.ModuleType:
             return lambda f: f
 
         @staticmethod
+        def admin_or_permissions(**_permissions: Any):
+            return lambda f: f
+
+        @staticmethod
         def check(predicate: Any):
             return lambda f: f
 
@@ -249,6 +262,12 @@ def _make_redbot_stub(fake_config: FakeConfig) -> types.ModuleType:
 
         async def add_cog(self, cog: Any) -> None:
             pass
+
+        async def cog_disabled_in_guild(self, cog: Any, guild: Any) -> bool:
+            return False
+
+        async def is_owner(self, user: Any) -> bool:
+            return False
 
     redbot.core.bot = types.ModuleType("redbot.core.bot")
     redbot.core.bot.Red = _FakeRed
@@ -368,6 +387,8 @@ def fake_bot():
     bot = Red()
     bot.get_shared_api_tokens = AsyncMock(return_value={})
     bot.add_cog = AsyncMock()
+    bot.cog_disabled_in_guild = AsyncMock(return_value=False)
+    bot.is_owner = AsyncMock(return_value=False)
     return bot
 
 

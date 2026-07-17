@@ -1,12 +1,12 @@
 {
     "author": ["Okkerka"],
-    "install_msg": "Install required dependencies: `[p]pipinstall tidalapi spotipy google-api-python-client`\nThen run `>tidalsetup` to authenticate with Tidal.",
+    "install_msg": "Install required dependencies: `[p]pipinstall tidalapi spotipy google-api-python-client rapidfuzz`\nThen run `>tidalsetup` to authenticate with Tidal.",
     "name": "TidalPlayer",
     "short": "Play music from Tidal with Hi-Res audio, album art, Spotify/YouTube importing and full metadata.",
     "description": "Tidal music integration for Red-DiscordBot. Supports Hi-Res FLAC, album art, Spotify playlist import, YouTube playlist import, ISRC lookup, MixV2, video URLs, similar albums, user playlist management, and rich now-playing embeds.",
     "tags": ["music", "tidal", "audio", "hifi", "lossless"],
-    "requirements": ["tidalapi>=0.8.0", "spotipy", "google-api-python-client"],
-    "min_bot_version": "3.5.0",
+    "requirements": ["tidalapi>=0.8.0", "spotipy", "google-api-python-client", "rapidfuzz>=3.0"],
+    "min_bot_version": "3.5.24",
     "hidden": false,
     "disabled": false,
     "type": "COG"
