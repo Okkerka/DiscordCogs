@@ -1202,10 +1202,6 @@ class TidalPlayer(commands.Cog):
             return False
         loaded_track.title = truncate(meta["title"], 100)
         loaded_track.author = f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
-        # Evaluate was_idle AFTER the retry block so it always uses the final player
-        # object. Checking before player.add() is correct; checking before the retry
-        # reassignment was the bug that caused first->tplay on a cold join to route
-        # to the queued-embed branch instead of the now-playing panel.
         queue = getattr(player, "queue", None)
         try:
             was_idle = not bool(getattr(player, "current", None)) and (len(queue) == 0 if queue is not None else True)
@@ -1214,12 +1210,6 @@ class TidalPlayer(commands.Cog):
         player.add(ctx.author, loaded_track)
         if was_idle:
             self._current_meta[ctx.guild.id] = meta
-            try:
-                refreshed_player = await self._get_player(ctx, connect=False)
-                if refreshed_player is not None:
-                    player = refreshed_player
-            except Exception:
-                pass
             try:
                 await player.play()
             except Exception:
@@ -1231,20 +1221,17 @@ class TidalPlayer(commands.Cog):
                     await self._send_now_playing(ctx, meta)
                 except Exception:
                     log.exception("Now playing controller failed for guild %s", ctx.guild.id)
-            # Do NOT send a queued embed for the first track.
-        else:
-            self._queued_meta[ctx.guild.id].append(meta)
-            if show_embed:
-                try:
-                    queued_msg = await ctx.send(embed=self._make_queued_embed(meta))
-                    asyncio.get_event_loop().call_later(
-                        180,
-                        lambda m=queued_msg: asyncio.ensure_future(
-                            _delete_message_safe(m)
-                        ),
-                    )
-                except discord.HTTPException:
-                    log.warning("Could not send queued embed for guild %s", ctx.guild.id)
+            return True
+        self._queued_meta[ctx.guild.id].append(meta)
+        if show_embed:
+            try:
+                queued_msg = await ctx.send(embed=self._make_queued_embed(meta))
+                asyncio.get_event_loop().call_later(
+                    180,
+                    lambda m=queued_msg: asyncio.ensure_future(_delete_message_safe(m)),
+                )
+            except discord.HTTPException:
+                log.warning("Could not send queued embed for guild %s", ctx.guild.id)
         return True
 
     async def _lastfm_similar_tracks(
