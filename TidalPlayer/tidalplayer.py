@@ -1593,6 +1593,8 @@ class TidalPlayer(commands.Cog):
             player.add(interaction.user, loaded)
             self._queued_meta[guild_id].append(meta)
             try:
+                if not interaction.response.is_done():
+                    await interaction.response.defer()
                 await interaction.followup.send(embed=make_queue_embed(meta), ephemeral=False)
             except Exception:
                 log.exception("Could not send queue confirmation for suggested track %s", selected_id)
