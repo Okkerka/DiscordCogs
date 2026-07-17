@@ -1346,16 +1346,9 @@ class TidalPlayer(commands.Cog):
         except Exception:
             log.exception("Could not build controller view for guild %s", guild_id)
             return
-        # Always send a fresh now-playing/controller panel for a new track.
-        # Delete the stale previous panel first so only one panel exists at a time.
-        previous = self._controller_messages.pop(guild_id, None)
-        if previous is not None:
-            try:
-                await previous.delete()
-            except (discord.HTTPException, discord.Forbidden, discord.NotFound):
-                pass
         try:
-            self._controller_messages[guild_id] = await ctx.send(view=view)
+            embed = await self._controller_embed(guild_id) or await self._build_now_playing_embed(guild_id, meta)
+            await self._replace_controller_message(guild_id, ctx.channel, embed, view=view)
         except discord.HTTPException:
             log.exception("Could not send controller message for guild %s", guild_id)
 
@@ -1478,6 +1471,10 @@ class TidalPlayer(commands.Cog):
             loaded.title = truncate(meta["title"], 100)
             loaded.author = f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
             player.add(interaction.user, loaded)
+            try:
+                await interaction.response.send_message(embed=make_queue_embed(meta), ephemeral=False)
+            except discord.InteractionResponded:
+                await interaction.followup.send(embed=make_queue_embed(meta), ephemeral=False)
             log.info("Queued suggested Tidal track %s in guild %s", selected_id, guild_id)
             return True
         except Exception:
