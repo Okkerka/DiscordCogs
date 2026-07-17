@@ -1109,23 +1109,15 @@ class TidalPlayer(commands.Cog):
         return player
 
     async def _ensure_vc_connected(self, ctx: commands.Context, player: Any) -> Optional[Any]:
-        # Red Audio/Lavalink players expose `channel` (the connected VoiceChannel object)
-        # rather than an `is_connected` bool. A truthy `channel` means the player is live.
-        # Falling back to `is_connected` covers other potential player implementations.
-        def _is_live(p: Any) -> bool:
-            if p is None:
-                return False
-            channel = getattr(p, "channel", None)
-            if channel is not None:
-                return True
-            return bool(getattr(p, "is_connected", False))
-
-        if _is_live(player):
+        # Red Audio already handles connection in self.audio.get_player(..., voice_channel).
+        # Be permissive here: if we have a player object, let playback proceed instead of
+        # second-guessing Red/Lavalink-specific connection state attributes.
+        if player is not None:
             return player
         for attempt in range(VC_RECONNECT_RETRIES):
             await asyncio.sleep(VC_RECONNECT_DELAY)
             new_player = await self._get_player(ctx, connect=True)
-            if _is_live(new_player):
+            if new_player is not None:
                 log.info("Reconnected to VC (attempt %d)", attempt + 1)
                 return new_player
         log.warning("Could not reconnect to VC, stopping queue")
@@ -1201,22 +1193,11 @@ class TidalPlayer(commands.Cog):
                     loaded_track = results.tracks[0]
             except Exception as e:
                 log.error(f"Lavalink load failed: {e}")
-        if not loaded_track and stream_url:
-            try:
-                player = await self._get_player(ctx, connect=True)
-                if not player:
-                    await ctx.send(embed=_error_embed(Messages.ERROR_NO_PLAYER))
-                    return False
-                player = await self._ensure_vc_connected(ctx, player)
-                if not player:
-                    await ctx.send(embed=_error_embed(Messages.ERROR_NO_PLAYER))
-                    return False
-                results = await player.load_tracks(stream_url)
-                if results and results.tracks:
-                    loaded_track = results.tracks[0]
-            except Exception as e:
-                log.error("Lavalink reload attempt failed: %r", e)
         if not loaded_track:
+            log.error(
+                "Lavalink could not load a playable track for guild %s from resolved stream URL.",
+                ctx.guild.id,
+            )
             await ctx.send(embed=_error_embed(Messages.ERROR_LAVALINK_FAILED))
             return False
         loaded_track.title = truncate(meta["title"], 100)
@@ -1468,7 +1449,7 @@ class TidalPlayer(commands.Cog):
         # Skip succeeded — consume the queued meta now
         if next_meta is not None and queued:
             try:
-                queued.pop(0)
+                queued.popleft()
             except IndexError:
                 next_meta = None
 
@@ -1486,22 +1467,24 @@ class TidalPlayer(commands.Cog):
             self._current_meta[guild_id] = next_meta
             self._controller_meta[guild_id] = next_meta
 
-        # Always resend a fresh controller panel so the user gets instant feedback
-        if channel is not None:
+        # Always resend a fresh controller panel so the user gets instant feedback.
+        # Use interaction.followup.send() (webhook) so the Components V2 flag is
+        # carried correctly. Fall back to channel.send() only if followup is unavailable.
+        try:
+            view = await self._controller_view(guild_id)
+            if not view.children:
+                log.error("Empty controller view after skip in guild %s — not sending", guild_id)
+                return
             try:
-                view = await self._controller_view(guild_id)
-                if view.children:
-                    self._controller_messages[guild_id] = await channel.send(view=view)
-                else:
-                    log.error(
-                        "Empty controller view after skip in guild %s — not sending", guild_id
-                    )
+                msg = await interaction.followup.send(view=view, wait=True)
+                self._controller_messages[guild_id] = msg
             except discord.HTTPException:
-                log.exception("Could not resend controller after skip in guild %s", guild_id)
-        else:
-            log.warning(
-                "No channel available to resend controller after skip in guild %s", guild_id
-            )
+                log.exception("followup.send failed after skip in guild %s, trying channel.send", guild_id)
+                if channel is not None:
+                    msg = await channel.send(view=view)
+                    self._controller_messages[guild_id] = msg
+        except Exception:
+            log.exception("Could not resend controller after skip in guild %s", guild_id)
 
     async def can_control_player(self, interaction: discord.Interaction) -> bool:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
@@ -1578,11 +1561,22 @@ class TidalPlayer(commands.Cog):
                     await result
         self._current_meta.pop(guild_id, None)
         self._controller_meta.pop(guild_id, None)
-        self._controller_messages.pop(guild_id, None)
-        await interaction.response.edit_message(
-            content="## Playback stopped\nThe queue was cleared.",
-            embed=None, embeds=[], attachments=[], view=None,
-        )
+        old_msg = self._controller_messages.pop(guild_id, None)
+        # edit_message with embed=None + embeds=[] conflicts — delete the panel
+        # and send a plain ephemeral confirmation instead.
+        if old_msg is not None:
+            try:
+                await old_msg.delete()
+            except (discord.HTTPException, discord.Forbidden, discord.NotFound):
+                pass
+        try:
+            await interaction.response.defer()
+        except Exception:
+            pass
+        try:
+            await interaction.followup.send("⏹ Playback stopped. Queue cleared.", ephemeral=True)
+        except Exception:
+            pass
 
     async def queue_recommendation(self, interaction: discord.Interaction, tidal_track: Any) -> bool:
         if interaction.guild is None:
