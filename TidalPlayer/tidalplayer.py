@@ -1169,6 +1169,10 @@ class TidalPlayer(commands.Cog):
         if not player:
             await ctx.send(embed=_error_embed(Messages.ERROR_NO_PLAYER))
             return False
+        player = await self._ensure_vc_connected(ctx, player)
+        if not player:
+            await ctx.send(embed=_error_embed(Messages.ERROR_NO_PLAYER))
+            return False
         stream_url = await self.tidal.get_stream_url(tidal_track)
         loaded_track = None
         if stream_url:
@@ -1181,6 +1185,13 @@ class TidalPlayer(commands.Cog):
         if not loaded_track and stream_url:
             try:
                 player = await self._get_player(ctx, connect=True)
+                if not player:
+                    await ctx.send(embed=_error_embed(Messages.ERROR_NO_PLAYER))
+                    return False
+                player = await self._ensure_vc_connected(ctx, player)
+                if not player:
+                    await ctx.send(embed=_error_embed(Messages.ERROR_NO_PLAYER))
+                    return False
                 results = await player.load_tracks(stream_url)
                 if results and results.tracks:
                     loaded_track = results.tracks[0]
@@ -1199,12 +1210,18 @@ class TidalPlayer(commands.Cog):
         player.add(ctx.author, loaded_track)
         if was_idle:
             self._current_meta[ctx.guild.id] = meta
-            # Start playback only if Lavalink has not already started it (belt-and-suspenders).
-            if not getattr(player, "current", None):
-                try:
-                    await player.play()
-                except Exception:
-                    log.exception("player.play() failed for guild %s", ctx.guild.id)
+            try:
+                refreshed_player = await self._get_player(ctx, connect=False)
+                if refreshed_player is not None:
+                    player = refreshed_player
+            except Exception:
+                pass
+            try:
+                await player.play()
+            except Exception:
+                log.exception("player.play() failed for guild %s", ctx.guild.id)
+                await ctx.send(embed=_error_embed(Messages.ERROR_LAVALINK_FAILED))
+                return False
             if show_embed:
                 try:
                     await self._send_now_playing(ctx, meta)
