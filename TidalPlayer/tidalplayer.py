@@ -8,13 +8,13 @@ from __future__ import annotations
 import asyncio
 import logging
 from urllib.parse import urlencode
-from urllib.request import urlopen
 from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from itertools import islice
 from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 
+import aiohttp
 import discord
 from redbot.core import Config, app_commands, commands
 from redbot.core.bot import Red
@@ -34,7 +34,8 @@ from .domain.normalization import (
 )
 from .ui.embeds import (
     COLOR_BLUE, COLOR_GREEN, COLOR_PURPLE, COLOR_RED, COLOR_TEAL, Messages,
-    error_embed as _error_embed, make_now_playing_embed, success_embed as _success_embed,
+    error_embed as _error_embed, make_now_playing_embed, make_queue_embed,
+    success_embed as _success_embed,
 )
 from .ui.controller import PlayerControllerView
 from .providers.audio import RedAudioGateway
@@ -96,7 +97,7 @@ QUEUE_PAGE_SIZE = 10
 TPL_LIST_PAGE_SIZE = 15
 SEARCH_BATCH_SIZE = 16
 CONTROLLER_REFRESH_COOLDOWN = 2.0
-PROGRESS_SLEEP_INTERVAL = 0.0
+PROGRESS_SLEEP_INTERVAL = 5.0  # FIX: was 0.0 — prevented tight busy-loop
 TOKEN_REFRESH_MIN_INTERVAL = 1800.0
 STREAM_URL_CACHE_TTL = 300.0
 LAVALINK_LOAD_TIMEOUT = 8.0
@@ -112,6 +113,10 @@ _CACHE_CAPS: Dict[str, int] = {
     "video": 100,
     "stream_url": 500,
 }
+
+# Sentinel object for cache misses — distinguishes "not cached" from a cached
+# falsy value such as None, False, or 0.
+_CACHE_MISS = object()
 
 
 def _is_tidal_track(obj: Any) -> bool:
@@ -129,7 +134,8 @@ def _spotify_item_to_query(item: dict) -> str:
     isrc = (track.get("external_ids") or {}).get("isrc")
     if isrc:
         return f"isrc:{isrc}"
-    artists = " ".join(a["name"] for a in track.get("artists", []))
+    # FIX: was a["name"] — KeyError on malformed artist dicts
+    artists = " ".join(a.get("name", "") for a in track.get("artists", []) if a.get("name"))
     return f"{track.get('name', '')} {artists}".strip()
 
 
@@ -137,7 +143,8 @@ def _spotify_album_item_to_query(item: dict) -> str:
     isrc = (item.get("external_ids") or {}).get("isrc")
     if isrc:
         return f"isrc:{isrc}"
-    artists = " ".join(a["name"] for a in item.get("artists", []))
+    # FIX: same as above, guard against missing "name" key in artist dicts
+    artists = " ".join(a.get("name", "") for a in item.get("artists", []) if a.get("name"))
     return f"{item.get('name', '')} {artists}".strip()
 
 
@@ -198,7 +205,9 @@ class TrackSelectView(discord.ui.View):
 
     async def wait_for_selection(self) -> Optional[Any]:
         try:
-            await asyncio.wait_for(self._event.wait(), timeout=self.timeout + 5.0)
+            # FIX: was self.timeout + 5.0 — caused a 5s phantom wait after
+            # buttons visually expired; callers thought the interaction was done.
+            await asyncio.wait_for(self._event.wait(), timeout=self.timeout)
         except asyncio.TimeoutError:
             self._timed_out = True
         return self.selected
@@ -217,7 +226,17 @@ class TidalHandler:
     def __init__(self, bot: Red, config: Config):
         self.bot = bot
         self.config = config
-        self.session: Optional[Any] = tidalapi.Session() if TIDALAPI_AVAILABLE else None
+        # FIX: wrapped Session() construction — was unguarded; a partial tidalapi
+        # install that passes the import check but fails the constructor would
+        # previously propagate an unhandled exception into __init__.
+        if TIDALAPI_AVAILABLE:
+            try:
+                self.session: Optional[Any] = tidalapi.Session()
+            except Exception as e:
+                log.error("Failed to create tidalapi.Session: %r", e)
+                self.session = None
+        else:
+            self.session = None
         self._refresh_task: Optional[asyncio.Task] = None
         self.api_semaphore = asyncio.Semaphore(API_SEMAPHORE_LIMIT)
         self._login_cache: Optional[bool] = None
@@ -227,18 +246,21 @@ class TidalHandler:
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tidal_io")
         self._last_refresh_ts: float = 0.0
 
-    def _get_cached(self, category: str, key: str) -> Optional[Any]:
+    def _get_cached(self, category: str, key: str) -> Any:
+        # FIX: was returning False on cache miss; callers checked `if cached is not None`
+        # which evaluates True for False, making every miss appear as a hit and
+        # preventing data from ever being re-fetched. Now uses a sentinel object.
         bucket = self._cache.get(category)
         if bucket is None:
-            return False
+            return _CACHE_MISS
         entry = bucket.get(key)
         if entry is None:
-            return False
+            return _CACHE_MISS
         value, expiry = entry
         now = asyncio.get_running_loop().time()
         if now > expiry:
             del bucket[key]
-            return False
+            return _CACHE_MISS
         bucket.move_to_end(key)
         return value
 
@@ -297,7 +319,11 @@ class TidalHandler:
                     delay *= 2
                 else:
                     raise
-        raise last_exc
+        # FIX: was `raise last_exc` which raises TypeError if last_exc is None
+        # (e.g. RATELIMIT_MAX_RETRIES == 0). Now always raises a valid exception.
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("_run_with_backoff exhausted retries with no exception captured")
 
     async def initialize(self, creds: Dict[str, Any]) -> None:
         if not self.session or not creds.get("access_token"):
@@ -396,29 +422,15 @@ class TidalHandler:
         return self._login_cache if self._login_cache is not None else False
 
     async def _auto_refresh_tokens(self) -> None:
+        # FIX: removed the pre-sleep expiry read that occurred outside _refresh_lock.
+        # That read raced with refresh_tokens(force=True) on 401. Now we simply
+        # sleep for the interval then delegate entirely to refresh_tokens(), which
+        # already performs the expiry check under the lock.
         while True:
-            sleep_secs = 1800
-            try:
-                if await self.is_logged_in():
-                    expiry_time = await self._run_blocking(lambda: self.session.expiry_time, timeout=5.0)
-                    if expiry_time:
-                        expiry_aware = _ensure_aware(expiry_time)
-                        until_expiry = (expiry_aware - _utc_now()).total_seconds()
-                        if until_expiry > 7200:
-                            sleep_secs = min(3600, max(1800, until_expiry - 3600))
-                        else:
-                            sleep_secs = 900
-            except Exception:
-                pass
-            await asyncio.sleep(sleep_secs)
+            await asyncio.sleep(TOKEN_REFRESH_MIN_INTERVAL)
             try:
                 if not await self.is_logged_in():
                     continue
-                expiry_time = await self._run_blocking(lambda: self.session.expiry_time, timeout=5.0)
-                if expiry_time:
-                    expiry_aware = _ensure_aware(expiry_time)
-                    if _utc_now() + timedelta(minutes=30) <= expiry_aware:
-                        continue
                 await self.refresh_tokens()
             except Exception as e:
                 log.error(f"Auto token refresh failed: {e}")
@@ -428,7 +440,7 @@ class TidalHandler:
             return []
         cache_key = f"{query}:{filter_remixes}"
         cached = self._get_cached("search", cache_key)
-        if cached is not None:
+        if cached is not _CACHE_MISS:
             return cached
         async with self.api_semaphore:
             try:
@@ -450,9 +462,9 @@ class TidalHandler:
 
     async def get_track_by_isrc(self, isrc: str) -> Optional[Any]:
         if not self.session:
-            return False
+            return None
         cached = self._get_cached("isrc", isrc)
-        if cached is not None:
+        if cached is not _CACHE_MISS:
             return cached
         async with self.api_semaphore:
             try:
@@ -460,20 +472,20 @@ class TidalHandler:
                     if hasattr(self.session, "get_tracks_by_isrc"):
                         results = self.session.get_tracks_by_isrc(isrc)
                         return results[0] if results else None
-                    return False
+                    return None
                 res = await self._run_with_backoff(_fetch, timeout=10.0)
                 if res:
                     self._set_cached("isrc", isrc, res, 3600.0)
                 return res
             except Exception as e:
                 log.debug(f"ISRC lookup failed for {isrc}: {e}")
-                return False
+                return None
 
     async def get_track(self, track_id: str) -> Optional[Any]:
         if not self.session:
-            return False
+            return None
         cached = self._get_cached("track", track_id)
-        if cached is not None:
+        if cached is not _CACHE_MISS:
             return cached
         async with self.api_semaphore:
             try:
@@ -483,10 +495,10 @@ class TidalHandler:
                 return res
             except asyncio.TimeoutError:
                 log.warning(f"Tidal get_track timeout for id {track_id}")
-                return False
+                return None
             except Exception as e:
                 log.debug(f"Failed to fetch track {track_id}: {e}")
-                return False
+                return None
 
     async def get_track_radio(self, track_id: str) -> List[Any]:
         """Get Tidal Track Radio candidates, retaining sparse objects by ID."""
@@ -494,7 +506,7 @@ class TidalHandler:
             return []
         cache_key = f"radio:{track_id}"
         cached = self._get_cached("mix", cache_key)
-        if cached is not None:
+        if cached is not _CACHE_MISS:
             return cached
         async with self.api_semaphore:
             try:
@@ -525,11 +537,12 @@ class TidalHandler:
         else:
             log.warning("Tidal Track Radio returned no usable tracks for %s.", track_id)
         return tracks
+
     async def get_video(self, video_id: str) -> Optional[Any]:
         if not self.session or not hasattr(self.session, "video"):
-            return False
+            return None
         cached = self._get_cached("video", video_id)
-        if cached is not None:
+        if cached is not _CACHE_MISS:
             return cached
         async with self.api_semaphore:
             try:
@@ -539,13 +552,13 @@ class TidalHandler:
                 return res
             except Exception as e:
                 log.debug(f"Failed to fetch video {video_id}: {e}")
-                return False
+                return None
 
     async def get_album(self, album_id: str) -> Optional[Any]:
         if not self.session:
-            return False
+            return None
         cached = self._get_cached("album", album_id)
-        if cached is not None:
+        if cached is not _CACHE_MISS:
             return cached
         async with self.api_semaphore:
             try:
@@ -554,13 +567,13 @@ class TidalHandler:
                     self._set_cached("album", album_id, res, 1800.0)
                 return res
             except Exception:
-                return False
+                return None
 
     async def get_playlist(self, playlist_id: str) -> Optional[Any]:
         if not self.session:
-            return False
+            return None
         cached = self._get_cached("playlist", playlist_id)
-        if cached is not None:
+        if cached is not _CACHE_MISS:
             return cached
         async with self.api_semaphore:
             try:
@@ -569,13 +582,13 @@ class TidalHandler:
                     self._set_cached("playlist", playlist_id, res, 300.0)
                 return res
             except Exception:
-                return False
+                return None
 
     async def get_mix(self, mix_id: str) -> Optional[Any]:
         if not self.session:
-            return False
+            return None
         cached = self._get_cached("mix", mix_id)
-        if cached is not None:
+        if cached is not _CACHE_MISS:
             return cached
         res = None
         async with self.api_semaphore:
@@ -606,7 +619,7 @@ class TidalHandler:
 
     async def get_album_review(self, album: Any) -> Optional[str]:
         if not album or not hasattr(album, "review"):
-            return False
+            return None
         async with self.api_semaphore:
             try:
                 result = await self._run_with_backoff(album.review, timeout=10.0)
@@ -616,7 +629,7 @@ class TidalHandler:
                     return result.text
                 return str(result) if result else None
             except Exception:
-                return False
+                return None
 
     async def get_user_playlists(self) -> List[Any]:
         if not self.session or not hasattr(self.session, "user"):
@@ -636,11 +649,11 @@ class TidalHandler:
 
     async def get_user_playlist_by_id(self, playlist_id: str) -> Optional[Any]:
         if not self.session:
-            return False
+            return None
         try:
             pl = await self.get_playlist(playlist_id)
             if pl is None:
-                return False
+                return None
             creator = getattr(pl, "creator", None)
             session_user = getattr(self.session, "user", None)
             if creator is None or session_user is None:
@@ -648,26 +661,26 @@ class TidalHandler:
             creator_id = getattr(creator, "id", None)
             user_id = getattr(session_user, "id", None)
             if creator_id is not None and user_id is not None and str(creator_id) != str(user_id):
-                return False
+                return None
             return pl
         except Exception as e:
             log.debug(f"get_user_playlist_by_id failed for {playlist_id}: {e}")
-            return False
+            return None
 
     async def create_user_playlist(self, name: str, description: str = "") -> Optional[Any]:
         if not self.session or not hasattr(self.session, "user"):
-            return False
+            return None
         async with self.api_semaphore:
             try:
                 def _create():
                     user = self.session.user
                     if hasattr(user, "create_playlist"):
                         return user.create_playlist(name, description)
-                    return False
+                    return None
                 return await self._run_with_backoff(_create, timeout=15.0)
             except Exception as e:
                 log.error(f"create_user_playlist failed: {e}")
-                return False
+                return None
 
     async def add_track_to_playlist(self, playlist: Any, track_id: int) -> bool:
         if not playlist or not hasattr(playlist, "add"):
@@ -759,7 +772,7 @@ class TidalHandler:
 
     async def get_audio_resolution(self, album_obj: Any) -> Optional[Tuple[int, int]]:
         if not album_obj or not hasattr(album_obj, "get_audio_resolution"):
-            return False
+            return None
         try:
             res = await self._run_blocking(album_obj.get_audio_resolution, timeout=5.0)
             if res:
@@ -809,6 +822,7 @@ class TidalHandler:
                 log.warning("get_url() failed for Tidal track %s: %r", track_id, error)
         log.error("No playable Tidal stream URL available for track %s.", track_id)
         return None
+
     def _extract_tracks(self, result: Any) -> List[Any]:
         if (t := getattr(result, "tracks", None)) is not None:
             return t if isinstance(t, list) else getattr(t, "items", [])
@@ -957,7 +971,6 @@ class TidalPlayer(commands.Cog):
         if player is not None:
             self._schedule_autoplay(guild_id, player)
 
-
     async def check_ready(self, ctx: commands.Context) -> bool:
         if not self._initialized:
             await ctx.send(embed=_error_embed(Messages.ERROR_STILL_LOADING))
@@ -1085,19 +1098,26 @@ class TidalPlayer(commands.Cog):
         return format_duration(seconds)
 
     def _format_track_embed(self, meta: TrackMeta, title: str = "Track queued") -> discord.Embed:
-        return make_queue_embed(meta)
+        # FIX: was calling bare make_queue_embed() which is not in scope at this
+        # call site — would raise NameError at runtime. Delegate to the safe helper.
+        return self._make_queued_embed(meta)
 
     async def _get_player(self, ctx: commands.Context, connect: bool = False) -> Optional[Any]:
+        # FIX: removed unreachable `return None` after the try/except block.
+        # Also added catch-all for non-PlaybackUnavailable exceptions which
+        # previously propagated unhandled into command handlers.
         if not self.audio.available or not ctx.guild:
-            return False
+            return None
         try:
             voice_channel = None
             if connect and getattr(ctx.author, "voice", None):
                 voice_channel = getattr(ctx.author.voice, "channel", None)
             return await self.audio.get_player(ctx.guild.id, voice_channel)
         except PlaybackUnavailable:
-            return False
-        return None
+            return None
+        except Exception as e:
+            log.warning("Unexpected error getting player for guild %s: %r", ctx.guild.id, e)
+            return None
 
     async def _ensure_player(self, ctx: commands.Context) -> Optional[Any]:
         player = await self._get_player(ctx, connect=True)
@@ -1181,9 +1201,14 @@ class TidalPlayer(commands.Cog):
             except Exception as e:
                 log.error(f"Lavalink load failed: {e}")
         if not loaded_track and stream_url:
+            # FIX: added null-check on retry_player. Previously re-assigned `player`
+            # from _get_player without checking, so a None return caused
+            # AttributeError on .load_tracks, silently swallowed by bare except.
             try:
-                player = await self._get_player(ctx, connect=True)
-                results = await asyncio.wait_for(player.load_tracks(stream_url), timeout=LAVALINK_LOAD_TIMEOUT)
+                retry_player = await self._get_player(ctx, connect=True)
+                if not retry_player:
+                    raise PlaybackUnavailable("Could not reconnect to voice on retry")
+                results = await asyncio.wait_for(retry_player.load_tracks(stream_url), timeout=LAVALINK_LOAD_TIMEOUT)
                 if results and results.tracks:
                     loaded_track = results.tracks[0]
             except Exception as e:
@@ -1210,7 +1235,6 @@ class TidalPlayer(commands.Cog):
                     log.exception("Now playing controller failed for guild %s", ctx.guild.id)
         else:
             self._queued_meta[ctx.guild.id].append(meta)
-            # Skip controller refresh here for speed; queued confirmation is enough.
             if show_embed:
                 await ctx.send(embed=self._make_queued_embed(meta))
         return True
@@ -1219,26 +1243,38 @@ class TidalPlayer(commands.Cog):
         self, artist: str, title: str, limit: int = 25,
     ) -> List[Tuple[str, str]]:
         """Get similar track names from Last.fm's public read-only API."""
+        # FIX: replaced blocking urllib.request.urlopen (dispatched to thread pool)
+        # with aiohttp (Red's own session). urlopen tied up executor threads for
+        # up to 15s per call and had no async cancellation. aiohttp is non-blocking
+        # and already a transitive dependency of Red.
         tokens = await self.bot.get_shared_api_tokens("lastfm")
         api_key = tokens.get("api_key")
         if not api_key or not artist or not title:
             return []
-        params = urlencode({
-            "method": "track.getsimilar", "artist": artist, "track": title,
-            "limit": limit, "autocorrect": 1, "api_key": api_key, "format": "json",
-        })
-        url = f"https://ws.audioscrobbler.com/2.0/?{params}"
+        params = {
+            "method": "track.getsimilar",
+            "artist": artist,
+            "track": title,
+            "limit": limit,
+            "autocorrect": 1,
+            "api_key": api_key,
+            "format": "json",
+        }
         try:
-            def fetch() -> Dict[str, Any]:
-                import json
-                with urlopen(url, timeout=15) as response:
-                    return json.load(response)
-            payload = await self.tidal._run_blocking(fetch, timeout=20.0)
+            async with self.bot._session.get(
+                "https://ws.audioscrobbler.com/2.0/",
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                payload = await resp.json()
             entries = payload.get("similartracks", {}).get("track", [])
             if isinstance(entries, dict):
                 entries = [entries]
             return [
-                (str(item.get("artist", {}).get("name", "")).strip(), str(item.get("name", "")).strip())
+                (
+                    str(item.get("artist", {}).get("name", "")).strip(),
+                    str(item.get("name", "")).strip(),
+                )
                 for item in entries
                 if item.get("artist", {}).get("name") and item.get("name")
             ]
@@ -1287,6 +1323,7 @@ class TidalPlayer(commands.Cog):
             track for track in fallback
             if str(getattr(track, "id", "") or "") not in seen_ids
         ][:25]
+
     async def _controller_view(
         self, guild_id: int, paused: bool = False,
     ) -> PlayerControllerView:
@@ -1299,12 +1336,9 @@ class TidalPlayer(commands.Cog):
         )
 
     def _make_queued_embed(self, meta: TrackMeta) -> discord.Embed:
-        from .ui.embeds import make_queue_embed
         return make_queue_embed(meta)
 
     async def _build_now_playing_embed(self, guild_id: int, meta: TrackMeta) -> discord.Embed:
-        # Legacy compact now-playing embed path kept only as a fallback.
-        # Main flow should use the controller panel instead.
         enabled = await self.config.guild_from_id(guild_id).autoplay_enabled()
         return make_now_playing_embed(meta, enabled)
 
@@ -1338,7 +1372,6 @@ class TidalPlayer(commands.Cog):
         except discord.HTTPException:
             log.exception("Could not send controller message for guild %s", guild_id)
 
-
     def _remember_track(self, guild_id: int, meta: TrackMeta) -> None:
         track_id = str(meta.get("track_id") or "")
         if track_id:
@@ -1348,7 +1381,7 @@ class TidalPlayer(commands.Cog):
         try:
             return await self.audio.get_player(guild_id)
         except PlaybackUnavailable:
-            return False
+            return None
 
     async def can_control_player(self, interaction: discord.Interaction) -> bool:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
@@ -1360,7 +1393,7 @@ class TidalPlayer(commands.Cog):
     async def _controller_embed(self, guild_id: int) -> discord.Embed | None:
         meta = self._controller_meta.get(guild_id) or self._current_meta.get(guild_id)
         if meta is None:
-            return False
+            return None
         return await self._build_now_playing_embed(guild_id, meta)
 
     async def _refresh_controller(
@@ -1385,7 +1418,6 @@ class TidalPlayer(commands.Cog):
                 await message.edit(view=view)
             except (discord.HTTPException, discord.Forbidden, discord.NotFound):
                 pass
-
 
     async def controller_toggle_autoplay(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
@@ -1463,8 +1495,6 @@ class TidalPlayer(commands.Cog):
         except Exception:
             log.exception("Could not queue suggested Tidal track %s in guild %s", selected_id, guild_id)
             return False
-
-
 
 
 async def setup(bot):
