@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+
+def test_queued_embed_delete_delay_is_one_minute(cog) -> None:
+    module = importlib.import_module(cog.__class__.__module__)
+    assert module.QUEUED_EMBED_DELETE_DELAY == 60.0
 
 
 @pytest.mark.asyncio

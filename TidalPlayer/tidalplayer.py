@@ -114,6 +114,7 @@ TPL_LIST_PAGE_SIZE = 15
 SEARCH_BATCH_SIZE = 8
 CONTROLLER_REFRESH_COOLDOWN = 3.0   # seconds between background-only controller edits
 PROGRESS_SLEEP_INTERVAL = 0.0       # Provider and executor limits already pace batch work.
+QUEUED_EMBED_DELETE_DELAY = 60.0    # Keep queue confirmations visible without cluttering chat.
 RECOMMENDATION_SEARCH_CONCURRENCY = 2  # Leave Tidal API capacity for playback requests.
 RECOMMENDATION_LOOKUP_CONCURRENCY = 2  # Reserve at least one Tidal API slot for foreground commands.
 LASTFM_REQUEST_TIMEOUT = 20.0
@@ -1742,7 +1743,7 @@ class TidalPlayer(commands.Cog):
         if show_embed:
             try:
                 queued_msg = await ctx.send(embed=self._make_queued_embed(meta))
-                task = asyncio.create_task(self._delete_after(queued_msg, 180))
+                task = asyncio.create_task(self._delete_after(queued_msg, QUEUED_EMBED_DELETE_DELAY))
                 self._tasks.add(task)
             except discord.HTTPException:
                 log.warning("Could not send queued embed for guild %s", ctx.guild.id)
@@ -2467,7 +2468,9 @@ class TidalPlayer(commands.Cog):
                     queued_message = await channel.send(
                         embed=make_queue_embed(meta, title="Autoplay song queued")
                     )
-                    task = asyncio.create_task(self._delete_after(queued_message, 180))
+                    task = asyncio.create_task(
+                        self._delete_after(queued_message, QUEUED_EMBED_DELETE_DELAY)
+                    )
                     self._tasks.add(task)
                 except (discord.HTTPException, discord.Forbidden):
                     log.warning("Could not announce autoplay track %s in guild %s", selected_id, guild_id)
