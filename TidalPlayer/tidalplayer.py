@@ -1162,6 +1162,9 @@ class TidalPlayer(commands.Cog):
         if not ctx.guild:
             return False
         meta = await self._extract_meta(tidal_track, skip_audio_res=skip_audio_res)
+        if not getattr(ctx.author, "voice", None) or getattr(ctx.author.voice, "channel", None) is None:
+            await ctx.send(embed=_error_embed(Messages.ERROR_NO_PLAYER))
+            return False
         player = await self._get_player(ctx, connect=True)
         if not player:
             await ctx.send(embed=_error_embed(Messages.ERROR_NO_PLAYER))
