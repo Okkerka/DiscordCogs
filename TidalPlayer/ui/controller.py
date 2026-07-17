@@ -123,7 +123,6 @@ class PlayerControllerView(discord.ui.LayoutView):
         container.add_item(
             discord.ui.ActionRow(autoplay_button, pause_button, skip_button, stop_button)
         )
-        self.add_item(container)
 
     def _make_suggestions_select(self) -> discord.ui.Select:
         if not self.recommendations:

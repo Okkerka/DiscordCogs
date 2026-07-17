@@ -1397,7 +1397,10 @@ class TidalPlayer(commands.Cog):
             else:
                 await interaction.followup.send(embed=_error_embed(Messages.ERROR_NOT_PLAYING), ephemeral=True)
             return
-        old_message = self._controller_messages.pop(guild_id, None)
+        old_message = interaction.message or self._controller_messages.pop(guild_id, None)
+        stored_message = self._controller_messages.pop(guild_id, None)
+        if old_message is None:
+            old_message = stored_message
         next_meta = None
         queued = self._queued_meta.get(guild_id)
         if queued:
@@ -1406,6 +1409,10 @@ class TidalPlayer(commands.Cog):
             except Exception:
                 next_meta = None
         try:
+            await interaction.response.defer()
+        except Exception:
+            pass
+        try:
             await player.skip()
         except Exception:
             if next_meta is not None:
@@ -1413,13 +1420,11 @@ class TidalPlayer(commands.Cog):
             if old_message is not None:
                 self._controller_messages[guild_id] = old_message
             log.exception("Could not skip track in guild %s", guild_id)
-            if not interaction.response.is_done():
-                await interaction.response.send_message("Could not skip the current track.", ephemeral=True)
-            else:
+            try:
                 await interaction.followup.send("Could not skip the current track.", ephemeral=True)
+            except Exception:
+                pass
             return
-        if not interaction.response.is_done():
-            await interaction.response.defer()
         if next_meta is not None:
             self._current_meta[guild_id] = next_meta
             self._controller_meta[guild_id] = next_meta
