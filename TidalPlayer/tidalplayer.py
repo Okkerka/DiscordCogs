@@ -118,7 +118,6 @@ RECOMMENDATION_SEARCH_CONCURRENCY = 2  # Leave Tidal API capacity for playback r
 RECOMMENDATION_LOOKUP_CONCURRENCY = 2  # Reserve at least one Tidal API slot for foreground commands.
 LASTFM_REQUEST_TIMEOUT = 20.0
 RECENT_TRACK_HISTORY = 50
-LAVALINK_LOAD_TIMEOUT = 10.0
 LAVALINK_NODE_READY_MAX_ATTEMPTS = 3
 LAVALINK_NODE_READY_RETRY_DELAY = 2.0
 
@@ -1474,7 +1473,12 @@ class TidalPlayer(commands.Cog):
         *,
         initial_stream_url: str | None = None,
     ) -> Any | None:
-        """Load one track without multiplying stream or LavaLink REST requests."""
+        """Load one track without multiplying stream or LavaLink REST requests.
+
+        ``player.load_tracks`` owns the REST-client timeout.  Adding a shorter
+        outer ``wait_for`` cancels healthy LavaLink requests before that client
+        can return, which turns slow-but-valid track loads into false failures.
+        """
         stream_url = initial_stream_url
         track_id = getattr(tidal_track, "id", None)
         node_ready_attempt = 0
@@ -1485,9 +1489,7 @@ class TidalPlayer(commands.Cog):
             return None
         while True:
             try:
-                results = await asyncio.wait_for(
-                    player.load_tracks(stream_url), timeout=LAVALINK_LOAD_TIMEOUT
-                )
+                results = await player.load_tracks(stream_url)
             except RuntimeError as error:
                 if not self._is_lavalink_node_not_ready(error):
                     log.exception("Lavalink failed loading Tidal track %s in guild %s", track_id, guild_id)
@@ -1514,10 +1516,9 @@ class TidalPlayer(commands.Cog):
                 continue
             except asyncio.TimeoutError:
                 log.warning(
-                    "Lavalink timed out loading Tidal track %s in guild %s after %.0f seconds; not retrying",
+                    "Lavalink timed out loading Tidal track %s in guild %s; not retrying",
                     track_id,
                     guild_id,
-                    LAVALINK_LOAD_TIMEOUT,
                 )
                 return None
             except Exception:
