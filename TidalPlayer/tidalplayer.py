@@ -82,6 +82,14 @@ except ImportError:
 
 log = logging.getLogger("red.tidalplayer")
 
+
+async def _delete_message_safe(message: discord.Message) -> None:
+    """Delete a Discord message, silently ignoring all expected errors."""
+    try:
+        await message.delete()
+    except (discord.HTTPException, discord.Forbidden, discord.NotFound):
+        pass
+
 API_SEMAPHORE_LIMIT = 5
 INTERACTIVE_TIMEOUT = 30
 BATCH_UPDATE_INTERVAL = 10
@@ -1232,7 +1240,13 @@ class TidalPlayer(commands.Cog):
             self._queued_meta[ctx.guild.id].append(meta)
             if show_embed:
                 try:
-                    await ctx.send(embed=self._make_queued_embed(meta))
+                    queued_msg = await ctx.send(embed=self._make_queued_embed(meta))
+                    asyncio.get_event_loop().call_later(
+                        180,
+                        lambda m=queued_msg: asyncio.ensure_future(
+                            _delete_message_safe(m)
+                        ),
+                    )
                 except discord.HTTPException:
                     log.warning("Could not send queued embed for guild %s", ctx.guild.id)
         return True
@@ -1361,6 +1375,13 @@ class TidalPlayer(commands.Cog):
         except Exception:
             log.exception("Could not build controller view for guild %s", guild_id)
             return
+        # Guard: a LayoutView with no top-level children causes Discord error 50006
+        if not view.children:
+            log.error(
+                "Controller view for guild %s has no children — aborting send to avoid 50006",
+                guild_id,
+            )
+            return
         previous = self._controller_messages.pop(guild_id, None)
         if previous is not None:
             try:
@@ -1387,63 +1408,85 @@ class TidalPlayer(commands.Cog):
     async def controller_skip(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
             if not interaction.response.is_done():
-                await interaction.response.send_message("This control can only be used in a server.", ephemeral=True)
+                await interaction.response.send_message(
+                    "This control can only be used in a server.", ephemeral=True
+                )
             return
+
         guild_id = interaction.guild.id
         player = await self._get_player_for_guild(guild_id)
         if player is None or not getattr(player, "current", None):
-            if not interaction.response.is_done():
-                await interaction.response.send_message(embed=_error_embed(Messages.ERROR_NOT_PLAYING), ephemeral=True)
-            else:
-                await interaction.followup.send(embed=_error_embed(Messages.ERROR_NOT_PLAYING), ephemeral=True)
+            resp = (
+                interaction.response.send_message
+                if not interaction.response.is_done()
+                else interaction.followup.send
+            )
+            await resp(embed=_error_embed(Messages.ERROR_NOT_PLAYING), ephemeral=True)
             return
-        old_message = interaction.message or self._controller_messages.pop(guild_id, None)
-        stored_message = self._controller_messages.pop(guild_id, None)
-        if old_message is None:
-            old_message = stored_message
-        next_meta = None
-        queued = self._queued_meta.get(guild_id)
-        if queued:
-            try:
-                next_meta = queued.pop(0)
-            except Exception:
-                next_meta = None
+
+        # Resolve old message and channel BEFORE any pops, so we never lose the reference
+        old_message = interaction.message or self._controller_messages.get(guild_id)
+        channel: discord.abc.Messageable | None = interaction.channel or (
+            old_message.channel if old_message is not None else None
+        )
+
+        # Acknowledge immediately so Discord's 3-second interaction window doesn't expire
         try:
             await interaction.response.defer()
         except Exception:
             pass
+
+        # Peek at next queued meta — don't consume yet in case skip fails
+        queued = self._queued_meta.get(guild_id, [])
+        next_meta = queued[0] if queued else None
+
         try:
             await player.skip()
         except Exception:
-            if next_meta is not None:
-                self._queued_meta[guild_id].insert(0, next_meta)
-            if old_message is not None:
-                self._controller_messages[guild_id] = old_message
             log.exception("Could not skip track in guild %s", guild_id)
             try:
                 await interaction.followup.send("Could not skip the current track.", ephemeral=True)
             except Exception:
                 pass
             return
+
+        # Skip succeeded — consume the queued meta now
+        if next_meta is not None and queued:
+            try:
+                queued.pop(0)
+            except IndexError:
+                next_meta = None
+
+        # Remove stale panel reference and delete the message
+        self._controller_messages.pop(guild_id, None)
+        if old_message is not None:
+            try:
+                await old_message.delete()
+            except (discord.HTTPException, discord.Forbidden, discord.NotFound):
+                pass
+
+        # Update meta if we already know the next track; otherwise Lavalink's
+        # track_start event will update _current_meta when the new track begins.
         if next_meta is not None:
             self._current_meta[guild_id] = next_meta
             self._controller_meta[guild_id] = next_meta
-            channel = interaction.channel or (old_message.channel if old_message is not None else None)
-            if old_message is not None:
-                try:
-                    await old_message.delete()
-                except (discord.HTTPException, discord.Forbidden, discord.NotFound):
-                    pass
-            if channel is not None:
-                try:
-                    view = await self._controller_view(guild_id)
+
+        # Always resend a fresh controller panel so the user gets instant feedback
+        if channel is not None:
+            try:
+                view = await self._controller_view(guild_id)
+                if view.children:
                     self._controller_messages[guild_id] = await channel.send(view=view)
-                except discord.HTTPException:
-                    log.exception("Could not resend controller after skip in guild %s", guild_id)
+                else:
+                    log.error(
+                        "Empty controller view after skip in guild %s — not sending", guild_id
+                    )
+            except discord.HTTPException:
+                log.exception("Could not resend controller after skip in guild %s", guild_id)
         else:
-            if old_message is not None:
-                self._controller_messages[guild_id] = old_message
-            await self._refresh_controller(guild_id)
+            log.warning(
+                "No channel available to resend controller after skip in guild %s", guild_id
+            )
 
     async def can_control_player(self, interaction: discord.Interaction) -> bool:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
