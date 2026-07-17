@@ -1,11 +1,11 @@
-_CACHE_MISS = object()
-
 """
 TidalPlayer - Tidal music integration for Red Discord Bot
 Features: Hi-Res Audio, Album Art, Spotify/YT Importing, MixV2, Video URLs,
           Hybrid Slash Commands, Similar Albums, UserPlaylist Mgmt, Rich UI
 """
 from __future__ import annotations
+
+_CACHE_MISS = object()
 
 import asyncio
 import logging
