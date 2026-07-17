@@ -1213,12 +1213,7 @@ class TidalPlayer(commands.Cog):
             # Do NOT send a queued embed for the first track.
         else:
             self._queued_meta[ctx.guild.id].append(meta)
-            # Refresh the existing controller for state changes, but do not resend it.
-            task = asyncio.create_task(self._refresh_controller(ctx.guild.id))
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
             if show_embed:
-                # Show a compact "added to queue" confirmation embed.
                 try:
                     await ctx.send(embed=self._make_queued_embed(meta))
                 except discord.HTTPException:
@@ -1372,6 +1367,29 @@ class TidalPlayer(commands.Cog):
         except PlaybackUnavailable:
             return None
 
+    async def controller_skip(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            if not interaction.response.is_done():
+                await interaction.response.send_message("This control can only be used in a server.", ephemeral=True)
+            return
+        player = await self._get_player_for_guild(interaction.guild.id)
+        if player is None or not getattr(player, "current", None):
+            if not interaction.response.is_done():
+                await interaction.response.send_message(embed=_error_embed(Messages.ERROR_NOT_PLAYING), ephemeral=True)
+            else:
+                await interaction.followup.send(embed=_error_embed(Messages.ERROR_NOT_PLAYING), ephemeral=True)
+            return
+        try:
+            await player.skip()
+        except Exception:
+            log.exception("Could not skip track in guild %s", interaction.guild.id)
+            if not interaction.response.is_done():
+                await interaction.response.send_message("Could not skip the current track.", ephemeral=True)
+            else:
+                await interaction.followup.send("Could not skip the current track.", ephemeral=True)
+            return
+        await self._refresh_controller(interaction.guild.id, interaction)
+
     async def can_control_player(self, interaction: discord.Interaction) -> bool:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             return False
@@ -1479,6 +1497,7 @@ class TidalPlayer(commands.Cog):
             loaded.title = truncate(meta["title"], 100)
             loaded.author = f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
             player.add(interaction.user, loaded)
+            self._queued_meta[guild_id].append(meta)
             try:
                 await interaction.followup.send(embed=make_queue_embed(meta), ephemeral=False)
             except Exception:
@@ -1567,11 +1586,24 @@ class TidalPlayer(commands.Cog):
                 self._current_meta[guild_id] = meta
                 self._controller_meta[guild_id] = meta
                 self._remember_track(guild_id, meta)
-                await self._refresh_controller(guild_id)
+                channel = None
+                old_message = self._controller_messages.get(guild_id)
+                if old_message is not None:
+                    channel = old_message.channel
+                elif guild is not None:
+                    channel = guild.system_channel
+                if channel is not None:
+                    previous = self._controller_messages.pop(guild_id, None)
+                    if previous is not None:
+                        try:
+                            await previous.delete()
+                        except (discord.HTTPException, discord.Forbidden, discord.NotFound):
+                            pass
+                    view = await self._controller_view(guild_id)
+                    self._controller_messages[guild_id] = await channel.send(view=view)
                 log.info("Autoplay started Tidal track %s in guild %s", selected_id, guild_id)
             else:
                 self._queued_meta[guild_id].append(meta)
-                await self._refresh_controller(guild_id)
                 log.info("Autoplay queued Tidal track %s in guild %s", selected_id, guild_id)
             return True
         except Exception:
