@@ -1,7 +1,5 @@
 """Stable Discord embed factories for TidalPlayer."""
 
-from typing import Final
-
 import discord
 
 from ..domain.models import TrackMeta

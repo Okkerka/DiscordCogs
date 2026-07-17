@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -142,3 +143,21 @@ async def test_get_url_is_preferred_without_calling_get_stream(cog) -> None:
         assert await cog.tidal.get_stream_url(track) == "https://stream/legacy"
 
     assert track.get_stream_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_lavalink_load_logs_elapsed_time_without_the_signed_url(cog, caplog) -> None:
+    caplog.set_level(logging.INFO, logger="red.tidalplayer")
+    signed_url = "https://stream.example/signed-secret"
+    loaded_track = SimpleNamespace()
+    player = SimpleNamespace(load_tracks=AsyncMock(return_value=SimpleNamespace(tracks=[loaded_track])))
+
+    assert await cog._load_lavalink_track(
+        player,
+        SimpleNamespace(id=530850206),
+        guild_id=1,
+        initial_stream_url=signed_url,
+    ) is loaded_track
+
+    assert "Lavalink loaded Tidal track 530850206 in" in caplog.text
+    assert signed_url not in caplog.text

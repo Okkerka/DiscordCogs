@@ -112,3 +112,31 @@ class TestCircuitBreakerHalfOpen:
         assert cb.state is CircuitState.HALF_OPEN
         _run(cb.call(_ok))  # second probe: closes
         assert cb.state is CircuitState.CLOSED
+
+    def test_half_open_allows_only_one_concurrent_probe(self) -> None:
+        async def scenario() -> None:
+            cb = CircuitBreaker("test", failure_threshold=1, recovery_timeout=0.0)
+            with pytest.raises(ValueError):
+                await cb.call(_fail)
+
+            probe_started = asyncio.Event()
+            release_probe = asyncio.Event()
+
+            async def probe() -> str:
+                probe_started.set()
+                await release_probe.wait()
+                return "ok"
+
+            first_probe = asyncio.create_task(cb.call(probe))
+            await probe_started.wait()
+
+            blocked_probe = AsyncMock(return_value="must-not-run")
+            with pytest.raises(TemporaryUnavailable):
+                await cb.call(blocked_probe)
+            blocked_probe.assert_not_awaited()
+
+            release_probe.set()
+            assert await first_probe == "ok"
+            assert cb.state is CircuitState.CLOSED
+
+        _run(scenario())

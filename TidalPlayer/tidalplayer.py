@@ -113,7 +113,7 @@ QUEUE_PAGE_SIZE = 10
 TPL_LIST_PAGE_SIZE = 15
 SEARCH_BATCH_SIZE = 8
 CONTROLLER_REFRESH_COOLDOWN = 3.0   # seconds between background-only controller edits
-PROGRESS_SLEEP_INTERVAL = 2.0       # seconds to sleep between batch chunks (0 = no sleep)
+PROGRESS_SLEEP_INTERVAL = 0.0       # Provider and executor limits already pace batch work.
 RECOMMENDATION_SEARCH_CONCURRENCY = 2  # Leave Tidal API capacity for playback requests.
 RECOMMENDATION_LOOKUP_CONCURRENCY = 2  # Reserve at least one Tidal API slot for foreground commands.
 LASTFM_REQUEST_TIMEOUT = 20.0
@@ -890,6 +890,7 @@ class TidalHandler:
     async def _get_stream_url_uncached(self, track: Any) -> Optional[str]:
         """Resolve a full Tidal track and return a real stream URL, never a web URL."""
         track_id = getattr(track, "id", None)
+        resolution_started = asyncio.get_running_loop().time()
         if track_id:
             full_track = await self.get_track(str(track_id))
             if full_track is not None:
@@ -901,7 +902,11 @@ class TidalHandler:
                 get_url = getattr(track, "get_url")
                 url = await self._run_with_backoff(get_url, timeout=15.0)
                 if url:
-                    log.info("Retrieved legacy Tidal stream URL for track %s.", track_id)
+                    log.info(
+                        "Resolved Tidal stream URL for track %s via get_url() in %.2fs.",
+                        track_id,
+                        asyncio.get_running_loop().time() - resolution_started,
+                    )
                     return url
             except AttributeError:
                 log.debug("Tidal track %s does not expose get_url(); trying get_stream fallback.", track_id)
@@ -914,7 +919,11 @@ class TidalHandler:
                     return stream.get_urls()
                 urls = await self._run_with_backoff(get_urls, timeout=20.0)
                 if urls:
-                    log.info("Retrieved Tidal stream URL for track %s.", track_id)
+                    log.info(
+                        "Resolved Tidal stream URL for track %s via get_stream() fallback in %.2fs.",
+                        track_id,
+                        asyncio.get_running_loop().time() - resolution_started,
+                    )
                     return urls[0]
             except asyncio.TimeoutError:
                 log.warning("Tidal stream request timed out for track %s.", track_id)
@@ -1091,17 +1100,7 @@ class TidalPlayer(commands.Cog):
     async def on_guild_remove(self, guild: discord.Guild) -> None:
         self._guild_locks.pop(guild.id, None)
         self._cancel_events.pop(guild.id, None)
-        task = self._autoplay_tasks.pop(guild.id, None)
-        if task is not None:
-            task.cancel()
-        task = self._recommendation_tasks.pop(guild.id, None)
-        if task is not None:
-            task.cancel()
-        self._recommendation_task_sources.pop(guild.id, None)
-        task = self._controller_recommendation_tasks.pop(guild.id, None)
-        if task is not None:
-            task.cancel()
-        self._recommendation_cache.pop(guild.id, None)
+        self._cancel_guild_background_tasks(guild.id)
         self._controller_messages.pop(guild.id, None)
         self._playback_channels.pop(guild.id, None)
         self._controller_meta.pop(guild.id, None)
@@ -1363,6 +1362,33 @@ class TidalPlayer(commands.Cog):
             or (signature and signature in self._recent_track_signatures[guild_id])
         )
 
+    def _is_current_or_queued_track(
+        self,
+        guild_id: int,
+        track_id: str,
+        signature: str,
+    ) -> bool:
+        """Check the active track and pending metadata for one song identity."""
+        current = self._current_meta.get(guild_id)
+        queued = self._queued_meta.get(guild_id, ())
+        for meta in (current,):
+            if meta is None:
+                continue
+            candidate_id = str(meta.get("track_id") or "")
+            candidate_signature = self._meta_track_signature(meta)
+            if (track_id and track_id == candidate_id) or (
+                signature and signature == candidate_signature
+            ):
+                return True
+        for meta in queued:
+            candidate_id = str(meta.get("track_id") or "")
+            candidate_signature = self._meta_track_signature(meta)
+            if (track_id and track_id == candidate_id) or (
+                signature and signature == candidate_signature
+            ):
+                return True
+        return False
+
     @staticmethod
     def _lavalink_track_matches_meta(track: Any, meta: TrackMeta) -> bool:
         """Match the metadata we set on a Lavalink track without trusting IDs."""
@@ -1428,6 +1454,26 @@ class TidalPlayer(commands.Cog):
                 task.cancel()
                 self._lavalink_load_tasks.pop(key, None)
 
+    def _cancel_guild_background_tasks(self, guild_id: int) -> None:
+        """Cancel provider work that is no longer useful after a guild stop/removal."""
+        current_task = asyncio.current_task()
+        for tasks in (
+            self._autoplay_tasks,
+            self._recommendation_tasks,
+            self._controller_recommendation_tasks,
+        ):
+            task = tasks.pop(guild_id, None)
+            if task is not None and task is not current_task:
+                task.cancel()
+        self._recommendation_task_sources.pop(guild_id, None)
+        self._recommendation_cache.pop(guild_id, None)
+
+    @staticmethod
+    def _lavalink_node_ready_state(player: Any) -> str:
+        node = getattr(player, "node", None)
+        ready = getattr(node, "available", None)
+        return str(bool(ready)).lower() if ready is not None else "unknown"
+
     @staticmethod
     def _is_lavalink_node_not_ready(error: RuntimeError) -> bool:
         return "node not ready" in str(error).casefold()
@@ -1482,53 +1528,100 @@ class TidalPlayer(commands.Cog):
         stream_url = initial_stream_url
         track_id = getattr(tidal_track, "id", None)
         node_ready_attempt = 0
+        loop = asyncio.get_running_loop()
         if not stream_url:
+            stream_resolution_started = loop.time()
             stream_url = await self.tidal.get_stream_url(tidal_track)
+            log.info(
+                "Resolved Tidal stream URL for track %s in guild %s in %.2fs.",
+                track_id,
+                guild_id,
+                loop.time() - stream_resolution_started,
+            )
         if not stream_url:
             log.warning("No playable Tidal stream URL for track %s in guild %s", track_id, guild_id)
             return None
         while True:
+            load_started = loop.time()
+            node_ready = self._lavalink_node_ready_state(player)
             try:
                 results = await player.load_tracks(stream_url)
             except RuntimeError as error:
                 if not self._is_lavalink_node_not_ready(error):
-                    log.exception("Lavalink failed loading Tidal track %s in guild %s", track_id, guild_id)
+                    log.exception(
+                        "Lavalink failed loading Tidal track %s in guild %s after %.2fs "
+                        "(node_ready=%s)",
+                        track_id,
+                        guild_id,
+                        loop.time() - load_started,
+                        node_ready,
+                    )
                     return None
                 node_ready_attempt += 1
                 if node_ready_attempt >= LAVALINK_NODE_READY_MAX_ATTEMPTS:
                     log.warning(
                         "Lavalink node stayed unavailable while loading Tidal track %s in guild %s "
-                        "after %s readiness check(s)",
+                        "after %s readiness check(s) (node_ready=%s, elapsed=%.2fs)",
                         track_id,
                         guild_id,
                         node_ready_attempt,
+                        node_ready,
+                        loop.time() - load_started,
                     )
                     return None
                 log.warning(
                     "Lavalink node is not ready for Tidal track %s in guild %s; "
-                    "waiting before retrying (%s/%s)",
+                    "waiting before retrying (%s/%s, node_ready=%s, elapsed=%.2fs)",
                     track_id,
                     guild_id,
                     node_ready_attempt,
                     LAVALINK_NODE_READY_MAX_ATTEMPTS - 1,
+                    node_ready,
+                    loop.time() - load_started,
                 )
                 await asyncio.sleep(LAVALINK_NODE_READY_RETRY_DELAY)
                 continue
             except asyncio.TimeoutError:
                 log.warning(
-                    "Lavalink timed out loading Tidal track %s in guild %s; not retrying",
+                    "Lavalink timed out loading Tidal track %s in guild %s after %.2fs "
+                    "(node_ready=%s); not retrying",
                     track_id,
                     guild_id,
+                    loop.time() - load_started,
+                    node_ready,
                 )
                 return None
             except Exception:
-                log.exception("Lavalink failed loading Tidal track %s in guild %s", track_id, guild_id)
+                log.exception(
+                    "Lavalink failed loading Tidal track %s in guild %s after %.2fs "
+                    "(node_ready=%s)",
+                    track_id,
+                    guild_id,
+                    loop.time() - load_started,
+                    node_ready,
+                )
                 return None
 
             tracks = getattr(results, "tracks", None) or []
             if tracks:
+                log.info(
+                    "Lavalink loaded Tidal track %s in guild %s in %.2fs "
+                    "(node_ready=%s, tracks=%s).",
+                    track_id,
+                    guild_id,
+                    loop.time() - load_started,
+                    node_ready,
+                    len(tracks),
+                )
                 return tracks[0]
-            log.warning("Lavalink returned no tracks for Tidal track %s in guild %s", track_id, guild_id)
+            log.warning(
+                "Lavalink returned no tracks for Tidal track %s in guild %s after %.2fs "
+                "(node_ready=%s)",
+                track_id,
+                guild_id,
+                loop.time() - load_started,
+                node_ready,
+            )
             return None
 
     async def _queue_resolved_chunk(
@@ -2150,8 +2243,7 @@ class TidalPlayer(commands.Cog):
             return
         guild_id = interaction.guild.id
         async with self._guild_locks[guild_id]:
-            if (task := self._autoplay_tasks.pop(guild_id, None)) is not None:
-                task.cancel()
+            self._cancel_guild_background_tasks(guild_id)
             self._cancel_lavalink_loads(guild_id)
             player = await self._get_player_for_guild(guild_id)
             if player is not None:
@@ -2190,8 +2282,10 @@ class TidalPlayer(commands.Cog):
         if player is None:
             return False
         selected_id = str(getattr(tidal_track, "id", "") or "")
-        current_id = str((self._current_meta.get(guild_id) or {}).get("track_id") or "")
-        if not selected_id or selected_id == current_id:
+        selected_signature = self._tidal_track_signature(tidal_track)
+        if not selected_id or self._is_current_or_queued_track(
+            guild_id, selected_id, selected_signature
+        ):
             log.warning("Refused duplicate suggested track %s in guild %s", selected_id, guild_id)
             return False
         try:
@@ -2202,8 +2296,10 @@ class TidalPlayer(commands.Cog):
             loaded.title = truncate(meta["title"], 100)
             loaded.author = f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
             async with self._guild_locks[guild_id]:
-                current_id = str((self._current_meta.get(guild_id) or {}).get("track_id") or "")
-                if selected_id == current_id:
+                if self._is_current_or_queued_track(
+                    guild_id, selected_id, self._meta_track_signature(meta)
+                ):
+                    log.warning("Refused duplicate suggested track %s in guild %s", selected_id, guild_id)
                     return False
                 player.add(interaction.user, loaded)
                 self._queued_meta[guild_id].append(meta)
@@ -2287,7 +2383,9 @@ class TidalPlayer(commands.Cog):
         except Exception:
             log.exception("Autoplay failed for guild %s", guild_id)
         finally:
-            self._autoplay_tasks.pop(guild_id, None)
+            task = asyncio.current_task()
+            if task is not None and self._autoplay_tasks.get(guild_id) is task:
+                self._autoplay_tasks.pop(guild_id, None)
 
     async def queue_autoplay_track(
         self,
@@ -2481,19 +2579,42 @@ class TidalPlayer(commands.Cog):
     async def _fetch_all_youtube_tracks(self, playlist_id: str) -> List[Any]:
         all_items: List[Any] = []
         page_token: Optional[str] = None
+        seen_page_tokens: set[str] = set()
         while True:
+            if page_token:
+                if page_token in seen_page_tokens:
+                    log.warning(
+                        "YouTube repeated a playlist page token for playlist %s; stopping import.",
+                        playlist_id,
+                    )
+                    break
+                seen_page_tokens.add(page_token)
             kwargs: Dict[str, Any] = {"part": "snippet", "playlistId": playlist_id, "maxResults": 50}
             if page_token:
                 kwargs["pageToken"] = page_token
             resp = await self.tidal._run_blocking(
                 self.yt.playlistItems().list(**kwargs).execute, timeout=20.0
             )
-            for item in resp.get("items", []):
-                if item.get("snippet", {}).get("title", "").lower() not in YOUTUBE_SKIP_TITLES:
-                    all_items.append(item)
-            page_token = resp.get("nextPageToken")
-            if not page_token or len(all_items) >= MAX_ITEMS:
+            if not isinstance(resp, dict):
+                log.warning("YouTube returned a malformed playlist response for playlist %s.", playlist_id)
                 break
+            items = resp.get("items", [])
+            if not isinstance(items, list):
+                log.warning("YouTube returned malformed playlist items for playlist %s.", playlist_id)
+                break
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                snippet = item.get("snippet")
+                if not isinstance(snippet, dict):
+                    continue
+                title = str(snippet.get("title") or "").casefold()
+                if title not in YOUTUBE_SKIP_TITLES:
+                    all_items.append(item)
+            next_page_token = resp.get("nextPageToken")
+            if not isinstance(next_page_token, str) or not next_page_token or len(all_items) >= MAX_ITEMS:
+                break
+            page_token = next_page_token
             await asyncio.sleep(0)
         return all_items[:MAX_ITEMS]
 

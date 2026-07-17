@@ -231,3 +231,138 @@ async def test_batch_playback_initialises_controller_state_with_current_track(co
     assert cog._current_meta[guild_id] == meta
     assert cog._controller_meta[guild_id] == meta
     assert cog._playback_channels[guild_id] == ctx.channel
+
+
+@pytest.mark.asyncio
+async def test_youtube_import_stops_when_the_api_repeats_a_page_token(cog) -> None:
+    responses = iter((
+        {
+            "items": [{"snippet": {"title": "First track"}}],
+            "nextPageToken": "repeat-token",
+        },
+        {
+            "items": [{"snippet": {"title": "Repeated page"}}],
+            "nextPageToken": "repeat-token",
+        },
+        {"items": [], "nextPageToken": None},
+    ))
+    request_count = 0
+
+    class PlaylistItems:
+        def list(self, **_kwargs):
+            return SimpleNamespace(execute=lambda: next(responses))
+
+    cog.yt = SimpleNamespace(playlistItems=lambda: PlaylistItems())
+
+    async def run_blocking(_handler, operation, **_kwargs):
+        nonlocal request_count
+        request_count += 1
+        return operation()
+
+    with patch.object(type(cog.tidal), "_run_blocking", new=run_blocking):
+        tracks = await cog._fetch_all_youtube_tracks("playlist")
+
+    assert [item["snippet"]["title"] for item in tracks] == ["First track", "Repeated page"]
+    assert request_count == 2
+
+
+@pytest.mark.asyncio
+async def test_youtube_import_handles_a_malformed_api_response_without_crashing(cog) -> None:
+    cog.yt = SimpleNamespace(
+        playlistItems=lambda: SimpleNamespace(
+            list=lambda **_kwargs: SimpleNamespace(execute=lambda: "not a response object")
+        )
+    )
+
+    async def run_blocking(_handler, operation, **_kwargs):
+        return operation()
+
+    with patch.object(type(cog.tidal), "_run_blocking", new=run_blocking):
+        assert await cog._fetch_all_youtube_tracks("playlist") == []
+
+
+@pytest.mark.asyncio
+async def test_finished_autoplay_task_does_not_remove_a_newer_task(cog) -> None:
+    guild_id = 101
+    await cog.config.guild_from_id(guild_id).autoplay_enabled.set(True)
+    cog._current_meta[guild_id] = {"track_id": 1, "title": "Track", "artist": "Artist"}
+    recommendations_started = asyncio.Event()
+    release_recommendations = asyncio.Event()
+
+    async def get_recommendations(_cog, _guild_id, _meta):
+        recommendations_started.set()
+        await release_recommendations.wait()
+        return []
+
+    player = SimpleNamespace(queue=[], current=None)
+    with patch.object(type(cog), "_get_recommendations", new=get_recommendations):
+        first_task = asyncio.create_task(cog._run_autoplay(guild_id, player))
+        cog._autoplay_tasks[guild_id] = first_task
+        await recommendations_started.wait()
+
+        replacement_task = asyncio.create_task(asyncio.Event().wait())
+        cog._autoplay_tasks[guild_id] = replacement_task
+        release_recommendations.set()
+        try:
+            await first_task
+            assert cog._autoplay_tasks[guild_id] is replacement_task
+        finally:
+            replacement_task.cancel()
+            await asyncio.gather(replacement_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_controller_stop_cancels_recommendation_work(cog) -> None:
+    guild_id = 102
+    pending = asyncio.Event()
+    recommendation_task = asyncio.create_task(pending.wait())
+    controller_task = asyncio.create_task(pending.wait())
+    cog._recommendation_tasks[guild_id] = recommendation_task
+    cog._recommendation_task_sources[guild_id] = "id:1"
+    cog._controller_recommendation_tasks[guild_id] = controller_task
+    cog._recommendation_cache[guild_id] = ("id:1", [])
+    interaction = SimpleNamespace(
+        guild=SimpleNamespace(id=guild_id),
+        response=SimpleNamespace(defer=AsyncMock()),
+        followup=SimpleNamespace(send=AsyncMock()),
+    )
+
+    try:
+        with patch.object(type(cog), "_get_player_for_guild", new=AsyncMock(return_value=None)):
+            await cog.controller_stop(interaction)
+        await asyncio.sleep(0)
+
+        assert recommendation_task.cancelled()
+        assert controller_task.cancelled()
+        assert guild_id not in cog._recommendation_tasks
+        assert guild_id not in cog._controller_recommendation_tasks
+        assert guild_id not in cog._recommendation_task_sources
+        assert guild_id not in cog._recommendation_cache
+    finally:
+        recommendation_task.cancel()
+        controller_task.cancel()
+        await asyncio.gather(recommendation_task, controller_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_recommendation_cannot_queue_a_song_already_in_the_queue(cog) -> None:
+    guild_id = 103
+    cog._queued_meta[guild_id].append(
+        {"track_id": 2, "title": "Suggested", "artist": "Artist"}
+    )
+    interaction = SimpleNamespace(
+        guild=SimpleNamespace(id=guild_id),
+        user=SimpleNamespace(),
+        response=SimpleNamespace(is_done=MagicMock(return_value=True)),
+        followup=SimpleNamespace(send=AsyncMock()),
+    )
+    player = SimpleNamespace()
+    candidate = SimpleNamespace(id=2, name="Suggested", artist=SimpleNamespace(name="Artist"))
+
+    with (
+        patch.object(type(cog), "_get_player_for_guild", new=AsyncMock(return_value=player)),
+        patch.object(type(cog), "_load_lavalink_track", new=AsyncMock()) as load_track,
+    ):
+        assert not await cog.queue_recommendation(interaction, candidate)
+
+    load_track.assert_not_awaited()

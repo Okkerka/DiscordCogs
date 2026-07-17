@@ -55,6 +55,7 @@ class CircuitBreaker:
         self._consecutive_failures = 0
         self._consecutive_probe_successes = 0
         self._opened_at: float | None = None
+        self._probe_in_flight = False
         self._lock = asyncio.Lock()
 
     @property
@@ -73,15 +74,27 @@ class CircuitBreaker:
                 raise TemporaryUnavailable(
                     f"Circuit open for provider '{self._name}'; retrying later"
                 )
+            if self._state is CircuitState.HALF_OPEN:
+                if self._probe_in_flight:
+                    raise TemporaryUnavailable(
+                        f"Circuit recovery probe already running for provider '{self._name}'"
+                    )
+                self._probe_in_flight = True
 
         try:
             result = await fn()
-        except Exception as exc:
+        except asyncio.CancelledError:
             async with self._lock:
+                self._probe_in_flight = False
+            raise
+        except Exception:
+            async with self._lock:
+                self._probe_in_flight = False
                 self._record_failure()
             raise
         else:
             async with self._lock:
+                self._probe_in_flight = False
                 self._record_success()
             return result
 
@@ -97,6 +110,7 @@ class CircuitBreaker:
         ):
             self._state = CircuitState.HALF_OPEN
             self._consecutive_probe_successes = 0
+            self._probe_in_flight = False
 
     def _record_failure(self) -> None:
         if self._state is CircuitState.HALF_OPEN:
@@ -121,9 +135,11 @@ class CircuitBreaker:
         self._opened_at = time.monotonic()
         self._consecutive_failures = 0
         self._consecutive_probe_successes = 0
+        self._probe_in_flight = False
 
     def _close(self) -> None:
         self._state = CircuitState.CLOSED
         self._consecutive_failures = 0
         self._consecutive_probe_successes = 0
         self._opened_at = None
+        self._probe_in_flight = False
