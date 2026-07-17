@@ -224,18 +224,18 @@ class TidalHandler:
         self._refresh_lock = asyncio.Lock()
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tidal_io")
 
-    def _get_cached(self, category: str, key: str) -> Optional[Any]:
+    def _get_cached(self, category: str, key: str) -> Any:
         bucket = self._cache.get(category)
         if bucket is None:
-            return None
+            return _CACHE_MISS
         entry = bucket.get(key)
         if entry is None:
-            return None
+            return _CACHE_MISS
         value, expiry = entry
         now = asyncio.get_running_loop().time()
         if now > expiry:
             del bucket[key]
-            return None
+            return _CACHE_MISS
         bucket.move_to_end(key)
         return value
 
