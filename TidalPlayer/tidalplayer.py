@@ -1389,23 +1389,56 @@ class TidalPlayer(commands.Cog):
             if not interaction.response.is_done():
                 await interaction.response.send_message("This control can only be used in a server.", ephemeral=True)
             return
-        player = await self._get_player_for_guild(interaction.guild.id)
+        guild_id = interaction.guild.id
+        player = await self._get_player_for_guild(guild_id)
         if player is None or not getattr(player, "current", None):
             if not interaction.response.is_done():
                 await interaction.response.send_message(embed=_error_embed(Messages.ERROR_NOT_PLAYING), ephemeral=True)
             else:
                 await interaction.followup.send(embed=_error_embed(Messages.ERROR_NOT_PLAYING), ephemeral=True)
             return
+        old_message = self._controller_messages.pop(guild_id, None)
+        next_meta = None
+        queued = self._queued_meta.get(guild_id)
+        if queued:
+            try:
+                next_meta = queued.pop(0)
+            except Exception:
+                next_meta = None
         try:
             await player.skip()
         except Exception:
-            log.exception("Could not skip track in guild %s", interaction.guild.id)
+            if next_meta is not None:
+                self._queued_meta[guild_id].insert(0, next_meta)
+            if old_message is not None:
+                self._controller_messages[guild_id] = old_message
+            log.exception("Could not skip track in guild %s", guild_id)
             if not interaction.response.is_done():
                 await interaction.response.send_message("Could not skip the current track.", ephemeral=True)
             else:
                 await interaction.followup.send("Could not skip the current track.", ephemeral=True)
             return
-        await self._refresh_controller(interaction.guild.id, interaction)
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+        if next_meta is not None:
+            self._current_meta[guild_id] = next_meta
+            self._controller_meta[guild_id] = next_meta
+            channel = interaction.channel or (old_message.channel if old_message is not None else None)
+            if old_message is not None:
+                try:
+                    await old_message.delete()
+                except (discord.HTTPException, discord.Forbidden, discord.NotFound):
+                    pass
+            if channel is not None:
+                try:
+                    view = await self._controller_view(guild_id)
+                    self._controller_messages[guild_id] = await channel.send(view=view)
+                except discord.HTTPException:
+                    log.exception("Could not resend controller after skip in guild %s", guild_id)
+        else:
+            if old_message is not None:
+                self._controller_messages[guild_id] = old_message
+            await self._refresh_controller(guild_id)
 
     async def can_control_player(self, interaction: discord.Interaction) -> bool:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
@@ -1529,11 +1562,16 @@ class TidalPlayer(commands.Cog):
         source_id = str(meta.get("track_id") or "")
         source_title = str(meta.get("title") or "").casefold().strip()
         source_artist = str(meta.get("artist") or "").casefold().strip()
+        recent_ids = set(self._recent_track_ids.get(guild_id, []))
         for track in await self._radio_candidates(guild_id, meta):
             track_id = str(getattr(track, "id", "") or "")
             title = str(getattr(track, "name", "") or "").casefold().strip()
             artist = str(getattr(getattr(track, "artist", None), "name", "") or "").casefold().strip()
-            if track_id == source_id or (title == source_title and artist == source_artist):
+            if track_id == source_id:
+                continue
+            if track_id and track_id in recent_ids:
+                continue
+            if title == source_title and artist == source_artist:
                 continue
             return track
         return None
