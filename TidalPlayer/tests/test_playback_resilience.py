@@ -161,3 +161,55 @@ async def test_lavalink_load_logs_elapsed_time_without_the_signed_url(cog, caplo
 
     assert "Lavalink loaded Tidal track 530850206 in" in caplog.text
     assert signed_url not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_slow_lavalink_load_warns_without_cancelling_the_request(cog, caplog, monkeypatch) -> None:
+    module = importlib.import_module(cog.__class__.__module__)
+    monkeypatch.setattr(module, "LAVALINK_SLOW_LOAD_WARNING_DELAY", 0.0)
+    caplog.set_level(logging.WARNING, logger="red.tidalplayer")
+    started = asyncio.Event()
+    release = asyncio.Event()
+    loaded_track = SimpleNamespace()
+
+    async def load_tracks(_url):
+        started.set()
+        await release.wait()
+        return SimpleNamespace(tracks=[loaded_track])
+
+    task = asyncio.create_task(
+        cog._load_lavalink_track(
+            SimpleNamespace(load_tracks=load_tracks),
+            SimpleNamespace(id=530850206),
+            guild_id=1,
+            initial_stream_url="https://stream.example/signed-secret",
+        )
+    )
+    await started.wait()
+    await asyncio.sleep(0)
+    assert "Lavalink is still loading Tidal track 530850206" in caplog.text
+
+    release.set()
+    assert await task is loaded_track
+
+
+@pytest.mark.asyncio
+async def test_lavalink_load_stops_after_the_hard_safety_deadline(cog, caplog, monkeypatch) -> None:
+    module = importlib.import_module(cog.__class__.__module__)
+    monkeypatch.setattr(module, "LAVALINK_SLOW_LOAD_WARNING_DELAY", 0.0)
+    monkeypatch.setattr(module, "LAVALINK_LOAD_HARD_TIMEOUT", 0.0)
+    caplog.set_level(logging.WARNING, logger="red.tidalplayer")
+    started = asyncio.Event()
+
+    async def load_tracks(_url):
+        started.set()
+        await asyncio.Event().wait()
+
+    assert await cog._load_lavalink_track(
+        SimpleNamespace(load_tracks=load_tracks),
+        SimpleNamespace(id=530850206),
+        guild_id=1,
+        initial_stream_url="https://stream.example/signed-secret",
+    ) is None
+    assert started.is_set()
+    assert "Lavalink timed out loading Tidal track 530850206" in caplog.text

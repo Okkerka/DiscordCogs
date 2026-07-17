@@ -121,6 +121,8 @@ LASTFM_REQUEST_TIMEOUT = 20.0
 RECENT_TRACK_HISTORY = 50
 LAVALINK_NODE_READY_MAX_ATTEMPTS = 3
 LAVALINK_NODE_READY_RETRY_DELAY = 2.0
+LAVALINK_SLOW_LOAD_WARNING_DELAY = 10.0
+LAVALINK_LOAD_HARD_TIMEOUT = 60.0
 
 
 _CACHE_CAPS: Dict[str, int] = {
@@ -1546,7 +1548,39 @@ class TidalPlayer(commands.Cog):
             load_started = loop.time()
             node_ready = self._lavalink_node_ready_state(player)
             try:
-                results = await player.load_tracks(stream_url)
+                load_task = asyncio.create_task(
+                    player.load_tracks(stream_url),
+                    name=f"tidalplayer-lavalink-rest-{guild_id}-{track_id}",
+                )
+                try:
+                    done, _ = await asyncio.wait(
+                        (load_task,), timeout=LAVALINK_SLOW_LOAD_WARNING_DELAY
+                    )
+                    if not done:
+                        log.warning(
+                            "Lavalink is still loading Tidal track %s in guild %s after %.2fs "
+                            "(node_ready=%s); continuing to wait for the REST client.",
+                            track_id,
+                            guild_id,
+                            loop.time() - load_started,
+                            node_ready,
+                        )
+                        remaining = max(
+                            0.0, LAVALINK_LOAD_HARD_TIMEOUT - (loop.time() - load_started)
+                        )
+                        done, _ = await asyncio.wait((load_task,), timeout=remaining)
+                        if not done:
+                            load_task.cancel()
+                            try:
+                                await load_task
+                            except asyncio.CancelledError:
+                                pass
+                            raise asyncio.TimeoutError
+                    results = await load_task
+                except BaseException:
+                    if not load_task.done():
+                        load_task.cancel()
+                    raise
             except RuntimeError as error:
                 if not self._is_lavalink_node_not_ready(error):
                     log.exception(
