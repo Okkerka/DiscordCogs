@@ -100,7 +100,7 @@ QUEUE_PAGE_SIZE = 10
 TPL_LIST_PAGE_SIZE = 15
 SEARCH_BATCH_SIZE = 8
 CONTROLLER_REFRESH_COOLDOWN = 3.0   # seconds between background-only controller edits
-PROGRESS_SLEEP_INTERVAL = 5.0       # seconds to sleep between batch chunks (0 = no sleep)
+PROGRESS_SLEEP_INTERVAL = 2.0       # seconds to sleep between batch chunks (0 = no sleep)
 
 
 _CACHE_CAPS: Dict[str, int] = {
@@ -1320,6 +1320,20 @@ class TidalPlayer(commands.Cog):
         album = str(meta.get("album") or "Unknown")
         duration = self._format_duration(int(meta.get("duration", 0) or 0))
         return f"Now playing: **{title}**\nArtist: {artist}\nAlbum: {album}\nDuration: {duration}"
+
+    async def _replace_controller_message(self, guild_id: int, channel: discord.abc.Messageable, embed: discord.Embed, view: Optional[discord.ui.View] = None) -> Optional[discord.Message]:
+        old = self._controller_messages.pop(guild_id, None)
+        if old:
+            try:
+                await old.delete()
+            except Exception:
+                pass
+        if view is not None:
+            msg = await channel.send(embed=embed, view=view)
+        else:
+            msg = await channel.send(embed=embed)
+        self._controller_messages[guild_id] = msg
+        return msg
 
     async def _send_now_playing(self, ctx: commands.Context, meta: TrackMeta) -> None:
         if ctx.guild is None:
