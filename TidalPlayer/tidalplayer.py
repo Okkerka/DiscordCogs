@@ -1109,13 +1109,16 @@ class TidalPlayer(commands.Cog):
         return player
 
     async def _ensure_vc_connected(self, ctx: commands.Context, player: Any) -> Optional[Any]:
-        if getattr(player, "is_connected", True):
+        # Default False: if the attribute is missing we treat the player as NOT connected
+        # and attempt to reconnect, rather than assuming it's fine (old bug: default True
+        # caused fresh joins to be skipped, making player.play() fail silently).
+        if getattr(player, "is_connected", False):
             return player
         for attempt in range(VC_RECONNECT_RETRIES):
             await asyncio.sleep(VC_RECONNECT_DELAY)
             new_player = await self._get_player(ctx, connect=True)
             if new_player and getattr(new_player, "is_connected", False):
-                log.info(f"Reconnected to VC (attempt {attempt + 1})")
+                log.info("Reconnected to VC (attempt %d)", attempt + 1)
                 return new_player
         log.warning("Could not reconnect to VC, stopping queue")
         return None
@@ -1210,6 +1213,10 @@ class TidalPlayer(commands.Cog):
             return False
         loaded_track.title = truncate(meta["title"], 100)
         loaded_track.author = f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
+        # Evaluate was_idle AFTER the retry block so it always uses the final player
+        # object. Checking before player.add() is correct; checking before the retry
+        # reassignment was the bug that caused first->tplay on a cold join to route
+        # to the queued-embed branch instead of the now-playing panel.
         queue = getattr(player, "queue", None)
         try:
             was_idle = not bool(getattr(player, "current", None)) and (len(queue) == 0 if queue is not None else True)
