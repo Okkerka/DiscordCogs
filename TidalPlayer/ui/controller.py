@@ -98,17 +98,31 @@ class PlayerControllerView(discord.ui.LayoutView):
             custom_id="tidalplayer:v2:autoplay",
         )
         autoplay_button.callback = self._toggle_autoplay
+
         pause_button = discord.ui.Button(
             label="Resume" if self.paused else "Pause",
             style=discord.ButtonStyle.primary,
             custom_id="tidalplayer:v2:pause",
         )
         pause_button.callback = self._toggle_pause
+
+        skip_button = discord.ui.Button(
+            label="Skip",
+            style=discord.ButtonStyle.primary,
+            custom_id="tidalplayer:v2:skip",
+        )
+        skip_button.callback = self._skip
+
         stop_button = discord.ui.Button(
-            label="Stop", style=discord.ButtonStyle.danger, custom_id="tidalplayer:v2:stop"
+            label="Stop",
+            style=discord.ButtonStyle.danger,
+            custom_id="tidalplayer:v2:stop",
         )
         stop_button.callback = self._stop
-        container.add_item(discord.ui.ActionRow(autoplay_button, pause_button, stop_button))
+
+        container.add_item(
+            discord.ui.ActionRow(autoplay_button, pause_button, skip_button, stop_button)
+        )
         self.add_item(container)
 
     def _make_suggestions_select(self) -> discord.ui.Select:
@@ -141,6 +155,9 @@ class PlayerControllerView(discord.ui.LayoutView):
 
     async def _stop(self, interaction: discord.Interaction) -> None:
         await self.cog.controller_stop(interaction)
+        
+    async def _skip(self, interaction: discord.Interaction) -> None:
+        await self.cog.controller_skip(interaction)
 
     async def _choose_suggestion(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
@@ -149,16 +166,17 @@ class PlayerControllerView(discord.ui.LayoutView):
             if isinstance(item, discord.ui.Select) and item.custom_id == "tidalplayer:v2:suggestions"
         )
         if not select.values or select.values[0] == "none":
-            await interaction.followup.send("No suggestion was selected.")
+            await interaction.followup.send("No suggestion was selected.", ephemeral=True)
             return
+
         index = int(select.values[0])
         if index >= len(self.recommendations):
             await interaction.followup.send(
-                "These suggestions expired. Play a track again to refresh them."
+                "These suggestions expired. Play a track again to refresh them.",
+                ephemeral=True,
             )
             return
+
         queued = await self.cog.queue_recommendation(interaction, self.recommendations[index])
-        if queued:
-            await interaction.followup.send(embed=queued)
-        else:
-            await interaction.followup.send("Could not queue that suggestion.")
+        if not queued:
+            await interaction.followup.send("Could not queue that suggestion.", ephemeral=True)

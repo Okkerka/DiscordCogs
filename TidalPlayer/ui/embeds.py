@@ -88,7 +88,7 @@ def make_queue_embed(meta: TrackMeta) -> discord.Embed:
         lines.append(f"_{album}_")
 
     embed = discord.Embed(
-        title="Added to queue",
+        title="Song added to the queue",
         description="\n".join(lines),
         color=COLOR_PURPLE,
     )
