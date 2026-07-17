@@ -118,9 +118,7 @@ RECOMMENDATION_SEARCH_CONCURRENCY = 2  # Leave Tidal API capacity for playback r
 RECOMMENDATION_LOOKUP_CONCURRENCY = 2  # Reserve at least one Tidal API slot for foreground commands.
 LASTFM_REQUEST_TIMEOUT = 20.0
 RECENT_TRACK_HISTORY = 50
-LAVALINK_LOAD_TIMEOUT = 30.0
-LAVALINK_LOAD_MAX_ATTEMPTS = 2
-LAVALINK_LOAD_RETRY_DELAY = 1.0
+LAVALINK_LOAD_TIMEOUT = 10.0
 LAVALINK_NODE_READY_MAX_ATTEMPTS = 3
 LAVALINK_NODE_READY_RETRY_DELAY = 2.0
 
@@ -901,6 +899,17 @@ class TidalHandler:
                 log.warning("Could not resolve full Tidal track object for %s.", track_id)
         async with self.api_semaphore:
             try:
+                get_url = getattr(track, "get_url")
+                url = await self._run_with_backoff(get_url, timeout=15.0)
+                if url:
+                    log.info("Retrieved legacy Tidal stream URL for track %s.", track_id)
+                    return url
+            except AttributeError:
+                log.debug("Tidal track %s does not expose get_url(); trying get_stream fallback.", track_id)
+            except Exception as error:
+                log.warning("get_url() failed for Tidal track %s: %r", track_id, error)
+        async with self.api_semaphore:
+            try:
                 def get_urls() -> List[str]:
                     stream = track.get_stream()
                     return stream.get_urls()
@@ -911,20 +920,9 @@ class TidalHandler:
             except asyncio.TimeoutError:
                 log.warning("Tidal stream request timed out for track %s.", track_id)
             except AttributeError:
-                log.warning("Tidal track %s does not expose get_stream().", track_id)
+                log.warning("Tidal track %s does not expose a compatible stream URL method.", track_id)
             except Exception as error:
                 log.warning("get_stream().get_urls() failed for Tidal track %s: %r", track_id, error)
-        async with self.api_semaphore:
-            try:
-                get_url = getattr(track, "get_url")
-                url = await self._run_with_backoff(get_url, timeout=15.0)
-                if url:
-                    log.info("Retrieved legacy Tidal stream URL for track %s.", track_id)
-                    return url
-            except AttributeError:
-                log.warning("Tidal track %s does not expose get_url().", track_id)
-            except Exception as error:
-                log.warning("get_url() failed for Tidal track %s: %r", track_id, error)
         log.error("No playable Tidal stream URL available for track %s.", track_id)
         return None
     def _extract_tracks(self, result: Any) -> List[Any]:
@@ -1476,17 +1474,16 @@ class TidalPlayer(commands.Cog):
         *,
         initial_stream_url: str | None = None,
     ) -> Any | None:
-        """Load one track with a fresh Tidal URL after a transient Lavalink timeout."""
+        """Load one track without multiplying stream or LavaLink REST requests."""
         stream_url = initial_stream_url
         track_id = getattr(tidal_track, "id", None)
-        stream_attempt = 0
         node_ready_attempt = 0
-        while stream_attempt < LAVALINK_LOAD_MAX_ATTEMPTS:
-            if not stream_url:
-                stream_url = await self.tidal.get_stream_url(tidal_track)
-            if not stream_url:
-                log.warning("No playable Tidal stream URL for track %s in guild %s", track_id, guild_id)
-                return None
+        if not stream_url:
+            stream_url = await self.tidal.get_stream_url(tidal_track)
+        if not stream_url:
+            log.warning("No playable Tidal stream URL for track %s in guild %s", track_id, guild_id)
+            return None
+        while True:
             try:
                 results = await asyncio.wait_for(
                     player.load_tracks(stream_url), timeout=LAVALINK_LOAD_TIMEOUT
@@ -1516,24 +1513,13 @@ class TidalPlayer(commands.Cog):
                 await asyncio.sleep(LAVALINK_NODE_READY_RETRY_DELAY)
                 continue
             except asyncio.TimeoutError:
-                stream_attempt += 1
-                if stream_attempt == LAVALINK_LOAD_MAX_ATTEMPTS:
-                    log.warning(
-                        "Lavalink timed out loading Tidal track %s in guild %s after %s attempt(s)",
-                        track_id,
-                        guild_id,
-                        stream_attempt,
-                    )
-                    return None
                 log.warning(
-                    "Lavalink timed out loading Tidal track %s in guild %s; retrying with a fresh URL",
+                    "Lavalink timed out loading Tidal track %s in guild %s after %.0f seconds; not retrying",
                     track_id,
                     guild_id,
+                    LAVALINK_LOAD_TIMEOUT,
                 )
-                stream_url = None
-                node_ready_attempt = 0
-                await asyncio.sleep(LAVALINK_LOAD_RETRY_DELAY)
-                continue
+                return None
             except Exception:
                 log.exception("Lavalink failed loading Tidal track %s in guild %s", track_id, guild_id)
                 return None
@@ -1543,7 +1529,6 @@ class TidalPlayer(commands.Cog):
                 return tracks[0]
             log.warning("Lavalink returned no tracks for Tidal track %s in guild %s", track_id, guild_id)
             return None
-        return None
 
     async def _queue_resolved_chunk(
         self,

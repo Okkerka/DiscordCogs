@@ -11,31 +11,22 @@ import pytest
 
 
 @pytest.mark.asyncio
-async def test_load_lavalink_track_retries_timeout_with_fresh_tidal_url(cog, monkeypatch) -> None:
-    module = importlib.import_module(cog.__class__.__module__)
-    monkeypatch.setattr(module, "LAVALINK_LOAD_RETRY_DELAY", 0)
-
-    loaded_track = SimpleNamespace()
+async def test_load_lavalink_track_does_not_retry_timeout_with_a_fresh_url(cog) -> None:
     player = SimpleNamespace(
-        load_tracks=AsyncMock(
-            side_effect=[
-                TimeoutError(),
-                SimpleNamespace(tracks=[loaded_track]),
-            ]
-        )
+        load_tracks=AsyncMock(side_effect=TimeoutError())
     )
     tidal_track = SimpleNamespace(id=460908504)
     with patch.object(
         type(cog.tidal),
         "get_stream_url",
-        new=AsyncMock(side_effect=["https://stream/first", "https://stream/fresh"]),
+        new=AsyncMock(return_value="https://stream/first"),
     ) as get_stream_url:
         result = await cog._load_lavalink_track(player, tidal_track, guild_id=1)
 
-    assert result is loaded_track
+    assert result is None
     assert player.load_tracks.await_args_list[0].args == ("https://stream/first",)
-    assert player.load_tracks.await_args_list[1].args == ("https://stream/fresh",)
-    assert get_stream_url.await_count == 2
+    assert player.load_tracks.await_count == 1
+    assert get_stream_url.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -129,3 +120,25 @@ async def test_duplicate_guild_track_loads_share_one_lavalink_request(cog) -> No
     assert first is loaded_track
     assert second is loaded_track
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_get_url_is_preferred_without_calling_get_stream(cog) -> None:
+    class Track:
+        id = 530850206
+
+        def __init__(self) -> None:
+            self.get_stream_calls = 0
+
+        def get_url(self) -> str:
+            return "https://stream/legacy"
+
+        def get_stream(self):
+            self.get_stream_calls += 1
+            raise AssertionError("get_stream must not be called when get_url works")
+
+    track = Track()
+    with patch.object(type(cog.tidal), "get_track", new=AsyncMock(return_value=track)):
+        assert await cog.tidal.get_stream_url(track) == "https://stream/legacy"
+
+    assert track.get_stream_calls == 0
