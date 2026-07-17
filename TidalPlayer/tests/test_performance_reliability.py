@@ -372,3 +372,31 @@ async def test_recommendation_cannot_queue_a_song_already_in_the_queue(cog) -> N
         assert not await cog.queue_recommendation(interaction, candidate)
 
     load_track.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_suggested_queue_confirmation_is_scheduled_for_deletion(cog) -> None:
+    guild_id = 104
+    queued_message = SimpleNamespace()
+    interaction = SimpleNamespace(
+        guild=SimpleNamespace(id=guild_id),
+        user=SimpleNamespace(),
+        response=SimpleNamespace(is_done=MagicMock(return_value=True)),
+        followup=SimpleNamespace(send=AsyncMock(return_value=queued_message)),
+    )
+    player = SimpleNamespace(add=MagicMock())
+    meta = {"track_id": 2, "title": "Suggested", "artist": "Artist", "album": None}
+    candidate = SimpleNamespace(id=2, name="Suggested", artist=SimpleNamespace(name="Artist"))
+    loaded = SimpleNamespace()
+
+    with (
+        patch.object(type(cog), "_get_player_for_guild", new=AsyncMock(return_value=player)),
+        patch.object(type(cog), "_extract_meta", new=AsyncMock(return_value=meta)),
+        patch.object(type(cog), "_load_lavalink_track", new=AsyncMock(return_value=loaded)),
+        patch.object(type(cog), "_delete_after", new=AsyncMock()) as delete_after,
+    ):
+        assert await cog.queue_recommendation(interaction, candidate)
+        await asyncio.sleep(0)
+
+    interaction.followup.send.assert_awaited_once()
+    delete_after.assert_awaited_once_with(queued_message, 60.0)

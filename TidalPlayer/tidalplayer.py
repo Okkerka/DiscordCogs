@@ -1185,7 +1185,7 @@ class TidalPlayer(commands.Cog):
             self._remember_track(guild_id, updated_meta)
             self._recommendation_cache.pop(guild_id, None)
 
-        await self._refresh_controller(guild_id)
+        await self._resend_controller_for_track_start(guild_id=guild_id)
         self._schedule_controller_recommendations(guild_id)
 
 
@@ -1478,6 +1478,12 @@ class TidalPlayer(commands.Cog):
         return str(bool(ready)).lower() if ready is not None else "unknown"
 
     @staticmethod
+    def _lavalink_load_result_type(results: Any) -> str:
+        load_type = getattr(results, "load_type", None) or getattr(results, "loadType", None)
+        value = getattr(load_type, "value", load_type)
+        return str(value) if value is not None else "unknown"
+
+    @staticmethod
     def _is_lavalink_node_not_ready(error: RuntimeError) -> bool:
         return "node not ready" in str(error).casefold()
 
@@ -1651,11 +1657,12 @@ class TidalPlayer(commands.Cog):
                 return tracks[0]
             log.warning(
                 "Lavalink returned no tracks for Tidal track %s in guild %s after %.2fs "
-                "(node_ready=%s)",
+                "(node_ready=%s, load_type=%s)",
                 track_id,
                 guild_id,
                 loop.time() - load_started,
                 node_ready,
+                self._lavalink_load_result_type(results),
             )
             return None
 
@@ -2092,6 +2099,31 @@ class TidalPlayer(commands.Cog):
         else:
             self._schedule_controller_recommendations(guild_id)
 
+    async def _resend_controller_for_track_start(self, *, guild_id: int) -> None:
+        """Replace the controller when Red Audio advances to a queued track."""
+        previous = self._controller_messages.pop(guild_id, None)
+        channel = self._playback_channels.get(guild_id)
+        if channel is None and previous is not None:
+            channel = previous.channel
+        if previous is not None:
+            try:
+                await previous.delete()
+            except (discord.HTTPException, discord.Forbidden, discord.NotFound):
+                pass
+        if channel is None:
+            log.debug("No playback channel is available to resend controller for guild %s", guild_id)
+            return
+        player = await self._get_player_for_guild(guild_id)
+        paused = bool(getattr(player, "paused", False)) if player else False
+        try:
+            view = await self._controller_view(guild_id, paused)
+            if not view.children:
+                log.error("Empty controller view on track start in guild %s", guild_id)
+                return
+            self._controller_messages[guild_id] = await channel.send(view=view)
+        except discord.HTTPException:
+            log.exception("Could not resend controller message for guild %s", guild_id)
+
 
     def _remember_track(self, guild_id: int, meta: TrackMeta) -> None:
         track_id = str(meta.get("track_id") or "")
@@ -2341,7 +2373,14 @@ class TidalPlayer(commands.Cog):
             try:
                 if not interaction.response.is_done():
                     await interaction.response.defer()
-                await interaction.followup.send(embed=make_queue_embed(meta), ephemeral=False)
+                queued_message = await interaction.followup.send(
+                    embed=make_queue_embed(meta), ephemeral=False, wait=True
+                )
+                if queued_message is not None:
+                    task = asyncio.create_task(
+                        self._delete_after(queued_message, QUEUED_EMBED_DELETE_DELAY)
+                    )
+                    self._tasks.add(task)
             except Exception:
                 log.exception("Could not send queue confirmation for suggested track %s", selected_id)
             log.info("Queued suggested Tidal track %s in guild %s", selected_id, guild_id)

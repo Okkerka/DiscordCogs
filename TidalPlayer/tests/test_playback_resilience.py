@@ -52,18 +52,20 @@ async def test_track_start_advances_queued_tidal_metadata(cog) -> None:
         "track_id": 337293380,
     }
     cog._queued_meta[guild.id].append(next_meta)
-    cog._refresh_controller = AsyncMock()
     cog._schedule_controller_recommendations = MagicMock()
 
-    await cog.on_red_audio_track_start(
-        guild,
-        SimpleNamespace(title="Next Track", author="Next Artist - Next Album"),
-        requester=SimpleNamespace(),
-    )
+    with patch.object(
+        type(cog), "_resend_controller_for_track_start", new=AsyncMock()
+    ) as resend_controller:
+        await cog.on_red_audio_track_start(
+            guild,
+            SimpleNamespace(title="Next Track", author="Next Artist - Next Album"),
+            requester=SimpleNamespace(),
+        )
 
     assert cog._current_meta[guild.id] == next_meta
     assert not cog._queued_meta[guild.id]
-    cog._refresh_controller.assert_awaited_once_with(guild.id)
+    resend_controller.assert_awaited_once_with(guild_id=guild.id)
     cog._schedule_controller_recommendations.assert_called_once_with(guild.id)
 
 
@@ -213,3 +215,22 @@ async def test_lavalink_load_stops_after_the_hard_safety_deadline(cog, caplog, m
     ) is None
     assert started.is_set()
     assert "Lavalink timed out loading Tidal track 530850206" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_lavalink_no_tracks_logs_the_safe_result_type(cog, caplog) -> None:
+    caplog.set_level(logging.WARNING, logger="red.tidalplayer")
+    signed_url = "https://stream.example/signed-secret"
+    player = SimpleNamespace(
+        load_tracks=AsyncMock(return_value=SimpleNamespace(tracks=[], load_type="LOAD_FAILED"))
+    )
+
+    assert await cog._load_lavalink_track(
+        player,
+        SimpleNamespace(id=530850206),
+        guild_id=1,
+        initial_stream_url=signed_url,
+    ) is None
+
+    assert "load_type=LOAD_FAILED" in caplog.text
+    assert signed_url not in caplog.text
