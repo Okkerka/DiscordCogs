@@ -122,7 +122,7 @@ class InvitePerms(commands.Cog):
 
     @commands.is_owner()
     @commands.dm_only()
-    @commands.command(name="invite")
+    @commands.command(name="invitep")
     async def invite_cmd(self, ctx: commands.Context, guild: discord.Guild):
         """`[p]invite <server_id>` — pick a role, get a one-time invite."""
         if guild not in self.bot.guilds:
