@@ -1,0 +1,10 @@
+{
+  "author": ["Okkerka"],
+  "name": "BotInvite",
+  "short": "Owner-only DM OAuth2 bot invite builder.",
+  "description": "Builds an OAuth2 invite URL requesting selected bot permissions using Components V2.",
+  "tags": ["oauth", "invite", "utility"],
+  "requirements": [],
+  "min_bot_version": "3.5.0",
+  "hidden": false
+}
