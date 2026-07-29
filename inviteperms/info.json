@@ -1,0 +1,11 @@
+{
+    "author": ["you"],
+    "install_msg": "Requires discord.py >= 2.5 (Components V2). Give the bot Manage Roles + Create Instant Invite. Owner-only, DM-only.",
+    "name": "InvitePerms",
+    "short": "Owner-only DM invites that grant a chosen role on join.",
+    "description": "Creates tracked invites via a Components V2 role picker; assigns the mapped role when someone joins through them.",
+    "tags": ["invite", "roles", "utility"],
+    "requirements": [],
+    "min_bot_version": "3.5.0",
+    "hidden": false
+}
