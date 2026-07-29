@@ -1,8 +1,8 @@
 """BotInvite — owner-only, DM-only OAuth2 bot invite-link builder.
 
 Requires discord.py >= 2.5 for Components V2.
-This creates an OAuth2 URL that asks for ONLY the permissions selected.
-It does not create server/member invite links or change any server settings.
+This creates an OAuth2 URL that asks for only the selected permissions.
+It does not create a server/member invite or modify server settings.
 """
 
 from urllib.parse import urlencode
@@ -40,11 +40,13 @@ PERMISSIONS = [
 
 class PermissionPicker(ui.ActionRow):
     def __init__(self, view: "BotInviteView"):
+        super().__init__()
         self.view_ref = view
+
         self.select = ui.Select(
             placeholder="Select requested bot permissions...",
             min_values=0,
-            max_values=min(21, len(PERMISSIONS)),
+            max_values=len(PERMISSIONS),
             options=[
                 discord.SelectOption(label=label, value=value)
                 for label, value in PERMISSIONS
@@ -60,8 +62,13 @@ class PermissionPicker(ui.ActionRow):
 
 class GenerateButton(ui.ActionRow):
     def __init__(self, view: "BotInviteView"):
+        super().__init__()
         self.view_ref = view
-        button = ui.Button(label="Generate OAuth2 invite", style=discord.ButtonStyle.success)
+
+        button = ui.Button(
+            label="Generate OAuth2 invite",
+            style=discord.ButtonStyle.success,
+        )
         button.callback = self.generate
         self.add_item(button)
 
@@ -76,41 +83,63 @@ class BotInviteView(ui.LayoutView):
         self.selected = set()
 
         container = ui.Container(accent_colour=discord.Colour.blurple())
-        container.add_item(ui.TextDisplay(
-            "## Bot OAuth2 invite builder\n"
-            "Select the permissions DripBot should request, then generate its install link."
-        ))
+
+        container.add_item(
+            ui.TextDisplay(
+                "## Bot OAuth2 invite builder\n"
+                "Select the permissions DripBot should request, then generate its install link."
+            )
+        )
+
         container.add_item(ui.Separator())
         container.add_item(PermissionPicker(self))
         container.add_item(ui.Separator())
         container.add_item(GenerateButton(self))
+
         self.add_item(container)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return await interaction.client.is_owner(interaction.user)
 
     async def generate(self, interaction: discord.Interaction):
-        perms = discord.Permissions.none()
-        for name in self.selected:
-            setattr(perms, name, True)
+        permissions = discord.Permissions.none()
 
-        query = urlencode({
-            "client_id": str(self.cog.bot.user.id),
-            "scope": "bot applications.commands",
-            "permissions": str(perms.value),
-        })
+        for permission in self.selected:
+            setattr(permissions, permission, True)
+
+        query = urlencode(
+            {
+                "client_id": str(self.cog.bot.user.id),
+                "scope": "bot applications.commands",
+                "permissions": str(permissions.value),
+            }
+        )
+
         url = f"https://discord.com/oauth2/authorize?{query}"
-        selected_names = [label for label, flag in PERMISSIONS if flag in self.selected]
-        chosen = ", ".join(selected_names) if selected_names else "No guild permissions"
+
+        selected_names = [
+            label for label, flag in PERMISSIONS if flag in self.selected
+        ]
+
+        chosen = (
+            ", ".join(selected_names)
+            if selected_names
+            else "No guild permissions"
+        )
 
         container = ui.Container(accent_colour=discord.Colour.green())
-        container.add_item(ui.TextDisplay(
-            f"### OAuth2 invite generated\n"
-            f"Requested permissions: **{chosen}**\n"
-            f"{url}"
-        ))
+
+        container.add_item(
+            ui.TextDisplay(
+                "### OAuth2 invite generated\n"
+                f"Requested permissions: **{chosen}**\n"
+                f"{url}"
+            )
+        )
+
         done = ui.LayoutView(timeout=None)
         done.add_item(container)
+
         await interaction.response.edit_message(view=done)
 
 
