@@ -58,7 +58,7 @@ class Deepwoken(commands.Cog):
         embed.add_field(name="Class / Type", value=f'{row.get("Weapon Class", "?")} / {row.get("Weapon Type", "?")}', inline=False)
         embed.add_field(name="Requirements", value=str(row.get("Requirements") or "N/A"), inline=False)
         embed.add_field(name="Base Damage", value=str(row.get("Base Damage") or "N/A"))
-        embed.add_field(name="Scaled Damage",value=str(row.get("Scaled Damage") or "N/A")
+        embed.add_field(name="Scaled Damage",value=str(row.get("Scaled Damage") or "N/A"))
         embed.add_field(name="Scaling", value=str(row.get("Scaling") or "N/A"))
         embed.add_field(name="Swing Speed", value=str(row.get("Swing Speed") or "N/A"))
         embed.add_field(name="Range", value=str(row.get("Range") or "N/A"))
