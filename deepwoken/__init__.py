@@ -1,4 +1,4 @@
-﻿from .deepwoken import Deepwoken
+from .deepwoken import Deepwoken
 
 
 async def setup(bot):

@@ -1,74 +1,219 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+import re
 from pathlib import Path
+from typing import Any
 
 import discord
 from openpyxl import load_workbook
 from redbot.core import commands
 
 
+CLASS_ALIASES = {
+    "light": "Light",
+    "lht": "Light",
+    "medium": "Medium",
+    "med": "Medium",
+    "heavy": "Heavy",
+    "hvy": "Heavy",
+    "hybrid": "Hybrid",
+    "elemental": "Elemental",
+    "gun": "Gun",
+    "guns": "Gun",
+    "fist": "Fighting Style",
+    "fists": "Fighting Style",
+    "fighting": "Fighting Style",
+    "style": "Fighting Style",
+    "crazy": "Crazy Slots",
+    "slots": "Crazy Slots",
+}
+
+
 class Deepwoken(commands.Cog):
-    """Deepwoken weapon base-stat lookup."""
+    """Deepwoken weapon base-stat lookup and comparison."""
 
     def __init__(self, bot):
         self.bot = bot
         self.workbook_path = Path(__file__).parent / "data" / "weapons.xlsx"
         self.weapons = self._load_weapons()
 
-    def _load_weapons(self) -> dict[str, dict[str, str]]:
+    def _load_weapons(self) -> list[dict[str, Any]]:
         if not self.workbook_path.exists():
             raise FileNotFoundError(f"Missing bundled workbook: {self.workbook_path}")
 
         workbook = load_workbook(self.workbook_path, read_only=True, data_only=True)
         sheet = workbook["All Weapons"]
-        headers = [cell.value for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
-        weapons = {}
+        headers = [str(cell.value or "").strip() for cell in next(sheet.iter_rows(max_row=1))]
+        rows = []
+        seen = set()
 
         for values in sheet.iter_rows(min_row=2, values_only=True):
-            row = dict(zip(headers, values))
+            row = {header: value for header, value in zip(headers, values)}
             name = str(row.get("Name") or "").strip()
-            if name:
-                weapons[name.casefold()] = row
+            if not name:
+                continue
+            key = (
+                name.casefold(),
+                str(row.get("Requirements") or ""),
+                str(row.get("Base Damage") or ""),
+                str(row.get("Scaling") or ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(row)
 
         workbook.close()
-        return weapons
+        return rows
 
-    @commands.command(name="weapon")
-    async def weapon(self, ctx: commands.Context, *, name: str):
-        """Show the base data of a Deepwoken weapon."""
-        query = name.casefold().strip()
-        row = self.weapons.get(query)
+    @staticmethod
+    def _number(value: Any) -> float | None:
+        match = re.search(r"-?\d+(?:\.\d+)?", str(value or ""))
+        return float(match.group()) if match else None
 
-        if row is None:
-            matches = [weapon for weapon in self.weapons if query in weapon]
-            if len(matches) == 1:
-                row = self.weapons[matches[0]]
-            elif matches:
-                suggestions = ", ".join(self.weapons[match]["Name"] for match in matches[:8])
-                await ctx.send(f"Multiple matches: {suggestions}")
+    @staticmethod
+    def _requirements(value: Any) -> dict[str, int]:
+        output = {}
+        for amount, stat in re.findall(r"(\d+)\s*([A-Z]{2,4})(?=\s|\d|$)", str(value or "").upper()):
+            output[stat] = int(amount)
+        return output
+
+    @staticmethod
+    def _scaling(value: Any) -> dict[str, float]:
+        return {
+            stat: float(amount)
+            for stat, amount in re.findall(
+                r"([A-Z]{2,4})\s*:\s*(\d+(?:\.\d+)?)",
+                str(value or "").upper(),
+            )
+        }
+
+    @staticmethod
+    def _primary_stat(weapon_class: str) -> str | None:
+        return {"Light": "LHT", "Medium": "MED", "Heavy": "HVY"}.get(weapon_class)
+
+    def _damage(self, row: dict[str, Any], investment: int, proficiency: int) -> float | None:
+        base = self._number(row.get("Base Damage"))
+        if base is None:
+            return None
+
+        scaling = self._scaling(row.get("Scaling"))
+        requirements = self._requirements(row.get("Requirements"))
+        primary = self._primary_stat(str(row.get("Weapon Class") or ""))
+        multiplier = 1 + proficiency * 0.065
+        damage = base
+
+        for stat, scale in scaling.items():
+            level = investment if stat == primary else requirements.get(stat, 0)
+            damage += 0.00075 * base * scale * level * multiplier
+
+        return damage
+
+    def _sheet_dps(self, row: dict[str, Any], investment: int, proficiency: int) -> float | None:
+        damage = self._damage(row, investment, proficiency)
+        speed = self._number(row.get("Swing Speed"))
+        if damage is None or speed is None:
+            return None
+        return damage * speed * 2
+
+    def _find_weapon(self, query: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        key = query.casefold().strip()
+        exact = [row for row in self.weapons if str(row.get("Name") or "").casefold() == key]
+        if exact:
+            return exact[0], []
+        matches = [row for row in self.weapons if key in str(row.get("Name") or "").casefold()]
+        return (matches[0], []) if len(matches) == 1 else (None, matches)
+
+    @commands.command(name="dwweapon", aliases=["dw", "weapon"])
+    async def dwweapon(self, ctx: commands.Context, *args: str):
+        """[p]dwweapon <name> or [p]dwweapon heavy 100 6."""
+        if not args:
+            await ctx.send("Use `[p]dwweapon <name>` or `[p]dwweapon heavy 100 6`.")
+            return
+
+        possible_class = CLASS_ALIASES.get(args[0].casefold())
+        if possible_class and len(args) in {2, 3}:
+            try:
+                investment = int(args[1])
+                proficiency = int(args[2]) if len(args) == 3 else 0
+            except ValueError:
+                await ctx.send("Investment and proficiency must be whole numbers, e.g. `[p]dwweapon heavy 100 6`.")
                 return
-            else:
-                await ctx.send("Weapon not found.")
+
+            if not 0 <= investment <= 100 or not 0 <= proficiency <= 6:
+                await ctx.send("Investment must be 0â€“100 and proficiency must be 0â€“6.")
                 return
+
+            await self._class_compare(ctx, possible_class, investment, proficiency)
+            return
+
+        await self._weapon_lookup(ctx, " ".join(args))
+
+    async def _class_compare(self, ctx: commands.Context, weapon_class: str, investment: int, proficiency: int):
+        ranked = []
+        for row in self.weapons:
+            if row.get("Weapon Class") != weapon_class:
+                continue
+            dps = self._sheet_dps(row, investment, proficiency)
+            damage = self._damage(row, investment, proficiency)
+            if dps is not None and damage is not None:
+                ranked.append((dps, damage, row))
+
+        if not ranked:
+            await ctx.send(f"No valid {weapon_class} weapons were found in the workbook.")
+            return
+
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        lines = []
+        for position, (dps, damage, row) in enumerate(ranked[:15], start=1):
+            lines.append(
+                f"`{position:>2}.` **{row['Name']}** â€” {dps:.2f} DPS Â· {damage:.2f} M1"
+            )
 
         embed = discord.Embed(
-            title=row["Name"],
+            title=f"{weapon_class} weapons â€” {investment} investment / {proficiency} proficiency",
+            description="\n".join(lines),
             colour=discord.Colour.blurple(),
         )
-        embed.add_field(name="Class / Type", value=f'{row.get("Weapon Class", "?")} / {row.get("Weapon Type", "?")}', inline=False)
-        embed.add_field(name="Requirements", value=str(row.get("Requirements") or "N/A"), inline=False)
-        embed.add_field(name="Base Damage", value=str(row.get("Base Damage") or "N/A"))
-        embed.add_field(name="Scaled Damage",value=str(row.get("Scaled Damage") or "N/A"))
-        embed.add_field(name="Scaling", value=str(row.get("Scaling") or "N/A"))
-        embed.add_field(name="Swing Speed", value=str(row.get("Swing Speed") or "N/A"))
-        embed.add_field(name="Range", value=str(row.get("Range") or "N/A"))
-        embed.add_field(name="Armor Penetration", value=str(row.get("Armor Penetration") or "N/A"))
-        embed.add_field(name="Tags", value=str(row.get("Tags") or "None"), inline=False)
+        embed.set_footer(text="Sheet DPS = calculated M1 damage Ã— swing speed Ã— 2. Bleed/procs are not added.")
         await ctx.send(embed=embed)
 
-    @commands.command(name="reloadweapons")
+    async def _weapon_lookup(self, ctx: commands.Context, query: str):
+        row, matches = self._find_weapon(query)
+        if row is None:
+            if matches:
+                suggestions = ", ".join(str(item["Name"]) for item in matches[:10])
+                await ctx.send(f"Multiple matches: {suggestions}")
+            else:
+                await ctx.send("Weapon not found.")
+            return
+
+        embed = discord.Embed(
+            title=str(row.get("Name") or "Unknown weapon"),
+            colour=discord.Colour.blurple(),
+        )
+        embed.add_field(
+            name="Class / Type",
+            value=f"{row.get('Weapon Class') or '?'} / {row.get('Weapon Type') or '?'}",
+            inline=False,
+        )
+        embed.add_field(name="Requirements", value=str(row.get("Requirements") or "N/A"), inline=False)
+        embed.add_field(name="Base Damage", value=str(row.get("Base Damage") or "N/A"))
+        embed.add_field(name="Scaled Damage", value=str(row.get("Scaled Damage") or "N/A"))
+        embed.add_field(name="Scaling", value=str(row.get("Scaling") or "N/A"))
+        embed.add_field(name="Armor Penetration", value=str(row.get("Armor Penetration") or "N/A"))
+        embed.add_field(name="Chip Damage", value=str(row.get("Chip Damage") or "N/A"))
+        embed.add_field(name="Posture Damage", value=str(row.get("Posture Damage") or "N/A"))
+        embed.add_field(name="Range", value=str(row.get("Range") or "N/A"))
+        embed.add_field(name="Swing Speed", value=str(row.get("Swing Speed") or "N/A"))
+        embed.add_field(name="Endlag", value=str(row.get("Endlag") or "N/A"))
+        embed.add_field(name="Tags", value=str(row.get("Tags") or "None"), inline=False)
+        embed.set_footer(text="Use [p]dwweapon heavy 100 6 to rank a weapon class.")
+        await ctx.send(embed=embed)
+
+    @commands.command(name="dwreload")
     @commands.is_owner()
-    async def reloadweapons(self, ctx: commands.Context):
-        """Reload the bundled workbook after updating it and restarting/reinstalling the cog."""
+    async def dwreload(self, ctx: commands.Context):
+        """Reload workbook data without restarting the bot."""
         self.weapons = self._load_weapons()
-        await ctx.send(f"Reloaded {len(self.weapons)} weapons.")
+        await ctx.send(f"Reloaded {len(self.weapons)} unique weapon rows.")
