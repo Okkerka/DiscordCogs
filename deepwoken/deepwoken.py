@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import re
 from pathlib import Path
@@ -28,9 +28,26 @@ CLASS_ALIASES = {
     "slots": "Crazy Slots",
 }
 
+RANKING_EXCLUSIONS = {
+    "Ebonshard Lexicon",
+    "The Rock",
+    "The Endless Wave",
+    "Unsung Scythern",
+    "Worldpainter Brush",
+    "Keyblade",
+    "Soulshot",
+    "Metal Greatsword",
+    "Prototype Railblade",
+    "Par's Glaive",
+    "Saintsblade",
+    "Ferractine",
+    "Formless Shard",
+    "Handcuffs",
+}
+
 
 class Deepwoken(commands.Cog):
-    """Deepwoken weapon base-stat lookup and comparison."""
+    """Deepwoken weapon base-stat lookup and standard weapon ranking."""
 
     def __init__(self, bot):
         self.bot = bot
@@ -44,7 +61,7 @@ class Deepwoken(commands.Cog):
         workbook = load_workbook(self.workbook_path, read_only=True, data_only=True)
         sheet = workbook["All Weapons"]
         headers = [str(cell.value or "").strip() for cell in next(sheet.iter_rows(max_row=1))]
-        rows = []
+        weapons = []
         seen = set()
 
         for values in sheet.iter_rows(min_row=2, values_only=True):
@@ -52,19 +69,21 @@ class Deepwoken(commands.Cog):
             name = str(row.get("Name") or "").strip()
             if not name:
                 continue
+
             key = (
                 name.casefold(),
                 str(row.get("Requirements") or ""),
                 str(row.get("Base Damage") or ""),
                 str(row.get("Scaling") or ""),
+                str(row.get("Swing Speed") or ""),
             )
             if key in seen:
                 continue
             seen.add(key)
-            rows.append(row)
+            weapons.append(row)
 
         workbook.close()
-        return rows
+        return weapons
 
     @staticmethod
     def _number(value: Any) -> float | None:
@@ -74,7 +93,8 @@ class Deepwoken(commands.Cog):
     @staticmethod
     def _requirements(value: Any) -> dict[str, int]:
         output = {}
-        for amount, stat in re.findall(r"(\d+)\s*([A-Z]{2,4})(?=\s|\d|$)", str(value or "").upper()):
+        text = str(value or "").upper().replace(" OR ", " ")
+        for amount, stat in re.findall(r"(\d+)\s*([A-Z]{2,4})(?=\s|\d|$)", text):
             output[stat] = int(amount)
         return output
 
@@ -90,99 +110,154 @@ class Deepwoken(commands.Cog):
 
     @staticmethod
     def _primary_stat(weapon_class: str) -> str | None:
-        return {"Light": "LHT", "Medium": "MED", "Heavy": "HVY"}.get(weapon_class)
+        return {
+            "Light": "LHT",
+            "Medium": "MED",
+            "Heavy": "HVY",
+        }.get(weapon_class)
 
     def _damage(self, row: dict[str, Any], investment: int, proficiency: int) -> float | None:
+        """Raw M1 damage before target resistance, PEN, enchants, talents, and procs."""
         base = self._number(row.get("Base Damage"))
         if base is None:
             return None
 
         scaling = self._scaling(row.get("Scaling"))
         requirements = self._requirements(row.get("Requirements"))
-        primary = self._primary_stat(str(row.get("Weapon Class") or ""))
-        multiplier = 1 + proficiency * 0.065
+        primary_stat = self._primary_stat(str(row.get("Weapon Class") or ""))
+        proficiency_multiplier = 1 + (proficiency * 0.065)
         damage = base
 
         for stat, scale in scaling.items():
-            level = investment if stat == primary else requirements.get(stat, 0)
-            damage += 0.00075 * base * scale * level * multiplier
+            stat_level = investment if stat == primary_stat else requirements.get(stat, 0)
+            damage += (
+                0.00075
+                * base
+                * scale
+                * stat_level
+                * proficiency_multiplier
+            )
 
         return damage
 
-    def _sheet_dps(self, row: dict[str, Any], investment: int, proficiency: int) -> float | None:
+    def _sustained_dps(self, row: dict[str, Any], investment: int, proficiency: int) -> float | None:
+        """M1 damage divided by attack interval, including listed additional endlag."""
         damage = self._damage(row, investment, proficiency)
         speed = self._number(row.get("Swing Speed"))
-        if damage is None or speed is None:
+        if damage is None or speed is None or speed <= 0:
             return None
-        return damage * speed * 2
+
+        endlag = self._number(row.get("Endlag")) or 0.0
+        attack_interval = (1 / (speed * 2)) + endlag
+        return damage / attack_interval
+
+    def _is_rankable(self, row: dict[str, Any]) -> bool:
+        name = str(row.get("Name") or "").strip()
+        weapon_class = str(row.get("Weapon Class") or "")
+        tags = str(row.get("Tags") or "")
+
+        if name in RANKING_EXCLUSIONS:
+            return False
+        if weapon_class in {"Special / Other", "Crazy Slots", "Elemental", "Fighting Style"}:
+            return False
+        if "Crazy Slots" in tags:
+            return False
+
+        requirements = self._requirements(row.get("Requirements"))
+        return not any(value > 100 for value in requirements.values())
 
     def _find_weapon(self, query: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-        key = query.casefold().strip()
-        exact = [row for row in self.weapons if str(row.get("Name") or "").casefold() == key]
+        query = query.casefold().strip()
+        exact = [row for row in self.weapons if str(row.get("Name") or "").casefold() == query]
         if exact:
             return exact[0], []
-        matches = [row for row in self.weapons if key in str(row.get("Name") or "").casefold()]
-        return (matches[0], []) if len(matches) == 1 else (None, matches)
+
+        matches = [row for row in self.weapons if query in str(row.get("Name") or "").casefold()]
+        if len(matches) == 1:
+            return matches[0], []
+        return None, matches
 
     @commands.command(name="dwweapon", aliases=["dw", "weapon"])
     async def dwweapon(self, ctx: commands.Context, *args: str):
-        """[p]dwweapon <name> or [p]dwweapon heavy 100 6."""
+        """Look up a weapon, or rank a class: [p]dwweapon heavy 100 6."""
         if not args:
             await ctx.send("Use `[p]dwweapon <name>` or `[p]dwweapon heavy 100 6`.")
             return
 
-        possible_class = CLASS_ALIASES.get(args[0].casefold())
-        if possible_class and len(args) in {2, 3}:
+        requested_class = CLASS_ALIASES.get(args[0].casefold())
+        if requested_class and len(args) in {2, 3}:
             try:
                 investment = int(args[1])
                 proficiency = int(args[2]) if len(args) == 3 else 0
             except ValueError:
-                await ctx.send("Investment and proficiency must be whole numbers, e.g. `[p]dwweapon heavy 100 6`.")
+                await ctx.send("Use whole numbers, e.g. `[p]dwweapon heavy 100 6`.")
                 return
 
             if not 0 <= investment <= 100 or not 0 <= proficiency <= 6:
-                await ctx.send("Investment must be 0â€“100 and proficiency must be 0â€“6.")
+                await ctx.send("Investment must be 0-100 and proficiency must be 0-6.")
                 return
 
-            await self._class_compare(ctx, possible_class, investment, proficiency)
+            await self._class_compare(ctx, requested_class, investment, proficiency)
             return
 
         await self._weapon_lookup(ctx, " ".join(args))
 
-    async def _class_compare(self, ctx: commands.Context, weapon_class: str, investment: int, proficiency: int):
+    async def _class_compare(
+        self,
+        ctx: commands.Context,
+        weapon_class: str,
+        investment: int,
+        proficiency: int,
+    ):
         ranked = []
+
         for row in self.weapons:
             if row.get("Weapon Class") != weapon_class:
                 continue
-            dps = self._sheet_dps(row, investment, proficiency)
+            if not self._is_rankable(row):
+                continue
+
             damage = self._damage(row, investment, proficiency)
-            if dps is not None and damage is not None:
+            dps = self._sustained_dps(row, investment, proficiency)
+            if damage is not None and dps is not None:
                 ranked.append((dps, damage, row))
 
         if not ranked:
-            await ctx.send(f"No valid {weapon_class} weapons were found in the workbook.")
+            await ctx.send(f"No standard {weapon_class} weapons were found.")
             return
 
         ranked.sort(key=lambda item: item[0], reverse=True)
         lines = []
+
         for position, (dps, damage, row) in enumerate(ranked[:15], start=1):
+            weapon_type = str(row.get("Weapon Type") or "Unknown")
             lines.append(
-                f"`{position:>2}.` **{row['Name']}** â€” {dps:.2f} DPS Â· {damage:.2f} M1"
+                f"`{position:>2}.` **{row['Name']}** ({weapon_type})\n"
+                f"`DPS:` {dps:.2f} | `M1:` {damage:.2f}"
             )
 
         embed = discord.Embed(
-            title=f"{weapon_class} weapons â€” {investment} investment / {proficiency} proficiency",
+            title=(
+                f"{weapon_class} ranking | "
+                f"{investment} investment | "
+                f"{proficiency} proficiency"
+            ),
             description="\n".join(lines),
             colour=discord.Colour.blurple(),
         )
-        embed.set_footer(text="Sheet DPS = calculated M1 damage Ã— swing speed Ã— 2. Bleed/procs are not added.")
+        embed.set_footer(
+            text=(
+                "Standard obtainable weapons only. Sustained DPS includes listed Endlag. "
+                "Bleed, crits, procs, enchants, talents, PEN, and resistance are excluded."
+            )
+        )
         await ctx.send(embed=embed)
 
     async def _weapon_lookup(self, ctx: commands.Context, query: str):
         row, matches = self._find_weapon(query)
         if row is None:
             if matches:
-                suggestions = ", ".join(str(item["Name"]) for item in matches[:10])
+                suggestions = ", ".join(str(match["Name"]) for match in matches[:10])
                 await ctx.send(f"Multiple matches: {suggestions}")
             else:
                 await ctx.send("Weapon not found.")
@@ -208,12 +283,12 @@ class Deepwoken(commands.Cog):
         embed.add_field(name="Swing Speed", value=str(row.get("Swing Speed") or "N/A"))
         embed.add_field(name="Endlag", value=str(row.get("Endlag") or "N/A"))
         embed.add_field(name="Tags", value=str(row.get("Tags") or "None"), inline=False)
-        embed.set_footer(text="Use [p]dwweapon heavy 100 6 to rank a weapon class.")
+        embed.set_footer(text="Use [p]dwweapon heavy 100 6 to rank standard heavy weapons.")
         await ctx.send(embed=embed)
 
     @commands.command(name="dwreload")
     @commands.is_owner()
     async def dwreload(self, ctx: commands.Context):
-        """Reload workbook data without restarting the bot."""
+        """Reload the bundled workbook."""
         self.weapons = self._load_weapons()
         await ctx.send(f"Reloaded {len(self.weapons)} unique weapon rows.")
