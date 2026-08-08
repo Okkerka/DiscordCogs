@@ -1,0 +1,9 @@
+﻿{
+  "author": ["Okkerka"],
+  "name": "Deepwoken",
+  "short": "Look up Deepwoken weapon base stats.",
+  "description": "Uses a bundled Deepwoken weapon workbook.",
+  "install_msg": "Installed. Use [p]weapon <name>.",
+  "requirements": ["openpyxl"],
+  "tags": ["deepwoken", "weapons", "lookup"]
+}
