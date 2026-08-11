@@ -3028,8 +3028,20 @@ class TidalPlayer(commands.Cog):
             pl_resp = await self.tidal._run_blocking(
                 self.yt.playlists().list(part="snippet", id=playlist_id, maxResults=1).execute, timeout=15.0
             )
-            title = pl_resp.get("items", [{}])[0].get("snippet", {}).get("title", "YouTube Playlist")
-            thumb = pl_resp.get("items", [{}])[0].get("snippet", {}).get("thumbnails", {}).get("high", {}).get("url")
+            metadata_items = pl_resp.get("items") if isinstance(pl_resp, dict) else None
+            if (
+                not isinstance(metadata_items, list)
+                or not metadata_items
+                or not isinstance(metadata_items[0], dict)
+            ):
+                raise ValueError("YouTube playlist metadata is unavailable")
+            snippet = metadata_items[0].get("snippet")
+            if not isinstance(snippet, dict) or not snippet.get("title"):
+                raise ValueError("YouTube playlist metadata is malformed")
+            title = str(snippet["title"])
+            thumbnails = snippet.get("thumbnails")
+            high_thumbnail = thumbnails.get("high") if isinstance(thumbnails, dict) else None
+            thumb = high_thumbnail.get("url") if isinstance(high_thumbnail, dict) else None
             items = await self._fetch_all_youtube_tracks(playlist_id)
             await self._process_track_list(
                 ctx, items, title,

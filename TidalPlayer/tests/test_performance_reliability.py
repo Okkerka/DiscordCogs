@@ -12,6 +12,7 @@ import pytest
 
 from TidalPlayer.domain.matching import select_best_tidal_track
 from TidalPlayer.ui.controller import _duration
+from TidalPlayer.ui.embeds import Messages
 
 
 def test_queued_embed_delete_delay_is_one_minute(cog) -> None:
@@ -406,6 +407,35 @@ async def test_youtube_import_handles_a_malformed_api_response_without_crashing(
 
     with patch.object(type(cog.tidal), "_run_blocking", new=run_blocking):
         assert await cog._fetch_all_youtube_tracks("playlist") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [{}, {"items": [{}]}])
+async def test_youtube_playlist_rejects_missing_metadata_before_fetching_tracks(
+    cog, payload
+) -> None:
+    request = SimpleNamespace(execute=lambda: payload)
+    playlists = SimpleNamespace(list=lambda **_kwargs: request)
+    cog.yt = SimpleNamespace(playlists=lambda: playlists)
+    ctx = SimpleNamespace(send=AsyncMock())
+    fetch_tracks = AsyncMock(return_value=[])
+    process_tracks = AsyncMock()
+
+    async def run_blocking(_handler, operation, **_kwargs):
+        return operation()
+
+    with (
+        patch.object(type(cog.tidal), "_run_blocking", new=run_blocking),
+        patch.object(type(cog), "_fetch_all_youtube_tracks", new=fetch_tracks),
+        patch.object(type(cog), "_process_track_list", new=process_tracks),
+    ):
+        await cog._handle_youtube_playlist(
+            ctx, "https://youtube.com/playlist?list=PL123"
+        )
+
+    fetch_tracks.assert_not_awaited()
+    process_tracks.assert_not_awaited()
+    assert ctx.send.await_args.kwargs["embed"].description == Messages.ERROR_FETCH_FAILED
 
 
 @pytest.mark.asyncio
