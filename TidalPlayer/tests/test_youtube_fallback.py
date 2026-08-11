@@ -53,13 +53,15 @@ def _loaded_track(
 
 
 def _player(load_result):
-    return SimpleNamespace(
+    player = SimpleNamespace(
         current=None,
         queue=[],
         add=MagicMock(),
         play=AsyncMock(),
         load_tracks=AsyncMock(return_value=load_result),
     )
+    player.add.side_effect = lambda _requester, track: player.queue.append(track)
+    return player
 
 
 def _youtube_client(payload):
@@ -94,20 +96,23 @@ async def _run_blocking(_handler, operation, **_kwargs):
 async def test_confident_tidal_match_avoids_youtube_lavalink_load(cog) -> None:
     ctx = _context()
     candidate = _candidate()
+    player = _player(None)
     cog.yt = _youtube_client(_api_payload())
     queue_tidal = AsyncMock(return_value=True)
-    get_player = AsyncMock(side_effect=AssertionError("YouTube player must not be prepared"))
+    get_player = AsyncMock(return_value=player)
 
     with (
         patch.object(type(cog.tidal), "_run_blocking", new=_run_blocking),
         patch.object(type(cog.tidal), "search", new=AsyncMock(return_value=[candidate])),
         patch.object(type(cog), "_load_and_queue_track", new=queue_tidal),
         patch.object(type(cog), "_get_player", new=get_player),
+        patch.object(type(cog), "_ensure_vc_connected", new=AsyncMock(return_value=player)),
     ):
         await cog._handle_youtube_video(ctx, VIDEO_ID)
 
-    queue_tidal.assert_awaited_once_with(ctx, candidate)
-    get_player.assert_not_awaited()
+    queue_tidal.assert_awaited_once_with(ctx, candidate, player=player)
+    get_player.assert_awaited_once_with(ctx, connect=True)
+    player.load_tracks.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -179,12 +184,17 @@ async def test_youtube_empty_load_sends_source_specific_error(cog) -> None:
 @pytest.mark.asyncio
 async def test_youtube_api_cancellation_propagates_without_error_message(cog) -> None:
     ctx = _context()
+    player = _player(None)
     cog.yt = _youtube_client(_api_payload())
 
     async def cancel(_handler, _operation, **_kwargs):
         raise asyncio.CancelledError
 
-    with patch.object(type(cog.tidal), "_run_blocking", new=cancel):
+    with (
+        patch.object(type(cog.tidal), "_run_blocking", new=cancel),
+        patch.object(type(cog), "_get_player", new=AsyncMock(return_value=player)),
+        patch.object(type(cog), "_ensure_vc_connected", new=AsyncMock(return_value=player)),
+    ):
         with pytest.raises(asyncio.CancelledError):
             await cog._handle_youtube_video(ctx, VIDEO_ID)
 
@@ -235,6 +245,7 @@ async def test_missing_youtube_client_still_uses_direct_fallback(cog) -> None:
 @pytest.mark.asyncio
 async def test_youtube_tidal_search_cancellation_propagates(cog) -> None:
     ctx = _context()
+    player = _player(None)
     cog.yt = _youtube_client(_api_payload())
 
     with (
@@ -242,11 +253,27 @@ async def test_youtube_tidal_search_cancellation_propagates(cog) -> None:
         patch.object(
             type(cog.tidal), "search", new=AsyncMock(side_effect=asyncio.CancelledError)
         ),
+        patch.object(type(cog), "_get_player", new=AsyncMock(return_value=player)),
+        patch.object(type(cog), "_ensure_vc_connected", new=AsyncMock(return_value=player)),
     ):
         with pytest.raises(asyncio.CancelledError):
             await cog._handle_youtube_video(ctx, VIDEO_ID)
 
     ctx.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_invalid_voice_state_is_rejected_before_youtube_api_lookup(cog) -> None:
+    ctx = _context()
+    ctx.author.voice = None
+    cog.yt = _youtube_client(_api_payload())
+    api_call = AsyncMock(side_effect=AssertionError("provider quota must not be spent"))
+
+    with patch.object(type(cog.tidal), "_run_blocking", new=api_call):
+        await cog._handle_youtube_video(ctx, VIDEO_ID)
+
+    api_call.assert_not_awaited()
+    assert ctx.send.await_args.kwargs["embed"].description == Messages.ERROR_NO_PLAYER
 
 
 @pytest.mark.asyncio
@@ -302,3 +329,39 @@ async def test_shared_admission_preserves_queued_metadata_and_deletes_confirmati
     assert list(cog._queued_meta[ctx.guild.id]) == [meta]
     queued_message.delete.assert_awaited_once()
     assert not cog._tasks
+
+
+@pytest.mark.asyncio
+async def test_youtube_play_start_failure_uses_source_specific_error_and_rolls_back(
+    cog, caplog
+) -> None:
+    ctx = _context()
+    loaded = _loaded_track()
+    player = _player(None)
+    secret = "signed-stream-url-secret"
+    player.play.side_effect = RuntimeError(secret)
+    meta = cog._youtube_track_meta(loaded, VIDEO_ID)
+    caplog.set_level(logging.WARNING, logger="red.tidalplayer")
+
+    assert not await cog._admit_loaded_track(ctx, player, loaded, meta)
+
+    assert loaded not in player.queue
+    assert ctx.guild.id not in cog._current_meta
+    assert ctx.send.await_args.kwargs["embed"].description == Messages.ERROR_YOUTUBE_FAILED
+    assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_cancelled_play_start_rolls_back_and_propagates(cog) -> None:
+    ctx = _context()
+    loaded = _loaded_track()
+    player = _player(None)
+    player.play.side_effect = asyncio.CancelledError
+    meta = cog._youtube_track_meta(loaded, VIDEO_ID)
+
+    with pytest.raises(asyncio.CancelledError):
+        await cog._admit_loaded_track(ctx, player, loaded, meta)
+
+    assert loaded not in player.queue
+    assert ctx.guild.id not in cog._current_meta
+    ctx.send.assert_not_awaited()

@@ -42,7 +42,7 @@ def _normalize_url(value: str) -> str:
             and normalized.count(">") == 1
         ):
             normalized = normalized[1:-1].strip()
-        else:
+        elif normalized.strip("<>").lstrip().startswith(("https://", "http://")):
             raise MalformedProviderURL("Malformed provider URL")
     return normalized
 

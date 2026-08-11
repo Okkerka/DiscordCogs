@@ -1788,10 +1788,20 @@ class TidalPlayer(commands.Cog):
             if was_idle:
                 try:
                     await player.play()
-                except Exception:
+                except asyncio.CancelledError:
                     self._remove_from_queue(player, loaded_track)
-                    log.exception("player.play() failed for guild %s", guild_id)
-                    await ctx.send(embed=_error_embed(Messages.ERROR_LAVALINK_FAILED))
+                    raise
+                except Exception as error:
+                    self._remove_from_queue(player, loaded_track)
+                    _log_provider_failure(
+                        "Lavalink", f"playback start in guild {guild_id}", error
+                    )
+                    failure = (
+                        Messages.ERROR_YOUTUBE_FAILED
+                        if str(meta.get("source") or "").casefold() == "youtube"
+                        else Messages.ERROR_LAVALINK_FAILED
+                    )
+                    await ctx.send(embed=_error_embed(failure))
                     return False
                 self._current_meta[guild_id] = meta
                 started_playback = True
@@ -1929,13 +1939,12 @@ class TidalPlayer(commands.Cog):
     async def _handle_youtube_video(self, ctx: commands.Context, video_id: str) -> None:
         if ctx.guild is None:
             return
+        player = await self._prepare_playback_player(ctx)
+        if player is None:
+            return
         metadata = await self._youtube_video_metadata(video_id)
-        player = None
         loaded_track = None
         if metadata is None:
-            player = await self._prepare_playback_player(ctx)
-            if player is None:
-                return
             loaded_track = await self._load_youtube_track(player, video_id, ctx.guild.id)
             if loaded_track is None:
                 await ctx.send(embed=_error_embed(Messages.ERROR_YOUTUBE_FAILED))
@@ -1959,16 +1968,9 @@ class TidalPlayer(commands.Cog):
             results = []
         tidal_track = select_confident_youtube_tidal_track(title, channel, results)
         if tidal_track is not None:
-            if player is None:
-                await self._load_and_queue_track(ctx, tidal_track)
-            else:
-                await self._load_and_queue_track(ctx, tidal_track, player=player)
+            await self._load_and_queue_track(ctx, tidal_track, player=player)
             return
 
-        if player is None:
-            player = await self._prepare_playback_player(ctx)
-            if player is None:
-                return
         if loaded_track is None:
             loaded_track = await self._load_youtube_track(player, video_id, ctx.guild.id)
         if loaded_track is None:

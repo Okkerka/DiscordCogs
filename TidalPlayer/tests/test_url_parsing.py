@@ -191,6 +191,11 @@ def test_strict_youtube_normalizes_one_discord_angle_pair() -> None:
     ) == ProviderURL(ProviderKind.YOUTUBE, "video", YOUTUBE_VIDEO_ID)
 
 
+@pytest.mark.parametrize("query", ["<azali rivals", "azali rivals>"])
+def test_non_url_search_text_with_unmatched_angles_remains_a_search(query: str) -> None:
+    assert parse_provider_url(query) is None
+
+
 def test_strict_youtube_playlist_takes_precedence_over_video() -> None:
     playlist_id = "PLrEnWoR732-BHrPp_Pm8_VleD68f9s14-"
     assert parse_provider_url(

@@ -168,7 +168,7 @@ Move only the post-load mutation block from `_load_and_queue_track()` into `_adm
 - `_current_meta` and `_queued_meta` order;
 - controller and queue confirmation behavior.
 
-Call this helper from the existing Tidal path. Do not hold the guild lock during provider or LavaLink I/O and do not change batch admission in this task.
+Call this helper from the existing Tidal path. Do not hold the guild lock during provider or LavaLink REST resolution. Keep the short `player.play()` queue transition serialized so concurrent admissions cannot both claim the idle player. Do not change batch admission in this task.
 
 Run: `python -m pytest TidalPlayer/tests/test_playback_resilience.py -q`
 
@@ -272,7 +272,7 @@ Confirm:
 - no signed stream URL, YouTube API key, query parameters, or raw provider exception text is logged;
 - every changed behavior has a regression test that failed first;
 - Spotify and Tidal album/mix code is behaviorally unchanged;
-- no provider or LavaLink I/O occurs while `_guild_locks[guild_id]` is held;
+- no provider or LavaLink REST loading occurs while `_guild_locks[guild_id]` is held;
 - direct YouTube fallback performs at most one LavaLink load per command;
 - Tidal playback output remains unchanged.
 

@@ -24,12 +24,13 @@ The dispatcher will pass the parsed `ProviderURL` to YouTube handlers. The handl
 ## Single-video data flow
 
 1. `tplay` parses the link and routes `content_type == "video"` to a single-video handler.
-2. The handler asks YouTube Data API `videos.list(part="snippet", id=video_id, maxResults=1)` for title, channel, and thumbnails when the client exists.
-3. If API metadata is unavailable, missing, or malformed, the handler loads the canonical YouTube URL through LavaLink once and uses the returned track title and author as matching metadata. It retains that loaded track for a possible fallback.
-4. The handler creates a catalog query from the available video metadata, then calls the existing bounded Tidal search path.
-5. A new matching helper accepts a candidate when the normalized Tidal title appears as a complete phrase in the cleaned video title and the normalized Tidal artist matches the cleaned channel or appears as a complete phrase in the video title.
-6. A confident candidate uses the existing Tidal stream and metadata path. The handler will not use the first Tidal result as a fallback.
-7. With no confident match, the handler queues the retained LavaLink track or loads the canonical YouTube URL once if it has not been loaded yet. Red LavaLink owns that request timeout. The cog queues the first returned track.
+2. The handler validates voice state and prepares the Red Audio player before spending provider quota.
+3. The handler asks YouTube Data API `videos.list(part="snippet", id=video_id, maxResults=1)` for title, channel, and thumbnails when the client exists.
+4. If API metadata is unavailable, missing, or malformed, the handler loads the canonical YouTube URL through LavaLink once and uses the returned track title and author as matching metadata. It retains that loaded track for a possible fallback.
+5. The handler creates a catalog query from the available video metadata, then calls the existing bounded Tidal search path.
+6. A new matching helper accepts a candidate when the normalized Tidal title appears as a complete phrase in the cleaned video title and the normalized Tidal artist matches the cleaned channel or appears as a complete phrase in the video title.
+7. A confident candidate uses the existing Tidal stream and metadata path. The handler will not use the first Tidal result as a fallback.
+8. With no confident match, the handler queues the retained LavaLink track or loads the canonical YouTube URL once if it has not been loaded yet. Red LavaLink owns that request timeout. The cog queues the first returned track.
 
 The handler can build fallback metadata from the loaded track title, author, `length`, `thumbnail`, and `uri`. It will not retry either provider call and will never load the same YouTube URL twice within one command.
 
