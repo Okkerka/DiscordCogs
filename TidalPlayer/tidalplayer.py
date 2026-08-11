@@ -3023,7 +3023,7 @@ class TidalPlayer(commands.Cog):
     @commands.hybrid_command(name="tplay")
     @commands.guild_only()
     async def tplay(self, ctx: commands.Context, *, query: str):
-        """Play a Tidal track, album, playlist, mix, Spotify link, YouTube playlist, or search query."""
+        """Play Tidal content, provider links, or a Tidal search result."""
         if not await self.check_ready(ctx):
             return
         try:

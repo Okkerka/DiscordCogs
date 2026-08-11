@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -279,3 +280,25 @@ async def test_tplay_dispatches_parsed_youtube_video_id(cog) -> None:
         await cog.tplay(ctx, query=f"https://youtu.be/{VIDEO_ID}")
 
     handler.assert_awaited_once_with(ctx, VIDEO_ID)
+
+
+@pytest.mark.asyncio
+async def test_shared_admission_preserves_queued_metadata_and_deletes_confirmation(cog) -> None:
+    module = importlib.import_module(cog.__class__.__module__)
+    ctx = _context()
+    queued_message = SimpleNamespace(delete=AsyncMock())
+    ctx.send.return_value = queued_message
+    loaded = _loaded_track()
+    player = _player(None)
+    player.current = SimpleNamespace(title="Current track")
+    meta = cog._youtube_track_meta(loaded, VIDEO_ID)
+
+    with patch.object(module, "QUEUED_EMBED_DELETE_DELAY", 0.0):
+        assert await cog._admit_loaded_track(ctx, player, loaded, meta)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    player.play.assert_not_awaited()
+    assert list(cog._queued_meta[ctx.guild.id]) == [meta]
+    queued_message.delete.assert_awaited_once()
+    assert not cog._tasks

@@ -208,31 +208,30 @@ Commit: `Add Tidal first YouTube fallback playback`
 
 ---
 
-## Task 5: Bound the generic task registry
+## Task 5: Validate the existing task registry cleanup
 
 **Files:**
 
 - Modify: `TidalPlayer/tidalplayer.py`
 - Modify: `TidalPlayer/tests/test_performance_reliability.py`
 
-### Step 1: Add a failing task-lifecycle regression
+### Step 1: Add task-lifecycle characterization coverage
 
-Create a completed coroutine through the new registration boundary and assert that after one event-loop turn its task is absent from `_tasks`. Also assert that a pending registered task remains cancelable by `cog_unload()`.
+Create a zero-delay temporary-message deletion task, add it to `_tasks` through the existing call pattern, and assert that it deletes the message and removes itself after completion.
 
 Run: `python -m pytest TidalPlayer/tests/test_performance_reliability.py -k task_registry -q`
 
-Expected: FAIL because no shared registration helper exists and queue deletion tasks remain stored.
+Expected: PASS because `_delete_after()` already removes its current task in `finally`.
 
-### Step 2: Implement and adopt the helper
+### Step 2: Confirm all generic task call sites use existing cleanup
 
-Add `_create_task(coro, *, name=None)` that calls `asyncio.create_task`, adds the task to `_tasks`, and attaches `self._tasks.discard` as a done callback. Use it for:
+Verify that:
 
-- queued-message deletion;
-- autoplay queue confirmations;
-- recommendation queue confirmations;
-- Last.fm session closure.
+- queue, autoplay, and recommendation confirmations run `_delete_after()`;
+- `_delete_after()` discards its current task in `finally`;
+- Last.fm session closure attaches `self._tasks.discard` as a done callback.
 
-Do not route guild-owned autoplay/recommendation tasks or coalesced LavaLink tasks through this helper because their keyed registries already own lifecycle cleanup.
+Do not add a second task-registration abstraction when the existing paths are already bounded.
 
 ### Step 3: Verify and commit
 
@@ -240,7 +239,7 @@ Run: `python -m pytest TidalPlayer/tests/test_performance_reliability.py -q`
 
 Expected: PASS.
 
-Commit: `Prune completed TidalPlayer tasks`
+Commit the characterization test with the final documentation cleanup.
 
 ---
 

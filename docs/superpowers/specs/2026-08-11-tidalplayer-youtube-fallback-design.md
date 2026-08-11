@@ -4,7 +4,7 @@
 
 `tplay` will accept single-video YouTube links, prefer a high-confidence Tidal recording, and queue the YouTube source through Red LavaLink when Tidal has no confident match.
 
-The batch also removes duplicate URL parsing, shares queue admission between Tidal and YouTube tracks, and removes finished temporary-message tasks from the cog task registry.
+The batch also removes duplicate URL parsing and shares queue admission between Tidal and YouTube tracks.
 
 ## URL boundary
 
@@ -49,9 +49,9 @@ The cog will extract the common loaded-track admission steps from `_load_and_que
 
 The embed factories and Components V2 controller will read `source`. They will render `Playing from YouTube` and `Open in YouTube` for fallback tracks. Tidal output will retain its current text and links. Autoplay history will continue to use the normalized artist/title signature when `track_id` is absent.
 
-## Task-registry optimization
+## Task-registry validation
 
-Temporary queue-message deletion tasks now remain in `_tasks` after they finish. A small task-registration helper will add a task and attach `self._tasks.discard` as its done callback. Queue confirmations, autoplay announcements, suggestion confirmations, and Last.fm session closure will use that helper. This bounds registry memory by active work instead of the number of tracks queued since cog load.
+Inspection found that temporary queue-message tasks already remove themselves from `_tasks` in `_delete_after()` and Last.fm session closure already attaches a discard callback. Regression coverage will preserve that bounded lifecycle. No extra task abstraction will be added because it would not improve speed or memory use.
 
 ## Errors and logs
 

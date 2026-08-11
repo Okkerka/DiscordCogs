@@ -18,7 +18,9 @@ Optional Spotify imports use Red shared API tokens:
 [p]set api spotify client_id,<client-id> client_secret,<client-secret>
 ```
 
-Optional YouTube playlist imports use:
+Single-video YouTube links can fall back directly through LavaLink without an
+API key. An optional YouTube API key enables playlist imports and lets
+single-video commands attempt the Tidal match before loading the YouTube source:
 
 ```text
 [p]set api youtube api_key,<api-key>

@@ -588,3 +588,16 @@ async def test_suggested_queue_confirmation_is_scheduled_for_deletion(cog) -> No
 
     interaction.followup.send.assert_awaited_once()
     delete_after.assert_awaited_once_with(queued_message, 60.0)
+
+
+@pytest.mark.asyncio
+async def test_temporary_message_task_removes_itself_from_registry(cog) -> None:
+    message = SimpleNamespace(delete=AsyncMock())
+    task = asyncio.create_task(cog._delete_after(message, 0.0))
+    cog._tasks.add(task)
+
+    await task
+    await asyncio.sleep(0)
+
+    message.delete.assert_awaited_once()
+    assert task not in cog._tasks
