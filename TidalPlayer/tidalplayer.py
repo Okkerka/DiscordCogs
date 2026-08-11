@@ -23,7 +23,7 @@ from redbot.core.utils.menus import SimpleMenu
 from .config_schema import COG_IDENTIFIER, GLOBAL_DEFAULTS, GUILD_DEFAULTS, SCHEMA_VERSION
 from .domain.models import PageResult as _PageResult
 from .domain.models import TrackMeta
-from .domain.matching import select_best_tidal_track
+from .domain.matching import select_best_tidal_track, select_confident_youtube_tidal_track
 from .domain.identity import normalize_identity_text, recording_signature
 from .domain.normalization import (
     FILTER_REGEX, ISRC_PATTERN, SPOTIFY_ALBUM_PATTERN, SPOTIFY_PLAYLIST_PATTERN,
@@ -1724,21 +1724,16 @@ class TidalPlayer(commands.Cog):
         tidal_track: Any,
         show_embed: bool = True,
         skip_audio_res: bool = True,
+        *,
+        player: Any | None = None,
     ) -> bool:
         if not ctx.guild:
             return False
         self._playback_channels[ctx.guild.id] = ctx.channel
         meta = await self._extract_meta(tidal_track, skip_audio_res=skip_audio_res)
-        if not getattr(ctx.author, "voice", None) or getattr(ctx.author.voice, "channel", None) is None:
-            await ctx.send(embed=_error_embed(Messages.ERROR_NO_PLAYER))
-            return False
-        player = await self._get_player(ctx, connect=True)
-        if not player:
-            await ctx.send(embed=_error_embed(Messages.ERROR_NO_PLAYER))
-            return False
-        player = await self._ensure_vc_connected(ctx, player)
-        if not player:
-            await ctx.send(embed=_error_embed(Messages.ERROR_NO_PLAYER))
+        if player is None:
+            player = await self._prepare_playback_player(ctx)
+        if player is None:
             return False
         loaded_track = await self._load_lavalink_track(player, tidal_track, ctx.guild.id)
         if not loaded_track:
@@ -1747,6 +1742,35 @@ class TidalPlayer(commands.Cog):
                 ctx.guild.id,
             )
             await ctx.send(embed=_error_embed(Messages.ERROR_LAVALINK_FAILED))
+            return False
+        return await self._admit_loaded_track(
+            ctx, player, loaded_track, meta, show_embed=show_embed
+        )
+
+    async def _prepare_playback_player(self, ctx: commands.Context) -> Any | None:
+        if not getattr(ctx.author, "voice", None) or getattr(ctx.author.voice, "channel", None) is None:
+            await ctx.send(embed=_error_embed(Messages.ERROR_NO_PLAYER))
+            return None
+        player = await self._get_player(ctx, connect=True)
+        if not player:
+            await ctx.send(embed=_error_embed(Messages.ERROR_NO_PLAYER))
+            return None
+        player = await self._ensure_vc_connected(ctx, player)
+        if not player:
+            await ctx.send(embed=_error_embed(Messages.ERROR_NO_PLAYER))
+            return None
+        return player
+
+    async def _admit_loaded_track(
+        self,
+        ctx: commands.Context,
+        player: Any,
+        loaded_track: Any,
+        meta: TrackMeta,
+        *,
+        show_embed: bool = True,
+    ) -> bool:
+        if not ctx.guild:
             return False
         loaded_track.title = truncate(meta["title"], 100)
         loaded_track.author = f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
@@ -1788,6 +1812,170 @@ class TidalPlayer(commands.Cog):
             except discord.HTTPException:
                 log.warning("Could not send queued embed for guild %s", ctx.guild.id)
         return True
+
+    @staticmethod
+    def _youtube_watch_url(video_id: str) -> str:
+        return f"https://www.youtube.com/watch?v={video_id}"
+
+    async def _youtube_video_metadata(
+        self, video_id: str
+    ) -> Tuple[str, str, Optional[str]] | None:
+        if self.yt is None:
+            return None
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        try:
+            response = await self.tidal._run_blocking(
+                self.yt.videos().list(
+                    part="snippet", id=video_id, maxResults=1
+                ).execute,
+                timeout=15.0,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            _log_provider_failure("YouTube", f"video metadata {video_id}", error)
+            return None
+
+        items = response.get("items") if isinstance(response, dict) else None
+        snippet = items[0].get("snippet") if isinstance(items, list) and items and isinstance(items[0], dict) else None
+        if not isinstance(snippet, dict):
+            log.warning("YouTube video metadata %s was missing or malformed.", video_id)
+            return None
+        title = str(snippet.get("title") or "").strip()
+        channel = str(snippet.get("channelTitle") or "").strip()
+        if not title or not channel or title.casefold() in YOUTUBE_SKIP_TITLES:
+            log.warning("YouTube video metadata %s was unavailable.", video_id)
+            return None
+        thumbnail = None
+        thumbnails = snippet.get("thumbnails")
+        if isinstance(thumbnails, dict):
+            for quality in ("maxres", "standard", "high", "medium", "default"):
+                candidate = thumbnails.get(quality)
+                if isinstance(candidate, dict) and candidate.get("url"):
+                    thumbnail = str(candidate["url"])
+                    break
+        log.info(
+            "Retrieved YouTube metadata for video %s in %.2fs.",
+            video_id,
+            loop.time() - started,
+        )
+        return title, channel, thumbnail
+
+    async def _load_youtube_track(
+        self, player: Any, video_id: str, guild_id: int
+    ) -> Any | None:
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        node_ready = self._lavalink_node_ready_state(player)
+        try:
+            results = await player.load_tracks(self._youtube_watch_url(video_id))
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            _log_provider_failure(
+                "Lavalink", f"YouTube video {video_id} load in guild {guild_id}", error
+            )
+            return None
+        tracks = self.tidal._extract_tracks(results)
+        elapsed = loop.time() - started
+        result_type = self._lavalink_load_result_type(results)
+        if not tracks:
+            log.warning(
+                "Lavalink returned no tracks for YouTube video %s in guild %s after %.2fs "
+                "(node_ready=%s, load_type=%s).",
+                video_id,
+                guild_id,
+                elapsed,
+                node_ready,
+                result_type,
+            )
+            return None
+        log.info(
+            "Lavalink loaded YouTube video %s in guild %s in %.2fs "
+            "(node_ready=%s, load_type=%s, tracks=%s).",
+            video_id,
+            guild_id,
+            elapsed,
+            node_ready,
+            result_type,
+            len(tracks),
+        )
+        return tracks[0]
+
+    def _youtube_track_meta(
+        self,
+        track: Any,
+        video_id: str,
+        fallback_thumbnail: str | None = None,
+    ) -> TrackMeta:
+        try:
+            duration = max(0, int(getattr(track, "length", 0) or 0) // 1000)
+        except (TypeError, ValueError):
+            duration = 0
+        return {
+            "title": str(getattr(track, "title", None) or "Unknown YouTube video"),
+            "artist": str(getattr(track, "author", None) or "Unknown artist"),
+            "album": None,
+            "duration": duration,
+            "quality": "YouTube",
+            "image": getattr(track, "thumbnail", None) or fallback_thumbnail,
+            "share_url": self._youtube_watch_url(video_id),
+            "audio_resolution": None,
+            "track_id": None,
+            "source": "YouTube",
+        }
+
+    async def _handle_youtube_video(self, ctx: commands.Context, video_id: str) -> None:
+        if ctx.guild is None:
+            return
+        metadata = await self._youtube_video_metadata(video_id)
+        player = None
+        loaded_track = None
+        if metadata is None:
+            player = await self._prepare_playback_player(ctx)
+            if player is None:
+                return
+            loaded_track = await self._load_youtube_track(player, video_id, ctx.guild.id)
+            if loaded_track is None:
+                await ctx.send(embed=_error_embed(Messages.ERROR_YOUTUBE_FAILED))
+                return
+            metadata = (
+                str(getattr(loaded_track, "title", None) or ""),
+                str(getattr(loaded_track, "author", None) or ""),
+                getattr(loaded_track, "thumbnail", None),
+            )
+
+        title, channel, _thumbnail = metadata
+        filter_remixes = await self.config.guild(ctx.guild).filter_remixes()
+        try:
+            results = await self.tidal.search(
+                f"{title} {channel}".strip(), filter_remixes=filter_remixes
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            _log_provider_failure("Tidal", f"YouTube video {video_id} match", error)
+            results = []
+        tidal_track = select_confident_youtube_tidal_track(title, channel, results)
+        if tidal_track is not None:
+            if player is None:
+                await self._load_and_queue_track(ctx, tidal_track)
+            else:
+                await self._load_and_queue_track(ctx, tidal_track, player=player)
+            return
+
+        if player is None:
+            player = await self._prepare_playback_player(ctx)
+            if player is None:
+                return
+        if loaded_track is None:
+            loaded_track = await self._load_youtube_track(player, video_id, ctx.guild.id)
+        if loaded_track is None:
+            await ctx.send(embed=_error_embed(Messages.ERROR_YOUTUBE_FAILED))
+            return
+        meta = self._youtube_track_meta(loaded_track, video_id, _thumbnail)
+        await self._admit_loaded_track(ctx, player, loaded_track, meta)
 
     async def _lastfm_similar_tracks(
         self, artist: str, title: str, limit: int = 25,

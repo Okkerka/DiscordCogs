@@ -26,6 +26,7 @@ class Messages:
     ERROR_INVALID_URL = "Invalid {platform} {content_type} URL"
     ERROR_CONTENT_UNAVAILABLE = "Content unavailable (private/region-locked)"
     ERROR_LAVALINK_FAILED = "Playback failed: Could not retrieve Tidal stream."
+    ERROR_YOUTUBE_FAILED = "Playback failed: Could not retrieve YouTube audio."
     ERROR_STILL_LOADING = "⏳ TidalPlayer is still initializing, please wait a moment."
     ERROR_NOT_PLAYING = "Nothing is currently playing."
     STATUS_PLAYING = "Playing from Tidal"
