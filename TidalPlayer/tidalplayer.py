@@ -2265,8 +2265,11 @@ class TidalPlayer(commands.Cog):
         player = await self._get_player_for_guild(guild_id)
         paused = bool(getattr(player, "paused", False)) if player else False
         view = await self._controller_view(guild_id, paused)
-        if interaction is not None and not interaction.response.is_done():
-            await interaction.response.edit_message(view=view)
+        if interaction is not None:
+            if interaction.response.is_done():
+                await interaction.edit_original_response(view=view)
+            else:
+                await interaction.response.edit_message(view=view)
             if interaction.message is not None:
                 self._controller_messages[guild_id] = interaction.message
             self._controller_last_refresh[guild_id] = now
@@ -2285,6 +2288,7 @@ class TidalPlayer(commands.Cog):
                 "You need the Manage Server permission to change autoplay.", ephemeral=True
             )
             return
+        await interaction.response.defer()
         setting = self.config.guild(interaction.guild).autoplay_enabled
         enabled = not await setting()
         await setting.set(enabled)
@@ -2295,10 +2299,11 @@ class TidalPlayer(commands.Cog):
         if interaction.guild is None:
             return
         guild_id = interaction.guild.id
+        await interaction.response.defer()
         async with self._guild_locks[guild_id]:
             player = await self._get_player_for_guild(guild_id)
             if player is None or not callable(getattr(player, "pause", None)):
-                await interaction.response.send_message("No active player is available.", ephemeral=True)
+                await interaction.followup.send("No active player is available.", ephemeral=True)
                 return
             result = player.pause(not bool(getattr(player, "paused", False)))
             if asyncio.iscoroutine(result):
@@ -2309,6 +2314,7 @@ class TidalPlayer(commands.Cog):
         if interaction.guild is None:
             return
         guild_id = interaction.guild.id
+        await interaction.response.defer()
         async with self._guild_locks[guild_id]:
             self._cancel_guild_background_tasks(guild_id)
             self._cancel_lavalink_loads(guild_id)
@@ -2332,10 +2338,6 @@ class TidalPlayer(commands.Cog):
                 await old_msg.delete()
             except (discord.HTTPException, discord.Forbidden, discord.NotFound):
                 pass
-        try:
-            await interaction.response.defer()
-        except Exception:
-            pass
         try:
             await interaction.followup.send("⏹ Playback stopped. Queue cleared.", ephemeral=True)
         except Exception:

@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Any, Sequence
 
 import discord
 
+from ..domain.normalization import format_duration
+
 if TYPE_CHECKING:
     from ..domain.models import TrackMeta
     from ..tidalplayer import TidalPlayer
@@ -15,8 +17,7 @@ def _short(value: str, limit: int = 100) -> str:
 
 
 def _duration(seconds: int) -> str:
-    minutes, seconds = divmod(max(0, int(seconds or 0)), 60)
-    return f"{minutes:02}:{seconds:02}"
+    return format_duration(max(0, int(seconds or 0)))
 
 
 class PlayerControllerView(discord.ui.LayoutView):

@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from TidalPlayer.domain.matching import select_best_tidal_track
+from TidalPlayer.ui.controller import _duration
 
 
 def test_queued_embed_delete_delay_is_one_minute(cog) -> None:
@@ -37,6 +38,103 @@ async def test_equivalent_search_queries_share_cache_entry(cog) -> None:
 
     assert cog.tidal.session.search.call_count == 1
     assert cog.tidal.session.search.call_args.args[0] == "  Artist   Track  "
+
+
+def test_controller_duration_formats_hour_long_tracks() -> None:
+    assert _duration(3661) == "1:01:01"
+
+
+@pytest.mark.asyncio
+async def test_controller_stop_defers_before_player_io(cog) -> None:
+    events: list[str] = []
+    interaction = SimpleNamespace(
+        guild=SimpleNamespace(id=10),
+        response=SimpleNamespace(defer=AsyncMock(side_effect=lambda: events.append("defer"))),
+        followup=SimpleNamespace(send=AsyncMock()),
+    )
+    player = SimpleNamespace(
+        queue=[],
+        stop=MagicMock(side_effect=lambda: events.append("stop")),
+    )
+    with patch.object(
+        type(cog), "_get_player_for_guild", new=AsyncMock(return_value=player)
+    ):
+        await cog.controller_stop(interaction)
+
+    assert events[:2] == ["defer", "stop"]
+
+
+@pytest.mark.asyncio
+async def test_controller_pause_defers_before_player_lookup(cog) -> None:
+    events: list[str] = []
+    interaction = SimpleNamespace(
+        guild=SimpleNamespace(id=11),
+        response=SimpleNamespace(
+            defer=AsyncMock(side_effect=lambda: events.append("defer")),
+            send_message=AsyncMock(),
+        ),
+        followup=SimpleNamespace(send=AsyncMock()),
+    )
+
+    async def get_player(_self, _guild_id):
+        events.append("player")
+        return None
+
+    with patch.object(type(cog), "_get_player_for_guild", new=get_player):
+        await cog.controller_toggle_pause(interaction)
+
+    assert events == ["defer", "player"]
+    interaction.followup.send.assert_awaited_once_with(
+        "No active player is available.", ephemeral=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_controller_autoplay_defers_before_config_read(cog) -> None:
+    events: list[str] = []
+
+    class Setting:
+        async def __call__(self):
+            events.append("config")
+            return False
+
+        async def set(self, _value):
+            events.append("set")
+
+    interaction = SimpleNamespace(
+        guild=SimpleNamespace(id=12),
+        response=SimpleNamespace(defer=AsyncMock(side_effect=lambda: events.append("defer"))),
+    )
+    cog.config.guild = MagicMock(return_value=SimpleNamespace(autoplay_enabled=Setting()))
+    with (
+        patch.object(
+            type(cog), "can_change_guild_settings", new=AsyncMock(return_value=True)
+        ),
+        patch.object(type(cog), "_refresh_controller", new=AsyncMock()),
+    ):
+        await cog.controller_toggle_autoplay(interaction)
+
+    assert events[:2] == ["defer", "config"]
+
+
+@pytest.mark.asyncio
+async def test_deferred_controller_refresh_edits_original_response(cog) -> None:
+    guild_id = 13
+    view = object()
+    interaction = SimpleNamespace(
+        response=SimpleNamespace(is_done=MagicMock(return_value=True)),
+        edit_original_response=AsyncMock(),
+        message=None,
+    )
+    with (
+        patch.object(type(cog), "_controller_view", new=AsyncMock(return_value=view)),
+        patch.object(
+            type(cog), "_get_player_for_guild", new=AsyncMock(return_value=None)
+        ),
+    ):
+        await cog._refresh_controller(guild_id, interaction)
+
+    interaction.edit_original_response.assert_awaited_once_with(view=view)
 
 
 @pytest.mark.asyncio
