@@ -21,22 +21,12 @@ FILTER_REGEX: Final = re.compile("|".join(re.escape(kw) for kw in FILTER_KEYWORD
 
 YOUTUBE_SKIP_TITLES: Final = frozenset({"[deleted video]", "private video", "[private video]"})
 
-TIDAL_URL_PATTERNS: Final = {
-    "track": re.compile(r"tidal\.com/(?:browse/)?track/(\d+)"),
-    "video": re.compile(r"tidal\.com/(?:browse/)?video/(\d+)"),
-    "album": re.compile(r"tidal\.com/(?:browse/)?album/(\d+)"),
-    "playlist": re.compile(r"tidal\.com/(?:browse/)?playlist/([a-f0-9-]+)"),
-    "mix": re.compile(r"tidal\.com/(?:browse/)?mix/([a-f0-9A-Z_-]+)"),
-}
 SPOTIFY_PLAYLIST_PATTERN: Final = re.compile(r"open\.spotify\.com/playlist/([a-zA-Z0-9]+)")
 SPOTIFY_TRACK_PATTERN: Final = re.compile(r"open\.spotify\.com/track/([a-zA-Z0-9]+)")
 SPOTIFY_ALBUM_PATTERN: Final = re.compile(r"open\.spotify\.com/album/([a-zA-Z0-9]+)")
 ISRC_PATTERN: Final = re.compile(r"^isrc:([A-Z]{2}[A-Z0-9]{3}\d{7})$", re.IGNORECASE)
 
-TIDAL_URL_RE: Final = re.compile(r"tidal\.com/")
-SPOTIFY_PLAYLIST_RE: Final = re.compile(r"open\.spotify\.com/playlist/")
-SPOTIFY_ALBUM_RE: Final = re.compile(r"open\.spotify\.com/album/")
-SPOTIFY_TRACK_RE: Final = re.compile(r"open\.spotify\.com/track/")
+
 def truncate(text: str, limit: int) -> str:
     """Shorten text to an exact display limit, preserving existing behavior."""
     if len(text) > limit:

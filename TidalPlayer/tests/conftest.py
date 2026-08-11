@@ -149,15 +149,16 @@ def _make_discord_stub() -> types.ModuleType:
     discord.Embed = _Embed
 
     class _View:
-        def __init__(self, *, timeout: float = 180.0) -> None:
+        def __init__(self, *, timeout: float | None = 180.0) -> None:
             self.timeout = timeout
             self.children: list = []
+            self.stopped = False
 
         def add_item(self, item: Any) -> None:
             self.children.append(item)
 
         def stop(self) -> None:
-            pass
+            self.stopped = True
 
     discord.ui = types.ModuleType("discord.ui")
     discord.ui.View = _View
@@ -386,6 +387,7 @@ def fake_bot():
     from redbot.core.bot import Red  # noqa: PLC0415 – resolved to stub
     bot = Red()
     bot.get_shared_api_tokens = AsyncMock(return_value={})
+    bot.add_view = MagicMock()
     bot.add_cog = AsyncMock()
     bot.cog_disabled_in_guild = AsyncMock(return_value=False)
     bot.is_owner = AsyncMock(return_value=False)

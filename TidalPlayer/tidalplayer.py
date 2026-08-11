@@ -27,7 +27,7 @@ from .domain.matching import select_best_tidal_track, select_confident_youtube_t
 from .domain.identity import normalize_identity_text, recording_signature
 from .domain.normalization import (
     FILTER_REGEX, ISRC_PATTERN, SPOTIFY_ALBUM_PATTERN, SPOTIFY_PLAYLIST_PATTERN,
-    SPOTIFY_TRACK_PATTERN, TIDAL_URL_PATTERNS,
+    SPOTIFY_TRACK_PATTERN,
     YOUTUBE_SKIP_TITLES, ensure_aware as _ensure_aware,
     format_duration, make_tidal_url, truncate, utc_now as _utc_now,
 )
@@ -120,7 +120,7 @@ SEARCH_BATCH_SIZE = 8
 CONTROLLER_REFRESH_COOLDOWN = 3.0   # seconds between background-only controller edits
 PROGRESS_SLEEP_INTERVAL = 0.0       # Provider and executor limits already pace batch work.
 QUEUED_EMBED_DELETE_DELAY = 60.0    # Keep queue confirmations visible without cluttering chat.
-RECOMMENDATION_SEARCH_CONCURRENCY = 2  # Leave Tidal API capacity for playback requests.
+RECOMMENDATION_SEARCH_CONCURRENCY = 1  # Leave Tidal API capacity for playback requests.
 RECOMMENDATION_LOOKUP_CONCURRENCY = 2  # Reserve at least one Tidal API slot for foreground commands.
 LASTFM_REQUEST_TIMEOUT = 20.0
 RECENT_TRACK_HISTORY = 50
@@ -311,9 +311,17 @@ class TidalHandler:
         return await asyncio.shield(task)
 
     async def _run_blocking(self, func: Callable[[], Any], timeout: float = 10.0) -> Any:
-        await self._executor_slots.acquire()
+        if timeout <= 0:
+            raise asyncio.TimeoutError
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        await asyncio.wait_for(self._executor_slots.acquire(), timeout=timeout)
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            self._executor_slots.release()
+            raise asyncio.TimeoutError
         try:
-            future = asyncio.get_running_loop().run_in_executor(self._executor, func)
+            future = loop.run_in_executor(self._executor, func)
         except BaseException:
             self._executor_slots.release()
             raise
@@ -321,7 +329,7 @@ class TidalHandler:
         future.add_done_callback(lambda _: self._executor_slots.release())
         # Shielding is deliberate: cancelling the waiter must not falsely free
         # a worker while its synchronous provider request is still running.
-        return await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+        return await asyncio.wait_for(asyncio.shield(future), timeout=remaining)
 
     async def _run_with_backoff(self, func: Callable[[], Any], timeout: float = 10.0) -> Any:
         delay = RATELIMIT_BACKOFF_BASE
@@ -436,12 +444,16 @@ class TidalHandler:
             self._refresh_task.cancel()
         self._refresh_task = asyncio.create_task(self._auto_refresh_tokens())
 
-    def unload(self) -> None:
-        if self._refresh_task:
-            self._refresh_task.cancel()
-        for task in self._inflight.values():
+    async def unload(self) -> None:
+        tasks = set(self._inflight.values())
+        if self._refresh_task is not None:
+            tasks.add(self._refresh_task)
+        for task in tasks:
             task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._inflight.clear()
+        self._refresh_task = None
         self._executor.shutdown(wait=False)
 
     async def logout(self) -> None:
@@ -966,6 +978,7 @@ class TidalPlayer(commands.Cog):
         "_recommendation_cache", "_recommendation_tasks", "_recommendation_task_sources",
         "_controller_recommendation_tasks", "_controller_last_refresh", "_queued_meta",
         "_recommendation_lookup_slots", "_lastfm_session", "_lavalink_load_tasks",
+        "_persistent_view", "_controller_views",
     )
 
     def __init__(self, bot: Red):
@@ -980,10 +993,12 @@ class TidalPlayer(commands.Cog):
         self.yt: Optional[Any] = None
         self._tasks: Set[asyncio.Task] = set()
         self._guild_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
-        self._cancel_events: Dict[int, asyncio.Event] = defaultdict(asyncio.Event)
+        self._cancel_events: Dict[int, asyncio.Event] = {}
         self._last_progress_edit: Dict[int, float] = {}
         self._current_meta: Dict[int, TrackMeta] = {}
         self._controller_messages: Dict[int, discord.Message] = {}
+        self._persistent_view: PlayerControllerView | None = None
+        self._controller_views: Dict[int, PlayerControllerView] = {}
         self._playback_channels: Dict[int, discord.abc.Messageable] = {}
         self._controller_meta: Dict[int, TrackMeta] = {}
         self._recent_track_ids: Dict[int, Deque[str]] = defaultdict(
@@ -1009,7 +1024,8 @@ class TidalPlayer(commands.Cog):
     async def cog_load(self) -> None:
         await self._migrate_config()
         await self._initialize_apis()
-        self.bot.add_view(PlayerControllerView(self))
+        self._persistent_view = PlayerControllerView(self)
+        self.bot.add_view(self._persistent_view)
 
     async def _migrate_config(self) -> None:
         try:
@@ -1023,29 +1039,38 @@ class TidalPlayer(commands.Cog):
         except Exception as e:
             log.warning(f"Config migration check failed (non-fatal): {e}")
 
-    def cog_unload(self) -> None:
+    async def cog_unload(self) -> None:
         for ev in self._cancel_events.values():
             ev.set()
-        for t in list(self._tasks):
-            t.cancel()
-        for task in self._lavalink_load_tasks.values():
+        tasks = {
+            *self._tasks,
+            *self._lavalink_load_tasks.values(),
+            *self._autoplay_tasks.values(),
+            *self._recommendation_tasks.values(),
+            *self._controller_recommendation_tasks.values(),
+        }
+        for task in tasks:
             task.cancel()
-        self._lavalink_load_tasks.clear()
-        self._close_lastfm_session()
-        self.tidal.unload()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await self._close_lastfm_session()
+        await self.tidal.unload()
+
+        for guild_id in tuple(self._controller_views):
+            self._stop_controller_view(guild_id)
+        if self._persistent_view is not None:
+            self._persistent_view.stop()
+            self._persistent_view = None
+
         self.sp = None
         self.yt = None
+        self._tasks.clear()
+        self._lavalink_load_tasks.clear()
         self._guild_locks.clear()
         self._cancel_events.clear()
-        for task in self._autoplay_tasks.values():
-            task.cancel()
         self._autoplay_tasks.clear()
-        for task in self._recommendation_tasks.values():
-            task.cancel()
         self._recommendation_tasks.clear()
         self._recommendation_task_sources.clear()
-        for task in self._controller_recommendation_tasks.values():
-            task.cancel()
         self._controller_recommendation_tasks.clear()
         self._recommendation_cache.clear()
         self._controller_messages.clear()
@@ -1054,24 +1079,52 @@ class TidalPlayer(commands.Cog):
         self._recent_track_ids.clear()
         self._recent_track_signatures.clear()
         self._current_meta.clear()
+        self._queued_meta.clear()
         self._last_progress_edit.clear()
         self._controller_last_refresh.clear()
         log.info("TidalPlayer cog unloaded")
 
-    def _close_lastfm_session(self) -> None:
-        """Schedule close for the reusable Last.fm HTTP session during cog unload."""
+    async def _close_lastfm_session(self) -> None:
+        """Close the reusable Last.fm HTTP session during cog unload."""
         session = self._lastfm_session
         self._lastfm_session = None
         if session is None or session.closed:
             return
         try:
-            task = asyncio.create_task(session.close())
-        except RuntimeError:
-            # Cog unload is normally called on the bot loop. Avoid masking unload
-            # if shutdown has already stopped that loop.
-            return
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+            await session.close()
+        except Exception as error:
+            _log_provider_failure("Last.fm", "session close", error)
+
+    def _stop_controller_view(self, guild_id: int) -> None:
+        view = self._controller_views.pop(guild_id, None)
+        if view is not None:
+            view.stop()
+
+    def _claim_batch(self, guild_id: int) -> asyncio.Event | None:
+        if guild_id in self._cancel_events:
+            return None
+        event = asyncio.Event()
+        self._cancel_events[guild_id] = event
+        return event
+
+    def _release_batch(self, guild_id: int, event: asyncio.Event) -> None:
+        if self._cancel_events.get(guild_id) is event:
+            self._cancel_events.pop(guild_id, None)
+
+    async def _activate_controller_view(
+        self,
+        guild_id: int,
+        view: PlayerControllerView,
+        operation: Callable[[PlayerControllerView], Awaitable[Any]],
+    ) -> Any:
+        self._stop_controller_view(guild_id)
+        try:
+            result = await operation(view)
+        except BaseException:
+            view.stop()
+            raise
+        self._controller_views[guild_id] = view
+        return result
 
     async def cog_command_error(self, ctx: commands.Context, error: Exception) -> None:
         if isinstance(error, commands.CommandInvokeError):
@@ -1106,8 +1159,11 @@ class TidalPlayer(commands.Cog):
 
     @commands.Cog.listener()
     async def on_guild_remove(self, guild: discord.Guild) -> None:
+        cancel_event = self._cancel_events.pop(guild.id, None)
+        if cancel_event is not None:
+            cancel_event.set()
+        self._stop_controller_view(guild.id)
         self._guild_locks.pop(guild.id, None)
-        self._cancel_events.pop(guild.id, None)
         self._cancel_guild_background_tasks(guild.id)
         self._controller_messages.pop(guild.id, None)
         self._playback_channels.pop(guild.id, None)
@@ -1131,14 +1187,24 @@ class TidalPlayer(commands.Cog):
             return
         guild_id = guild.id
 
-        if guild_id not in self._current_meta:
-            return
+        autoplay_enabled = await self.config.guild_from_id(guild_id).autoplay_enabled()
+        stale_message = None
+        async with self._guild_locks[guild_id]:
+            current = self._current_meta.get(guild_id)
+            if current is None:
+                return
+            if not autoplay_enabled:
+                self._current_meta.pop(guild_id, None)
+                self._controller_meta.pop(guild_id, None)
+                stale_message = self._controller_messages.pop(guild_id, None)
+                self._stop_controller_view(guild_id)
+            else:
+                self._remember_track(guild_id, current)
 
-        if not await self.config.guild_from_id(guild_id).autoplay_enabled():
-            self._current_meta.pop(guild_id, None)
+        if not autoplay_enabled:
+            if stale_message is not None:
+                await _delete_message_safe(stale_message)
             return
-
-        self._remember_track(guild_id, self._current_meta[guild_id])
 
         player = await self._get_player_for_guild(guild_id)
         if player is not None:
@@ -1212,9 +1278,6 @@ class TidalPlayer(commands.Cog):
             return False
         return True
 
-    async def _check_ready(self, ctx: commands.Context) -> bool:
-        return await self.check_ready(ctx)
-
     async def _initialize_apis(self) -> None:
         t0 = asyncio.get_running_loop().time()
         snapshot = await self.tokens.restore()
@@ -1227,13 +1290,14 @@ class TidalPlayer(commands.Cog):
         )
         for name, r in zip(["Tidal", "Spotify", "YouTube"], results):
             if isinstance(r, Exception):
-                log.error(f"{name} init error: {r}")
+                _log_provider_failure(name, "initialization", r)
         elapsed = asyncio.get_running_loop().time() - t0
         self._initialized = True
         self.tidal.start_refresh_loop()
         log.info(f"TidalPlayer fully initialized in {elapsed:.2f}s")
 
     async def _initialize_spotify(self) -> None:
+        self.sp = None
         if not SPOTIFY_AVAILABLE:
             return
         tokens = await self.bot.get_shared_api_tokens("spotify")
@@ -1251,6 +1315,7 @@ class TidalPlayer(commands.Cog):
                 _log_provider_failure("Spotify", "client initialization", error)
 
     async def _initialize_youtube(self) -> None:
+        self.yt = None
         if not YOUTUBE_API_AVAILABLE:
             return
         tokens = await self.bot.get_shared_api_tokens("youtube")
@@ -1669,7 +1734,7 @@ class TidalPlayer(commands.Cog):
         self,
         ctx: commands.Context,
         player: Any,
-        resolved_chunk: List[Optional[Tuple[Any, str, TrackMeta]]],
+        resolved_chunk: List[Optional[Tuple[Any, TrackMeta]]],
         cancel_event: asyncio.Event,
     ) -> Tuple[int, int]:
         queued = skipped = 0
@@ -1679,9 +1744,9 @@ class TidalPlayer(commands.Cog):
             if res is None:
                 skipped += 1
                 continue
-            track, stream_url, meta = res
+            track, meta = res
             loaded_track = await self._load_lavalink_track(
-                player, track, ctx.guild.id, initial_stream_url=stream_url
+                player, track, ctx.guild.id
             )
             if loaded_track:
                 loaded_track.title = truncate(meta["title"], 100)
@@ -2062,7 +2127,9 @@ class TidalPlayer(commands.Cog):
                     continue
                 if not results:
                     continue
-                track = select_best_tidal_track(f"{artist} {title}", results) or results[0]
+                track = select_best_tidal_track(f"{artist} {title}", results)
+                if track is None:
+                    continue
                 track_id = str(getattr(track, "id", "") or "")
                 found_title = str(getattr(track, "name", "") or "").casefold().strip()
                 found_artist = str(getattr(getattr(track, "artist", None), "name", "") or "").casefold().strip()
@@ -2088,10 +2155,8 @@ class TidalPlayer(commands.Cog):
             log.info("Last.fm produced %s Tidal suggestion(s) for guild %s.", len(candidates), guild_id)
             return candidates
         log.info("Last.fm returned no usable Tidal matches; using Tidal search fallback.")
-        fallback = await self.tidal.search(
-            f"{meta.get('artist', '')} {meta.get('title', '')}".strip(),
-            filter_remixes=False,
-        )
+        fallback_query = f"{meta.get('artist', '')} {meta.get('title', '')}".strip()
+        fallback = await self.tidal.search(fallback_query, filter_remixes=False)
         fallback_candidates: List[Any] = []
         for track in fallback:
             track_id = str(getattr(track, "id", "") or "")
@@ -2203,7 +2268,9 @@ class TidalPlayer(commands.Cog):
             view = await self._controller_view(
                 guild_id, paused=bool(getattr(player, "paused", False)) if player else False,
             )
-            await message.edit(view=view)
+            await self._activate_controller_view(
+                guild_id, view, lambda active_view: message.edit(view=active_view)
+            )
         except asyncio.CancelledError:
             raise
         except (discord.HTTPException, discord.Forbidden, discord.NotFound):
@@ -2251,13 +2318,16 @@ class TidalPlayer(commands.Cog):
             )
             return
         previous = self._controller_messages.pop(guild_id, None)
+        self._stop_controller_view(guild_id)
         if previous is not None:
             try:
                 await previous.delete()
             except (discord.HTTPException, discord.Forbidden, discord.NotFound):
                 pass
         try:
-            self._controller_messages[guild_id] = await ctx.send(view=view)
+            self._controller_messages[guild_id] = await self._activate_controller_view(
+                guild_id, view, lambda active_view: ctx.send(view=active_view)
+            )
         except discord.HTTPException:
             log.exception("Could not send controller message for guild %s", guild_id)
         else:
@@ -2266,6 +2336,7 @@ class TidalPlayer(commands.Cog):
     async def _resend_controller_for_track_start(self, *, guild_id: int) -> None:
         """Replace the controller when Red Audio advances to a queued track."""
         previous = self._controller_messages.pop(guild_id, None)
+        self._stop_controller_view(guild_id)
         channel = self._playback_channels.get(guild_id)
         if channel is None and previous is not None:
             channel = previous.channel
@@ -2284,7 +2355,9 @@ class TidalPlayer(commands.Cog):
             if not view.children:
                 log.error("Empty controller view on track start in guild %s", guild_id)
                 return
-            self._controller_messages[guild_id] = await channel.send(view=view)
+            self._controller_messages[guild_id] = await self._activate_controller_view(
+                guild_id, view, lambda active_view: channel.send(view=active_view)
+            )
         except discord.HTTPException:
             log.exception("Could not resend controller message for guild %s", guild_id)
 
@@ -2314,16 +2387,6 @@ class TidalPlayer(commands.Cog):
             return
 
         guild_id = interaction.guild.id
-        player = await self._get_player_for_guild(guild_id)
-        if player is None or not getattr(player, "current", None):
-            resp = (
-                interaction.response.send_message
-                if not interaction.response.is_done()
-                else interaction.followup.send
-            )
-            await resp(embed=_error_embed(Messages.ERROR_NOT_PLAYING), ephemeral=True)
-            return
-
         # Resolve old message and channel BEFORE any pops, so we never lose the reference
         old_message = interaction.message or self._controller_messages.get(guild_id)
         channel: discord.abc.Messageable | None = interaction.channel or (
@@ -2338,42 +2401,60 @@ class TidalPlayer(commands.Cog):
         except Exception:
             pass
 
-        # Peek at next queued meta — don't consume yet in case skip fails
-        queued = self._queued_meta.get(guild_id, [])
-        next_meta = queued[0] if queued else None
+        no_active_player = False
+        skip_error: Exception | None = None
+        next_meta = None
+        async with self._guild_locks[guild_id]:
+            player = await self._get_player_for_guild(guild_id)
+            if player is None or not getattr(player, "current", None):
+                no_active_player = True
+            else:
+                queued = self._queued_meta.get(guild_id)
+                next_meta = queued[0] if queued else None
+                try:
+                    await player.skip()
+                except Exception as error:
+                    skip_error = error
+                else:
+                    if next_meta is not None and queued and queued[0] is next_meta:
+                        queued.popleft()
+                        self._current_meta[guild_id] = next_meta
+                        self._controller_meta[guild_id] = next_meta
+                    elif next_meta is None:
+                        autoplay_enabled = await self.config.guild_from_id(
+                            guild_id
+                        ).autoplay_enabled()
+                        if not autoplay_enabled:
+                            self._current_meta.pop(guild_id, None)
+                            self._controller_meta.pop(guild_id, None)
 
-        try:
-            await player.skip()
-        except Exception:
-            log.exception("Could not skip track in guild %s", guild_id)
+        if no_active_player:
+            await interaction.followup.send(
+                embed=_error_embed(Messages.ERROR_NOT_PLAYING), ephemeral=True
+            )
+            return
+
+        if skip_error is not None:
+            _log_provider_failure("Red Audio", f"skip in guild {guild_id}", skip_error)
             try:
                 await interaction.followup.send("Could not skip the current track.", ephemeral=True)
             except Exception:
                 pass
             return
 
-        # Skip succeeded — consume the queued meta now
-        if next_meta is not None and queued:
-            try:
-                queued.popleft()
-            except IndexError:
-                next_meta = None
-
         # Remove stale panel reference and delete the message
         self._controller_messages.pop(guild_id, None)
+        self._stop_controller_view(guild_id)
         if old_message is not None:
             try:
                 await old_message.delete()
             except (discord.HTTPException, discord.Forbidden, discord.NotFound):
                 pass
 
-        # Update meta if we already know the next track; otherwise Lavalink's
-        # track_start event will update _current_meta when the new track begins.
-        if next_meta is not None:
-            self._current_meta[guild_id] = next_meta
-            self._controller_meta[guild_id] = next_meta
+        if next_meta is None:
+            return
 
-        # Always resend a fresh controller panel so the user gets instant feedback.
+        # Resend a fresh controller panel so the user gets instant feedback.
         # Use interaction.followup.send() (webhook) so the Components V2 flag is
         # carried correctly. Fall back to channel.send() only if followup is unavailable.
         try:
@@ -2382,15 +2463,25 @@ class TidalPlayer(commands.Cog):
                 log.error("Empty controller view after skip in guild %s — not sending", guild_id)
                 return
             try:
-                msg = await interaction.followup.send(view=view, wait=True)
+                msg = await self._activate_controller_view(
+                    guild_id,
+                    view,
+                    lambda active_view: interaction.followup.send(
+                        view=active_view, wait=True
+                    ),
+                )
                 self._controller_messages[guild_id] = msg
             except discord.HTTPException:
                 log.exception("followup.send failed after skip in guild %s, trying channel.send", guild_id)
                 if channel is not None:
-                    msg = await channel.send(view=view)
+                    view = await self._controller_view(guild_id)
+                    msg = await self._activate_controller_view(
+                        guild_id,
+                        view,
+                        lambda active_view: channel.send(view=active_view),
+                    )
                     self._controller_messages[guild_id] = msg
-            if next_meta is not None:
-                self._schedule_controller_recommendations(guild_id)
+            self._schedule_controller_recommendations(guild_id)
         except Exception:
             log.exception("Could not resend controller after skip in guild %s", guild_id)
 
@@ -2424,15 +2515,29 @@ class TidalPlayer(commands.Cog):
         view = await self._controller_view(guild_id, paused)
         if interaction is not None:
             if interaction.response.is_done():
-                await interaction.edit_original_response(view=view)
+                await self._activate_controller_view(
+                    guild_id,
+                    view,
+                    lambda active_view: interaction.edit_original_response(
+                        view=active_view
+                    ),
+                )
             else:
-                await interaction.response.edit_message(view=view)
+                await self._activate_controller_view(
+                    guild_id,
+                    view,
+                    lambda active_view: interaction.response.edit_message(
+                        view=active_view
+                    ),
+                )
             if interaction.message is not None:
                 self._controller_messages[guild_id] = interaction.message
             self._controller_last_refresh[guild_id] = now
         elif (message := self._controller_messages.get(guild_id)) is not None:
             try:
-                await message.edit(view=view)
+                await self._activate_controller_view(
+                    guild_id, view, lambda active_view: message.edit(view=active_view)
+                )
             except (discord.HTTPException, discord.Forbidden, discord.NotFound):
                 pass
 
@@ -2488,6 +2593,7 @@ class TidalPlayer(commands.Cog):
             self._current_meta.pop(guild_id, None)
             self._controller_meta.pop(guild_id, None)
             old_msg = self._controller_messages.pop(guild_id, None)
+            self._stop_controller_view(guild_id)
         # edit_message with embed=None + embeds=[] conflicts — delete the panel
         # and send a plain ephemeral confirmation instead.
         if old_msg is not None:
@@ -2689,13 +2795,18 @@ class TidalPlayer(commands.Cog):
             if started_playback:
                 if channel is not None:
                     previous = self._controller_messages.pop(guild_id, None)
+                    self._stop_controller_view(guild_id)
                     if previous is not None:
                         try:
                             await previous.delete()
                         except (discord.HTTPException, discord.Forbidden, discord.NotFound):
                             pass
                     view = await self._controller_view(guild_id)
-                    self._controller_messages[guild_id] = await channel.send(view=view)
+                    self._controller_messages[guild_id] = await self._activate_controller_view(
+                        guild_id,
+                        view,
+                        lambda active_view: channel.send(view=active_view),
+                    )
                     self._schedule_controller_recommendations(guild_id)
                 log.info("Autoplay started Tidal track %s in guild %s", selected_id, guild_id)
             else:
@@ -2754,8 +2865,9 @@ class TidalPlayer(commands.Cog):
 
     async def _fetch_all_spotify_tracks(self, playlist_id: str) -> List[Any]:
         all_items: List[Any] = []
+        seen_next: set[str] = set()
         offset = 0
-        while len(all_items) < MAX_ITEMS:
+        while offset < MAX_ITEMS:
             resp = await self.tidal._run_blocking(
                 lambda o=offset: self.sp.playlist_tracks(
                     playlist_id, limit=100, offset=o,
@@ -2763,9 +2875,24 @@ class TidalPlayer(commands.Cog):
                 ),
                 timeout=20.0,
             )
-            all_items.extend(i for i in resp.get("items", []) if i.get("track"))
-            if not resp.get("next"):
+            if not isinstance(resp, dict):
                 break
+            page = resp.get("items")
+            if not isinstance(page, list):
+                break
+            all_items.extend(
+                item
+                for item in page
+                if isinstance(item, dict) and item.get("track")
+            )
+            next_url = resp.get("next")
+            if (
+                not isinstance(next_url, str)
+                or not next_url
+                or next_url in seen_next
+            ):
+                break
+            seen_next.add(next_url)
             offset += 100
         return all_items[:MAX_ITEMS]
 
@@ -2774,15 +2901,38 @@ class TidalPlayer(commands.Cog):
         album_name = album_id
         try:
             alb = await self.tidal._run_blocking(lambda: self.sp.album(album_id), timeout=15.0)
+            if not isinstance(alb, dict):
+                return [], album_name
             album_name = alb.get("name", album_id)
             tracks = alb.get("tracks", {})
-            all_items.extend(tracks.get("items", []))
+            if not isinstance(tracks, dict):
+                return [], album_name
+            page = tracks.get("items")
+            if not isinstance(page, list):
+                return [], album_name
+            all_items.extend(item for item in page if isinstance(item, dict))
             next_url = tracks.get("next")
-            while next_url and len(all_items) < MAX_ITEMS:
+            seen_next_urls: set[str] = set()
+            max_pages = (MAX_ITEMS + PAGINATION_LIMIT - 1) // PAGINATION_LIMIT
+            pages = 1
+            while (
+                isinstance(next_url, str)
+                and next_url
+                and next_url not in seen_next_urls
+                and len(all_items) < MAX_ITEMS
+                and pages < max_pages
+            ):
+                seen_next_urls.add(next_url)
                 resp = await self.tidal._run_blocking(
                     lambda u=next_url: self.sp._get(u), timeout=20.0
                 )
-                all_items.extend(resp.get("items", []))
+                pages += 1
+                if not isinstance(resp, dict):
+                    break
+                page = resp.get("items")
+                if not isinstance(page, list):
+                    break
+                all_items.extend(item for item in page if isinstance(item, dict))
                 next_url = resp.get("next")
         except Exception as error:
             _log_provider_failure("Spotify", "album fetch", error)
@@ -2834,7 +2984,7 @@ class TidalPlayer(commands.Cog):
         item: Any,
         item_processor: Callable[[Any], Any],
         filter_remixes: bool,
-    ) -> Optional[Tuple[Any, str, TrackMeta]]:
+    ) -> Optional[Tuple[Any, TrackMeta]]:
         try:
             query = item_processor(item)
             if not query:
@@ -2849,23 +2999,11 @@ class TidalPlayer(commands.Cog):
                 if not track:
                     results = await self.tidal.search(query, filter_remixes=filter_remixes)
                     if results:
-                        track = select_best_tidal_track(query, results) or results[0]
+                        track = select_best_tidal_track(query, results)
             if not track:
                 return None
-            meta_result, stream_url_result = await asyncio.gather(
-                self._extract_meta(track, skip_audio_res=True),
-                self.tidal.get_stream_url(track),
-                return_exceptions=True,
-            )
-            if isinstance(meta_result, Exception):
-                log.error(f"Error extracting metadata: {meta_result}")
-                return None
-            if isinstance(stream_url_result, Exception):
-                log.error(f"Error getting stream URL: {stream_url_result}")
-                return None
-            if not stream_url_result:
-                return None
-            return track, stream_url_result, meta_result
+            meta = await self._extract_meta(track, skip_audio_res=True)
+            return track, meta
         except Exception as error:
             _log_provider_failure("Tidal", "batch track resolution", error)
             return None
@@ -2888,7 +3026,11 @@ class TidalPlayer(commands.Cog):
         player = await self._ensure_player(ctx)
         if not player:
             return
-        cancel_event = self._cancel_events[ctx.guild.id]
+        guild_id = ctx.guild.id
+        cancel_event = self._claim_batch(guild_id)
+        if cancel_event is None:
+            await ctx.send(embed=_error_embed(Messages.ERROR_BATCH_IN_PROGRESS))
+            return
         trunc_name = truncate(name, 50)
         total = len(items)
         initial_embed = discord.Embed(
@@ -2896,7 +3038,11 @@ class TidalPlayer(commands.Cog):
         )
         if thumbnail_url:
             initial_embed.set_thumbnail(url=thumbnail_url)
-        pmsg = await ctx.send(embed=initial_embed)
+        try:
+            pmsg = await ctx.send(embed=initial_embed)
+        except BaseException:
+            self._release_batch(guild_id, cancel_event)
+            raise
         queued, skipped, last_up = 0, 0, 0
         try:
             for chunk_start in range(0, total, SEARCH_BATCH_SIZE):
@@ -2949,32 +3095,7 @@ class TidalPlayer(commands.Cog):
             except Exception:
                 pass
         finally:
-            cancel_event.clear()
-
-    async def _handle_tidal_url(self, ctx: commands.Context, url: str) -> None:
-        for kind, pattern in TIDAL_URL_PATTERNS.items():
-            m = pattern.search(url)
-            if not m:
-                continue
-            match kind:
-                case "track":
-                    await self._handle_track(ctx, m.group(1))
-                case "video":
-                    await self._handle_video(ctx, m.group(1))
-                case "album":
-                    await self._handle_album(ctx, m.group(1))
-                case "playlist":
-                    await self._handle_playlist(ctx, m.group(1))
-                case "mix":
-                    await self._handle_mix(ctx, m.group(1))
-                case _:
-                    await ctx.send(embed=_error_embed(
-                        Messages.ERROR_INVALID_URL.format(platform="Tidal", content_type="link")
-                    ))
-            return
-        await ctx.send(embed=_error_embed(
-            Messages.ERROR_INVALID_URL.format(platform="Tidal", content_type="link")
-        ))
+            self._release_batch(guild_id, cancel_event)
 
     async def _handle_track(self, ctx: commands.Context, tid: str) -> None:
         t = await self.tidal.get_track(tid)
@@ -3211,6 +3332,7 @@ class TidalPlayer(commands.Cog):
             return
         # Delete the previous controller panel before resending.
         previous = self._controller_messages.pop(guild_id, None)
+        self._stop_controller_view(guild_id)
         if previous is not None:
             try:
                 await previous.delete()
@@ -3220,7 +3342,9 @@ class TidalPlayer(commands.Cog):
         paused = bool(getattr(player, "paused", False)) if player else False
         try:
             view = await self._controller_view(guild_id, paused)
-            self._controller_messages[guild_id] = await ctx.send(view=view)
+            self._controller_messages[guild_id] = await self._activate_controller_view(
+                guild_id, view, lambda active_view: ctx.send(view=active_view)
+            )
         except discord.HTTPException:
             log.exception("Could not resend controller message for guild %s", guild_id)
         else:
@@ -3271,7 +3395,9 @@ class TidalPlayer(commands.Cog):
     async def tstop(self, ctx: commands.Context):
         """Stop queueing the current playlist."""
         if ctx.guild:
-            self._cancel_events[ctx.guild.id].set()
+            event = self._cancel_events.get(ctx.guild.id)
+            if event is not None:
+                event.set()
             await ctx.send(embed=_success_embed(Messages.STATUS_STOPPING))
 
     @commands.hybrid_command(name="tfilter")

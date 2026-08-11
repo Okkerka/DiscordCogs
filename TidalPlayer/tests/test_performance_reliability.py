@@ -390,7 +390,7 @@ async def test_batch_playback_initialises_controller_state_with_current_track(co
         queued, skipped = await cog._queue_resolved_chunk(
             ctx,
             Player(),
-            [(SimpleNamespace(id=77), "https://stream", meta)],
+            [(SimpleNamespace(id=77), meta)],
             asyncio.Event(),
         )
 

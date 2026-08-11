@@ -3,7 +3,7 @@ Phase-0 characterization tests: command registration and basic error paths.
 
 Verifies that:
 - all required command names are present on the cog class;
-- _check_ready returns False (and sends an error embed) when prerequisites
+- check_ready returns False (and sends an error embed) when prerequisites
   are not met, without raising;
 - _format_duration produces the correct string for known inputs.
 
@@ -98,11 +98,11 @@ class TestFormatDuration:
 
 
 # ---------------------------------------------------------------------------
-# _check_ready guard behaviour
+# check_ready guard behaviour
 # ---------------------------------------------------------------------------
 
 class TestCheckReady:
-    """_check_ready must send a precise error embed and return False, not raise."""
+    """check_ready must send a precise error embed and return False, not raise."""
 
     def _make_ctx(self) -> MagicMock:
         ctx = MagicMock()
@@ -115,7 +115,7 @@ class TestCheckReady:
     async def test_returns_false_when_not_initialized(self, cog):
         cog._initialized = False
         ctx = self._make_ctx()
-        result = await cog._check_ready(ctx)
+        result = await cog.check_ready(ctx)
         assert result is False
         ctx.send.assert_called_once()
         embed = ctx.send.call_args.kwargs.get("embed") or ctx.send.call_args[1].get("embed")
@@ -130,7 +130,7 @@ class TestCheckReady:
         with patch.object(
             sys.modules[MODULE_NAME], "TIDALAPI_AVAILABLE", False
         ):
-            result = await cog._check_ready(ctx)
+            result = await cog.check_ready(ctx)
         assert result is False
         ctx.send.assert_called_once()
 
@@ -143,7 +143,7 @@ class TestCheckReady:
             patch.object(mod, "TIDALAPI_AVAILABLE", True),
             patch.object(type(cog.tidal), "is_logged_in", AsyncMock(return_value=False)),
         ):
-            result = await cog._check_ready(ctx)
+            result = await cog.check_ready(ctx)
         assert result is False
         ctx.send.assert_called_once()
 
@@ -157,7 +157,7 @@ class TestCheckReady:
             patch.object(type(cog.tidal), "is_logged_in", AsyncMock(return_value=True)),
             patch.object(mod, "LAVALINK_AVAILABLE", False),
         ):
-            result = await cog._check_ready(ctx)
+            result = await cog.check_ready(ctx)
         assert result is False
         ctx.send.assert_called_once()
 
