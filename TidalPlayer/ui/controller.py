@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Sequence
 import discord
 
 from ..domain.normalization import format_duration
+from .embeds import display_source, source_link_label
 
 if TYPE_CHECKING:
     from ..domain.models import TrackMeta
@@ -18,6 +19,28 @@ def _short(value: str, limit: int = 100) -> str:
 
 def _duration(seconds: int) -> str:
     return format_duration(max(0, int(seconds or 0)))
+
+
+def _track_info(meta: "TrackMeta", *, autoplay_enabled: bool) -> str:
+    title = str(meta.get("title") or "Unknown track")
+    artist = str(meta.get("artist") or "Unknown artist")
+    album = str(meta.get("album") or "Unknown album")
+    quality = str(meta.get("quality") or "LOSSLESS").replace("_", " ")
+    duration = _duration(int(meta.get("duration") or 0))
+    source_url = meta.get("share_url")
+    autoplay_state = "On" if autoplay_enabled else "Off"
+    info = (
+        f"## Playing from {display_source(meta)}\n"
+        f"### {title}\n"
+        f"**{artist}**\n"
+        f"*{album}*\n\n"
+        f"**Quality:** {quality}\n"
+        f"**Autoplay:** {autoplay_state}\n"
+        f"**Duration:** {duration}"
+    )
+    if source_url:
+        info += f"\n[Open in {source_link_label(meta)}]({source_url})"
+    return info
 
 
 class PlayerControllerView(discord.ui.LayoutView):
@@ -51,25 +74,9 @@ class PlayerControllerView(discord.ui.LayoutView):
 
     def _build_layout(self) -> None:
         title = str(self.meta.get("title") or "Unknown track")
-        artist = str(self.meta.get("artist") or "Unknown artist")
-        album = str(self.meta.get("album") or "Unknown album")
-        quality = str(self.meta.get("quality") or "LOSSLESS").replace("_", " ")
-        duration = _duration(int(self.meta.get("duration") or 0))
         image_url = self.meta.get("image")
-        tidal_url = self.meta.get("share_url")
         autoplay_state = "On" if self.autoplay_enabled else "Off"
-
-        info = (
-            "## Playing from Tidal\n"
-            f"### {title}\n"
-            f"**{artist}**\n"
-            f"*{album}*\n\n"
-            f"**Quality:** {quality}\n"
-            f"**Autoplay:** {autoplay_state}\n"
-            f"**Duration:** {duration}"
-        )
-        if tidal_url:
-            info += f"\n[Open in TIDAL]({tidal_url})"
+        info = _track_info(self.meta, autoplay_enabled=self.autoplay_enabled)
         next_title = str(self.next_up.get("title") or "")
         next_artist = str(self.next_up.get("artist") or "")
         if next_title:

@@ -1,6 +1,6 @@
 """Type-only immutable-at-boundary metadata models."""
 
-from typing import Any, NamedTuple, Optional, TypedDict
+from typing import Any, NamedTuple, NotRequired, Optional, TypedDict
 
 
 class TrackMeta(TypedDict):
@@ -15,6 +15,7 @@ class TrackMeta(TypedDict):
     share_url: Optional[str]
     audio_resolution: Optional[str]
     track_id: Optional[int]
+    source: NotRequired[str]
 
 
 class PageResult(NamedTuple):

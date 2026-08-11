@@ -51,6 +51,15 @@ class Messages:
     ERROR_NO_QUEUE = "The queue is empty."
 
 
+def display_source(meta: TrackMeta) -> str:
+    return str(meta.get("source") or "Tidal")
+
+
+def source_link_label(meta: TrackMeta) -> str:
+    source = display_source(meta)
+    return "TIDAL" if source.casefold() == "tidal" else source
+
+
 def error_embed(message: str) -> discord.Embed:
     return discord.Embed(description=message, color=COLOR_RED)
 
@@ -63,11 +72,19 @@ def make_now_playing_embed(meta: TrackMeta, autoplay_enabled: bool = False) -> d
     description = [f"**{meta['title']}**", meta["artist"]]
     if meta.get("album"):
         description.append(f"_{meta['album']}_")
-    embed = discord.Embed(title=Messages.STATUS_PLAYING, description="\n".join(description), color=COLOR_BLUE)
+    embed = discord.Embed(
+        title=f"Playing from {display_source(meta)}",
+        description="\n".join(description),
+        color=COLOR_BLUE,
+    )
     quality = meta.get("audio_resolution") or QUALITY_LABELS.get(meta["quality"], meta["quality"])
     embed.add_field(name="Quality", value=quality, inline=True)
     if meta.get("share_url"):
-        embed.add_field(name="Open in TIDAL", value=f"[Listen]({meta['share_url']})", inline=True)
+        embed.add_field(
+            name=f"Open in {source_link_label(meta)}",
+            value=f"[Listen]({meta['share_url']})",
+            inline=True,
+        )
     embed.set_footer(text=f"Duration: {format_duration(meta['duration'])}")
     if meta.get("image"):
         embed.set_thumbnail(url=meta["image"])
@@ -92,7 +109,11 @@ def make_queue_embed(meta: TrackMeta, *, title: str = "Song added to the queue")
     )
     embed.set_footer(text=f"Duration: {duration}")
     if share_url:
-        embed.add_field(name="Open in TIDAL", value=f"[Listen]({share_url})", inline=True)
+        embed.add_field(
+            name=f"Open in {source_link_label(meta)}",
+            value=f"[Listen]({share_url})",
+            inline=True,
+        )
     if meta.get("image"):
         embed.set_thumbnail(url=meta["image"])
     return embed

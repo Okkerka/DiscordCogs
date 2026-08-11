@@ -20,6 +20,11 @@ def make_now_playing_embed(cog):
     return importlib.import_module("TidalPlayer.ui.embeds").make_now_playing_embed
 
 
+@pytest.fixture()
+def make_queue_embed(cog):
+    return importlib.import_module("TidalPlayer.ui.embeds").make_queue_embed
+
+
 def _field_value(embed, name: str) -> str | None:
     for field in embed.fields:
         field_name = field.get("name") if isinstance(field, dict) else field.name
@@ -54,8 +59,9 @@ def _make_meta(
     share_url: str | None = "https://listen.tidal.com/track/12345",
     audio_resolution: str | None = None,
     track_id: int | None = 12345,
+    source: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    meta = {
         "title": title,
         "artist": artist,
         "album": album,
@@ -66,6 +72,9 @@ def _make_meta(
         "audio_resolution": audio_resolution,
         "track_id": track_id,
     }
+    if source is not None:
+        meta["source"] = source
+    return meta
 
 
 class TestNowPlayingEmbed:
@@ -157,3 +166,45 @@ class TestNowPlayingEmbed:
     def test_title_is_bold_in_description(self, make_now_playing_embed):
         embed = make_now_playing_embed(_make_meta(title="Levitating"))
         assert "**Levitating**" in embed.description
+
+
+def test_youtube_now_playing_uses_source_title_and_link(make_now_playing_embed) -> None:
+    url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    embed = make_now_playing_embed(
+        _make_meta(source="YouTube", quality="YouTube", share_url=url)
+    )
+
+    assert embed.title == "Playing from YouTube"
+    assert _field_value(embed, "Open in YouTube") == f"[Listen]({url})"
+    assert _field_value(embed, "Open in TIDAL") is None
+
+
+def test_youtube_queue_embed_uses_source_link(make_queue_embed) -> None:
+    url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    embed = make_queue_embed(_make_meta(source="YouTube", share_url=url))
+
+    assert _field_value(embed, "Open in YouTube") == f"[Listen]({url})"
+    assert _field_value(embed, "Open in TIDAL") is None
+
+
+def test_controller_track_info_is_source_aware(cog) -> None:
+    controller = importlib.import_module("TidalPlayer.ui.controller")
+    url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+    info = controller._track_info(
+        _make_meta(source="YouTube", quality="YouTube", share_url=url),
+        autoplay_enabled=False,
+    )
+
+    assert "## Playing from YouTube" in info
+    assert f"[Open in YouTube]({url})" in info
+
+
+def test_controller_track_info_defaults_to_tidal(cog) -> None:
+    controller = importlib.import_module("TidalPlayer.ui.controller")
+    url = "https://listen.tidal.com/track/12345"
+
+    info = controller._track_info(_make_meta(share_url=url), autoplay_enabled=True)
+
+    assert "## Playing from Tidal" in info
+    assert f"[Open in TIDAL]({url})" in info
