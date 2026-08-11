@@ -20,6 +20,30 @@ import pytest
 def make_now_playing_embed(cog):
     return importlib.import_module("TidalPlayer.ui.embeds").make_now_playing_embed
 
+
+def _field_value(embed, name: str) -> str | None:
+    for field in embed.fields:
+        field_name = field.get("name") if isinstance(field, dict) else field.name
+        if field_name == name:
+            return field.get("value") if isinstance(field, dict) else field.value
+    return None
+
+
+def _footer_text(embed) -> str:
+    footer = getattr(embed, "footer", None)
+    if text := getattr(footer, "text", None):
+        return text
+    raw_footer = getattr(embed, "_footer", "")
+    return raw_footer.get("text", "") if isinstance(raw_footer, dict) else raw_footer
+
+
+def _thumbnail_url(embed) -> str | None:
+    thumbnail = getattr(embed, "thumbnail", None)
+    if url := getattr(thumbnail, "url", None):
+        return url
+    raw_thumbnail = getattr(embed, "_thumbnail", None)
+    return raw_thumbnail.get("url") if isinstance(raw_thumbnail, dict) else raw_thumbnail
+
 def _make_meta(
     *,
     title: str = "Good 4 U",
@@ -71,18 +95,15 @@ class TestNowPlayingEmbed:
 
     def test_embed_has_quality_field(self, make_now_playing_embed):
         embed = make_now_playing_embed(_make_meta(quality="LOSSLESS"))
-        field_names = [f["name"] for f in embed.fields]
-        assert "Quality" in field_names
+        assert _field_value(embed, "Quality") is not None
 
     def test_quality_label_lossless(self, make_now_playing_embed):
         embed = make_now_playing_embed(_make_meta(quality="LOSSLESS"))
-        quality_field = next(f for f in embed.fields if f["name"] == "Quality")
-        assert quality_field["value"] == "LOSSLESS (FLAC)"
+        assert _field_value(embed, "Quality") == "LOSSLESS (FLAC)"
 
     def test_quality_label_hi_res(self, make_now_playing_embed):
         embed = make_now_playing_embed(_make_meta(quality="HI_RES_LOSSLESS"))
-        quality_field = next(f for f in embed.fields if f["name"] == "Quality")
-        assert quality_field["value"] == "HI-RES LOSSLESS (FLAC)"
+        assert _field_value(embed, "Quality") == "HI-RES LOSSLESS (FLAC)"
 
     def test_audio_resolution_overrides_quality_label(self, make_now_playing_embed):
         meta = _make_meta(
@@ -90,43 +111,39 @@ class TestNowPlayingEmbed:
             audio_resolution="HI-RES LOSSLESS (24-bit / 96kHz)",
         )
         embed = make_now_playing_embed(meta)
-        quality_field = next(f for f in embed.fields if f["name"] == "Quality")
-        assert quality_field["value"] == "HI-RES LOSSLESS (24-bit / 96kHz)"
+        assert _field_value(embed, "Quality") == "HI-RES LOSSLESS (24-bit / 96kHz)"
 
     def test_embed_has_tidal_link_field(self, make_now_playing_embed):
         embed = make_now_playing_embed(_make_meta())
-        field_names = [f["name"] for f in embed.fields]
-        assert "Open in TIDAL" in field_names
+        assert _field_value(embed, "Open in TIDAL") is not None
 
     def test_tidal_link_field_value_format(self, make_now_playing_embed):
         share_url = "https://listen.tidal.com/track/12345"
         embed = make_now_playing_embed(_make_meta(share_url=share_url))
-        link_field = next(f for f in embed.fields if f["name"] == "Open in TIDAL")
-        assert f"[Listen]({share_url})" == link_field["value"]
+        assert _field_value(embed, "Open in TIDAL") == f"[Listen]({share_url})"
 
     def test_no_tidal_link_field_when_no_share_url(self, make_now_playing_embed):
         embed = make_now_playing_embed(_make_meta(share_url=None))
-        field_names = [f["name"] for f in embed.fields]
-        assert "Open in TIDAL" not in field_names
+        assert _field_value(embed, "Open in TIDAL") is None
 
     def test_footer_contains_duration(self, make_now_playing_embed):
         embed = make_now_playing_embed(_make_meta(duration=178))
         # 178 seconds = 02:58
-        assert "02:58" in embed._footer
+        assert "02:58" in _footer_text(embed)
 
     def test_footer_duration_hours(self, make_now_playing_embed):
         embed = make_now_playing_embed(_make_meta(duration=3661))
         # 3661 seconds = 1:01:01
-        assert "1:01:01" in embed._footer
+        assert "1:01:01" in _footer_text(embed)
 
     def test_thumbnail_set_when_image_present(self, make_now_playing_embed):
         url = "https://example.com/cover.jpg"
         embed = make_now_playing_embed(_make_meta(image=url))
-        assert embed._thumbnail == url
+        assert _thumbnail_url(embed) == url
 
     def test_no_thumbnail_when_image_none(self, make_now_playing_embed):
         embed = make_now_playing_embed(_make_meta(image=None))
-        assert embed._thumbnail is None
+        assert _thumbnail_url(embed) is None
 
     def test_field_count_with_share_url(self, make_now_playing_embed):
         """Exactly 2 fields: Quality + Open in TIDAL."""
