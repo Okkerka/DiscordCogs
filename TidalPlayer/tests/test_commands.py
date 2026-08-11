@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -159,3 +160,30 @@ class TestCheckReady:
             result = await cog._check_ready(ctx)
         assert result is False
         ctx.send.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_queue_title_reports_displayed_and_total_tracks(cog) -> None:
+    current_mod = importlib.import_module(cog.__class__.__module__)
+    queue = [
+        SimpleNamespace(title=f"Track {index}", author="Artist")
+        for index in range(current_mod.MAX_ITEMS + 7)
+    ]
+    ctx = SimpleNamespace(send=AsyncMock())
+    menu = SimpleNamespace(start=AsyncMock())
+
+    with (
+        patch.object(type(cog), "check_ready", new=AsyncMock(return_value=True)),
+        patch.object(
+            type(cog),
+            "_get_player",
+            new=AsyncMock(return_value=SimpleNamespace(queue=queue)),
+        ),
+        patch.object(current_mod, "SimpleMenu", return_value=menu) as menu_factory,
+    ):
+        await cog.tqueue(ctx)
+
+    first_page = menu_factory.call_args.args[0][0]
+    assert first_page.title == (
+        f"Queue (first {current_mod.MAX_ITEMS} of {len(queue)} tracks)"
+    )

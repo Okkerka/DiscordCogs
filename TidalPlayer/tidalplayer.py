@@ -33,7 +33,7 @@ from .domain.normalization import (
 )
 from .ui.embeds import (
     COLOR_BLUE, COLOR_GREEN, COLOR_PURPLE, COLOR_RED, COLOR_TEAL, Messages,
-    error_embed as _error_embed, make_now_playing_embed, make_queue_embed, success_embed as _success_embed,
+    error_embed as _error_embed, make_queue_embed, success_embed as _success_embed,
 )
 from .ui.controller import PlayerControllerView
 from .providers.audio import RedAudioGateway
@@ -838,7 +838,6 @@ class TidalHandler:
         offset = 0
         _sparse_supported: Optional[bool] = None
         while len(all_items) < MAX_ITEMS:
-            await asyncio.sleep(0)
             async with self.api_semaphore:
                 try:
                     def _fetch(o: int = offset, sparse: Optional[bool] = _sparse_supported) -> _PageResult:
@@ -1333,9 +1332,6 @@ class TidalPlayer(commands.Cog):
         except (ValueError, AttributeError):
             pass
 
-    def _has_playback(self, player: Any) -> bool:
-        return bool(getattr(player, "current", None)) or self._queued_count(player) > 0
-
     @staticmethod
     def _track_signature(title: Any, artist: Any) -> str:
         """Return a stable song identity across Tidal album/version IDs."""
@@ -1412,9 +1408,6 @@ class TidalPlayer(commands.Cog):
 
     def _format_duration(self, seconds: int) -> str:
         return format_duration(seconds)
-
-    def _format_track_embed(self, meta: TrackMeta, title: str = "Track queued") -> discord.Embed:
-        return make_queue_embed(meta)
 
     async def _get_player(self, ctx: commands.Context, connect: bool = False) -> Optional[Any]:
         if not self.audio.available or not ctx.guild:
@@ -2043,34 +2036,10 @@ class TidalPlayer(commands.Cog):
             autoplay_enabled=autoplay_enabled, paused=paused,
         )
 
-    def _build_now_playing_embed(self, meta: TrackMeta) -> discord.Embed:
-        return make_now_playing_embed(meta)
-
     def _make_queued_embed(self, meta: TrackMeta) -> discord.Embed:
         """Return a compact embed confirming a track was added to the queue."""
         from .ui.embeds import make_queue_embed
         return make_queue_embed(meta)
-
-    def _controller_fallback_text(self, meta: TrackMeta) -> str:
-        title = truncate(str(meta.get("title") or "Unknown"), 100)
-        artist = str(meta.get("artist") or "Unknown")
-        album = str(meta.get("album") or "Unknown")
-        duration = self._format_duration(int(meta.get("duration", 0) or 0))
-        return f"Now playing: **{title}**\nArtist: {artist}\nAlbum: {album}\nDuration: {duration}"
-
-    async def _replace_controller_message(self, guild_id: int, channel: discord.abc.Messageable, embed: discord.Embed, view: Optional[discord.ui.View] = None) -> Optional[discord.Message]:
-        old = self._controller_messages.pop(guild_id, None)
-        if old:
-            try:
-                await old.delete()
-            except Exception:
-                pass
-        if view is not None:
-            msg = await channel.send(embed=embed, view=view)
-        else:
-            msg = await channel.send(embed=embed)
-        self._controller_messages[guild_id] = msg
-        return msg
 
     async def _send_now_playing(self, ctx: commands.Context, meta: TrackMeta) -> None:
         if ctx.guild is None:
@@ -2251,13 +2220,6 @@ class TidalPlayer(commands.Cog):
         permissions = getattr(interaction.user, "guild_permissions", None)
         return bool(getattr(permissions, "manage_guild", False))
 
-    async def _controller_embed(self, guild_id: int) -> discord.Embed | None:
-        meta = self._controller_meta.get(guild_id) or self._current_meta.get(guild_id)
-        if meta is None:
-            return None
-        enabled = await self.config.guild_from_id(guild_id).autoplay_enabled()
-        return make_now_playing_embed(meta, enabled)
-
     async def _refresh_controller(
         self, guild_id: int, interaction: discord.Interaction | None = None,
     ) -> None:
@@ -2395,27 +2357,6 @@ class TidalPlayer(commands.Cog):
         except Exception:
             log.exception("Could not queue suggested Tidal track %s", selected_id)
             return False
-
-    async def _autoplay_candidate(self, guild_id: int, meta: TrackMeta) -> Any | None:
-        source_id = str(meta.get("track_id") or "")
-        source_title = str(meta.get("title") or "").casefold().strip()
-        source_artist = str(meta.get("artist") or "").casefold().strip()
-        recent_ids = set(self._recent_track_ids.get(guild_id, []))
-        recent_signatures = set(self._recent_track_signatures.get(guild_id, []))
-        for track in await self._radio_candidates(guild_id, meta):
-            track_id = str(getattr(track, "id", "") or "")
-            title = str(getattr(track, "name", "") or "").casefold().strip()
-            artist = str(getattr(getattr(track, "artist", None), "name", "") or "").casefold().strip()
-            if track_id == source_id:
-                continue
-            if track_id and track_id in recent_ids:
-                continue
-            if self._tidal_track_signature(track) in recent_signatures:
-                continue
-            if title == source_title and artist == source_artist:
-                continue
-            return track
-        return None
 
     async def _run_autoplay(self, guild_id: int, player: Any) -> None:
         """Queue the first playable, non-current Last.fm recommendation."""
@@ -2636,7 +2577,6 @@ class TidalPlayer(commands.Cog):
             if not resp.get("next"):
                 break
             offset += 100
-            await asyncio.sleep(0)
         return all_items[:MAX_ITEMS]
 
     async def _fetch_all_spotify_album_tracks(self, album_id: str) -> Tuple[List[Any], str]:
@@ -2654,7 +2594,6 @@ class TidalPlayer(commands.Cog):
                 )
                 all_items.extend(resp.get("items", []))
                 next_url = resp.get("next")
-                await asyncio.sleep(0)
         except Exception as error:
             _log_provider_failure("Spotify", "album fetch", error)
         return all_items[:MAX_ITEMS], album_name
@@ -2698,7 +2637,6 @@ class TidalPlayer(commands.Cog):
             if not isinstance(next_page_token, str) or not next_page_token or len(all_items) >= MAX_ITEMS:
                 break
             page_token = next_page_token
-            await asyncio.sleep(0)
         return all_items[:MAX_ITEMS]
 
     async def _resolve_and_extract(
@@ -3115,7 +3053,13 @@ class TidalPlayer(commands.Cog):
         if not queue or not len(queue):
             await ctx.send(embed=_error_embed(Messages.ERROR_NO_QUEUE))
             return
+        total_count = len(queue)
         queue_list = list(islice(queue, MAX_ITEMS))
+        queue_title = (
+            f"Queue ({total_count} tracks)"
+            if total_count <= MAX_ITEMS
+            else f"Queue (first {len(queue_list)} of {total_count} tracks)"
+        )
         pages = []
         for start in range(0, len(queue_list), QUEUE_PAGE_SIZE):
             chunk = queue_list[start:start + QUEUE_PAGE_SIZE]
@@ -3125,7 +3069,7 @@ class TidalPlayer(commands.Cog):
                 for i, t in enumerate(chunk)
             )
             embed = discord.Embed(
-                title=f"Queue ({len(queue_list)} tracks)",
+                title=queue_title,
                 description=desc,
                 color=COLOR_BLUE,
             )
