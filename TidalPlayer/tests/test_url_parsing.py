@@ -18,7 +18,22 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from TidalPlayer.providers.urls import MalformedProviderURL, parse_provider_url
+
 MODULE_NAME = "TidalPlayer.tidalplayer"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://tidal.com/track/not-a-number",
+        "https://tidal.com/album/12x",
+        "https://tidal.com/video/-1",
+    ],
+)
+def test_strict_tidal_numeric_media_rejects_non_numeric_ids(url: str) -> None:
+    with pytest.raises(MalformedProviderURL):
+        parse_provider_url(url)
 
 
 @pytest.fixture(scope="module")

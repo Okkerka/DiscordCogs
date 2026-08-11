@@ -45,6 +45,8 @@ def parse_provider_url(value: str) -> ProviderURL | None:
             path = path[1:]
         if len(path) != 2 or path[0] not in _TIDAL_TYPES or not path[1]:
             raise MalformedProviderURL("Unsupported Tidal URL")
+        if path[0] in {"track", "album", "video"} and not path[1].isdigit():
+            raise MalformedProviderURL("Tidal media identifiers must be numeric")
         return ProviderURL(ProviderKind.TIDAL, path[0], path[1])
     if host == "open.spotify.com":
         if len(path) != 2 or path[0] not in _SPOTIFY_TYPES or not path[1].isalnum():

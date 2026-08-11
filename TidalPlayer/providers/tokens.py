@@ -66,7 +66,8 @@ class TokenRepository:
         self._lock = asyncio.Lock()
 
     async def load(self) -> TokenSnapshot | None:
-        return TokenSnapshot.from_mapping(await self._config.all())
+        async with self._lock:
+            return TokenSnapshot.from_mapping(await self._config.all())
 
     async def replace(self, snapshot: TokenSnapshot) -> None:
         if not snapshot.is_complete:

@@ -32,6 +32,18 @@ class _FakeField:
         self._value = value
 
 
+class _BlockingField(_FakeField):
+    def __init__(self, started: asyncio.Event, release: asyncio.Event) -> None:
+        super().__init__()
+        self.started = started
+        self.release = release
+
+    async def set(self, value: Any) -> None:
+        self.started.set()
+        await self.release.wait()
+        self._value = value
+
+
 class _FakeConfigGroup:
     def __init__(self, data: dict[str, Any] | None = None) -> None:
         defaults = data or {}
@@ -144,6 +156,25 @@ class TestTokenRepository:
         asyncio.run(repo_with_data.clear())
         loaded = asyncio.run(repo_with_data.load())
         assert loaded is None
+
+    @pytest.mark.asyncio
+    async def test_load_waits_for_complete_token_replacement(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        config = _FakeConfigGroup()
+        config.token_type = _BlockingField(started, release)
+        repository = TokenRepository(config)
+        snapshot = TokenSnapshot(**_COMPLETE)
+
+        replace_task = asyncio.create_task(repository.replace(snapshot))
+        await started.wait()
+        load_task = asyncio.create_task(repository.load())
+        await asyncio.sleep(0)
+
+        assert not load_task.done()
+        release.set()
+        await replace_task
+        assert await load_task == snapshot
 
 
 # ---------------------------------------------------------------------------
