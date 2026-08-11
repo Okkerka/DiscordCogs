@@ -27,7 +27,7 @@ from .domain.matching import select_best_tidal_track
 from .domain.identity import normalize_identity_text, recording_signature
 from .domain.normalization import (
     FILTER_REGEX, ISRC_PATTERN, SPOTIFY_ALBUM_PATTERN, SPOTIFY_PLAYLIST_PATTERN,
-    SPOTIFY_TRACK_PATTERN, TIDAL_URL_PATTERNS, YOUTUBE_PLAYLIST_PATTERN,
+    SPOTIFY_TRACK_PATTERN, TIDAL_URL_PATTERNS,
     YOUTUBE_SKIP_TITLES, ensure_aware as _ensure_aware,
     format_duration, make_tidal_url, truncate, utc_now as _utc_now,
 )
@@ -2860,8 +2860,10 @@ class TidalPlayer(commands.Cog):
                     "track": self._handle_spotify_track,
                 }
                 await handlers[provider_url.content_type](ctx, query)
+            elif provider_url.content_type == "playlist":
+                await self._handle_youtube_playlist(ctx, provider_url.identifier)
             else:
-                await self._handle_youtube_playlist(ctx, query)
+                await self._handle_youtube_video(ctx, provider_url.identifier)
             return
         if ISRC_PATTERN.match(query):
             isrc = ISRC_PATTERN.match(query).group(1).upper()
@@ -2958,15 +2960,10 @@ class TidalPlayer(commands.Cog):
             _log_provider_failure("Spotify", "album import", error)
             await ctx.send(embed=_error_embed(Messages.ERROR_FETCH_FAILED))
 
-    async def _handle_youtube_playlist(self, ctx: commands.Context, url: str) -> None:
+    async def _handle_youtube_playlist(self, ctx: commands.Context, playlist_id: str) -> None:
         if not self.yt:
             await ctx.send(embed=_error_embed(Messages.ERROR_NO_YOUTUBE))
             return
-        match = YOUTUBE_PLAYLIST_PATTERN.search(url)
-        if not match:
-            await ctx.send(embed=_error_embed(Messages.ERROR_INVALID_URL.format(platform="YouTube", content_type="playlist")))
-            return
-        playlist_id = match.group(1)
         try:
             pl_resp = await self.tidal._run_blocking(
                 self.yt.playlists().list(part="snippet", id=playlist_id, maxResults=1).execute, timeout=15.0

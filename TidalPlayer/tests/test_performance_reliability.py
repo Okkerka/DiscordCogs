@@ -468,9 +468,7 @@ async def test_youtube_playlist_rejects_missing_metadata_before_fetching_tracks(
         patch.object(type(cog), "_fetch_all_youtube_tracks", new=fetch_tracks),
         patch.object(type(cog), "_process_track_list", new=process_tracks),
     ):
-        await cog._handle_youtube_playlist(
-            ctx, "https://youtube.com/playlist?list=PL123"
-        )
+        await cog._handle_youtube_playlist(ctx, "PL123")
 
     fetch_tracks.assert_not_awaited()
     process_tracks.assert_not_awaited()

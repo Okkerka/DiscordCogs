@@ -31,16 +31,12 @@ TIDAL_URL_PATTERNS: Final = {
 SPOTIFY_PLAYLIST_PATTERN: Final = re.compile(r"open\.spotify\.com/playlist/([a-zA-Z0-9]+)")
 SPOTIFY_TRACK_PATTERN: Final = re.compile(r"open\.spotify\.com/track/([a-zA-Z0-9]+)")
 SPOTIFY_ALBUM_PATTERN: Final = re.compile(r"open\.spotify\.com/album/([a-zA-Z0-9]+)")
-YOUTUBE_PLAYLIST_PATTERN: Final = re.compile(r"youtube\.com/.*[?&]list=([a-zA-Z0-9_-]+)")
 ISRC_PATTERN: Final = re.compile(r"^isrc:([A-Z]{2}[A-Z0-9]{3}\d{7})$", re.IGNORECASE)
 
 TIDAL_URL_RE: Final = re.compile(r"tidal\.com/")
 SPOTIFY_PLAYLIST_RE: Final = re.compile(r"open\.spotify\.com/playlist/")
 SPOTIFY_ALBUM_RE: Final = re.compile(r"open\.spotify\.com/album/")
 SPOTIFY_TRACK_RE: Final = re.compile(r"open\.spotify\.com/track/")
-YOUTUBE_PLAYLIST_RE: Final = re.compile(r"youtube\.com/.*[?&]list=")
-
-
 def truncate(text: str, limit: int) -> str:
     """Shorten text to an exact display limit, preserving existing behavior."""
     if len(text) > limit:

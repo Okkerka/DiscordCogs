@@ -18,7 +18,12 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from TidalPlayer.providers.urls import MalformedProviderURL, parse_provider_url
+from TidalPlayer.providers.urls import (
+    MalformedProviderURL,
+    ProviderKind,
+    ProviderURL,
+    parse_provider_url,
+)
 
 MODULE_NAME = "TidalPlayer.tidalplayer"
 
@@ -156,31 +161,59 @@ class TestSpotifyAlbumPattern:
 
 
 # ---------------------------------------------------------------------------
-# YouTube playlist pattern
+# YouTube provider URLs
 # ---------------------------------------------------------------------------
 
-class TestYouTubePlaylistPattern:
-    def test_valid_watch_with_list(self, mod):
-        assert mod.YOUTUBE_PLAYLIST_PATTERN.search(
-            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLrEnWoR732-BHrPp_Pm8_VleD68f9s14-"
-        )
+YOUTUBE_VIDEO_ID = "dQw4w9WgXcQ"
 
-    def test_valid_playlist_url(self, mod):
-        assert mod.YOUTUBE_PLAYLIST_PATTERN.search(
-            "https://www.youtube.com/playlist?list=PLrEnWoR732-BHrPp_Pm8_VleD68f9s14-"
-        )
 
-    def test_extracts_list_id(self, mod):
-        m = mod.YOUTUBE_PLAYLIST_PATTERN.search(
-            "https://www.youtube.com/playlist?list=PLrEnWoR732-BHrPp_Pm8_VleD68f9s14-"
-        )
-        assert m and m.group(1) == "PLrEnWoR732-BHrPp_Pm8_VleD68f9s14-"
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"https://www.youtube.com/watch?v={YOUTUBE_VIDEO_ID}",
+        f"https://m.youtube.com/watch?v={YOUTUBE_VIDEO_ID}",
+        f"https://music.youtube.com/watch?v={YOUTUBE_VIDEO_ID}",
+        f"https://youtu.be/{YOUTUBE_VIDEO_ID}",
+        f"https://www.youtube.com/shorts/{YOUTUBE_VIDEO_ID}",
+        f"https://youtube.com/live/{YOUTUBE_VIDEO_ID}",
+        f"https://youtube.com/embed/{YOUTUBE_VIDEO_ID}",
+    ],
+)
+def test_strict_youtube_video_shapes(url: str) -> None:
+    assert parse_provider_url(url) == ProviderURL(
+        ProviderKind.YOUTUBE, "video", YOUTUBE_VIDEO_ID
+    )
 
-    def test_no_match_plain_watch(self, mod):
-        # A plain watch URL without a list param must NOT match
-        assert not mod.YOUTUBE_PLAYLIST_PATTERN.search(
-            "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-        )
+
+def test_strict_youtube_normalizes_one_discord_angle_pair() -> None:
+    assert parse_provider_url(
+        f"  <https://www.youtube.com/watch?v={YOUTUBE_VIDEO_ID}>  "
+    ) == ProviderURL(ProviderKind.YOUTUBE, "video", YOUTUBE_VIDEO_ID)
+
+
+def test_strict_youtube_playlist_takes_precedence_over_video() -> None:
+    playlist_id = "PLrEnWoR732-BHrPp_Pm8_VleD68f9s14-"
+    assert parse_provider_url(
+        f"https://www.youtube.com/watch?v={YOUTUBE_VIDEO_ID}&list={playlist_id}"
+    ) == ProviderURL(ProviderKind.YOUTUBE, "playlist", playlist_id)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        "https://user@example.com/watch?v=dQw4w9WgXcQ",
+        "https://youtube.example/watch?v=dQw4w9WgXcQ",
+        "https://www.youtube.com/watch?v=too-short",
+        "https://www.youtube.com/watch?v=dQw4w9WgXc!",
+        "https://youtu.be/dQw4w9WgXcQ/extra",
+        "https://www.youtube.com/channel/dQw4w9WgXcQ",
+        "<<https://www.youtube.com/watch?v=dQw4w9WgXcQ>>",
+    ],
+)
+def test_strict_youtube_rejects_malformed_or_unsupported_urls(url: str) -> None:
+    with pytest.raises(MalformedProviderURL):
+        parse_provider_url(url)
 
 
 # ---------------------------------------------------------------------------
