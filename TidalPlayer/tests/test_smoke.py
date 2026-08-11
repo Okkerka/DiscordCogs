@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
 import os
 import py_compile
 import sys
@@ -52,6 +53,17 @@ def test_tidalplayer_class_exported():
     mod = importlib.import_module(MODULE_NAME)
     assert hasattr(mod, "TidalPlayer")
     assert inspect.isclass(mod.TidalPlayer)
+
+
+def test_info_declares_data_statement_without_unconfigured_quality_claims():
+    with open(os.path.join(COG_DIR, "info.json"), encoding="utf-8") as info_file:
+        info = json.load(info_file)
+
+    assert info["end_user_data_statement"]
+    description = f"{info['short']} {info['description']} {' '.join(info['tags'])}".casefold()
+    assert "hi-res" not in description
+    assert "lossless" not in description
+    assert "spotipy" in info["requirements"]
 
 
 @pytest.mark.asyncio
