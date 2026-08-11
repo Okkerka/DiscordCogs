@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable
-from urllib.parse import urlencode
 from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -86,6 +85,11 @@ __red_end_user_data_statement__ = (
     "This cog stores Tidal OAuth credentials globally for the bot owner. "
     "It does not store data associated with individual Discord users."
 )
+
+
+def _log_provider_failure(provider: str, operation: str, error: BaseException) -> None:
+    """Log provider failures without formatting credential-bearing exception text."""
+    log.warning("%s %s failed (%s)", provider, operation, type(error).__name__)
 
 
 async def _delete_message_safe(message: discord.Message) -> None:
@@ -378,8 +382,8 @@ class TidalHandler:
             log.info("Tidal session loaded successfully")
         except asyncio.TimeoutError:
             log.warning("Timed out loading Tidal session from stored credentials")
-        except Exception as e:
-            log.warning(f"Failed to load Tidal session: {e}")
+        except Exception as error:
+            _log_provider_failure("Tidal", "session restore", error)
 
     async def refresh_tokens(self) -> bool:
         if not self.session:
@@ -421,8 +425,8 @@ class TidalHandler:
                 self._login_cache = True
                 self._login_cache_time = asyncio.get_running_loop().time()
                 return True
-            except Exception as e:
-                log.error(f"Token refresh failed: {e}")
+            except Exception as error:
+                _log_provider_failure("Tidal", "token refresh", error)
                 self._login_cache = False
                 self._login_cache_time = asyncio.get_running_loop().time()
                 return False
@@ -502,8 +506,8 @@ class TidalHandler:
                 if _utc_now() + timedelta(hours=2) <= expiry_aware:
                     continue
                 await self.refresh_tokens()
-            except Exception as e:
-                log.error(f"Auto token refresh failed: {e}")
+            except Exception as error:
+                _log_provider_failure("Tidal", "automatic token refresh", error)
 
     async def search(self, query: str, filter_remixes: bool = False) -> List[Any]:
         if not self.session:
@@ -537,8 +541,8 @@ class TidalHandler:
             except asyncio.TimeoutError:
                 log.warning(f"Tidal search timeout for '{query}'")
                 return []
-            except Exception as e:
-                log.error(f"Search failed for '{query}': {e}")
+            except Exception as error:
+                _log_provider_failure("Tidal", "catalog search", error)
                 return []
 
     async def get_track_by_isrc(self, isrc: str) -> Optional[Any]:
@@ -615,7 +619,7 @@ class TidalHandler:
                     raise RuntimeError("Installed tidalapi exposes no Track Radio method")
                 result = await self._run_with_backoff(fetch, timeout=20.0)
             except Exception as error:
-                log.exception("Tidal Track Radio failed for track %s: %r", track_id, error)
+                _log_provider_failure("Tidal", f"Track Radio lookup for {track_id}", error)
                 return []
         if isinstance(result, (list, tuple)):
             tracks = list(result)
@@ -776,8 +780,8 @@ class TidalHandler:
                         return user.create_playlist(name, description)
                     return None
                 return await self._run_with_backoff(_create, timeout=15.0)
-            except Exception as e:
-                log.error(f"create_user_playlist failed: {e}")
+            except Exception as error:
+                _log_provider_failure("Tidal", "playlist creation", error)
                 return None
 
     async def add_track_to_playlist(self, playlist: Any, track_id: int) -> bool:
@@ -787,8 +791,8 @@ class TidalHandler:
             try:
                 await self._run_with_backoff(lambda: playlist.add([track_id]), timeout=10.0)
                 return True
-            except Exception as e:
-                log.error(f"add_track_to_playlist failed: {e}")
+            except Exception as error:
+                _log_provider_failure("Tidal", "playlist track addition", error)
                 return False
 
     async def remove_track_from_playlist(self, playlist: Any, track_id: int) -> bool:
@@ -798,16 +802,16 @@ class TidalHandler:
             try:
                 await self._run_with_backoff(lambda: playlist.remove_by_id(track_id), timeout=10.0)
                 return True
-            except Exception as e:
-                log.error(f"remove_track_from_playlist failed: {e}")
+            except Exception as error:
+                _log_provider_failure("Tidal", "playlist track removal", error)
                 return False
 
     async def get_items(self, container: Any) -> List[Any]:
         if hasattr(container, "items") and callable(container.items):
             try:
                 return await self._paginate_items(container)
-            except Exception as e:
-                log.warning(f"Paginated fetch failed, falling back to legacy: {e}")
+            except Exception as error:
+                _log_provider_failure("Tidal", "paginated item fetch", error)
         def _fetch():
             if hasattr(container, "tracks"):
                 val = container.tracks
@@ -822,8 +826,8 @@ class TidalHandler:
             except asyncio.TimeoutError:
                 log.error("Timed out extracting items from Tidal container")
                 return []
-            except Exception as e:
-                log.error(f"Failed to extract items: {e}")
+            except Exception as error:
+                _log_provider_failure("Tidal", "item extraction", error)
                 return []
         if len(items) > MAX_ITEMS:
             log.warning(f"Truncating Tidal container from {len(items)} to {MAX_ITEMS} items")
@@ -855,8 +859,8 @@ class TidalHandler:
                 except asyncio.TimeoutError:
                     log.error(f"Pagination timeout at offset {offset}")
                     break
-                except Exception as e:
-                    log.error(f"Pagination error at offset {offset}: {e}")
+                except Exception as error:
+                    _log_provider_failure("Tidal", f"pagination at offset {offset}", error)
                     break
             if _sparse_supported is None and page.sparse_supported is not None:
                 _sparse_supported = page.sparse_supported
@@ -916,7 +920,7 @@ class TidalHandler:
             except AttributeError:
                 log.debug("Tidal track %s does not expose get_url(); trying get_stream fallback.", track_id)
             except Exception as error:
-                log.warning("get_url() failed for Tidal track %s: %r", track_id, error)
+                _log_provider_failure("Tidal", f"get_url for track {track_id}", error)
         async with self.api_semaphore:
             try:
                 def get_urls() -> List[str]:
@@ -935,7 +939,7 @@ class TidalHandler:
             except AttributeError:
                 log.warning("Tidal track %s does not expose a compatible stream URL method.", track_id)
             except Exception as error:
-                log.warning("get_stream().get_urls() failed for Tidal track %s: %r", track_id, error)
+                _log_provider_failure("Tidal", f"get_stream for track {track_id}", error)
         log.error("No playable Tidal stream URL available for track %s.", track_id)
         return None
     def _extract_tracks(self, result: Any) -> List[Any]:
@@ -1244,8 +1248,8 @@ class TidalPlayer(commands.Cog):
                     ),
                     timeout=15.0,
                 )
-            except Exception as e:
-                log.error(f"Spotify init failed: {e}")
+            except Exception as error:
+                _log_provider_failure("Spotify", "client initialization", error)
 
     async def _initialize_youtube(self) -> None:
         if not YOUTUBE_API_AVAILABLE:
@@ -1258,8 +1262,8 @@ class TidalPlayer(commands.Cog):
                     lambda: build("youtube", "v3", developerKey=key, cache_discovery=False),
                     timeout=15.0,
                 )
-            except Exception as e:
-                log.error(f"YouTube init failed: {e}")
+            except Exception as error:
+                _log_provider_failure("YouTube", "client initialization", error)
 
     @commands.Cog.listener()
     async def on_red_api_tokens_update(self, service_name: str, api_tokens: Dict[str, str]) -> None:
@@ -1589,13 +1593,14 @@ class TidalPlayer(commands.Cog):
                     raise
             except RuntimeError as error:
                 if not self._is_lavalink_node_not_ready(error):
-                    log.exception(
+                    log.warning(
                         "Lavalink failed loading Tidal track %s in guild %s after %.2fs "
-                        "(node_ready=%s)",
+                        "(node_ready=%s, error=%s)",
                         track_id,
                         guild_id,
                         loop.time() - load_started,
                         node_ready,
+                        type(error).__name__,
                     )
                     return None
                 node_ready_attempt += 1
@@ -1632,14 +1637,15 @@ class TidalPlayer(commands.Cog):
                     node_ready,
                 )
                 return None
-            except Exception:
-                log.exception(
+            except Exception as error:
+                log.warning(
                     "Lavalink failed loading Tidal track %s in guild %s after %.2fs "
-                    "(node_ready=%s)",
+                    "(node_ready=%s, error=%s)",
                     track_id,
                     guild_id,
                     loop.time() - load_started,
                     node_ready,
+                    type(error).__name__,
                 )
                 return None
 
@@ -1799,11 +1805,10 @@ class TidalPlayer(commands.Cog):
         if not api_key or not artist or not title:
             return []
 
-        params = urlencode({
+        params = {
             "method": "track.getsimilar", "artist": artist, "track": title,
             "limit": limit, "autocorrect": 1, "api_key": api_key, "format": "json",
-        })
-        url = f"https://ws.audioscrobbler.com/2.0/?{params}"
+        }
         try:
             session = self._lastfm_session
             if session is None or session.closed:
@@ -1811,7 +1816,7 @@ class TidalPlayer(commands.Cog):
                     timeout=aiohttp.ClientTimeout(total=LASTFM_REQUEST_TIMEOUT)
                 )
                 self._lastfm_session = session
-            async with session.get(url) as response:
+            async with session.get("https://ws.audioscrobbler.com/2.0/", params=params) as response:
                 response.raise_for_status()
                 payload = await response.json(content_type=None)
             entries = payload.get("similartracks", {}).get("track", [])
@@ -1823,7 +1828,7 @@ class TidalPlayer(commands.Cog):
                 if item.get("artist", {}).get("name") and item.get("name")
             ]
         except Exception as error:
-            log.warning("Last.fm similar-track lookup failed for %s — %s: %r", artist, title, error)
+            _log_provider_failure("Last.fm", "similar-track lookup", error)
             return []
 
     async def _delete_after(self, message: discord.Message, delay: float) -> None:
@@ -1870,7 +1875,7 @@ class TidalPlayer(commands.Cog):
             )
             for (artist, title), results in zip(batch, searches):
                 if isinstance(results, Exception):
-                    log.warning("Tidal suggestion lookup failed for %s - %s: %r", artist, title, results)
+                    _log_provider_failure("Tidal", "suggestion lookup", results)
                     continue
                 if not results:
                     continue
@@ -2650,8 +2655,8 @@ class TidalPlayer(commands.Cog):
                 all_items.extend(resp.get("items", []))
                 next_url = resp.get("next")
                 await asyncio.sleep(0)
-        except Exception as e:
-            log.error(f"Spotify album fetch error: {e}")
+        except Exception as error:
+            _log_provider_failure("Spotify", "album fetch", error)
         return all_items[:MAX_ITEMS], album_name
 
     async def _fetch_all_youtube_tracks(self, playlist_id: str) -> List[Any]:
@@ -2733,8 +2738,8 @@ class TidalPlayer(commands.Cog):
             if not stream_url_result:
                 return None
             return track, stream_url_result, meta_result
-        except Exception as e:
-            log.error(f"Failed to resolve track concurrently: {e}")
+        except Exception as error:
+            _log_provider_failure("Tidal", "batch track resolution", error)
             return None
 
     async def _process_track_list(
@@ -2809,8 +2814,8 @@ class TidalPlayer(commands.Cog):
                 await pmsg.edit(embed=final)
             except Exception:
                 pass
-        except Exception as e:
-            log.error(f"Queue processing error: {e}")
+        except Exception as error:
+            _log_provider_failure("Tidal", "batch queue processing", error)
             try:
                 await pmsg.edit(embed=_error_embed(Messages.ERROR_FETCH_FAILED))
             except Exception:
@@ -2962,8 +2967,8 @@ class TidalPlayer(commands.Cog):
                 ctx, items, meta.get("name", "Spotify Playlist"),
                 _spotify_item_to_query, color=COLOR_GREEN, thumbnail_url=thumb,
             )
-        except Exception as e:
-            log.error(f"Spotify playlist handling failed: {e}")
+        except Exception as error:
+            _log_provider_failure("Spotify", "playlist import", error)
             await ctx.send(embed=_error_embed(Messages.ERROR_FETCH_FAILED))
 
     async def _handle_spotify_track(self, ctx: commands.Context, url: str) -> None:
@@ -2990,8 +2995,8 @@ class TidalPlayer(commands.Cog):
                 await self._load_and_queue_track(ctx, results[0])
             else:
                 await ctx.send(embed=_error_embed(Messages.ERROR_NO_TRACKS_FOUND))
-        except Exception as e:
-            log.error(f"Spotify track handling failed: {e}")
+        except Exception as error:
+            _log_provider_failure("Spotify", "track import", error)
             await ctx.send(embed=_error_embed(Messages.ERROR_FETCH_FAILED))
 
     async def _handle_spotify_album(self, ctx: commands.Context, url: str) -> None:
@@ -3011,8 +3016,8 @@ class TidalPlayer(commands.Cog):
                 ctx, items, album_name,
                 _spotify_album_item_to_query, color=COLOR_GREEN, thumbnail_url=thumb,
             )
-        except Exception as e:
-            log.error(f"Spotify album handling failed: {e}")
+        except Exception as error:
+            _log_provider_failure("Spotify", "album import", error)
             await ctx.send(embed=_error_embed(Messages.ERROR_FETCH_FAILED))
 
     async def _handle_youtube_playlist(self, ctx: commands.Context, url: str) -> None:
@@ -3048,8 +3053,8 @@ class TidalPlayer(commands.Cog):
                 lambda item: item.get("snippet", {}).get("title"),
                 color=COLOR_RED, thumbnail_url=thumb,
             )
-        except Exception as e:
-            log.error(f"YouTube playlist handling failed: {e}")
+        except Exception as error:
+            _log_provider_failure("YouTube", "playlist import", error)
             await ctx.send(embed=_error_embed(Messages.ERROR_FETCH_FAILED))
 
     @commands.hybrid_command(name="tsearch")
@@ -3306,8 +3311,8 @@ class TidalPlayer(commands.Cog):
             await ctx.send(embed=_success_embed("Tidal authentication successful!"))
         except asyncio.TimeoutError:
             await ctx.send(embed=_error_embed("Authentication timed out. Please try again."))
-        except Exception as e:
-            log.error(f"Tidal OAuth login failed: {e}")
+        except Exception as error:
+            _log_provider_failure("Tidal", "OAuth login", error)
             await ctx.send(embed=_error_embed("Authentication failed. Check logs for details."))
 
     @tidalsetup.command(name="logout")

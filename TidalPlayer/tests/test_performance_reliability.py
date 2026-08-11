@@ -8,6 +8,7 @@ import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import pytest
 
 from TidalPlayer.domain.matching import select_best_tidal_track
@@ -231,6 +232,44 @@ async def test_lastfm_request_uses_the_reusable_async_session(cog) -> None:
 
     assert await cog._lastfm_similar_tracks("Artist", "Song") == [("Artist", "Song")]
     session.get.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_lastfm_error_log_does_not_contain_api_key(cog, caplog) -> None:
+    secret = "lastfm-secret-value"
+
+    class FailingRequest:
+        async def __aenter__(self):
+            raise aiohttp.ClientError(f"https://example.invalid/?api_key={secret}")
+
+        async def __aexit__(self, *_args):
+            return None
+
+    cog._lastfm_session = SimpleNamespace(
+        closed=False,
+        get=MagicMock(return_value=FailingRequest()),
+    )
+    cog.bot.get_shared_api_tokens = AsyncMock(return_value={"api_key": secret})
+
+    assert await cog._lastfm_similar_tracks("Artist", "Song") == []
+    assert secret not in caplog.text
+    assert "https://" not in caplog.text
+    assert "ClientError" in caplog.text
+
+
+def test_provider_failure_logger_never_formats_exception_text(caplog) -> None:
+    module = importlib.import_module("TidalPlayer.tidalplayer")
+    secret = "signed-secret"
+
+    module._log_provider_failure(
+        "Tidal",
+        "stream resolution",
+        RuntimeError(f"https://stream.example/file?token={secret}"),
+    )
+
+    assert secret not in caplog.text
+    assert "https://" not in caplog.text
+    assert "RuntimeError" in caplog.text
 
 
 @pytest.mark.asyncio
