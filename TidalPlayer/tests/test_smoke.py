@@ -76,3 +76,22 @@ async def test_setup_calls_add_cog(fake_bot):
     fake_bot.add_cog.assert_called_once()
     added = fake_bot.add_cog.call_args[0][0]
     assert isinstance(added, mod.TidalPlayer)
+
+
+def test_updated_modules_reload_with_legacy_normalization_cached(monkeypatch):
+    """Red hot reload must not depend on newly added names in an old module."""
+    domain = importlib.import_module("TidalPlayer.domain")
+    matching = importlib.import_module("TidalPlayer.domain.matching")
+    normalization = importlib.import_module("TidalPlayer.domain.normalization")
+    tidalplayer = importlib.import_module(MODULE_NAME)
+
+    monkeypatch.delattr(normalization, "normalize_identity_text", raising=False)
+    monkeypatch.delattr(normalization, "recording_signature", raising=False)
+    monkeypatch.delitem(sys.modules, "TidalPlayer.domain.identity", raising=False)
+    monkeypatch.delattr(domain, "identity", raising=False)
+
+    matching = importlib.reload(matching)
+    tidalplayer = importlib.reload(tidalplayer)
+
+    assert matching._normalize("Beyoncé 東京") == "beyoncé 東京"
+    assert tidalplayer.TidalPlayer._track_signature("Song", "Artist") == "artist\0song"

@@ -6,7 +6,7 @@ from typing import Any, Iterable
 
 from rapidfuzz import fuzz
 
-from .normalization import normalize_identity_text
+from .identity import normalize_identity_text
 
 _BRACKETED = re.compile(r"\[[^\]]*\]|\([^)]*(?:official|video|audio|lyrics|visualizer|remaster|live|hd|4k)[^)]*\)", re.IGNORECASE)
 def _normalize(value: str) -> str:

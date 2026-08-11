@@ -24,12 +24,12 @@ from .config_schema import COG_IDENTIFIER, GLOBAL_DEFAULTS, GUILD_DEFAULTS, SCHE
 from .domain.models import PageResult as _PageResult
 from .domain.models import TrackMeta
 from .domain.matching import select_best_tidal_track
+from .domain.identity import normalize_identity_text, recording_signature
 from .domain.normalization import (
     FILTER_REGEX, ISRC_PATTERN, SPOTIFY_ALBUM_PATTERN, SPOTIFY_PLAYLIST_PATTERN,
     SPOTIFY_TRACK_PATTERN, TIDAL_URL_PATTERNS, YOUTUBE_PLAYLIST_PATTERN,
     YOUTUBE_SKIP_TITLES, ensure_aware as _ensure_aware,
-    format_duration, make_tidal_url, normalize_identity_text, recording_signature,
-    truncate, utc_now as _utc_now,
+    format_duration, make_tidal_url, truncate, utc_now as _utc_now,
 )
 from .ui.embeds import (
     COLOR_BLUE, COLOR_GREEN, COLOR_PURPLE, COLOR_RED, COLOR_TEAL, Messages,
