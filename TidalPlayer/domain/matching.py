@@ -6,15 +6,11 @@ from typing import Any, Iterable
 
 from rapidfuzz import fuzz
 
+from .normalization import normalize_identity_text
+
 _BRACKETED = re.compile(r"\[[^\]]*\]|\([^)]*(?:official|video|audio|lyrics|visualizer|remaster|live|hd|4k)[^)]*\)", re.IGNORECASE)
-_NON_ALNUM = re.compile(r"[^a-z0-9\s]")
-_WHITESPACE = re.compile(r"\s+")
-
-
 def _normalize(value: str) -> str:
-    value = _BRACKETED.sub(" ", value.lower())
-    value = _NON_ALNUM.sub(" ", value)
-    return _WHITESPACE.sub(" ", value).strip()
+    return normalize_identity_text(_BRACKETED.sub(" ", value))
 
 
 def _title(track: Any) -> str:

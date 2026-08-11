@@ -10,10 +10,33 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from TidalPlayer.domain.matching import select_best_tidal_track
+
 
 def test_queued_embed_delete_delay_is_one_minute(cog) -> None:
     module = importlib.import_module(cog.__class__.__module__)
     assert module.QUEUED_EMBED_DELETE_DELAY == 60.0
+
+
+def test_non_latin_catalog_match_is_not_discarded() -> None:
+    track = SimpleNamespace(
+        name="夜に駆ける",
+        full_name=None,
+        artist=SimpleNamespace(name="YOASOBI"),
+    )
+
+    assert select_best_tidal_track("YOASOBI 夜に駆ける", [track]) is track
+
+
+@pytest.mark.asyncio
+async def test_equivalent_search_queries_share_cache_entry(cog) -> None:
+    cog.tidal.session.search = MagicMock(return_value={"tracks": []})
+
+    await cog.tidal.search("  Artist   Track  ")
+    await cog.tidal.search("artist track")
+
+    assert cog.tidal.session.search.call_count == 1
+    assert cog.tidal.session.search.call_args.args[0] == "  Artist   Track  "
 
 
 @pytest.mark.asyncio

@@ -29,7 +29,8 @@ from .domain.normalization import (
     FILTER_REGEX, ISRC_PATTERN, SPOTIFY_ALBUM_PATTERN, SPOTIFY_PLAYLIST_PATTERN,
     SPOTIFY_TRACK_PATTERN, TIDAL_URL_PATTERNS, YOUTUBE_PLAYLIST_PATTERN,
     YOUTUBE_SKIP_TITLES, ensure_aware as _ensure_aware,
-    format_duration, make_tidal_url, truncate, utc_now as _utc_now,
+    format_duration, make_tidal_url, normalize_identity_text, recording_signature,
+    truncate, utc_now as _utc_now,
 )
 from .ui.embeds import (
     COLOR_BLUE, COLOR_GREEN, COLOR_PURPLE, COLOR_RED, COLOR_TEAL, Messages,
@@ -507,7 +508,8 @@ class TidalHandler:
     async def search(self, query: str, filter_remixes: bool = False) -> List[Any]:
         if not self.session:
             return []
-        cache_key = f"{query}:{filter_remixes}"
+        normalized_query = normalize_identity_text(query) or " ".join(query.casefold().split())
+        cache_key = f"{normalized_query}:{filter_remixes}"
         cached = self._get_cached("search", cache_key)
         if cached is not _CACHE_MISS:
             return cached
@@ -1333,9 +1335,7 @@ class TidalPlayer(commands.Cog):
     @staticmethod
     def _track_signature(title: Any, artist: Any) -> str:
         """Return a stable song identity across Tidal album/version IDs."""
-        normalised_title = " ".join(str(title or "").casefold().split())
-        normalised_artist = " ".join(str(artist or "").casefold().split())
-        return f"{normalised_artist}\x00{normalised_title}" if normalised_title else ""
+        return recording_signature(title, artist)
 
     @classmethod
     def _meta_track_signature(cls, meta: TrackMeta | None) -> str:
