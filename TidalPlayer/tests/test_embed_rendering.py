@@ -1,9 +1,8 @@
 """
-Phase-0 characterization tests: now-playing embed rendering.
+Characterization tests for the canonical now-playing embed factory.
 
-Captures the exact visual contract of _build_now_playing_embed so any
-future move of this method into ui/embeds.py is verified to be
-behaviour-preserving.
+Captures the exact visual contract of ui.embeds.make_now_playing_embed so
+future changes remain behaviour-preserving.
 
 The embed this characterizes is the compact 'Playing from Tidal' embed
 that MUST NOT be visually changed during the refactor.
