@@ -10,6 +10,50 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from TidalPlayer.domain.matching import select_confident_youtube_tidal_track
+
+
+def _tidal_candidate(title: str, artist: str):
+    return SimpleNamespace(name=title, full_name=title, artist=SimpleNamespace(name=artist))
+
+
+@pytest.mark.parametrize(
+    ("video_title", "channel"),
+    [
+        ("AZALI - Rivals", "AZALI"),
+        ("AZALI - Rivals (Official Audio)", "AZALI - Topic"),
+        ("AZALI - Rivals [Official Music Video]", "Independent Label"),
+    ],
+)
+def test_youtube_tidal_match_accepts_only_title_and_artist_identity(
+    video_title: str, channel: str
+) -> None:
+    candidate = _tidal_candidate("Rivals", "AZALI")
+
+    assert select_confident_youtube_tidal_track(video_title, channel, [candidate]) is candidate
+
+
+@pytest.mark.parametrize(
+    ("video_title", "channel", "tidal_title", "tidal_artist"),
+    [
+        ("AZALI - Rivals (Piano Cover)", "AZALI", "Rivals", "AZALI"),
+        ("AZALI - Rivals Remix", "AZALI", "Rivals", "AZALI"),
+        ("AZALI - Rivals (Live)", "AZALI", "Rivals", "AZALI"),
+        ("AZALI - Rivals", "AZALI", "Rival", "AZALI"),
+        ("Someone Else - Rivals", "Someone Else", "Rivals", "AZALI"),
+        ("AZALI - Rivals", "AZALI", "", "AZALI"),
+        ("AZALI - Rivals", "AZALI", "Rivals", ""),
+    ],
+)
+def test_youtube_tidal_match_rejects_uncertain_recordings(
+    video_title: str,
+    channel: str,
+    tidal_title: str,
+    tidal_artist: str,
+) -> None:
+    candidate = _tidal_candidate(tidal_title, tidal_artist)
+
+    assert select_confident_youtube_tidal_track(video_title, channel, [candidate]) is None
 
 @pytest.mark.asyncio
 async def test_load_lavalink_track_does_not_retry_timeout_with_a_fresh_url(cog) -> None:
