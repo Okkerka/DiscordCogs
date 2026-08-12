@@ -129,3 +129,39 @@ async def test_queue_end_without_autoplay_removes_stale_controller(cog) -> None:
     assert guild.id not in cog._controller_messages
     view.stop.assert_called_once()
     message.delete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_queue_end_with_autoplay_removes_controller_before_scheduling(cog) -> None:
+    guild = SimpleNamespace(id=54)
+    meta = {
+        "track_id": 1,
+        "title": "Ended",
+        "artist": "Artist",
+        "album": None,
+    }
+    channel = SimpleNamespace()
+    message = SimpleNamespace(channel=channel, delete=AsyncMock())
+    view = MagicMock()
+    player = SimpleNamespace()
+    cog._current_meta[guild.id] = meta
+    cog._controller_meta[guild.id] = meta
+    cog._controller_messages[guild.id] = message
+    cog._controller_views[guild.id] = view
+    await cog.config.guild_from_id(guild.id).autoplay_enabled.set(True)
+
+    async def get_player(_self, _guild_id):
+        message.delete.assert_awaited_once()
+        return player
+
+    with (
+        patch.object(type(cog), "_get_player_for_guild", new=get_player),
+        patch.object(type(cog), "_schedule_autoplay") as schedule_autoplay,
+    ):
+        await cog.on_red_audio_queue_end(guild, SimpleNamespace(), SimpleNamespace())
+
+    assert cog._current_meta[guild.id] == meta
+    assert guild.id not in cog._controller_messages
+    assert cog._playback_channels[guild.id] is channel
+    view.stop.assert_called_once()
+    schedule_autoplay.assert_called_once_with(guild.id, player)

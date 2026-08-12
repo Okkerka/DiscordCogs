@@ -1193,17 +1193,21 @@ class TidalPlayer(commands.Cog):
             current = self._current_meta.get(guild_id)
             if current is None:
                 return
+            stale_message = self._controller_messages.pop(guild_id, None)
+            self._stop_controller_view(guild_id)
+            if autoplay_enabled and guild_id not in self._playback_channels:
+                channel = getattr(stale_message, "channel", None)
+                if channel is not None:
+                    self._playback_channels[guild_id] = channel
             if not autoplay_enabled:
                 self._current_meta.pop(guild_id, None)
                 self._controller_meta.pop(guild_id, None)
-                stale_message = self._controller_messages.pop(guild_id, None)
-                self._stop_controller_view(guild_id)
             else:
                 self._remember_track(guild_id, current)
 
+        if stale_message is not None:
+            await _delete_message_safe(stale_message)
         if not autoplay_enabled:
-            if stale_message is not None:
-                await _delete_message_safe(stale_message)
             return
 
         player = await self._get_player_for_guild(guild_id)
@@ -3147,6 +3151,7 @@ class TidalPlayer(commands.Cog):
     @commands.guild_only()
     async def tplay(self, ctx: commands.Context, *, query: str):
         """Play Tidal content, provider links, or a Tidal search result."""
+        await ctx.defer()
         if not await self.check_ready(ctx):
             return
         try:

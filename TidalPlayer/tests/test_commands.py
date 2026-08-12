@@ -163,6 +163,18 @@ class TestCheckReady:
 
 
 @pytest.mark.asyncio
+async def test_tplay_defers_before_readiness_checks(cog) -> None:
+    ctx = SimpleNamespace(defer=AsyncMock())
+
+    async def check_ready(_self, _ctx):
+        ctx.defer.assert_awaited_once_with()
+        return False
+
+    with patch.object(type(cog), "check_ready", new=check_ready):
+        await cog.tplay(ctx, query="track")
+
+
+@pytest.mark.asyncio
 async def test_queue_title_reports_displayed_and_total_tracks(cog) -> None:
     current_mod = importlib.import_module(cog.__class__.__module__)
     queue = [

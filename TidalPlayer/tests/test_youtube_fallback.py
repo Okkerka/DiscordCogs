@@ -23,6 +23,7 @@ def _context(guild_id: int = 71):
         guild=SimpleNamespace(id=guild_id),
         author=SimpleNamespace(voice=SimpleNamespace(channel=channel)),
         channel=channel,
+        defer=AsyncMock(),
         send=AsyncMock(),
     )
 
