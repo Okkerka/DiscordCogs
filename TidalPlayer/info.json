@@ -1,6 +1,6 @@
 {
     "author": ["Okkerka"],
-    "install_msg": "Install required dependencies: `[p]pipinstall tidalapi spotipy google-api-python-client rapidfuzz`\nThen run `>tidalsetup` to authenticate with Tidal.",
+    "install_msg": "Install required dependencies: `[p]pipinstall tidalapi spotipy google-api-python-client rapidfuzz`\nThen run `[p]tidalsetup login` for Tidal, `[p]tidalsetup spotify` for Spotify imports, and `[p]tidalsetup youtube` for YouTube metadata and playlists.",
     "name": "TidalPlayer",
     "short": "Play Tidal music with provider imports, YouTube fallback, and full metadata.",
     "description": "Tidal music integration for Red-DiscordBot. Supports Tidal playback, album art, Spotify and YouTube playlist imports, Tidal-first YouTube video fallback, ISRC lookup, MixV2, video URLs, similar albums, user playlist management, and rich now-playing embeds.",

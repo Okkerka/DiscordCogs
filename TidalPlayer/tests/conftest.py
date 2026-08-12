@@ -276,6 +276,8 @@ def _make_redbot_stub(fake_config: FakeConfig) -> types.ModuleType:
     redbot.core.utils = types.ModuleType("redbot.core.utils")
     redbot.core.utils.menus = types.ModuleType("redbot.core.utils.menus")
     redbot.core.utils.menus.SimpleMenu = MagicMock()
+    redbot.core.utils.views = types.ModuleType("redbot.core.utils.views")
+    redbot.core.utils.views.SetApiView = MagicMock()
 
     return redbot
 
@@ -360,6 +362,7 @@ def _patch_dependencies():
         "redbot.core.bot": redbot_stub.core.bot,
         "redbot.core.utils": redbot_stub.core.utils,
         "redbot.core.utils.menus": redbot_stub.core.utils.menus,
+        "redbot.core.utils.views": redbot_stub.core.utils.views,
         "lavalink": _make_lavalink_stub(),
         "tidalapi": _make_tidalapi_stub(),
         "tidalapi.media": _make_tidalapi_stub().media,

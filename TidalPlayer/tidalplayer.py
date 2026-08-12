@@ -19,6 +19,7 @@ import discord
 from redbot.core import Config, app_commands, commands
 from redbot.core.bot import Red
 from redbot.core.utils.menus import SimpleMenu
+from redbot.core.utils.views import SetApiView
 
 from .config_schema import COG_IDENTIFIER, GLOBAL_DEFAULTS, GUILD_DEFAULTS, SCHEMA_VERSION
 from .domain.models import PageResult as _PageResult
@@ -3534,7 +3535,48 @@ class TidalPlayer(commands.Cog):
     @commands.group(name="tidalsetup")
     @commands.is_owner()
     async def tidalsetup(self, ctx: commands.Context):
-        """Tidal OAuth setup commands (bot owner only)."""
+        """Configure Tidal, Spotify, and YouTube access (bot owner only)."""
+
+    @tidalsetup.command(name="spotify")
+    @commands.is_owner()
+    async def tidalsetup_spotify(self, ctx: commands.Context):
+        """Open Red's secure modal for Spotify API credentials."""
+        view = SetApiView(
+            default_service="spotify",
+            default_keys={"client_id": "", "client_secret": ""},
+        )
+        await ctx.send(
+            embed=discord.Embed(
+                title="Spotify API setup",
+                description=(
+                    "Create an app in the Spotify Developer Dashboard, then use the button "
+                    "below to enter its client ID and client secret securely. Spotify requires "
+                    "the app owner to have Premium while the app is in Development Mode."
+                ),
+                color=COLOR_GREEN,
+            ),
+            view=view,
+        )
+
+    @tidalsetup.command(name="youtube")
+    @commands.is_owner()
+    async def tidalsetup_youtube(self, ctx: commands.Context):
+        """Open Red's secure modal for a YouTube Data API key."""
+        view = SetApiView(
+            default_service="youtube",
+            default_keys={"api_key": ""},
+        )
+        await ctx.send(
+            embed=discord.Embed(
+                title="YouTube API setup",
+                description=(
+                    "Enable YouTube Data API v3 in a Google Cloud project, then use the button "
+                    "below to enter its API key securely."
+                ),
+                color=COLOR_RED,
+            ),
+            view=view,
+        )
 
     @tidalsetup.command(name="login")
     @commands.is_owner()

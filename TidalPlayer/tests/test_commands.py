@@ -175,6 +175,40 @@ async def test_tplay_defers_before_readiness_checks(cog) -> None:
 
 
 @pytest.mark.asyncio
+async def test_tidalsetup_spotify_opens_red_secure_token_view(cog) -> None:
+    ctx = SimpleNamespace(send=AsyncMock())
+    view = SimpleNamespace()
+    view_factory = MagicMock(return_value=view)
+    module = importlib.import_module(cog.__class__.__module__)
+
+    with patch.object(module, "SetApiView", view_factory, create=True):
+        await cog.tidalsetup_spotify(ctx)
+
+    view_factory.assert_called_once_with(
+        default_service="spotify",
+        default_keys={"client_id": "", "client_secret": ""},
+    )
+    assert ctx.send.await_args.kwargs["view"] is view
+
+
+@pytest.mark.asyncio
+async def test_tidalsetup_youtube_opens_red_secure_token_view(cog) -> None:
+    ctx = SimpleNamespace(send=AsyncMock())
+    view = SimpleNamespace()
+    view_factory = MagicMock(return_value=view)
+    module = importlib.import_module(cog.__class__.__module__)
+
+    with patch.object(module, "SetApiView", view_factory, create=True):
+        await cog.tidalsetup_youtube(ctx)
+
+    view_factory.assert_called_once_with(
+        default_service="youtube",
+        default_keys={"api_key": ""},
+    )
+    assert ctx.send.await_args.kwargs["view"] is view
+
+
+@pytest.mark.asyncio
 async def test_queue_title_reports_displayed_and_total_tracks(cog) -> None:
     current_mod = importlib.import_module(cog.__class__.__module__)
     queue = [

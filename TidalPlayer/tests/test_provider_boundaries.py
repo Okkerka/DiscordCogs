@@ -26,6 +26,20 @@ async def test_missing_provider_credentials_clear_existing_client(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("service_name", "initializer"),
+    [("spotify", "_initialize_spotify"), ("youtube", "_initialize_youtube")],
+)
+async def test_shared_token_update_reinitializes_provider(
+    cog, service_name: str, initializer: str
+) -> None:
+    with patch.object(type(cog), initializer, new=AsyncMock()) as initialize:
+        await cog.on_red_api_tokens_update(service_name, {})
+
+    initialize.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
 async def test_spotify_playlist_stops_on_repeated_next_cursor(cog) -> None:
     item_one = {"track": {"name": "One"}}
     item_two = {"track": {"name": "Two"}}
