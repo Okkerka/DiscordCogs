@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 from collections.abc import Awaitable
 from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from itertools import islice
 from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
+from urllib.parse import parse_qs, urlsplit
 
 import aiohttp
 import discord
@@ -75,7 +77,8 @@ except ImportError:
 
 try:
     import spotipy
-    from spotipy.oauth2 import SpotifyClientCredentials
+    from spotipy.cache_handler import MemoryCacheHandler
+    from spotipy.oauth2 import SpotifyClientCredentials, SpotifyOAuth
     SPOTIFY_AVAILABLE = True
 except ImportError:
     SPOTIFY_AVAILABLE = False
@@ -83,7 +86,7 @@ except ImportError:
 log = logging.getLogger("red.tidalplayer")
 
 __red_end_user_data_statement__ = (
-    "This cog stores Tidal OAuth credentials globally for the bot owner. "
+    "This cog stores Tidal and Spotify OAuth credentials globally for the bot owner. "
     "It does not store data associated with individual Discord users."
 )
 
@@ -129,6 +132,9 @@ LAVALINK_NODE_READY_MAX_ATTEMPTS = 3
 LAVALINK_NODE_READY_RETRY_DELAY = 2.0
 LAVALINK_SLOW_LOAD_WARNING_DELAY = 10.0
 LAVALINK_LOAD_HARD_TIMEOUT = 60.0
+SPOTIFY_REDIRECT_URI = "http://127.0.0.1:2402/callback"
+SPOTIFY_OAUTH_SCOPE = "playlist-read-private playlist-read-collaborative"
+SPOTIFY_LOGIN_TTL = 600.0
 
 
 _CACHE_CAPS: Dict[str, int] = {
@@ -153,7 +159,7 @@ def _is_tidal_track(obj: Any) -> bool:
 
 
 def _spotify_item_to_query(item: dict) -> str:
-    track = item.get("track") or {}
+    track = item.get("item") or item.get("track") or {}
     isrc = (track.get("external_ids") or {}).get("isrc")
     if isrc:
         return f"isrc:{isrc}"
@@ -167,6 +173,102 @@ def _spotify_album_item_to_query(item: dict) -> str:
         return f"isrc:{isrc}"
     artists = " ".join(a.get("name", "") for a in item.get("artists", []) if a.get("name"))
     return f"{item.get('name', '')} {artists}".strip()
+
+
+class SpotifyLoginError(ValueError):
+    """A safe, user-facing Spotify OAuth validation error."""
+
+
+class SpotifyCallbackModal(discord.ui.Modal):
+    def __init__(self, cog: "TidalPlayer", owner_id: int):
+        super().__init__(title="Complete Spotify login", timeout=SPOTIFY_LOGIN_TTL)
+        self.cog = cog
+        self.owner_id = owner_id
+        self.callback_url = discord.ui.TextInput(
+            label="Redirected URL",
+            placeholder="http://127.0.0.1:2402/callback?code=...&state=...",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=2000,
+        )
+        self.add_item(self.callback_url)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if (
+            interaction.user.id != self.owner_id
+            or not await self.cog.bot.is_owner(interaction.user)
+        ):
+            await interaction.response.send_message(
+                "Only the bot owner who started this login can complete it.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await self.cog._complete_spotify_login(
+                self.owner_id,
+                str(self.callback_url.value),
+            )
+        except SpotifyLoginError as error:
+            await interaction.edit_original_response(embed=_error_embed(str(error)))
+        except Exception as error:
+            _log_provider_failure("Spotify", "OAuth completion", error)
+            await interaction.edit_original_response(
+                embed=_error_embed("Spotify authentication failed. Start the login again.")
+            )
+        else:
+            await interaction.edit_original_response(
+                embed=_success_embed("Spotify authentication successful!")
+            )
+
+
+class SpotifyLoginView(discord.ui.View):
+    def __init__(self, cog: "TidalPlayer", owner_id: int, state: str):
+        super().__init__(timeout=SPOTIFY_LOGIN_TTL)
+        self.cog = cog
+        self.owner_id = owner_id
+        self.state = state
+        button = discord.ui.Button(
+            label="Finish Spotify login",
+            style=discord.ButtonStyle.primary,
+            custom_id="tidalplayer:spotify-login:v1",
+        )
+        button.callback = self._open_modal
+        self.add_item(button)
+
+    async def _open_modal(self, interaction: discord.Interaction) -> None:
+        if (
+            interaction.user.id != self.owner_id
+            or not await self.cog.bot.is_owner(interaction.user)
+        ):
+            await interaction.response.send_message(
+                "Only the bot owner who started this login can complete it.",
+                ephemeral=True,
+            )
+            return
+        pending = self.cog._spotify_login_states.get(self.owner_id)
+        if (
+            self.cog._spotify_login_views.get(self.owner_id) is not self
+            or pending is None
+            or pending[0] != self.state
+        ):
+            await interaction.response.send_message(
+                "This Spotify login has expired. Start a new one.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(
+            SpotifyCallbackModal(self.cog, self.owner_id)
+        )
+
+    async def on_timeout(self) -> None:
+        if self.cog._spotify_login_views.get(self.owner_id) is self:
+            self.cog._spotify_login_views.pop(self.owner_id, None)
+            pending = self.cog._spotify_login_states.get(self.owner_id)
+            if pending is not None and pending[0] == self.state:
+                self.cog._spotify_login_states.pop(self.owner_id, None)
+        self.stop()
 
 
 class TrackSelectView(discord.ui.View):
@@ -980,6 +1082,8 @@ class TidalPlayer(commands.Cog):
         "_controller_recommendation_tasks", "_controller_last_refresh", "_queued_meta",
         "_recommendation_lookup_slots", "_lastfm_session", "_lavalink_load_tasks",
         "_persistent_view", "_controller_views",
+        "_spotify_auth_manager", "_spotify_refresh_token", "_spotify_login_states",
+        "_spotify_login_views", "_spotify_auth_lock",
     )
 
     def __init__(self, bot: Red):
@@ -991,6 +1095,11 @@ class TidalPlayer(commands.Cog):
         self.tidal = TidalHandler(bot, self.tokens)
         self.audio = RedAudioGateway(lavalink if LAVALINK_AVAILABLE else None)
         self.sp: Optional[Any] = None
+        self._spotify_auth_manager: Optional[Any] = None
+        self._spotify_refresh_token: Optional[str] = None
+        self._spotify_login_states: Dict[int, Tuple[str, float]] = {}
+        self._spotify_login_views: Dict[int, SpotifyLoginView] = {}
+        self._spotify_auth_lock = asyncio.Lock()
         self.yt: Optional[Any] = None
         self._tasks: Set[asyncio.Task] = set()
         self._guild_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -1064,6 +1173,12 @@ class TidalPlayer(commands.Cog):
             self._persistent_view = None
 
         self.sp = None
+        self._spotify_auth_manager = None
+        self._spotify_refresh_token = None
+        self._spotify_login_states.clear()
+        for view in self._spotify_login_views.values():
+            view.stop()
+        self._spotify_login_views.clear()
         self.yt = None
         self._tasks.clear()
         self._lavalink_load_tasks.clear()
@@ -1302,22 +1417,199 @@ class TidalPlayer(commands.Cog):
         log.info(f"TidalPlayer fully initialized in {elapsed:.2f}s")
 
     async def _initialize_spotify(self) -> None:
-        self.sp = None
-        if not SPOTIFY_AVAILABLE:
-            return
-        tokens = await self.bot.get_shared_api_tokens("spotify")
-        cid = tokens.get("client_id")
-        csec = tokens.get("client_secret")
-        if cid and csec:
+        async with self._spotify_auth_lock:
+            self.sp = None
+            self._spotify_auth_manager = None
+            self._spotify_refresh_token = None
+            if not SPOTIFY_AVAILABLE:
+                return
+            tokens = await self.bot.get_shared_api_tokens("spotify")
+            cid = tokens.get("client_id")
+            csec = tokens.get("client_secret")
+            if not cid or not csec:
+                return
             try:
+                stored_refresh_token = tokens.get("refresh_token")
+                if stored_refresh_token:
+                    token_info = {
+                        "access_token": "",
+                        "refresh_token": stored_refresh_token,
+                        "expires_at": 0,
+                        "scope": SPOTIFY_OAUTH_SCOPE,
+                    }
+                    oauth = self._new_spotify_oauth(
+                        cid,
+                        csec,
+                        token_info=token_info,
+                    )
+                    validated = await self.tidal._run_blocking(
+                        lambda: oauth.validate_token(token_info),
+                        timeout=15.0,
+                    )
+                    if isinstance(validated, dict) and validated.get("refresh_token"):
+                        self.sp = await self.tidal._run_blocking(
+                            lambda: spotipy.Spotify(
+                                auth_manager=oauth,
+                                requests_timeout=15.0,
+                            ),
+                            timeout=15.0,
+                        )
+                        self._spotify_auth_manager = oauth
+                        self._spotify_refresh_token = str(validated["refresh_token"])
+                        if self._spotify_refresh_token != stored_refresh_token:
+                            await self.bot.set_shared_api_tokens(
+                                "spotify",
+                                refresh_token=self._spotify_refresh_token,
+                            )
+                        return
+
                 self.sp = await self.tidal._run_blocking(
                     lambda: spotipy.Spotify(
-                        client_credentials_manager=SpotifyClientCredentials(cid, csec)
+                        client_credentials_manager=SpotifyClientCredentials(
+                            cid,
+                            csec,
+                            cache_handler=MemoryCacheHandler(),
+                        ),
+                        requests_timeout=15.0,
                     ),
                     timeout=15.0,
                 )
             except Exception as error:
                 _log_provider_failure("Spotify", "client initialization", error)
+
+    @staticmethod
+    def _parse_spotify_callback(callback_url: str, expected_state: str) -> str:
+        try:
+            parsed = urlsplit(callback_url.strip())
+            is_expected_redirect = (
+                parsed.scheme == "http"
+                and parsed.hostname == "127.0.0.1"
+                and parsed.port == 2402
+                and parsed.path == "/callback"
+                and parsed.username is None
+                and parsed.password is None
+            )
+        except ValueError as error:
+            raise SpotifyLoginError("Invalid Spotify redirect URL.") from error
+        if not is_expected_redirect:
+            raise SpotifyLoginError("Invalid Spotify redirect URL.")
+
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        if query.get("error"):
+            raise SpotifyLoginError("Spotify authorization was denied.")
+        states = query.get("state", [])
+        if len(states) != 1 or not secrets.compare_digest(states[0], expected_state):
+            raise SpotifyLoginError("Invalid Spotify OAuth state.")
+        codes = query.get("code", [])
+        if len(codes) != 1 or not codes[0]:
+            raise SpotifyLoginError(
+                "Spotify callback did not include an authorization code."
+            )
+        return codes[0]
+
+    @staticmethod
+    def _new_spotify_oauth(
+        client_id: str,
+        client_secret: str,
+        *,
+        state: Optional[str] = None,
+        token_info: Optional[dict] = None,
+    ) -> Any:
+        return SpotifyOAuth(
+            client_id=client_id,
+            client_secret=client_secret,
+            redirect_uri=SPOTIFY_REDIRECT_URI,
+            state=state,
+            scope=SPOTIFY_OAUTH_SCOPE,
+            open_browser=False,
+            requests_timeout=15.0,
+            cache_handler=MemoryCacheHandler(token_info=token_info),
+        )
+
+    async def _begin_spotify_login(self, owner_id: int) -> Tuple[str, str]:
+        tokens = await self.bot.get_shared_api_tokens("spotify")
+        client_id = tokens.get("client_id")
+        client_secret = tokens.get("client_secret")
+        if not client_id or not client_secret:
+            raise SpotifyLoginError("Spotify client credentials are not configured.")
+        state = secrets.token_urlsafe(32)
+        expires_at = asyncio.get_running_loop().time() + SPOTIFY_LOGIN_TTL
+        oauth = self._new_spotify_oauth(
+            client_id,
+            client_secret,
+            state=state,
+        )
+        self._spotify_login_states[owner_id] = (state, expires_at)
+        return oauth.get_authorize_url(), state
+
+    async def _complete_spotify_login(self, owner_id: int, callback_url: str) -> None:
+        pending = self._spotify_login_states.get(owner_id)
+        if pending is None:
+            raise SpotifyLoginError("No Spotify login is pending.")
+        state, expires_at = pending
+        if asyncio.get_running_loop().time() >= expires_at:
+            self._clear_spotify_login(owner_id)
+            raise SpotifyLoginError("Spotify login expired. Start it again.")
+
+        code = self._parse_spotify_callback(callback_url, state)
+        tokens = await self.bot.get_shared_api_tokens("spotify")
+        client_id = tokens.get("client_id")
+        client_secret = tokens.get("client_secret")
+        if not client_id or not client_secret:
+            raise SpotifyLoginError("Spotify client credentials are not configured.")
+
+        oauth = self._new_spotify_oauth(client_id, client_secret, state=state)
+        token_info = await self.tidal._run_blocking(
+            lambda: oauth.get_access_token(code, as_dict=True, check_cache=False),
+            timeout=20.0,
+        )
+        if not isinstance(token_info, dict) or not token_info.get("refresh_token"):
+            raise SpotifyLoginError("Spotify did not return a refreshable token.")
+
+        self._clear_spotify_login(owner_id)
+        await self.bot.set_shared_api_tokens(
+            "spotify",
+            refresh_token=str(token_info["refresh_token"]),
+        )
+        await self._initialize_spotify()
+        if self._spotify_auth_manager is None or self.sp is None:
+            raise RuntimeError("Spotify session could not activate after authorization.")
+
+    def _clear_spotify_login(self, owner_id: int) -> None:
+        self._spotify_login_states.pop(owner_id, None)
+        view = self._spotify_login_views.pop(owner_id, None)
+        if view is not None:
+            view.stop()
+
+    async def _run_spotify(
+        self,
+        operation: Callable[[Any], Any],
+        *,
+        timeout: float,
+    ) -> Any:
+        client = self.sp
+        if client is None:
+            raise RuntimeError("Spotify client is unavailable")
+        result = await self.tidal._run_blocking(
+            lambda: operation(client),
+            timeout=timeout,
+        )
+
+        oauth = self._spotify_auth_manager
+        if oauth is not None:
+            try:
+                token_info = oauth.cache_handler.get_cached_token()
+                if isinstance(token_info, dict) and token_info.get("refresh_token"):
+                    refresh_token = str(token_info["refresh_token"])
+                    if refresh_token != self._spotify_refresh_token:
+                        self._spotify_refresh_token = refresh_token
+                        await self.bot.set_shared_api_tokens(
+                            "spotify",
+                            refresh_token=refresh_token,
+                        )
+            except Exception as error:
+                _log_provider_failure("Spotify", "token persistence", error)
+        return result
 
     async def _initialize_youtube(self) -> None:
         self.yt = None
@@ -2873,10 +3165,10 @@ class TidalPlayer(commands.Cog):
         seen_next: set[str] = set()
         offset = 0
         while offset < MAX_ITEMS:
-            resp = await self.tidal._run_blocking(
-                lambda o=offset: self.sp.playlist_tracks(
+            resp = await self._run_spotify(
+                lambda client, o=offset: client.playlist_items(
                     playlist_id, limit=100, offset=o,
-                    fields="items(track(name,artists(name),external_ids)),next",
+                    fields="items(item(name,artists(name),external_ids)),next",
                 ),
                 timeout=20.0,
             )
@@ -2888,7 +3180,7 @@ class TidalPlayer(commands.Cog):
             all_items.extend(
                 item
                 for item in page
-                if isinstance(item, dict) and item.get("track")
+                if isinstance(item, dict) and (item.get("item") or item.get("track"))
             )
             next_url = resp.get("next")
             if (
@@ -2905,7 +3197,10 @@ class TidalPlayer(commands.Cog):
         all_items: List[Any] = []
         album_name = album_id
         try:
-            alb = await self.tidal._run_blocking(lambda: self.sp.album(album_id), timeout=15.0)
+            alb = await self._run_spotify(
+                lambda client: client.album(album_id),
+                timeout=15.0,
+            )
             if not isinstance(alb, dict):
                 return [], album_name
             album_name = alb.get("name", album_id)
@@ -2928,8 +3223,9 @@ class TidalPlayer(commands.Cog):
                 and pages < max_pages
             ):
                 seen_next_urls.add(next_url)
-                resp = await self.tidal._run_blocking(
-                    lambda u=next_url: self.sp._get(u), timeout=20.0
+                resp = await self._run_spotify(
+                    lambda client, u=next_url: client._get(u),
+                    timeout=20.0,
                 )
                 pages += 1
                 if not isinstance(resp, dict):
@@ -3209,14 +3505,23 @@ class TidalPlayer(commands.Cog):
         if not self.sp:
             await ctx.send(embed=_error_embed(Messages.ERROR_NO_SPOTIFY))
             return
+        if self._spotify_auth_manager is None:
+            await ctx.send(
+                embed=_error_embed(
+                    "Spotify playlist imports require user OAuth. "
+                    "Use `[p]tidalsetup spotifylogin`."
+                )
+            )
+            return
         match = SPOTIFY_PLAYLIST_PATTERN.search(url)
         if not match:
             await ctx.send(embed=_error_embed(Messages.ERROR_INVALID_URL.format(platform="Spotify", content_type="playlist")))
             return
         playlist_id = match.group(1)
         try:
-            meta = await self.tidal._run_blocking(
-                lambda: self.sp.playlist(playlist_id, fields="name,images"), timeout=15.0
+            meta = await self._run_spotify(
+                lambda client: client.playlist(playlist_id, fields="name,images"),
+                timeout=15.0,
             )
             items = await self._fetch_all_spotify_tracks(playlist_id)
             thumb = meta.get("images", [{}])[0].get("url") if meta.get("images") else None
@@ -3238,7 +3543,10 @@ class TidalPlayer(commands.Cog):
             return
         track_id = match.group(1)
         try:
-            item = await self.tidal._run_blocking(lambda: self.sp.track(track_id), timeout=15.0)
+            item = await self._run_spotify(
+                lambda client: client.track(track_id),
+                timeout=15.0,
+            )
             isrc = (item.get("external_ids", {}) or {}).get("isrc")
             if isrc:
                 track = await self.tidal.get_track_by_isrc(isrc)
@@ -3266,7 +3574,10 @@ class TidalPlayer(commands.Cog):
             return
         album_id = match.group(1)
         try:
-            album_meta = await self.tidal._run_blocking(lambda: self.sp.album(album_id), timeout=15.0)
+            album_meta = await self._run_spotify(
+                lambda client: client.album(album_id),
+                timeout=15.0,
+            )
             items, album_name = await self._fetch_all_spotify_album_tracks(album_id)
             thumb = album_meta.get("images", [{}])[0].get("url") if album_meta.get("images") else None
             await self._process_track_list(
@@ -3557,6 +3868,76 @@ class TidalPlayer(commands.Cog):
             ),
             view=view,
         )
+
+    @tidalsetup.command(name="spotifylogin")
+    @commands.is_owner()
+    async def tidalsetup_spotifylogin(self, ctx: commands.Context):
+        """Authorize the Spotify account used for playlist imports."""
+        if not SPOTIFY_AVAILABLE:
+            await ctx.send(embed=_error_embed(Messages.ERROR_NO_SPOTIFY))
+            return
+        try:
+            authorize_url, state = await self._begin_spotify_login(ctx.author.id)
+            previous_view = self._spotify_login_views.pop(ctx.author.id, None)
+            if previous_view is not None:
+                previous_view.stop()
+            view = SpotifyLoginView(self, ctx.author.id, state)
+            self._spotify_login_views[ctx.author.id] = view
+            await ctx.author.send(
+                "Open this URL and authorize Spotify:\n"
+                f"<{authorize_url}>\n\n"
+                "After Spotify redirects you, the local page may fail to load because "
+                "DripBot is hosted remotely. Copy the complete URL from your browser, "
+                "then press **Finish Spotify login** below and paste it.",
+                view=view,
+            )
+        except SpotifyLoginError as error:
+            await ctx.send(embed=_error_embed(str(error)))
+            return
+        except discord.HTTPException:
+            self._clear_spotify_login(ctx.author.id)
+            await ctx.send(
+                embed=_error_embed("I could not DM you. Enable DMs and try again.")
+            )
+            return
+        except Exception as error:
+            self._clear_spotify_login(ctx.author.id)
+            _log_provider_failure("Spotify", "OAuth start", error)
+            await ctx.send(
+                embed=_error_embed("Could not start Spotify authentication.")
+            )
+            return
+        await ctx.send(embed=_success_embed("Check your DMs to finish Spotify login."))
+
+    @tidalsetup.command(name="spotifystatus")
+    @commands.is_owner()
+    async def tidalsetup_spotifystatus(self, ctx: commands.Context):
+        """Check Spotify app and user authentication status."""
+        if self._spotify_auth_manager is not None and self.sp is not None:
+            await ctx.send(embed=_success_embed("Spotify user session is active."))
+        elif self.sp is not None:
+            await ctx.send(
+                embed=_error_embed(
+                    "Spotify app credentials are configured, but user OAuth is not connected. "
+                    "Use `[p]tidalsetup spotifylogin`."
+                )
+            )
+        else:
+            await ctx.send(
+                embed=_error_embed(
+                    "Spotify is not configured. Use `[p]tidalsetup spotify` first."
+                )
+            )
+
+    @tidalsetup.command(name="spotifylogout")
+    @commands.is_owner()
+    async def tidalsetup_spotifylogout(self, ctx: commands.Context):
+        """Remove Spotify user authorization while keeping app credentials."""
+        for owner_id in tuple(self._spotify_login_states):
+            self._clear_spotify_login(owner_id)
+        await self.bot.remove_shared_api_tokens("spotify", "refresh_token")
+        await self._initialize_spotify()
+        await ctx.send(embed=_success_embed("Spotify user session logged out."))
 
     @tidalsetup.command(name="youtube")
     @commands.is_owner()

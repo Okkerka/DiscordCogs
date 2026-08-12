@@ -165,6 +165,25 @@ def _make_discord_stub() -> types.ModuleType:
     discord.ui.LayoutView = _View
     discord.ui.Button = MagicMock()
 
+    class _Modal:
+        def __init_subclass__(cls, **_kwargs: Any) -> None:
+            return super().__init_subclass__()
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.children: list[Any] = []
+
+        def add_item(self, item: Any) -> None:
+            self.children.append(item)
+
+    class _TextInput:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.value = ""
+
+    discord.ui.Modal = _Modal
+    discord.ui.TextInput = _TextInput
+    discord.TextStyle = MagicMock()
+    discord.TextStyle.paragraph = 2
+
     class _Interaction:
         def __init__(self, user_id: int = 123) -> None:
             self.user = MagicMock()
@@ -175,6 +194,9 @@ def _make_discord_stub() -> types.ModuleType:
     discord.ButtonStyle = MagicMock()
     discord.ButtonStyle.primary = 1
     discord.ButtonStyle.danger = 4
+    discord.HTTPException = type("HTTPException", (Exception,), {})
+    discord.Forbidden = type("Forbidden", (discord.HTTPException,), {})
+    discord.NotFound = type("NotFound", (discord.HTTPException,), {})
     discord.Guild = MagicMock
     discord.User = MagicMock
     return discord
@@ -261,6 +283,12 @@ def _make_redbot_stub(fake_config: FakeConfig) -> types.ModuleType:
         async def get_shared_api_tokens(self, service: str) -> dict:
             return {}
 
+        async def set_shared_api_tokens(self, service: str, **tokens: str) -> None:
+            pass
+
+        async def remove_shared_api_tokens(self, service: str, *token_names: str) -> None:
+            pass
+
         async def add_cog(self, cog: Any) -> None:
             pass
 
@@ -331,6 +359,9 @@ def _make_spotipy_stub() -> types.ModuleType:
     spotipy.Spotify = MagicMock()
     spotipy.oauth2 = types.ModuleType("spotipy.oauth2")
     spotipy.oauth2.SpotifyClientCredentials = MagicMock()
+    spotipy.oauth2.SpotifyOAuth = MagicMock()
+    spotipy.cache_handler = types.ModuleType("spotipy.cache_handler")
+    spotipy.cache_handler.MemoryCacheHandler = MagicMock()
     return spotipy
 
 
@@ -368,6 +399,7 @@ def _patch_dependencies():
         "tidalapi.media": _make_tidalapi_stub().media,
         "spotipy": _make_spotipy_stub(),
         "spotipy.oauth2": _make_spotipy_stub().oauth2,
+        "spotipy.cache_handler": _make_spotipy_stub().cache_handler,
         "googleapiclient": _make_googleapi_stub(),
         "googleapiclient.discovery": _make_googleapi_stub().discovery,
     }
@@ -390,6 +422,8 @@ def fake_bot():
     from redbot.core.bot import Red  # noqa: PLC0415 – resolved to stub
     bot = Red()
     bot.get_shared_api_tokens = AsyncMock(return_value={})
+    bot.set_shared_api_tokens = AsyncMock()
+    bot.remove_shared_api_tokens = AsyncMock()
     bot.add_view = MagicMock()
     bot.add_cog = AsyncMock()
     bot.cog_disabled_in_guild = AsyncMock(return_value=False)

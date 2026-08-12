@@ -43,8 +43,7 @@ class Messages:
     ERROR_TIMEOUT = "Selection timed out."
     ERROR_FETCH_FAILED = "Could not fetch playlist."
     ERROR_NO_SPOTIFY = (
-        "Spotify not configured. Set credentials with: "
-        "`[p]set api spotify client_id,<id> client_secret,<secret>`"
+        "Spotify not configured. Use `[p]tidalsetup spotify` to set app credentials."
     )
     ERROR_NO_YOUTUBE = "YouTube not configured. Set credentials with: `[p]set api youtube api_key,<key>`"
     ERROR_NOT_USER_PLAYLIST = "That playlist is not a user-owned playlist. Use `[p]tpl list` to see your playlists."

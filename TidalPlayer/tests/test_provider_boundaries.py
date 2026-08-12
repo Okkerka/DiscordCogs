@@ -44,7 +44,7 @@ async def test_spotify_playlist_stops_on_repeated_next_cursor(cog) -> None:
     item_one = {"track": {"name": "One"}}
     item_two = {"track": {"name": "Two"}}
     cog.sp = SimpleNamespace(
-        playlist_tracks=MagicMock(
+        playlist_items=MagicMock(
             side_effect=[
                 {"items": [item_one], "next": "same-page"},
                 {"items": [item_two], "next": "same-page"},
@@ -55,7 +55,7 @@ async def test_spotify_playlist_stops_on_repeated_next_cursor(cog) -> None:
         tracks = await cog._fetch_all_spotify_tracks("playlist")
 
     assert tracks == [item_one, item_two]
-    assert cog.sp.playlist_tracks.call_count == 2
+    assert cog.sp.playlist_items.call_count == 2
 
 
 @pytest.mark.asyncio
@@ -83,7 +83,7 @@ async def test_spotify_album_stops_on_repeated_next_cursor(cog) -> None:
 @pytest.mark.asyncio
 async def test_spotify_playlist_rejects_malformed_items(cog) -> None:
     cog.sp = SimpleNamespace(
-        playlist_tracks=MagicMock(
+        playlist_items=MagicMock(
             return_value={"items": "not-a-list", "next": "page"}
         )
     )
