@@ -16,7 +16,7 @@ STAT_ALIASES = {
     "shadow": "SDW", "sdw": "SDW", "blood": "BLD", "bloodrend": "BLD", "bld": "BLD",
     "metal": "MTL", "mtl": "MTL", "strength": "STR", "str": "STR", "fortitude": "FTD", "ftd": "FTD",
     "agility": "AGI", "agi": "AGI", "intelligence": "INT", "int": "INT", "charisma": "CHA", "cha": "CHA",
-    "willpower": "WLL", "will": "WLL", "wll": "WLL", "mind": "MND", "mnd": "MND", "body": "BDY", "bdy": "BDY",
+    "willpower": "WLL", "will": "WLL", "wll": "WLL", "mind": "MND", "body": "BDY", "bdy": "BDY",
 }
 STAT_PATTERN = "|".join(sorted(set(STAT_ALIASES.values())))
 
@@ -26,6 +26,11 @@ RANKING_EXCLUSIONS = {
     "Ferractine", "Formless Shard", "Handcuffs",
 }
 RANKING_PAGE_SIZE = 15
+
+
+class PublicSimpleMenu(SimpleMenu):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return True
 
 
 class Deepwoken(commands.Cog):
@@ -178,7 +183,7 @@ class Deepwoken(commands.Cog):
         if len(pages) == 1:
             await ctx.send(embed=pages[0])
         else:
-            await SimpleMenu(pages).start(ctx)
+            await PublicSimpleMenu(pages).start(ctx)
 
     async def _lookup(self, ctx: commands.Context, query: str):
         query = query.casefold().strip()
