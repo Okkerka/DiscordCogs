@@ -7,3 +7,5 @@ Apply-TidalPlayerFixes.ps1
 *.ps1
 TidalPlayer/.pytest_cache/
 AGENTS.md
+/docs
+.worktrees/
