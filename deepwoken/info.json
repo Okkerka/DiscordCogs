@@ -1,9 +1,10 @@
 {
   "author": ["Okkerka"],
   "name": "Deepwoken",
-  "short": "Look up Deepwoken weapon base stats and compare class damage.",
-  "description": "Reads bundled Deepwoken weapon data from data/weapons.xlsx.",
-  "install_msg": "Installed. Use [p]dwweapon <name> or [p]dwweapon <class> <investment> <proficiency>.",
+  "short": "Look up weapons and rank every weapon usable by a multi-stat build.",
+  "description": "Reads bundled Deepwoken weapon data and ranks eligible weapons by sustained DPS.",
+  "install_msg": "Installed. Use [p]dwweapon <name> or [p]dwweapon heavy 100 medium 100 prof 6.",
   "requirements": ["openpyxl"],
+  "min_bot_version": "3.5.24",
   "tags": ["deepwoken", "weapons", "lookup", "calculator"]
 }
