@@ -1,0 +1,9 @@
+<!-- Expanded excerpt from https://deepwoken.fandom.com/wiki/Template:AllMediumWeapons?oldid=219604; revision 219604, 2026-07-10T21:22:10Z. -->
+{| class="article-table sortable" style="border: 2px solid #004d4d; text-align: center;"
+|-
+!Name!!Requirements!!Base Damage!!Scaling!!Armor Penetration!!Chip Damage!!Posture Damage!!Range!!Swing Speed!!Endlag!!Scaled Damage
+|-
+|colspan="11" style="background:#003325; border-radius:3.25px;"|[[Swords|<span style="color: #ffffff">Swords</span>]]
+|-
+|'''[[Wyrmtooth]]'''||60 MED<br>40 HVY<br>LVL 15||20||MED: 6.2<br>HVY: 4.2||25%|| - ||7||9||0.93x|| - ||35.6
+|}

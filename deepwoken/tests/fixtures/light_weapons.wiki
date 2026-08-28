@@ -1,0 +1,13 @@
+<!-- Expanded excerpt from https://deepwoken.fandom.com/wiki/Template:AllLightWeapons?oldid=219602; revision 219602, 2026-07-10T21:20:44Z. -->
+{| class="article-table sortable" style="border: 2px solid #004d4d; text-align: center"
+|-
+!Name!!Requirements!!Base Damage!!Scaling!!Armor Penetration!!Chip Damage!!Posture Damage!!Range!!Swing Speed!!Endlag!!Scaled Damage
+|-
+|colspan="11" style="background:#FE7316; border-radius:3.25px;"|[[Daggers|<span style="color: #ffffff">Daggers</span>]]
+|-
+|<span id="Whaling Knife"></span><span id="'''"></span>'''[[Whaling Knife]]'''<br><div class="mw-collapsible mw-collapsed" style="display: grid;" data-expandtext="Variants ▼" data-collapsetext="Variants ▲"><br/><small>[[#Alloyed Whaling Knife|<span style="text-shadow: steelblue 1px 1px 8px; color: cadetblue">Alloyed Whaling Knife</span>]]</small></div>||40 LHT||16||LHT: 5|| - || - ||4||6||1.2x|| - ||22
+|-
+|'''[[Flareblood Kamas|<span style="text-shadow: purple 1px 1px 10px;"><font color="#8232b8">Flareblood Kamas</font></span>]]<br>([[Bleed|<span style="color: red">Bleed</span>]])'''||60 LHT<br>30 INT||14||LHT: 8<br>INT: 1.5<br>BLD: 3||30%|| - ||4||6||1.2x|| - ||27.1<br>([[Bleed|<span style="color: red">+4.1 BLD</span>]])
+|-
+|'''[[Soulwrought Dagger|<span style="color: #ebca71">Soulwrought Dagger</span>]]'''||[[Crazy Slots]]||19||LHT: 9|| - || - ||4||6||1.25x|| - ||31.8
+|}

@@ -1,0 +1,7 @@
+<!-- Expanded excerpt from https://deepwoken.fandom.com/wiki/Template:AllHybridWeapons?oldid=210433; revision 210433, 2026-05-17T08:22:26Z. -->
+{| class="article-table" style="border: 2px solid #004d4d; text-align: center"
+!Name!!Hybrid Type!!Requirements!!Base Damage!!Scaling!!Armor Penetration!!Chip Damage!!Posture Damage!!Range!!Swing Speed!!Endlag!!Scaled Damage
+|+<div style="color:#1E90FF;">Hybrid Weapons</div>
+|-
+|'''[[Wyrmtooth]]'''||Medium & Heavy||60 MED 40 HVY LVL 10||20||MED: 6.2 HVY: 4.2||25%||-||7||9||0.93x||-||35.6
+|}

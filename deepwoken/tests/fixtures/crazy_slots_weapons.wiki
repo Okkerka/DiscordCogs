@@ -1,0 +1,7 @@
+<!-- Expanded excerpt from https://deepwoken.fandom.com/wiki/Template:AllCrazySlotsWeapons?oldid=225720; revision 225720, 2026-08-04T09:32:21Z. -->
+{| class="article-table" style="border: 2px solid #004d4d; text-align: center"
+|-
+!Name!!Base Damage!!Scaling!!Penetration!!Chip Damage!!Posture Damage!!Range!!Swing Speed!!Endlag!!Scaled Damage
+|-
+|'''[[Soulwrought Dagger|<span style="color: #ebca71">Soulwrought Dagger</span>]]'''||19||LHT: 9|| - || - ||4||6||1.25x|| - ||31.8
+|}
