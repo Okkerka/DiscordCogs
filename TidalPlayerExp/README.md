@@ -1,0 +1,67 @@
+# TidalPlayerExp (experimental baseline)
+
+TidalPlayerExp queues Tidal content through Red Discord Bot's Audio cog and its
+Red-managed Lavalink deployment. This cog does not start, configure, or own a
+separate Lavalink node. It preserves the current playback behavior while a
+later migration prepares native playback; native playback is not implemented
+in this baseline.
+
+## Prerequisites
+
+- Red Discord Bot 3.5 or newer.
+- Red's Audio cog loaded before TidalPlayerExp: `[p]load audio`.
+- A healthy Audio/Lavalink deployment. In Red's managed Audio mode, Red owns the
+  Lavalink process; Java 17 or 21 is required by Red Audio.
+- `tidalapi` installed in Red's Python environment.
+
+Optional Spotify imports use Red shared API tokens:
+
+```text
+[p]set api spotify client_id,<client-id> client_secret,<client-secret>
+```
+
+Single-video YouTube links can fall back directly through LavaLink without an
+API key. An optional YouTube API key enables playlist imports and lets
+single-video commands attempt the Tidal match before loading the YouTube source:
+
+```text
+[p]set api youtube api_key,<api-key>
+```
+
+## Installation and update
+
+Install from a Downloader repository using the repository's cog name. Load Audio
+first, then TidalPlayerExp. Do not load TidalPlayerExp and TidalPlayer together:
+their public command names overlap.
+
+```text
+[p]load audio
+[p]load TidalPlayerExp
+[p]tidalsetup login
+```
+
+Update code with:
+
+```text
+[p]cog update TidalPlayerExp
+[p]reload TidalPlayerExp
+```
+
+Tidal OAuth state is stored in Red Config, not in the installed cog directory,
+so a normal Downloader update preserves it. Do not use `[p]tidalsetup logout`
+unless you intend to remove stored authentication.
+
+## Operational boundaries
+
+- Tidal stream URLs are short-lived and must never be logged or persisted.
+- Red Audio owns voice connections, Lavalink nodes, and player lifecycle.
+- If Audio is unavailable, TidalPlayerExp must fail closed with a user-safe error.
+- Audio compatibility changes require testing against the exact deployed Red
+  release before changing the audio gateway implementation.
+
+## Development validation
+
+```text
+python -m compileall -q TidalPlayerExp
+python -m pytest -q TidalPlayerExp/tests
+```
