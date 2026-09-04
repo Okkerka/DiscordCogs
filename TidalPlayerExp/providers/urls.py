@@ -28,8 +28,8 @@ class MalformedProviderURL(ValueError):
 _TIDAL_TYPES = {"track", "video", "album", "playlist", "mix"}
 _SPOTIFY_TYPES = {"track", "album", "playlist"}
 _YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}
-_YOUTUBE_VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
-_YOUTUBE_PLAYLIST_ID = re.compile(r"[A-Za-z0-9_-]+")
+_YOUTUBE_VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}\Z")
+_YOUTUBE_PLAYLIST_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 
 
 def _normalize_url(value: str) -> str:
@@ -64,6 +64,10 @@ def parse_provider_url(value: str) -> ProviderURL | None:
         return None
     if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
         raise MalformedProviderURL("Provider URLs must be HTTPS without credentials")
+    try:
+        _ = parts.port
+    except ValueError as error:
+        raise MalformedProviderURL("Malformed provider URL") from error
     host = parts.hostname.lower()
     path = [segment for segment in parts.path.split("/") if segment]
     if host in {"tidal.com", "www.tidal.com", "listen.tidal.com"}:
@@ -79,22 +83,41 @@ def parse_provider_url(value: str) -> ProviderURL | None:
             raise MalformedProviderURL("Unsupported Spotify URL")
         return ProviderURL(ProviderKind.SPOTIFY, path[0], path[1])
     if host in _YOUTUBE_HOSTS or host == "youtu.be":
-        query = parse_qs(parts.query)
-        playlist_id = query.get("list", [None])[0]
-        if playlist_id is not None:
-            if _YOUTUBE_PLAYLIST_ID.fullmatch(playlist_id) is None:
+        if parts.path.endswith("/") or "//" in parts.path:
+            raise MalformedProviderURL("Unsupported YouTube URL")
+        try:
+            query = parse_qs(parts.query, keep_blank_values=True)
+        except ValueError as error:
+            raise MalformedProviderURL("Malformed provider URL") from error
+
+        def _single(name: str) -> str | None:
+            values = query.get(name)
+            if values is None:
+                return None
+            if len(values) != 1 or not values[0]:
                 raise MalformedProviderURL("Unsupported YouTube URL")
-            if path == ["playlist"] or path == ["watch"] or (
-                host == "youtu.be" and len(path) == 1
-            ):
-                return ProviderURL(ProviderKind.YOUTUBE, "playlist", playlist_id)
+            return values[0]
+
+        video_id = _single("v")
+        playlist_id = _single("list")
+        if playlist_id is not None and _YOUTUBE_PLAYLIST_ID.fullmatch(playlist_id) is None:
+            raise MalformedProviderURL("Unsupported YouTube URL")
         if host == "youtu.be":
-            if len(path) != 1:
+            if len(path) != 1 or video_id is not None:
                 raise MalformedProviderURL("Unsupported YouTube URL")
             return _youtube_video(path[0])
         if path == ["watch"]:
-            return _youtube_video(query.get("v", [None])[0])
+            if playlist_id is not None:
+                # A list attached to a video is metadata, not routing.
+                return _youtube_video(video_id)
+            return _youtube_video(video_id)
+        if path == ["playlist"]:
+            if video_id is not None or playlist_id is None:
+                raise MalformedProviderURL("Unsupported YouTube URL")
+            return ProviderURL(ProviderKind.YOUTUBE, "playlist", playlist_id)
         if len(path) == 2 and path[0] in {"shorts", "live", "embed"}:
+            if video_id is not None:
+                raise MalformedProviderURL("Unsupported YouTube URL")
             return _youtube_video(path[1])
         raise MalformedProviderURL("Unsupported YouTube URL")
     if "." in host:

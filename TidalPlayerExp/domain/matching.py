@@ -2,28 +2,33 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 from rapidfuzz import fuzz
 
 from .identity import normalize_identity_text
 
-_BRACKETED = re.compile(r"\[[^\]]*\]|\([^)]*(?:official|video|audio|lyrics|visualizer|remaster|live|hd|4k)[^)]*\)", re.IGNORECASE)
-_RECORDING_VARIANTS = (
-    "cover",
-    "remix",
-    "live",
-    "karaoke",
-    "instrumental",
-    "nightcore",
-    "sped up",
-    "slowed",
-    "reverb",
+_OFFICIAL_MARKERS = frozenset({"official", "audio", "video", "lyrics", "visualizer", "hd", "4k"})
+_RECORDING_VARIANT_PHRASES = (
+    "sped up", "slowed down", "cover", "remix", "live", "karaoke",
+    "instrumental", "nightcore", "slowed", "reverb", "remastered",
+    "remaster", "acoustic",
 )
+_VARIANT_RE = re.compile(
+    r"(?<!\w)(?:" + "|".join(re.escape(value) for value in _RECORDING_VARIANT_PHRASES) + r")(?!\w)"
+)
+_VARIANT_ALIASES = {
+    "remaster": "remaster",
+    "remastered": "remaster",
+    "slowed": "slowed",
+    "slowed down": "slowed",
+    "sped up": "sped up",
+}
 
 
 def _normalize(value: str) -> str:
-    return normalize_identity_text(_BRACKETED.sub(" ", value))
+    return normalize_identity_text(value)
 
 
 def _title(track: Any) -> str:
@@ -34,8 +39,25 @@ def _artist(track: Any) -> str:
     return str(getattr(getattr(track, "artist", None), "name", "") or "")
 
 
-def _contains_phrase(haystack: str, needle: str) -> bool:
-    return bool(needle) and f" {needle} " in f" {haystack} "
+def _recording_variants(value: str) -> frozenset[str]:
+    return frozenset(_VARIANT_ALIASES.get(match.group(0), match.group(0)) for match in _VARIANT_RE.finditer(_normalize(value)))
+
+
+def _identity_title(value: str) -> str:
+    normalized = _VARIANT_RE.sub(" ", _normalize(value))
+    return " ".join(word for word in normalized.split() if word not in _OFFICIAL_MARKERS)
+
+
+def _tokens(value: str) -> frozenset[str]:
+    return frozenset(value.split())
+
+
+def _artist_is_explicit(artist: str, video_title: str, channel: str) -> bool:
+    artist_tokens = _tokens(_normalize(artist))
+    return bool(artist_tokens) and (
+        artist_tokens <= _tokens(_normalize(video_title))
+        or artist_tokens <= _tokens(_normalize(channel))
+    )
 
 
 def select_confident_youtube_tidal_track(
@@ -45,32 +67,37 @@ def select_confident_youtube_tidal_track(
 ) -> Any | None:
     """Return a Tidal candidate only when title and artist identity are explicit."""
     normalized_video_title = _normalize(video_title)
-    normalized_channel = _normalize(channel)
-    raw_video_title = normalize_identity_text(video_title)
     if not normalized_video_title:
         return None
-
+    video_identity = _identity_title(video_title)
+    video_tokens = _tokens(video_identity)
+    video_variants = _recording_variants(video_title)
+    normalized_channel = _normalize(channel)
+    best_track: Any | None = None
+    best_score = -1.0
     for track in tracks:
         title = _title(track)
         artist = _artist(track)
-        normalized_title = _normalize(title)
         normalized_artist = _normalize(artist)
-        if not normalized_title or not normalized_artist:
+        title_identity = _identity_title(title)
+        title_tokens = _tokens(title_identity)
+        if not title_identity or not normalized_artist:
             continue
-        raw_title = normalize_identity_text(title)
-        if any(
-            _contains_phrase(raw_video_title, variant)
-            and not _contains_phrase(raw_title, variant)
-            for variant in _RECORDING_VARIANTS
-        ):
+        if _recording_variants(title) != video_variants:
             continue
-        if not _contains_phrase(normalized_video_title, normalized_title):
+        if not title_tokens or not (title_tokens <= video_tokens or video_tokens <= title_tokens):
             continue
-        if _contains_phrase(normalized_channel, normalized_artist) or _contains_phrase(
-            normalized_video_title, normalized_artist
-        ):
-            return track
-    return None
+        if not _artist_is_explicit(artist, video_title, channel):
+            continue
+        title_score = fuzz.token_set_ratio(video_identity, title_identity)
+        artist_score = max(
+            fuzz.token_set_ratio(normalized_artist, normalized_channel),
+            fuzz.token_set_ratio(normalized_artist, normalized_video_title),
+        )
+        score = title_score * 0.65 + artist_score * 0.35
+        if score > best_score:
+            best_track, best_score = track, score
+    return best_track
 
 
 def select_best_tidal_track(query: str, tracks: Iterable[Any], *, minimum_score: float = 88.0) -> Any | None:

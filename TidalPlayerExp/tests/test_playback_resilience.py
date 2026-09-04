@@ -55,6 +55,54 @@ def test_youtube_tidal_match_rejects_uncertain_recordings(
 
     assert select_confident_youtube_tidal_track(video_title, channel, [candidate]) is None
 
+
+@pytest.mark.parametrize(
+    "variant",
+    ["Cover", "Remix", "Live", "Karaoke", "Instrumental", "Nightcore", "Sped Up", "Slowed Down", "Reverb", "Remastered", "Acoustic"],
+)
+@pytest.mark.parametrize("direction", ["video", "tidal"])
+def test_youtube_tidal_recording_variants_must_match_symmetrically(variant: str, direction: str) -> None:
+    video_title = f"AZALI - Rivals{f' ({variant})' if direction == 'video' else ''}"
+    tidal_title = f"Rivals{f' ({variant})' if direction == 'tidal' else ''}"
+    candidate = _tidal_candidate(tidal_title, "AZALI")
+
+    assert select_confident_youtube_tidal_track(video_title, "AZALI", [candidate]) is None
+
+
+def test_youtube_tidal_match_accepts_equal_recording_variant() -> None:
+    candidate = _tidal_candidate("Rivals (Acoustic)", "AZALI")
+
+    assert select_confident_youtube_tidal_track("AZALI - Rivals (Acoustic)", "AZALI", [candidate]) is candidate
+
+
+@pytest.mark.parametrize(
+    ("video_variant", "tidal_variant"),
+    [("Remaster", "Remastered"), ("Remastered", "Remaster"), ("Slowed", "Slowed Down"), ("Slowed Down", "Slowed")],
+)
+def test_youtube_tidal_match_canonicalizes_recording_variant_aliases(
+    video_variant: str, tidal_variant: str
+) -> None:
+    candidate = _tidal_candidate(f"Rivals ({tidal_variant})", "AZALI")
+
+    assert select_confident_youtube_tidal_track(
+        f"AZALI - Rivals ({video_variant})", "AZALI", [candidate]
+    ) is candidate
+
+
+def test_youtube_tidal_match_canonicalizes_hyphenated_sped_up() -> None:
+    candidate = _tidal_candidate("Rivals (Sped Up)", "AZALI")
+
+    assert select_confident_youtube_tidal_track(
+        "AZALI - Rivals (Sped-up)", "AZALI", [candidate]
+    ) is candidate
+
+
+def test_youtube_tidal_match_selects_best_eligible_candidate_instead_of_first() -> None:
+    weaker = _tidal_candidate("Rivals", "AZALI feat. Someone")
+    stronger = _tidal_candidate("AZALI Rivals", "AZALI")
+
+    assert select_confident_youtube_tidal_track("AZALI - Rivals", "AZALI", [weaker, stronger]) is stronger
+
 @pytest.mark.asyncio
 async def test_load_lavalink_track_does_not_retry_timeout_with_a_fresh_url(cog) -> None:
     player = SimpleNamespace(

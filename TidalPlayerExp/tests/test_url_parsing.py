@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+from typing import ClassVar
 
 import pytest
 from hypothesis import given, settings
@@ -114,11 +115,33 @@ def test_non_url_search_text_with_unmatched_angles_remains_a_search(query: str) 
     assert parse_provider_url(query) is None
 
 
-def test_strict_youtube_playlist_takes_precedence_over_video() -> None:
+def test_strict_youtube_video_takes_precedence_over_attached_playlist() -> None:
     playlist_id = "PLrEnWoR732-BHrPp_Pm8_VleD68f9s14-"
     assert parse_provider_url(
         f"https://www.youtube.com/watch?v={YOUTUBE_VIDEO_ID}&list={playlist_id}"
+    ) == ProviderURL(ProviderKind.YOUTUBE, "video", YOUTUBE_VIDEO_ID)
+
+
+def test_strict_youtube_explicit_playlist_is_playlist() -> None:
+    playlist_id = "PLrEnWoR732-BHrPp_Pm8_VleD68f9s14-"
+    assert parse_provider_url(
+        f"https://www.youtube.com/playlist?list={playlist_id}"
     ) == ProviderURL(ProviderKind.YOUTUBE, "playlist", playlist_id)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"https://www.youtube.com/watch?v={YOUTUBE_VIDEO_ID}&v={YOUTUBE_VIDEO_ID}",
+        "https://www.youtube.com/watch?v=",
+        "https://www.youtube.com/playlist?list=",
+        "https://www.youtube.com/playlist?list=ok&list=again",
+        f"https://www.youtube.com/playlist?list=ok&v={YOUTUBE_VIDEO_ID}",
+    ],
+)
+def test_strict_youtube_rejects_duplicate_blank_or_mixed_significant_parameters(url: str) -> None:
+    with pytest.raises(MalformedProviderURL):
+        parse_provider_url(url)
 
 
 @pytest.mark.parametrize(
@@ -144,12 +167,12 @@ def test_strict_youtube_rejects_malformed_or_unsupported_urls(url: str) -> None:
 # ---------------------------------------------------------------------------
 
 class TestISRCPattern:
-    VALID = [
+    VALID: ClassVar[list[str]] = [
         "isrc:USUM71703861",
         "isrc:GBF088761084",
         "ISRC:USUM71703861",  # case-insensitive flag
     ]
-    INVALID = [
+    INVALID: ClassVar[list[str]] = [
         "USUM71703861",       # missing prefix
         "isrc:USUM717038",    # too short
         "isrc:12345678901234",  # wrong format
