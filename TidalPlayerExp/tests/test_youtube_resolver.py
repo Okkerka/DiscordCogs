@@ -558,6 +558,7 @@ async def test_close_terminates_live_children(tmp_path) -> None:
     assert process.terminated
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
+    assert resolver._slots._value == 2
 
 
 @pytest.mark.asyncio

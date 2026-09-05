@@ -215,6 +215,7 @@ class YouTubeResolver:
         self._slots = asyncio.Semaphore(2)
         self._children: set[Any] = set()
         self._reapers: dict[Any, asyncio.Task[None]] = {}
+        self._cleanup_futures: dict[Any, asyncio.Future[bool]] = {}
         self._cleanup_tasks: set[asyncio.Task[Any]] = set()
         self._factory_tasks: set[asyncio.Task[Any]] = set()
         self._late_factory_tasks: set[asyncio.Task[Any]] = set()
@@ -375,15 +376,33 @@ class YouTubeResolver:
         async with self._state_lock:
             if child in self._reapers:
                 return False
-        reaped = await self._terminate(child)
-        if reaped:
+            if self._closed and child not in self._children:
+                return False
+            existing = self._cleanup_futures.get(child)
+            if existing is None:
+                existing = asyncio.get_running_loop().create_future()
+                self._cleanup_futures[child] = existing
+                owner = True
+            else:
+                owner = False
+        if not owner:
+            return await asyncio.shield(existing)
+        reaped = False
+        try:
+            reaped = await self._terminate(child)
+            if reaped:
+                async with self._state_lock:
+                    self._children.discard(child)
+                if release_slot:
+                    self._slots.release()
+                return True
+            self._register_reaper(child, release_slot=release_slot)
+            return False
+        finally:
             async with self._state_lock:
-                self._children.discard(child)
-            if release_slot:
-                self._slots.release()
-            return True
-        self._register_reaper(child, release_slot=release_slot)
-        return False
+                current = self._cleanup_futures.pop(child, None)
+            if current is not None and not current.done():
+                current.set_result(reaped)
 
     def _register_reaper(self, child: Any, *, release_slot: bool) -> None:
         if child in self._reapers:
@@ -641,10 +660,13 @@ class YouTubeResolver:
             self._closed = True
         while True:
             async with self._state_lock:
-                children = tuple(child for child in self._children if child not in self._reapers)
+                children = tuple(
+                    child for child in self._children if child not in self._reapers and child not in self._cleanup_futures
+                )
                 reapers = tuple(self._reapers.values())
                 factories = tuple(self._factory_tasks)
                 cleanup = tuple(self._cleanup_tasks)
+                terminating = tuple(self._cleanup_futures.values())
             if children:
                 cleanup_tasks = [
                     asyncio.create_task(self._cleanup_child(child, release_slot=True))
@@ -654,7 +676,7 @@ class YouTubeResolver:
                     self._track_cleanup_task(task)
                 await asyncio.shield(asyncio.gather(*cleanup_tasks, return_exceptions=True))
                 continue
-            pending = tuple(dict.fromkeys((*reapers, *factories, *cleanup)))
+            pending = tuple(dict.fromkeys((*reapers, *factories, *cleanup, *terminating)))
             if not pending:
                 return
             try:
