@@ -17,6 +17,7 @@ class SourceKind(StrEnum):
     """Stable source kinds understood by the playback boundary."""
 
     TIDAL = "tidal"
+    TIDAL_VIDEO = "tidal_video"
     YOUTUBE = "youtube"
 
 
@@ -93,7 +94,7 @@ class SourceReference:
         if not isinstance(self.kind, SourceKind) or not isinstance(self.identifier, str):
             raise ValueError("Source reference is invalid")  # noqa: TRY004 - stable invariant error
 
-        if self.kind is SourceKind.TIDAL:
+        if self.kind in (SourceKind.TIDAL, SourceKind.TIDAL_VIDEO):
             valid = (
                 self.identifier.isascii()
                 and self.identifier.isdecimal()

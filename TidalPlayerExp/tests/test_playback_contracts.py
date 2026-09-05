@@ -43,21 +43,28 @@ def _meta() -> TrackMeta:
 def test_source_kind_contains_only_stable_provider_kinds() -> None:
     assert [(kind.name, kind.value) for kind in SourceKind] == [
         ("TIDAL", "tidal"),
+        ("TIDAL_VIDEO", "tidal_video"),
         ("YOUTUBE", "youtube"),
     ]
 
 
 @pytest.mark.parametrize("identifier", ["", "0", "-1", "1.2", "track"])
-def test_tidal_source_reference_rejects_non_positive_decimal_identifier(identifier: str) -> None:
+@pytest.mark.parametrize("kind_value", ["tidal", "tidal_video"])
+def test_tidal_source_reference_rejects_non_positive_decimal_identifier(
+    identifier: str, kind_value: str
+) -> None:
+    kind = SourceKind(kind_value)
     with pytest.raises(ValueError) as caught:
-        SourceReference(SourceKind.TIDAL, identifier)
+        SourceReference(kind, identifier)
 
     if identifier:
         assert identifier not in str(caught.value)
 
 
-def test_tidal_source_reference_accepts_positive_decimal_identifier() -> None:
-    reference = SourceReference(SourceKind.TIDAL, "00123")
+@pytest.mark.parametrize("kind_value", ["tidal", "tidal_video"])
+def test_tidal_source_reference_accepts_positive_decimal_identifier(kind_value: str) -> None:
+    kind = SourceKind(kind_value)
+    reference = SourceReference(kind, "00123")
 
     assert reference.identifier == "00123"
 

@@ -1022,7 +1022,7 @@ class TidalHandler:
                 log.warning("Could not resolve full Tidal track object for %s.", track_id)
         async with self.api_semaphore:
             try:
-                get_url = getattr(track, "get_url")
+                get_url = track.get_url
                 url = await self._run_with_backoff(get_url, timeout=15.0)
                 if url:
                     log.info(
@@ -1039,7 +1039,16 @@ class TidalHandler:
             try:
                 def get_urls() -> List[str]:
                     stream = track.get_stream()
-                    return stream.get_urls()
+                    manifest = stream.get_stream_manifest()
+                    if (
+                        manifest.is_mpd
+                        or not manifest.is_bts
+                        or str(manifest.encryption_type).upper() != "NONE"
+                        or manifest.encryption_key
+                        or manifest.is_encrypted
+                    ):
+                        return []
+                    return manifest.get_urls()
                 urls = await self._run_with_backoff(get_urls, timeout=20.0)
                 if urls:
                     log.info(
