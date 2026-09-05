@@ -122,6 +122,44 @@ class _HelperProcess:
         self.returncode = -9
 
 
+class _DeferredReapProcess:
+    def __init__(self, pid: int | None = None) -> None:
+        self.pid = pid
+        self.stdout = _BlockingStream()
+        self.returncode: int | None = None
+        self.events: list[str] = []
+        self.reaped = asyncio.Event()
+
+    def send_signal(self, _value: int) -> None:
+        self.events.append("graceful-signal")
+
+    def terminate(self) -> None:
+        self.events.append("graceful-terminate")
+
+    def kill(self) -> None:
+        self.events.append("force-kill")
+
+    async def wait(self) -> int:
+        await self.reaped.wait()
+        self.returncode = 0
+        return 0
+
+
+class _DeferredReapHelper:
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+        self.reaped = asyncio.Event()
+        self.killed = False
+
+    async def wait(self) -> int:
+        await self.reaped.wait()
+        self.returncode = 0
+        return 0
+
+    def kill(self) -> None:
+        self.killed = True
+
+
 def _reference() -> SourceReference:
     return SourceReference(SourceKind.YOUTUBE, VIDEO_ID)
 
@@ -165,9 +203,14 @@ async def test_resolve_uses_canonical_url_explicit_deno_and_safe_child_environme
     monkeypatch.setenv("YTDLP_PARENT_ONLY", "secret")
     deno_path = tmp_path / "deno"
     deno_path.write_bytes(b"")
+    dependency_root = tmp_path / "downloader-lib"
+    dependency_package = dependency_root / "yt_dlp"
+    dependency_package.mkdir(parents=True)
+    (dependency_package / "__main__.py").write_text("", encoding="utf-8")
     resolver = YouTubeResolver(
         process_factory=factory,
         deno_locator=lambda: str(deno_path),
+        yt_dlp_locator=lambda: str(dependency_root),
     )
 
     result = await resolver.resolve(SourceReference(SourceKind.YOUTUBE, VIDEO_ID))
@@ -180,27 +223,40 @@ async def test_resolve_uses_canonical_url_explicit_deno_and_safe_child_environme
     assert result.duration == 120
     assert calls
     args, kwargs = calls[0]
-    assert args[:3] == (
-        os.sys.executable,
+    expected = (
+        sys.executable,
         "-I",
         "-c",
+        "import runpy,sys; sys.path.insert(0,sys.argv[1]); sys.argv=['yt_dlp',*sys.argv[2:]]; runpy.run_module('yt_dlp',run_name='__main__')",
+        str(dependency_root),
+        "--ignore-config",
+        "--no-plugin-dirs",
+        "--no-js-runtimes",
+        "--js-runtimes",
+        f"deno:{deno_path}",
+        "--no-cache-dir",
+        "--no-update",
+        "--no-netrc",
+        "--no-download",
+        "--quiet",
+        "--no-warnings",
+        "--no-progress",
+        "--socket-timeout",
+        "15",
+        "--extractor-retries",
+        "1",
+        "--fragment-retries",
+        "0",
+        "--file-access-retries",
+        "0",
+        "--no-playlist",
+        "--format",
+        "bestaudio[acodec!=none]/bestaudio/best",
+        "--print",
+        '{"url":%(url)j,"http_headers":%(http_headers)j,"acodec":%(acodec)j,"vcodec":%(vcodec)j,"asr":%(asr)j,"audio_channels":%(audio_channels)j,"duration":%(duration)j}',
+        f"https://www.youtube.com/watch?v={VIDEO_ID}",
     )
-    assert "run_module('yt_dlp'" in args[3]
-    assert "-m" not in args
-    assert "--no-plugin-dirs" in args
-    assert args[args.index("--js-runtimes") + 1] == f"deno:{deno_path}"
-    assert args[-1] == f"https://www.youtube.com/watch?v={VIDEO_ID}"
-    forbidden = {
-        "--cookies",
-        "--cookies-from-browser",
-        "--default-search",
-        "ytsearch",
-        "--postprocessor-args",
-        "--remote-components",
-        "--remote-components-ejs",
-        "--dump-single-json",
-    }
-    assert not forbidden.intersection(args)
+    assert args == expected
     assert kwargs["shell"] is False
     child_env = kwargs["env"]
     assert child_env["YTDLP_NO_PLUGINS"] == "1"
@@ -419,6 +475,23 @@ async def test_non_mapping_oversized_and_wrong_kind_outputs_are_sanitized(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_process_factory_traceback_is_sanitized(tmp_path) -> None:
+    deno = tmp_path / "deno"
+    deno.write_bytes(b"")
+    secret = "provider-traceback-secret"
+
+    async def factory(*args: object, **kwargs: object) -> _Process:
+        raise RuntimeError(secret)
+
+    resolver = YouTubeResolver(process_factory=factory, deno_locator=lambda: str(deno))
+    with pytest.raises(PlaybackUnavailable) as caught:
+        await resolver.resolve(_reference())
+    assert secret not in str(caught.value)
+    assert secret not in repr(caught.value)
+    assert caught.value.__cause__ is None
+
+
+@pytest.mark.asyncio
 async def test_bootstrap_runs_dependency_from_red_target_layout_without_parent_import(
     tmp_path,
 ) -> None:
@@ -540,6 +613,122 @@ async def test_timeout_terminates_owned_child_before_releasing_capacity(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_timeout_retains_slot_and_close_until_child_is_confirmed_reaped(tmp_path, monkeypatch) -> None:
+    module = __import__("TidalPlayerExp.providers.youtube_resolver", fromlist=["YouTubeResolver"])
+    monkeypatch.setattr(module, "_VIDEO_DEADLINE", 0.01)
+    processes = [_DeferredReapProcess(), _DeferredReapProcess()]
+    calls: list = []
+    deno = tmp_path / "deno"
+    deno.write_bytes(b"")
+
+    async def factory(*args: object, **kwargs: object) -> _DeferredReapProcess:
+        calls.append((args, kwargs))
+        return processes[len(calls) - 1]
+
+    resolver = YouTubeResolver(process_factory=factory, deno_locator=lambda: str(deno))
+    first = asyncio.create_task(resolver.resolve(_reference()))
+    second = asyncio.create_task(resolver.resolve(_reference()))
+    await asyncio.gather(first, second, return_exceptions=True)
+    third = asyncio.create_task(resolver.resolve(_reference()))
+    await asyncio.sleep(0.05)
+    assert len(calls) == 2
+    close_task = asyncio.create_task(resolver.close())
+    await asyncio.sleep(0.05)
+    assert not close_task.done()
+    for process in processes:
+        process.reaped.set()
+    await close_task
+    with pytest.raises(PlaybackUnavailable):
+        await third
+
+
+@pytest.mark.asyncio
+async def test_cancellation_retains_cleanup_owner_until_child_is_reaped(tmp_path) -> None:
+    processes = [_DeferredReapProcess(), _DeferredReapProcess()]
+    calls: list = []
+    deno = tmp_path / "deno"
+    deno.write_bytes(b"")
+
+    async def factory(*args: object, **kwargs: object) -> _DeferredReapProcess:
+        calls.append((args, kwargs))
+        return processes[len(calls) - 1]
+
+    resolver = YouTubeResolver(process_factory=factory, deno_locator=lambda: str(deno))
+    tasks = [asyncio.create_task(resolver.resolve(_reference())) for _ in processes]
+    await asyncio.gather(*(process.stdout.started.wait() for process in processes))
+    tasks[0].cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await tasks[0]
+    third = asyncio.create_task(resolver.resolve(_reference()))
+    await asyncio.sleep(0.05)
+    assert len(calls) == 2
+    for process in processes:
+        process.reaped.set()
+    tasks[1].cancel()
+    await asyncio.gather(tasks[1], return_exceptions=True)
+    await resolver.close()
+    with pytest.raises(PlaybackUnavailable):
+        await third
+
+
+@pytest.mark.asyncio
+async def test_close_owns_child_created_after_factory_cancellation(tmp_path) -> None:
+    factory_started = asyncio.Event()
+    release_factory = asyncio.Event()
+    process = _DeferredReapProcess()
+    deno = tmp_path / "deno"
+    deno.write_bytes(b"")
+
+    async def factory(*args: object, **kwargs: object) -> _DeferredReapProcess:
+        factory_started.set()
+        await release_factory.wait()
+        return process
+
+    resolver = YouTubeResolver(process_factory=factory, deno_locator=lambda: str(deno))
+    resolve_task = asyncio.create_task(resolver.resolve(_reference()))
+    await factory_started.wait()
+    close_task = asyncio.create_task(resolver.close())
+    await asyncio.sleep(0.05)
+    assert not close_task.done()
+    resolve_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await resolve_task
+    await asyncio.sleep(0.05)
+    assert not close_task.done()
+    release_factory.set()
+    await asyncio.sleep(0.05)
+    assert not close_task.done()
+    process.reaped.set()
+    await close_task
+    assert not resolver._children
+    assert not resolver._reapers
+
+
+@pytest.mark.asyncio
+async def test_close_reports_bounded_cleanup_failure_without_orphaning_reaper(tmp_path, monkeypatch) -> None:
+    module = __import__("TidalPlayerExp.providers.youtube_resolver", fromlist=["YouTubeResolver"])
+    monkeypatch.setattr(module, "_VIDEO_DEADLINE", 0.01)
+    monkeypatch.setattr(module, "_CLOSE_DEADLINE", 0.01)
+    process = _DeferredReapProcess()
+    deno = tmp_path / "deno"
+    deno.write_bytes(b"")
+
+    async def factory(*args: object, **kwargs: object) -> _DeferredReapProcess:
+        return process
+
+    resolver = YouTubeResolver(process_factory=factory, deno_locator=lambda: str(deno))
+    with pytest.raises(PlaybackUnavailable):
+        await resolver.resolve(_reference())
+    with pytest.raises(PlaybackUnavailable):
+        await resolver.close()
+    assert resolver._reapers
+    process.reaped.set()
+    monkeypatch.setattr(module, "_CLOSE_DEADLINE", 0.25)
+    await resolver.close()
+    assert not resolver._reapers
+
+
+@pytest.mark.asyncio
 async def test_cleanup_escalates_after_bounded_grace_period(tmp_path) -> None:
     process = _EscalatingProcess()
     deno = tmp_path / "deno"
@@ -580,3 +769,50 @@ async def test_windows_cleanup_signals_then_boundedly_reaps_taskkill_helper(tmp_
     assert helper_calls and helper_calls[0][0] == str(taskkill)
     assert helper_calls[0][1:] == ("/PID", "4321", "/T", "/F")
     assert helper.killed
+
+
+@pytest.mark.asyncio
+async def test_windows_helper_reap_failure_retains_child_slot_and_close(tmp_path, monkeypatch) -> None:
+    module = __import__("TidalPlayerExp.providers.youtube_resolver", fromlist=["YouTubeResolver"])
+    system_root = tmp_path / "Windows"
+    taskkill = system_root / "System32" / "taskkill.exe"
+    taskkill.parent.mkdir(parents=True)
+    taskkill.write_bytes(b"")
+    processes = [_DeferredReapProcess(pid=4321), _DeferredReapProcess(pid=4322)]
+    helpers = [_DeferredReapHelper(), _DeferredReapHelper()]
+    calls: list[tuple[object, ...]] = []
+    helper_calls: list[tuple[object, ...]] = []
+    deno = tmp_path / "deno"
+    deno.write_bytes(b"")
+
+    async def factory(*args: object, **kwargs: object) -> _DeferredReapProcess:
+        calls.append(args)
+        return processes[len(calls) - 1]
+
+    async def helper_factory(*args: object, **kwargs: object) -> _DeferredReapHelper:
+        helper_calls.append(args)
+        return helpers[len(helper_calls) - 1]
+
+    monkeypatch.setattr(module, "_VIDEO_DEADLINE", 0.01)
+    monkeypatch.setattr(module.os, "name", "nt")
+    monkeypatch.setenv("SystemRoot", str(system_root))
+    monkeypatch.setattr(module.asyncio, "create_subprocess_exec", helper_factory)
+    resolver = YouTubeResolver(process_factory=factory, deno_locator=lambda: str(deno))
+    first = asyncio.create_task(resolver.resolve(_reference()))
+    second = asyncio.create_task(resolver.resolve(_reference()))
+    await asyncio.gather(first, second, return_exceptions=True)
+    third = asyncio.create_task(resolver.resolve(_reference()))
+    await asyncio.sleep(0.05)
+    assert len(calls) == 2
+    close_task = asyncio.create_task(resolver.close())
+    await asyncio.sleep(0.05)
+    assert not close_task.done()
+    for helper in helpers:
+        helper.reaped.set()
+    for process in processes:
+        process.reaped.set()
+    await close_task
+    with pytest.raises(PlaybackUnavailable):
+        await third
+    assert len(helper_calls) == 2
+    assert helper_calls[0][0] == str(taskkill)

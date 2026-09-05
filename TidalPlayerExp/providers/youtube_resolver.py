@@ -28,6 +28,7 @@ _MAX_PLAYLIST_LIMIT = 100
 _VIDEO_DEADLINE = 30.0
 _PLAYLIST_DEADLINE = 45.0
 _GRACE_PERIOD = 0.25
+_CLOSE_DEADLINE = 1.0
 _READ_CHUNK = 4096
 _ALLOWED_HEADERS = {"user-agent": "User-Agent", "referer": "Referer", "origin": "Origin"}
 _YT_DLP_BOOTSTRAP = (
@@ -36,6 +37,15 @@ _YT_DLP_BOOTSTRAP = (
 )
 
 ProcessFactory = Callable[..., Awaitable[Any]]
+
+
+class _SpawnedAfterClose(Exception):
+    def __init__(self, child: Any) -> None:
+        self.child = child
+
+
+class _SpawnCancelled(asyncio.CancelledError):
+    """The caller cancelled while the resolver still owns a factory task."""
 
 
 def _safe_display(value: object, limit: int) -> str:
@@ -204,6 +214,10 @@ class YouTubeResolver:
         self._yt_dlp_locator = yt_dlp_locator or _yt_dlp_root
         self._slots = asyncio.Semaphore(2)
         self._children: set[Any] = set()
+        self._reapers: dict[Any, asyncio.Task[None]] = {}
+        self._cleanup_tasks: set[asyncio.Task[Any]] = set()
+        self._factory_tasks: set[asyncio.Task[Any]] = set()
+        self._late_factory_tasks: set[asyncio.Task[Any]] = set()
         self._closed = False
         self._state_lock = asyncio.Lock()
 
@@ -258,18 +272,53 @@ class YouTubeResolver:
             )
         else:
             kwargs["start_new_session"] = True
+        async def _invoke_factory() -> Any:
+            return await self._process_factory(*args, **kwargs)
+
+        factory_task = asyncio.create_task(_invoke_factory())
+        self._factory_tasks.add(factory_task)
         try:
-            child = await self._process_factory(*args, **kwargs)
+            child = await asyncio.shield(factory_task)
         except asyncio.CancelledError:
-            raise
+            self._late_factory_tasks.add(factory_task)
+            factory_task.add_done_callback(self._adopt_late_factory_child)
+            raise _SpawnCancelled() from None
         except Exception:  # noqa: BLE001 - process factories expose platform errors
             raise PlaybackUnavailable() from None
+        finally:
+            if factory_task.done():
+                self._factory_tasks.discard(factory_task)
         async with self._state_lock:
             if self._closed:
-                await self._terminate(child)
-                raise PlaybackUnavailable() from None
+                self._children.add(child)
+                raise _SpawnedAfterClose(child)
             self._children.add(child)
         return child
+
+    def _adopt_late_factory_child(self, factory_task: asyncio.Task[Any]) -> None:
+        self._factory_tasks.discard(factory_task)
+        if factory_task not in self._late_factory_tasks:
+            return
+        self._late_factory_tasks.discard(factory_task)
+        if factory_task.cancelled():
+            self._slots.release()
+            return
+        try:
+            child = factory_task.result()
+        except Exception:  # noqa: BLE001 - late factory failures are sanitized
+            self._slots.release()
+            return
+        cleanup_task = asyncio.create_task(self._adopt_and_cleanup_child(child))
+        self._track_cleanup_task(cleanup_task)
+
+    async def _adopt_and_cleanup_child(self, child: Any) -> None:
+        async with self._state_lock:
+            self._children.add(child)
+        await self._cleanup_child(child, release_slot=True)
+
+    def _track_cleanup_task(self, task: asyncio.Task[Any]) -> None:
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_tasks.discard)
 
     async def _read_stdout(self, child: Any, ceiling: int) -> bytes:
         stream = getattr(child, "stdout", None)
@@ -288,11 +337,14 @@ class YouTubeResolver:
     async def _run_child(self, args: list[str], *, deadline: float, ceiling: int) -> bytes:
         await self._slots.acquire()
         child: Any | None = None
+        slot_handed_off = False
         try:
             child = await self._spawn(args)
+            running_child = child
+
             async def _read_and_wait() -> bytes:
-                output = await self._read_stdout(child, ceiling)
-                returncode = await child.wait()
+                output = await self._read_stdout(running_child, ceiling)
+                returncode = await running_child.wait()
                 if returncode != 0:
                     raise RuntimeError
                 return output
@@ -300,6 +352,12 @@ class YouTubeResolver:
             return await asyncio.wait_for(_read_and_wait(), timeout=deadline)
         except asyncio.TimeoutError:
             raise PlaybackUnavailable() from None
+        except _SpawnedAfterClose as error:
+            child = error.child
+            raise PlaybackUnavailable() from None
+        except _SpawnCancelled:
+            slot_handed_off = True
+            raise
         except asyncio.CancelledError:
             raise
         except (PlaybackUnavailable, SourceResolutionError):
@@ -308,16 +366,49 @@ class YouTubeResolver:
             raise SourceResolutionError() from None
         finally:
             if child is not None:
-                await self._terminate(child)
-                async with self._state_lock:
-                    self._children.discard(child)
+                reaped = await self._cleanup_child(child, release_slot=True)
+                slot_handed_off = slot_handed_off or not reaped
+            if not slot_handed_off and child is None:
+                self._slots.release()
+
+    async def _cleanup_child(self, child: Any, *, release_slot: bool) -> bool:
+        async with self._state_lock:
+            if child in self._reapers:
+                return False
+        reaped = await self._terminate(child)
+        if reaped:
+            async with self._state_lock:
+                self._children.discard(child)
+            if release_slot:
+                self._slots.release()
+            return True
+        self._register_reaper(child, release_slot=release_slot)
+        return False
+
+    def _register_reaper(self, child: Any, *, release_slot: bool) -> None:
+        if child in self._reapers:
+            return
+        task = asyncio.create_task(self._reap_owned(child, release_slot=release_slot))
+        self._reapers[child] = task
+        self._track_cleanup_task(task)
+
+    async def _reap_owned(self, child: Any, *, release_slot: bool) -> None:
+        while not await self._wait_bounded(child):
+            force = getattr(child, "kill", None)
+            if callable(force):
+                with contextlib.suppress(Exception):
+                    force()
+        async with self._state_lock:
+            self._children.discard(child)
+            self._reapers.pop(child, None)
+        if release_slot:
             self._slots.release()
 
-    async def _terminate(self, child: Any) -> None:
+    async def _terminate(self, child: Any) -> bool:
         pid = getattr(child, "pid", None)
         try:
             if getattr(child, "returncode", None) is not None:
-                return
+                return True
             if isinstance(pid, int) and pid > 0 and os.name != "nt":
                 with contextlib.suppress(ProcessLookupError, OSError):
                     signaled = _signal_process_group(pid, "SIGTERM")
@@ -342,24 +433,27 @@ class YouTubeResolver:
                     with contextlib.suppress(Exception):
                         terminate()
             if await self._wait_bounded(child):
-                return
+                return True
+            helper_reaped = True
             if isinstance(pid, int) and pid > 0 and os.name != "nt":
                 with contextlib.suppress(ProcessLookupError, OSError):
                     _signal_process_group(pid, "SIGKILL")
             elif isinstance(pid, int) and pid > 0 and os.name == "nt":
-                await self._force_windows_tree(pid)
+                helper_reaped = await self._force_windows_tree(pid)
             kill = getattr(child, "kill", None)
             if callable(kill):
                 with contextlib.suppress(Exception):
                     kill()
-            await self._wait_bounded(child)
+            child_reaped = await self._wait_bounded(child)
+            return child_reaped and helper_reaped
         except asyncio.CancelledError:
             # Cleanup must finish even when the caller goes away.
             with contextlib.suppress(Exception):
                 kill = getattr(child, "kill", None)
                 if callable(kill):
                     kill()
-                await self._wait_bounded(child)
+                return await self._wait_bounded(child)
+            return False
 
     async def _wait_bounded(self, child: Any) -> bool:
         try:
@@ -370,12 +464,12 @@ class YouTubeResolver:
             return False
         return True
 
-    async def _force_windows_tree(self, pid: int) -> None:
+    async def _force_windows_tree(self, pid: int) -> bool:
         # taskkill.exe is an absolute system tool and is used only for our tracked PID.
         system_root = os.environ.get("SystemRoot", r"C:\\Windows")
         taskkill = os.path.join(system_root, "System32", "taskkill.exe")
         if not os.path.isabs(taskkill) or not os.path.isfile(taskkill):
-            return
+            return True
         helper: Any | None = None
         try:
             helper = await asyncio.create_subprocess_exec(
@@ -388,21 +482,24 @@ class YouTubeResolver:
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            if not await self._wait_bounded(helper):
+            helper_reaped = await self._wait_bounded(helper)
+            if not helper_reaped:
                 force = getattr(helper, "kill", None)
                 if callable(force):
                     with contextlib.suppress(Exception):
                         force()
-                await self._wait_bounded(helper)
+                helper_reaped = await self._wait_bounded(helper)
+            if not helper_reaped:
+                self._register_reaper(helper, release_slot=False)
+            return helper_reaped
         except Exception:  # noqa: BLE001 - cleanup helper failures are sanitized
-            return
+            return True
         finally:
             if helper is not None and getattr(helper, "returncode", None) is None:
                 force = getattr(helper, "kill", None)
                 if callable(force):
                     with contextlib.suppress(Exception):
                         force()
-                await self._wait_bounded(helper)
 
     @staticmethod
     def _parse_document(output: bytes) -> object:
@@ -541,11 +638,32 @@ class YouTubeResolver:
 
     async def close(self) -> None:
         async with self._state_lock:
-            if self._closed:
-                return
             self._closed = True
-            children = tuple(self._children)
-        await asyncio.gather(*(self._terminate(child) for child in children), return_exceptions=True)
+        while True:
+            async with self._state_lock:
+                children = tuple(child for child in self._children if child not in self._reapers)
+                reapers = tuple(self._reapers.values())
+                factories = tuple(self._factory_tasks)
+                cleanup = tuple(self._cleanup_tasks)
+            if children:
+                cleanup_tasks = [
+                    asyncio.create_task(self._cleanup_child(child, release_slot=True))
+                    for child in children
+                ]
+                for task in cleanup_tasks:
+                    self._track_cleanup_task(task)
+                await asyncio.shield(asyncio.gather(*cleanup_tasks, return_exceptions=True))
+                continue
+            pending = tuple(dict.fromkeys((*reapers, *factories, *cleanup)))
+            if not pending:
+                return
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(asyncio.gather(*pending, return_exceptions=True)),
+                    timeout=_CLOSE_DEADLINE,
+                )
+            except asyncio.TimeoutError:
+                raise PlaybackUnavailable() from None
 
 
 __all__ = ["YouTubeResolver", "YouTubeVideoMetadata"]
