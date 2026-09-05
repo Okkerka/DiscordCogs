@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -142,6 +143,108 @@ def _error_surface(error: BaseException) -> str:
     )
 
 
+def _pid_exists(pid: int) -> bool:
+    if os.name == "nt":
+        import ctypes
+
+        synchronize = 0x00100000
+        handle = ctypes.windll.kernel32.OpenProcess(synchronize, False, pid)
+        if not handle:
+            return False
+        exit_code = ctypes.c_ulong()
+        queried = ctypes.windll.kernel32.GetExitCodeProcess(
+            handle, ctypes.byref(exit_code)
+        )
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return bool(queried) and exit_code.value == 259  # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def test_default_locator_uses_packaged_files_without_upstream_probe(
+    ffmpeg_module: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import imageio_ffmpeg
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> str:
+        pytest.fail("default discovery must not run imageio-ffmpeg validation")
+
+    monkeypatch.delenv("IMAGEIO_FFMPEG_EXE", raising=False)
+    monkeypatch.setattr(imageio_ffmpeg, "get_ffmpeg_exe", forbidden)
+    monkeypatch.setattr(subprocess, "check_call", forbidden)
+
+    located = Path(ffmpeg_module._default_locator())
+
+    assert located.is_absolute()
+    assert located.is_file()
+    assert "imageio_ffmpeg" in located.parts
+    assert "binaries" in located.parts
+
+
+def test_default_probe_times_out_and_reaps_hung_candidate(
+    ffmpeg_module: Any, tmp_path: Path
+) -> None:
+    marker = tmp_path / "hung-probe.pid"
+    script = (
+        "import os, pathlib, sys, time; "
+        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
+        "time.sleep(60)"
+    )
+    started = time.monotonic()
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        ffmpeg_module._default_probe(
+            (sys.executable, "-c", script, str(marker)), timeout=0.2
+        )
+
+    elapsed = time.monotonic() - started
+    assert marker.is_file()
+    pid = int(marker.read_text())
+    assert elapsed < 2
+    assert not _pid_exists(pid)
+
+
+@pytest.mark.asyncio
+async def test_close_accounts_for_timed_out_owned_probe(
+    ffmpeg_module: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "factory-probe.pid"
+    script = (
+        "import os, pathlib, sys, time; "
+        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
+        "time.sleep(60)"
+    )
+
+    def hung_probe(_argv: Sequence[str], timeout: float) -> bytes:
+        return ffmpeg_module._default_probe(
+            (sys.executable, "-c", script, str(marker)), timeout
+        )
+
+    monkeypatch.setattr(ffmpeg_module, "_PROBE_TIMEOUT_SECONDS", 0.2)
+    factory = ffmpeg_module.FFmpegSourceFactory(
+        locator=lambda: sys.executable,
+        probe=hung_probe,
+    )
+    checking = asyncio.create_task(factory.check())
+    for _ in range(100):
+        if marker.is_file():
+            break
+        await asyncio.sleep(0.01)
+    assert marker.is_file()
+
+    await factory.close()
+    await factory.close()
+    with pytest.raises(PlaybackUnavailable):
+        await checking
+
+    assert not _pid_exists(int(marker.read_text()))
+    with pytest.raises(PlaybackUnavailable):
+        await factory.check()
+
+
 @pytest.mark.asyncio
 async def test_check_coalesces_exact_bounded_probes_and_returns_immutable_capability(
     ffmpeg_module: Any, tmp_path: Path
@@ -204,6 +307,44 @@ async def test_check_coalesces_exact_bounded_probes_and_returns_immutable_capabi
             10.0,
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_bare_path_locator_resolves_executable_outside_current_directory(
+    ffmpeg_module: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    binary_dir = tmp_path / "bin"
+    binary_dir.mkdir()
+    executable = binary_dir / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+    executable.write_bytes(b"binary")
+    executable.chmod(0o755)
+    working_dir = tmp_path / "working"
+    working_dir.mkdir()
+    monkeypatch.setenv("PATH", str(binary_dir))
+    monkeypatch.chdir(working_dir)
+    probe_calls: list[tuple[tuple[str, ...], float]] = []
+    spawn_calls: list[tuple[str, ...]] = []
+
+    def spawn(argv: Sequence[str], **_kwargs: Any) -> _Process:
+        spawn_calls.append(tuple(argv))
+        return _Process()
+
+    factory = ffmpeg_module.FFmpegSourceFactory(
+        locator=lambda: "ffmpeg",
+        probe=_probe_success(probe_calls),
+        spawn=spawn,
+    )
+
+    capability = await factory.check()
+    audio = await factory.create(ResolvedSource("https://media.example/stream", {}))
+
+    found = shutil.which("ffmpeg")
+    assert found is not None
+    expected = str(Path(found).resolve())
+    assert capability.executable == expected
+    assert [call[0][0] for call in probe_calls] == [expected, expected, expected]
+    assert spawn_calls[0][0] == expected
+    audio.cleanup()
 
 
 @pytest.mark.asyncio
@@ -651,6 +792,28 @@ async def test_read_detects_nonzero_exit_that_races_with_stdout_eof(
         audio.read()
 
     assert process.wait_calls >= 1
+    assert process.stdout.closed
+
+
+@pytest.mark.asyncio
+async def test_read_treats_unconfirmed_eof_timeout_as_sanitized_failure(
+    ffmpeg_module: Any, tmp_path: Path
+) -> None:
+    process = _Process(
+        (b"OpusHead", b"OpusTags", b"\x08first"),
+        returncode=None,
+    )
+    factory, _, _ = _factory(ffmpeg_module, tmp_path, lambda _argv, **_kwargs: process)
+    audio = await factory.create(ResolvedSource("https://media.example/stream", {}))
+
+    assert audio.read() == b"\x08first"
+    with pytest.raises(PlaybackStartError) as caught:
+        audio.read()
+
+    assert str(caught.value) == "Playback start failed"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert process.terminate_calls == 1
     assert process.stdout.closed
 
 

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.resources
 import os
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import unicodedata
@@ -73,11 +76,51 @@ class _InvalidPacketDuration(Exception):
 
 
 def _default_locator() -> str:
-    """Resolve imageio-ffmpeg lazily, including its admin/PATH overrides."""
+    """Discover imageio-ffmpeg candidates without executing any of them."""
 
-    from imageio_ffmpeg import get_ffmpeg_exe  # type: ignore[import-untyped]
+    configured = os.getenv("IMAGEIO_FFMPEG_EXE")
+    if configured:
+        return configured
 
-    return get_ffmpeg_exe()
+    from imageio_ffmpeg._definitions import (  # type: ignore[import-untyped]
+        FNAME_PER_PLATFORM,
+        get_platform,
+    )
+
+    platform = get_platform()
+    packaged_name = FNAME_PER_PLATFORM.get(platform)
+    if packaged_name:
+        packaged = importlib.resources.files("imageio_ffmpeg.binaries").joinpath(
+            packaged_name
+        )
+        if packaged.is_file() and isinstance(packaged, os.PathLike):
+            return os.fspath(packaged)
+
+    if platform.startswith("win"):
+        conda = Path(sys.prefix, "Library", "bin", "ffmpeg.exe")
+    else:
+        conda = Path(sys.prefix, "bin", "ffmpeg")
+    if conda.is_file():
+        return str(conda)
+    return "ffmpeg"
+
+
+def _resolve_executable(located: str) -> Path | None:
+    """Resolve an official locator result as either a path or PATH command."""
+
+    candidate = Path(located)
+    if not candidate.is_absolute() and candidate.parent == Path():
+        found = shutil.which(located)
+        if found is None:
+            return None
+        candidate = Path(found)
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        return None
+    return resolved
 
 
 def _default_probe(argv: Sequence[str], timeout: float) -> bytes:
@@ -248,7 +291,7 @@ class _FFmpegAudioSource(discord.AudioSource):
                 try:
                     returncode = self._process.wait(timeout=_EOF_WAIT_SECONDS)
                 except subprocess.TimeoutExpired:
-                    returncode = None
+                    returncode = -1
                 except Exception:  # noqa: BLE001 - process errors are redacted at this boundary
                     returncode = -1
             if returncode not in (None, 0):
@@ -317,8 +360,8 @@ class FFmpegSourceFactory:
             located = self._locator()
             if not isinstance(located, str) or _has_control(located):
                 return None
-            executable_path = Path(located).resolve(strict=True)
-            if not executable_path.is_file() or not os.access(executable_path, os.X_OK):
+            executable_path = _resolve_executable(located)
+            if executable_path is None:
                 return None
             executable = str(executable_path)
             prefix = (executable, "-hide_banner", "-loglevel", "quiet")
