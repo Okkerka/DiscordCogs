@@ -706,6 +706,34 @@ async def test_close_owns_child_created_after_factory_cancellation(tmp_path) -> 
 
 
 @pytest.mark.asyncio
+async def test_cancellation_during_child_registration_retains_cleanup_owner(tmp_path) -> None:
+    factory_started = asyncio.Event()
+    process = _DeferredReapProcess()
+    deno = tmp_path / "deno"
+    deno.write_bytes(b"")
+
+    async def factory(*args: object, **kwargs: object) -> _DeferredReapProcess:
+        factory_started.set()
+        return process
+
+    resolver = YouTubeResolver(process_factory=factory, deno_locator=lambda: str(deno))
+    resolve_task = asyncio.create_task(resolver.resolve(_reference()))
+    await factory_started.wait()
+    await resolver._state_lock.acquire()
+    await asyncio.sleep(0.05)
+    resolve_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await resolve_task
+    resolver._state_lock.release()
+    await asyncio.sleep(0.05)
+    assert process in resolver._children or process in resolver._reapers
+    assert resolver._slots._value == 1
+    process.reaped.set()
+    await resolver.close()
+    assert resolver._slots._value == 2
+
+
+@pytest.mark.asyncio
 async def test_close_reports_bounded_cleanup_failure_without_orphaning_reaper(tmp_path, monkeypatch) -> None:
     module = __import__("TidalPlayerExp.providers.youtube_resolver", fromlist=["YouTubeResolver"])
     monkeypatch.setattr(module, "_VIDEO_DEADLINE", 0.01)

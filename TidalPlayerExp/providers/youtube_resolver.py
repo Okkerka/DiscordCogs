@@ -289,12 +289,33 @@ class YouTubeResolver:
         finally:
             if factory_task.done():
                 self._factory_tasks.discard(factory_task)
+        registration_task = asyncio.create_task(self._register_spawned_child(child))
+        self._track_cleanup_task(registration_task)
+        try:
+            await asyncio.shield(registration_task)
+        except asyncio.CancelledError:
+            adoption_task = asyncio.create_task(self._adopt_after_registration(child, registration_task))
+            self._track_cleanup_task(adoption_task)
+            raise _SpawnCancelled() from None
+        return child
+
+    async def _register_spawned_child(self, child: Any) -> None:
         async with self._state_lock:
             if self._closed:
                 self._children.add(child)
                 raise _SpawnedAfterClose(child)
             self._children.add(child)
-        return child
+
+    async def _adopt_after_registration(self, child: Any, registration_task: asyncio.Task[Any]) -> None:
+        try:
+            await asyncio.shield(registration_task)
+        except asyncio.CancelledError:
+            registration_task.cancelled()
+        except Exception:  # noqa: BLE001 - registration failure must still clean up the child
+            registration_task.exception()
+        async with self._state_lock:
+            self._children.add(child)
+        await self._cleanup_child(child, release_slot=True)
 
     def _adopt_late_factory_child(self, factory_task: asyncio.Task[Any]) -> None:
         self._factory_tasks.discard(factory_task)
