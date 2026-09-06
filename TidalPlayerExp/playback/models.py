@@ -161,6 +161,7 @@ class PlaybackEntry:
     fallback: SourceReference | None
     meta: TrackMeta
     requester_id: int | None
+    fallback_meta: TrackMeta | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.entry_id, str) or not self.entry_id or len(self.entry_id) > 64:
@@ -173,6 +174,11 @@ class PlaybackEntry:
         # TrackMeta is a TypedDict, while MappingProxyType supplies the
         # runtime read-only boundary; this cast preserves the public shape.
         object.__setattr__(self, "meta", cast(TrackMeta, MappingProxyType(copied_meta)))
+        if self.fallback_meta is not None:
+            copied_fallback = _copy_track_meta(self.fallback_meta)
+            if copied_fallback is None:
+                raise ValueError("Playback fallback metadata is invalid")
+            object.__setattr__(self, "fallback_meta", cast(TrackMeta, MappingProxyType(copied_fallback)))
 
 
 @dataclass(frozen=True, slots=True)

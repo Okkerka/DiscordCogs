@@ -62,7 +62,9 @@ def test_tidal_source_reference_rejects_non_positive_decimal_identifier(
 
 
 @pytest.mark.parametrize("kind_value", ["tidal", "tidal_video"])
-def test_tidal_source_reference_accepts_positive_decimal_identifier(kind_value: str) -> None:
+def test_tidal_source_reference_accepts_positive_decimal_identifier(
+    kind_value: str,
+) -> None:
     kind = SourceKind(kind_value)
     reference = SourceReference(kind, "00123")
 
@@ -109,7 +111,9 @@ def test_resolved_source_redacts_media_values_and_freezes_headers() -> None:
 
 class _HostileMapping(Mapping[str, str]):
     def __iter__(self):
-        raise RuntimeError("signed-url=https://audio.example/private?token=header-secret")
+        raise RuntimeError(
+            "signed-url=https://audio.example/private?token=header-secret"
+        )
 
     def __len__(self) -> int:
         return 1
@@ -119,7 +123,9 @@ class _HostileMapping(Mapping[str, str]):
 
 
 def _error_surface(error: BaseException) -> str:
-    formatted = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    formatted = "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
     return "\n".join(
         (
             str(error),
@@ -131,7 +137,9 @@ def _error_surface(error: BaseException) -> str:
     )
 
 
-def test_resolved_source_rejects_hostile_or_non_mapping_headers_without_leaking_context() -> None:
+def test_resolved_source_rejects_hostile_or_non_mapping_headers_without_leaking_context() -> (
+    None
+):
     secret = "signed-url=https://audio.example/private?token=header-secret"
     for headers in (_HostileMapping(), [("Authorization", secret)]):
         with pytest.raises(ValueError) as caught:
@@ -195,6 +203,32 @@ def test_playback_entry_exposes_read_only_metadata() -> None:
         entry.meta["title"] = "caller mutation"  # type: ignore[index]
 
 
+def test_fallback_metadata_is_validated_and_detached() -> None:
+    metadata = _meta()
+    entry = PlaybackEntry(
+        "fallback",
+        SourceReference(SourceKind.TIDAL, "1"),
+        SourceReference(SourceKind.YOUTUBE, "dQw4w9WgXcQ"),
+        _meta(),
+        None,
+        fallback_meta=metadata,
+    )
+    metadata["title"] = "changed"
+    assert entry.fallback_meta is not None
+    assert entry.fallback_meta["title"] == "Track"
+    with pytest.raises(TypeError):
+        entry.fallback_meta["title"] = "changed"
+    with pytest.raises(ValueError):
+        PlaybackEntry(
+            "invalid",
+            entry.primary,
+            entry.fallback,
+            _meta(),
+            None,
+            fallback_meta={"title": []},
+        )  # type: ignore[typeddict-item]
+
+
 @pytest.mark.parametrize(
     "metadata",
     [
@@ -204,7 +238,9 @@ def test_playback_entry_exposes_read_only_metadata() -> None:
         {key: value for key, value in _meta().items() if key != "artist"},
     ],
 )
-def test_playback_entry_rejects_non_mapping_or_invalid_metadata(metadata: object) -> None:
+def test_playback_entry_rejects_non_mapping_or_invalid_metadata(
+    metadata: object,
+) -> None:
     with pytest.raises(ValueError) as caught:
         PlaybackEntry(
             "entry-1",
@@ -243,7 +279,9 @@ def test_playback_snapshot_copies_queue_to_tuple() -> None:
         requester_id=None,
     )
     queued = [entry]
-    snapshot = PlaybackSnapshot(current=entry, queued=queued, paused=False, channel_id=99)  # type: ignore[arg-type]
+    snapshot = PlaybackSnapshot(
+        current=entry, queued=queued, paused=False, channel_id=99
+    )  # type: ignore[arg-type]
     queued.append(entry)
 
     assert snapshot.queued == (entry,)
@@ -254,7 +292,9 @@ def test_playback_snapshot_copies_queue_to_tuple() -> None:
     "error_type",
     [PlaybackError, PlaybackUnavailable, SourceResolutionError, PlaybackStartError],
 )
-def test_playback_errors_do_not_retain_or_echo_unsafe_message(error_type: type[PlaybackError]) -> None:
+def test_playback_errors_do_not_retain_or_echo_unsafe_message(
+    error_type: type[PlaybackError],
+) -> None:
     unsafe = "https://audio.example/secret?token=top-secret"
     error = error_type(unsafe)
 
@@ -276,7 +316,9 @@ class _SinkFake:
     async def track_started(self, guild_id: int, entry: PlaybackEntry) -> None:
         return None
 
-    async def track_failed(self, guild_id: int, entry: PlaybackEntry, reason: str) -> None:
+    async def track_failed(
+        self, guild_id: int, entry: PlaybackEntry, reason: str
+    ) -> None:
         return None
 
     async def queue_ended(self, guild_id: int, previous: PlaybackEntry | None) -> None:
@@ -289,7 +331,9 @@ class _SessionFake:
     def snapshot(self) -> PlaybackSnapshot:
         return PlaybackSnapshot(None, (), False, None)
 
-    async def enqueue(self, entry: PlaybackEntry, *, start_if_idle: bool = True) -> bool:
+    async def enqueue(
+        self, entry: PlaybackEntry, *, start_if_idle: bool = True
+    ) -> bool:
         return start_if_idle
 
     async def skip(self) -> bool:
