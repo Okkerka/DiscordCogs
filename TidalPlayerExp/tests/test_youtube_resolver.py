@@ -346,6 +346,56 @@ async def test_playlist_caps_before_extraction_and_skips_invalid_entries(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_full_playlist_metadata_can_exceed_single_video_buffer(tmp_path) -> None:
+    entries = [
+        {
+            "id": f"{index:011d}",
+            "title": f"A complete recording with artist and album information {index}",
+            "uploader": "An artist channel with a descriptive name",
+            "duration": 180,
+            "thumbnail": f"https://i.ytimg.com/vi/{index:011d}/hqdefault.jpg",
+        }
+        for index in range(100)
+    ]
+    raw = ("\n".join(json.dumps(item) for item in entries) + "\n").encode()
+    assert len(raw) > 16 * 1024
+    process = _Process({})
+    process.stdout = _Stream(raw)
+
+    async def factory(*args: object, **kwargs: object) -> _Process:
+        return process
+
+    deno = tmp_path / "deno"
+    deno.write_bytes(b"")
+    resolver = YouTubeResolver(process_factory=factory, deno_locator=lambda: str(deno))
+    try:
+        result = await resolver.fetch_playlist("PL_valid", 100)
+        assert len(result) == 100
+        assert result[0].video_id == "00000000000"
+        assert result[-1].video_id == "00000000099"
+    finally:
+        await resolver.close()
+
+
+@pytest.mark.asyncio
+async def test_playlist_metadata_budget_still_rejects_oversized_output(tmp_path) -> None:
+    process = _Process({})
+    process.stdout = _Stream(b" " * (100 * 4096 + 1))
+
+    async def factory(*args: object, **kwargs: object) -> _Process:
+        return process
+
+    deno = tmp_path / "deno"
+    deno.write_bytes(b"")
+    resolver = YouTubeResolver(process_factory=factory, deno_locator=lambda: str(deno))
+    try:
+        with pytest.raises(SourceResolutionError):
+            await resolver.fetch_playlist("PL_valid", 100)
+    finally:
+        await resolver.close()
+
+
+@pytest.mark.asyncio
 async def test_playlist_accepts_exactly_limit_nonblank_json_lines(tmp_path) -> None:
     entries = [
         {"id": VIDEO_ID, "title": "One", "uploader": "Channel", "duration": 1},

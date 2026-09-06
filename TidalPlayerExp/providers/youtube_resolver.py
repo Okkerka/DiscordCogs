@@ -656,7 +656,9 @@ class YouTubeResolver:
                 '{"id":%(id)j,"title":%(title)j,"uploader":%(uploader)j,"duration":%(duration)j,"thumbnail":%(thumbnail)j}',
                 _canonical_playlist_url(playlist_id),
             ]
-            output = await self._run_child(args, deadline=_PLAYLIST_DEADLINE, ceiling=min(_MAX_STDOUT, limit * 4096))
+            # A playlist contains one projected document per item, not one
+            # video's document. The validated 100-item cap bounds this to 400 KiB.
+            output = await self._run_child(args, deadline=_PLAYLIST_DEADLINE, ceiling=limit * 4096)
             text = output.decode("utf-8")
             if sum(1 for line in text.splitlines() if line.strip()) > limit:
                 raise ValueError
