@@ -734,6 +734,74 @@ async def test_cancellation_during_child_registration_retains_cleanup_owner(tmp_
 
 
 @pytest.mark.asyncio
+async def test_close_before_cancelled_registration_adoption_does_not_release_slot_twice(tmp_path, monkeypatch) -> None:
+    registration_started = asyncio.Event()
+    release_registration = asyncio.Event()
+    adoption_paused = asyncio.Event()
+    release_adoption = asyncio.Event()
+    process = _DeferredReapProcess()
+    deno = tmp_path / "deno"
+    deno.write_bytes(b"")
+
+    async def factory(*args: object, **kwargs: object) -> _DeferredReapProcess:
+        return process
+
+    resolver = YouTubeResolver(process_factory=factory, deno_locator=lambda: str(deno))
+    register = resolver._register_spawned_child
+    adopt = resolver._adopt_after_registration
+
+    async def paused_registration(child: object) -> None:
+        registration_started.set()
+        await release_registration.wait()
+        await register(child)
+
+    async def paused_adoption(child: object, registration_task: asyncio.Task) -> None:
+        await asyncio.shield(registration_task)
+        adoption_paused.set()
+        await release_adoption.wait()
+        await adopt(child, registration_task)
+
+    monkeypatch.setattr(resolver, "_register_spawned_child", paused_registration)
+    monkeypatch.setattr(resolver, "_adopt_after_registration", paused_adoption)
+    resolve_task = asyncio.create_task(resolver.resolve(_reference()))
+    close_task = None
+    try:
+        async with asyncio.timeout(2):
+            await registration_started.wait()
+            resolve_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await resolve_task
+            release_registration.set()
+            await adoption_paused.wait()
+            assert process in resolver._children
+            assert resolver._slots._value == 1
+
+            process.reaped.set()
+            close_task = asyncio.create_task(resolver.close())
+            # Let close finish physical cleanup while adoption is still paused.
+            while process in resolver._children:
+                await asyncio.sleep(0)
+            assert resolver._slots._value == 2
+            assert process.events == ["graceful-terminate"]
+            release_adoption.set()
+            await close_task
+
+            assert resolver._slots._value == 2
+            assert process.events == ["graceful-terminate"]
+            assert not resolver._children
+            assert not resolver._reapers
+    finally:
+        release_registration.set()
+        release_adoption.set()
+        process.reaped.set()
+        resolve_task.cancel()
+        await asyncio.gather(resolve_task, return_exceptions=True)
+        if close_task is not None:
+            await asyncio.gather(close_task, return_exceptions=True)
+        await resolver.close()
+
+
+@pytest.mark.asyncio
 async def test_close_reports_bounded_cleanup_failure_without_orphaning_reaper(tmp_path, monkeypatch) -> None:
     module = __import__("TidalPlayerExp.providers.youtube_resolver", fromlist=["YouTubeResolver"])
     monkeypatch.setattr(module, "_VIDEO_DEADLINE", 0.01)

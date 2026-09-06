@@ -313,8 +313,7 @@ class YouTubeResolver:
             registration_task.cancelled()
         except Exception:  # noqa: BLE001 - registration failure must still clean up the child
             registration_task.exception()
-        async with self._state_lock:
-            self._children.add(child)
+        # Registration already owns the child; close may have reaped it since.
         await self._cleanup_child(child, release_slot=True)
 
     def _adopt_late_factory_child(self, factory_task: asyncio.Task[Any]) -> None:
