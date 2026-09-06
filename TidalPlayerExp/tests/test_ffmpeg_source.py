@@ -179,7 +179,9 @@ def _pid_exists(pid: int) -> bool:
                 f"GetExitCodeProcess failed with WinError {query_error}"
             ) from None
         if not closed:
-            raise AssertionError(f"CloseHandle failed with WinError {close_error}") from None
+            raise AssertionError(
+                f"CloseHandle failed with WinError {close_error}"
+            ) from None
         return exit_code.value == still_active
     try:
         os.kill(pid, 0)
