@@ -1,12 +1,4 @@
-"""
-Characterization tests for the canonical now-playing embed factory.
-
-Captures the exact visual contract of ui.embeds.make_now_playing_embed so
-future changes remain behaviour-preserving.
-
-The embed this characterizes is the compact 'Playing from Tidal' embed
-that MUST NOT be visually changed during the refactor.
-"""
+"""Compact now-playing rendering with honest catalog and delivery labels."""
 from __future__ import annotations
 
 import importlib
@@ -103,15 +95,15 @@ class TestNowPlayingEmbed:
 
     def test_embed_has_quality_field(self, make_now_playing_embed):
         embed = make_now_playing_embed(_make_meta(quality="LOSSLESS"))
-        assert _field_value(embed, "Quality") is not None
+        assert _field_value(embed, "Catalog quality") is not None
 
     def test_quality_label_lossless(self, make_now_playing_embed):
         embed = make_now_playing_embed(_make_meta(quality="LOSSLESS"))
-        assert _field_value(embed, "Quality") == "LOSSLESS (FLAC)"
+        assert _field_value(embed, "Catalog quality") == "LOSSLESS (FLAC)"
 
     def test_quality_label_hi_res(self, make_now_playing_embed):
         embed = make_now_playing_embed(_make_meta(quality="HI_RES_LOSSLESS"))
-        assert _field_value(embed, "Quality") == "HI-RES LOSSLESS (FLAC)"
+        assert _field_value(embed, "Catalog quality") == "HI-RES LOSSLESS (FLAC)"
 
     def test_audio_resolution_overrides_quality_label(self, make_now_playing_embed):
         meta = _make_meta(
@@ -119,7 +111,8 @@ class TestNowPlayingEmbed:
             audio_resolution="HI-RES LOSSLESS (24-bit / 96kHz)",
         )
         embed = make_now_playing_embed(meta)
-        assert _field_value(embed, "Quality") == "HI-RES LOSSLESS (24-bit / 96kHz)"
+        assert _field_value(embed, "Catalog quality") == "HI-RES LOSSLESS (24-bit / 96kHz)"
+        assert "Discord Opus" in _footer_text(embed)
 
     def test_embed_has_tidal_link_field(self, make_now_playing_embed):
         embed = make_now_playing_embed(_make_meta())
@@ -208,3 +201,32 @@ def test_controller_track_info_defaults_to_tidal(cog) -> None:
 
     assert "## Playing from Tidal" in info
     assert f"[Open in TIDAL]({url})" in info
+
+
+def test_youtube_embed_never_inherits_tidal_quality(make_now_playing_embed) -> None:
+    embed = make_now_playing_embed(
+        _make_meta(source="YouTube", quality="HI_RES_LOSSLESS", audio_resolution="24-bit / 96kHz")
+    )
+
+    assert _field_value(embed, "Catalog quality") is None
+    assert _field_value(embed, "Quality") is None
+    assert _field_value(embed, "Source") == "YouTube audio"
+    assert "Discord Opus" in _footer_text(embed)
+
+
+@pytest.mark.parametrize("source", [None, "YouTube"])
+def test_controller_separates_catalog_quality_from_discord_delivery(cog, source) -> None:
+    controller = importlib.import_module("TidalPlayerExp.ui.controller")
+    info = controller._track_info(
+        _make_meta(source=source, quality="HI_RES_LOSSLESS", audio_resolution="24-bit / 96kHz"),
+        autoplay_enabled=False,
+    )
+
+    assert "**Delivery:** Discord Opus" in info
+    assert "**Quality:**" not in info
+    if source is None:
+        assert "**Catalog quality:** 24-bit / 96kHz" in info
+    else:
+        assert "LOSSLESS" not in info
+        assert "96kHz" not in info
+        assert "**Source:** YouTube audio" in info

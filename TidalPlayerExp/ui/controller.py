@@ -1,12 +1,13 @@
 """Components V2 now-playing controller for TidalPlayerExp."""
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Sequence
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any
 
 import discord
 
 from ..domain.normalization import format_duration
-from .embeds import display_source, source_link_label
+from .embeds import display_source, source_link_label, source_quality_field
 
 if TYPE_CHECKING:
     from ..domain.models import TrackMeta
@@ -21,11 +22,11 @@ def _duration(seconds: int) -> str:
     return format_duration(max(0, int(seconds or 0)))
 
 
-def _track_info(meta: "TrackMeta", *, autoplay_enabled: bool) -> str:
+def _track_info(meta: TrackMeta, *, autoplay_enabled: bool) -> str:
     title = str(meta.get("title") or "Unknown track")
     artist = str(meta.get("artist") or "Unknown artist")
     album = str(meta.get("album") or "Unknown album")
-    quality = str(meta.get("quality") or "LOSSLESS").replace("_", " ")
+    quality_label, quality = source_quality_field(meta)
     duration = _duration(int(meta.get("duration") or 0))
     source_url = meta.get("share_url")
     autoplay_state = "On" if autoplay_enabled else "Off"
@@ -34,7 +35,8 @@ def _track_info(meta: "TrackMeta", *, autoplay_enabled: bool) -> str:
         f"### {title}\n"
         f"**{artist}**\n"
         f"*{album}*\n\n"
-        f"**Quality:** {quality}\n"
+        f"**{quality_label}:** {quality}\n"
+        "**Delivery:** Discord Opus\n"
         f"**Autoplay:** {autoplay_state}\n"
         f"**Duration:** {duration}"
     )
@@ -48,12 +50,12 @@ class PlayerControllerView(discord.ui.LayoutView):
 
     def __init__(
         self,
-        cog: "TidalPlayerExp",
-        meta: "TrackMeta | None" = None,
+        cog: TidalPlayerExp,
+        meta: TrackMeta | None = None,
         recommendations: Sequence[Any] = (),
         autoplay_enabled: bool = False,
         paused: bool = False,
-        next_up: "TrackMeta | None" = None,
+        next_up: TrackMeta | None = None,
     ) -> None:
         super().__init__(timeout=None)
         self.cog = cog

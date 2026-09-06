@@ -5,7 +5,6 @@ import discord
 from ..domain.models import TrackMeta
 from ..domain.normalization import QUALITY_LABELS, format_duration
 
-
 COLOR_BLUE = discord.Color.blue()
 COLOR_GREEN = discord.Color.green()
 COLOR_RED = discord.Color.red()
@@ -63,6 +62,15 @@ def source_link_label(meta: TrackMeta) -> str:
     return "TIDAL" if source.casefold() == "tidal" else source
 
 
+def source_quality_field(meta: TrackMeta) -> tuple[str, str]:
+    """Describe catalog availability without claiming measured stream quality."""
+    source = display_source(meta)
+    if source.casefold() != "tidal":
+        return "Source", f"{source} audio"
+    quality = str(meta.get("quality") or "Unknown")
+    return "Catalog quality", str(meta.get("audio_resolution") or QUALITY_LABELS.get(quality, quality))
+
+
 def error_embed(message: str) -> discord.Embed:
     return discord.Embed(description=message, color=COLOR_RED)
 
@@ -80,15 +88,15 @@ def make_now_playing_embed(meta: TrackMeta, autoplay_enabled: bool = False) -> d
         description="\n".join(description),
         color=COLOR_BLUE,
     )
-    quality = meta.get("audio_resolution") or QUALITY_LABELS.get(meta["quality"], meta["quality"])
-    embed.add_field(name="Quality", value=quality, inline=True)
+    quality_label, quality = source_quality_field(meta)
+    embed.add_field(name=quality_label, value=quality, inline=True)
     if meta.get("share_url"):
         embed.add_field(
             name=f"Open in {source_link_label(meta)}",
             value=f"[Listen]({meta['share_url']})",
             inline=True,
         )
-    embed.set_footer(text=f"Duration: {format_duration(meta['duration'])}")
+    embed.set_footer(text=f"Duration: {format_duration(meta['duration'])} · Delivery: Discord Opus")
     if meta.get("image"):
         embed.set_thumbnail(url=meta["image"])
     return embed
