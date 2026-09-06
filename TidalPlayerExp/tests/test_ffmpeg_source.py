@@ -146,22 +146,51 @@ def _error_surface(error: BaseException) -> str:
 def _pid_exists(pid: int) -> bool:
     if os.name == "nt":
         import ctypes
+        from ctypes import wintypes
 
-        synchronize = 0x00100000
-        handle = ctypes.windll.kernel32.OpenProcess(synchronize, False, pid)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        open_process.restype = wintypes.HANDLE
+        get_exit_code = kernel32.GetExitCodeProcess
+        get_exit_code.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        get_exit_code.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+
+        process_query_limited_information = 0x1000
+        error_invalid_parameter = 87
+        still_active = 259
+        handle = open_process(process_query_limited_information, False, pid)
         if not handle:
-            return False
-        exit_code = ctypes.c_ulong()
-        queried = ctypes.windll.kernel32.GetExitCodeProcess(
-            handle, ctypes.byref(exit_code)
-        )
-        ctypes.windll.kernel32.CloseHandle(handle)
-        return bool(queried) and exit_code.value == 259  # STILL_ACTIVE
+            error = ctypes.get_last_error()
+            if error == error_invalid_parameter:
+                return False
+            raise AssertionError(f"OpenProcess failed with WinError {error}") from None
+
+        exit_code = wintypes.DWORD()
+        queried = get_exit_code(handle, ctypes.byref(exit_code))
+        query_error = ctypes.get_last_error() if not queried else 0
+        closed = close_handle(handle)
+        close_error = ctypes.get_last_error() if not closed else 0
+        if not queried:
+            raise AssertionError(
+                f"GetExitCodeProcess failed with WinError {query_error}"
+            ) from None
+        if not closed:
+            raise AssertionError(f"CloseHandle failed with WinError {close_error}") from None
+        return exit_code.value == still_active
     try:
         os.kill(pid, 0)
     except OSError:
         return False
     return True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Win32 process helper positive control")
+def test_pid_exists_recognizes_current_windows_process() -> None:
+    assert _pid_exists(os.getpid())
 
 
 def test_default_locator_uses_packaged_files_without_upstream_probe(
