@@ -194,10 +194,11 @@ class CompositeSourceResolver:
     def __init__(self, tidal: TidalSourceResolver, youtube: SourceResolver) -> None:
         self._tidal = tidal
         self._youtube = youtube
+        self._closing_task: asyncio.Task[None] | None = None
         self._closed = False
 
     async def resolve(self, reference: SourceReference) -> ResolvedSource:
-        if self._closed:
+        if self._closed or self._closing_task is not None:
             raise PlaybackUnavailable()
         if not isinstance(reference, SourceReference):
             raise SourceResolutionError()
@@ -210,8 +211,19 @@ class CompositeSourceResolver:
     async def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
-        await self._youtube.close()
+        task = self._closing_task
+        if task is None:
+            task = asyncio.create_task(self._youtube.close())
+            self._closing_task = task
+            task.add_done_callback(self._close_finished)
+        await asyncio.shield(task)
+
+    def _close_finished(self, task: asyncio.Task[None]) -> None:
+        if self._closing_task is not task:
+            return
+        self._closing_task = None
+        if not task.cancelled() and task.exception() is None:
+            self._closed = True
 
 
 __all__ = ["CompositeSourceResolver", "TidalSourceResolver"]

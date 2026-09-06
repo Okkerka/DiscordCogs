@@ -414,6 +414,84 @@ async def test_composite_dispatches_and_owns_only_youtube_lifecycle() -> None:
 
 
 @pytest.mark.asyncio
+async def test_composite_close_retries_after_child_cleanup_failure() -> None:
+    class YouTube(_YouTubeFake):
+        async def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise PlaybackUnavailable()
+
+    youtube = YouTube()
+    resolver = CompositeSourceResolver(TidalSourceResolver(_HandlerFake()), youtube)
+
+    with pytest.raises(PlaybackUnavailable):
+        await resolver.close()
+    await resolver.close()
+
+    assert youtube.close_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_composite_close_waiters_share_child_cleanup() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class YouTube(_YouTubeFake):
+        async def close(self) -> None:
+            self.close_calls += 1
+            started.set()
+            await release.wait()
+
+    youtube = YouTube()
+    resolver = CompositeSourceResolver(TidalSourceResolver(_HandlerFake()), youtube)
+    first = asyncio.create_task(resolver.close())
+    await started.wait()
+    second = asyncio.create_task(resolver.close())
+    await asyncio.sleep(0)
+
+    assert not first.done()
+    assert not second.done()
+    assert youtube.close_calls == 1
+    with pytest.raises(PlaybackUnavailable):
+        await resolver.resolve(SourceReference(SourceKind.YOUTUBE, "dQw4w9WgXcQ"))
+
+    release.set()
+    await asyncio.gather(first, second)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_composite_close_waiter_does_not_orphan_child_cleanup() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    completed = asyncio.Event()
+
+    class YouTube(_YouTubeFake):
+        async def close(self) -> None:
+            self.close_calls += 1
+            started.set()
+            await release.wait()
+            completed.set()
+
+    youtube = YouTube()
+    resolver = CompositeSourceResolver(TidalSourceResolver(_HandlerFake()), youtube)
+    cancelled_waiter = asyncio.create_task(resolver.close())
+    await started.wait()
+
+    cancelled_waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_waiter
+
+    later_waiter = asyncio.create_task(resolver.close())
+    await asyncio.sleep(0)
+    assert not later_waiter.done()
+    assert youtube.close_calls == 1
+
+    release.set()
+    await later_waiter
+    assert completed.is_set()
+
+
+@pytest.mark.asyncio
 async def test_composite_preserves_youtube_cancellation() -> None:
     started = asyncio.Event()
 
