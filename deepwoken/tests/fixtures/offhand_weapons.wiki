@@ -1,0 +1,19 @@
+<!-- Expanded excerpt from https://deepwoken.fandom.com/wiki/Template:AllOffhandWeapons?oldid=204616; revision 204616, 2026-04-10T08:26:05Z. -->
+{| class="article-table sortable" style="border: 2px solid #004d4d; text-align: center"
+|+[[Shields|<div style="color:#8F111D;">Shields</div>]]
+!Name!!Requirements!!Max Posture Bonus
+|-
+|[[Targe]]||10 FTD||4
+|}
+{| class="article-table sortable" style="border: 2px solid #004d4d; text-align: center"
+|+[[Parrying Daggers|<div style="color:#A91622;">Parrying Daggers</div>]]
+!Name!!Requirements!!Parry Posture Restoration
+|-
+|[[Parrying Dagger]]||10 AGI||20%
+|}
+{| class="article-table" style="border: 2px solid #004d4d; margin:auto; text-align: center;"
+|+[[Pistols|<div style="color:#BD1628;text-align:center;border-radius:10%;">Offhand Pistols</div>]]
+!Name!!Requirements!!Base Damage!!Penetration!!Chip Damage!!Posture Damage!!Range!!Offhand Cooldown
+|-
+|[[Silversix]]||N/A||10 (8)||-||-||1||10||?
+|}
