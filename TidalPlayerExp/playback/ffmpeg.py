@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.resources
+import logging
 import os
 import re
 import shutil
@@ -31,6 +32,7 @@ _PROBE_OUTPUT_LIMIT = 256 * 1024
 _PROCESS_WAIT_SECONDS = 0.5
 _EOF_WAIT_SECONDS = 0.1
 _VERSION_PATTERN = re.compile(r"\Affmpeg version ([^\s]+)")
+log = logging.getLogger("red.tidalplayerexp.ffmpeg")
 _ALLOWED_HEADERS = (
     ("user-agent", "User-Agent"),
     ("referer", "Referer"),
@@ -73,6 +75,66 @@ class FFmpegCapability:
 
 class _InvalidPacketDuration(Exception):
     """Internal signal that copy mode cannot preserve Discord pacing."""
+
+
+def _stderr_reason(output: bytes) -> str | None:
+    """Reduce untrusted tool output to a fixed category, never a quoted line."""
+    lowered = output.lower()
+    status = re.search(rb"\b(?:http error|server returned) ([45][0-9]{2})\b", lowered)
+    if status:
+        return "http_" + status[1].decode("ascii")
+    if b"[tcp @" in lowered and b"connection to" in lowered and b"failed" in lowered:
+        return "connection_failed"
+    patterns = (
+        (b"not on whitelist", "protocol_blocked"),
+        (b"protocol not found", "protocol_unavailable"),
+        (b"failed to resolve hostname", "dns_error"),
+        (b"name or service not known", "dns_error"),
+        (b"error in the pull function", "tls_error"),
+        (b"certificate verify failed", "tls_error"),
+        (b"tls handshake", "tls_error"),
+        (b"connection timed out", "network_timeout"),
+        (b"connection refused", "connection_failed"),
+        (b"connection reset", "connection_failed"),
+        (b"invalid data found", "invalid_media"),
+        (b"unrecognized option", "unsupported_option"),
+        (b"option not found", "unsupported_option"),
+        (b"unknown encoder", "codec_unavailable"),
+        (b"decoder not found", "codec_unavailable"),
+    )
+    return next((reason for pattern, reason in patterns if pattern in lowered), None)
+
+
+class _StderrReader:
+    """Continuously drain a pipe; retain only a safe category and bounded chunks."""
+
+    def __init__(self, stream: BinaryIO | None) -> None:
+        self.reason: str | None = None
+        self._thread: threading.Thread | None = None
+        if stream is not None:
+            self._thread = threading.Thread(
+                target=self._drain, args=(stream,), name="tidal_ffmpeg_stderr", daemon=True,
+            )
+            self._thread.start()
+
+    def _drain(self, stream: BinaryIO) -> None:
+        tail = b""
+        try:
+            while chunk := stream.read(4096):
+                if self.reason is None:
+                    combined = tail + chunk
+                    self.reason = _stderr_reason(combined)
+                    tail = combined[-256:]
+        except Exception:  # noqa: BLE001 - never let pipe errors print raw provider output
+            # Cleanup can close the pipe while its final bytes are being read.
+            return
+        finally:
+            _quiet_process_call(stream.close)
+
+    def finish(self) -> None:
+        """Allow the reaped process's final diagnostics to drain without hanging."""
+        if self._thread is not None:
+            self._thread.join(timeout=_PROCESS_WAIT_SECONDS)
 
 
 def _default_locator() -> str:
@@ -248,6 +310,8 @@ class _FFmpegAudioSource(discord.AudioSource):
         stdout = process.stdout
         if stdout is None:
             raise PlaybackStartError()
+        self._stderr = _StderrReader(getattr(process, "stderr", None))
+        self._failure_exit: int | None = None
         self._packets = iter(oggparse.OggStream(stdout).iter_packets())
 
     def __repr__(self) -> str:
@@ -259,6 +323,13 @@ class _FFmpegAudioSource(discord.AudioSource):
     def _mark_failed(self) -> PlaybackStartError:
         error = PlaybackStartError()
         with self._state_lock:
+            # Cleanup sets _closed before sending SIGTERM/SIGKILL. A worker
+            # observing that induced EOF must not report it as an external crash.
+            if not self._closed:
+                try:
+                    self._failure_exit = self._process.poll()
+                except Exception:  # noqa: BLE001 - only a bounded exit code is diagnostic input
+                    self._failure_exit = None
             self._current_error = error
         self.cleanup()
         return error
@@ -336,6 +407,17 @@ class _FFmpegAudioSource(discord.AudioSource):
                 return
             self._closed = True
         _cleanup_process(self._process)
+        self._stderr.finish()
+
+    def failure_summary(self, default: str) -> str:
+        """Return a safe failure category, excluding provider text and arguments."""
+        code = self._failure_exit
+        if not isinstance(code, int) or not -2147483648 <= code <= 4294967295:
+            code = None
+        reason = self._stderr.reason or default
+        if code is not None and -127 <= code < 0:
+            reason = f"process_signal_{-code}"
+        return f"{reason} (exit={code if code is not None else 'unknown'})"
 
 
 class FFmpegSourceFactory:
@@ -354,6 +436,16 @@ class FFmpegSourceFactory:
         self._capability_task: asyncio.Task[FFmpegCapability] | None = None
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
         self._closed = False
+        self._last_failure: str | None = None
+
+    @property
+    def last_failure(self) -> str | None:
+        """Most recent safe startup failure, for the owner-only doctor command."""
+        return self._last_failure
+
+    def _record_failure(self, summary: str) -> None:
+        self._last_failure = summary
+        log.warning("FFmpeg startup failed: %s", summary)
 
     def _check_sync(self) -> FFmpegCapability | None:
         try:
@@ -515,7 +607,7 @@ class FFmpegSourceFactory:
                 self._argv(capability, source, copied=copied),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 shell=False,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
@@ -523,6 +615,9 @@ class FFmpegSourceFactory:
         except Exception:  # noqa: BLE001 - argv, URL, and headers must not survive this boundary
             if process is not None:
                 _cleanup_process(process)
+                stderr = getattr(process, "stderr", None)
+                if stderr is not None:
+                    _quiet_process_call(stderr.close)
             return None
 
     def _retain_eventual_cleanup(
@@ -562,6 +657,7 @@ class FFmpegSourceFactory:
             self._retain_eventual_cleanup(construction)
             raise
         if result is None:
+            self._record_failure("spawn_failed (exit=unknown)")
             raise PlaybackStartError()
         return result
 
@@ -595,6 +691,7 @@ class FFmpegSourceFactory:
         if invalid_duration:
             raise _InvalidPacketDuration
         if timed_out or failed:
+            self._record_failure(source.failure_summary("prime_timeout" if timed_out else "no_audio"))
             raise PlaybackStartError()
 
     async def create(self, source: ResolvedSource) -> discord.AudioSource:

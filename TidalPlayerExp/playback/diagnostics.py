@@ -89,6 +89,11 @@ async def collect_diagnostics(
             f"libopus {'yes' if capability.libopus else 'no'}; "
             f"Opus output {'yes' if capability.passthrough else 'no'})"
         )
+    last_failure = getattr(source_factory, "last_failure", None)
+    if isinstance(last_failure, str) and re.fullmatch(
+        r"[a-z][a-z0-9_]{0,63} \(exit=(?:-?[0-9]{1,10}|unknown)\)", last_failure,
+    ):
+        lines.append(f"FFmpeg last failure: {last_failure}")
     lines.extend([
         (
             f"yt-dlp: {_safe_version(youtube_version) if youtube_version else 'missing or outdated'} "

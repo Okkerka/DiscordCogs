@@ -443,7 +443,7 @@ class TidalHandler:
                 is_unauthorized = status == 401 or "401" in str(e).lower() or "unauthorized" in str(e).lower()
                 if is_unauthorized:
                     log.warning("Encountered 401 Unauthorized from Tidal API. Attempting token refresh...")
-                    refreshed = await self.refresh_tokens()
+                    refreshed = await self.refresh_tokens(force=True)
                     if refreshed:
                         log.info("Token refresh succeeded after 401, retrying...")
                         continue
@@ -469,7 +469,22 @@ class TidalHandler:
             raise last_exc
         raise RuntimeError("_run_with_backoff exhausted retries with no exception captured")
 
+    def _session_token_snapshot(self) -> TokenSnapshot:
+        """Validate the current session credentials before persisting them."""
+        expiry = self.session.expiry_time
+        snapshot = TokenSnapshot(
+            token_type=self.session.token_type,
+            access_token=self.session.access_token,
+            refresh_token=self.session.refresh_token,
+            expiry_time=int(_ensure_aware(expiry).timestamp()) if expiry else 0,
+        )
+        if not snapshot.is_complete:
+            raise RuntimeError("Tidal returned an incomplete credential set")
+        return snapshot
+
     async def initialize(self, creds: Dict[str, Any]) -> None:
+        self._login_cache = False
+        self._login_cache_time = asyncio.get_running_loop().time()
         if not self.session or not creds.get("access_token"):
             return
         try:
@@ -478,11 +493,18 @@ class TidalHandler:
                 if creds.get("expiry_time")
                 else None
             )
-            def _load() -> None:
-                self.session.load_oauth_session(
+            def _load() -> TokenSnapshot:
+                loaded = self.session.load_oauth_session(
                     creds["token_type"], creds["access_token"], creds["refresh_token"], expiry
                 )
-            await self._run_blocking(_load, timeout=15.0)
+                if not loaded:
+                    raise RuntimeError("Tidal rejected the stored session")
+                return self._session_token_snapshot()
+
+            snapshot = await self._run_blocking(_load, timeout=15.0)
+            # tidalapi can refresh expired credentials while loading the session.
+            if snapshot != TokenSnapshot.from_mapping(creds):
+                await self.tokens.replace(snapshot)
             self._login_cache = True
             self._login_cache_time = asyncio.get_running_loop().time()
             log.info("Tidal session loaded successfully")
@@ -491,45 +513,42 @@ class TidalHandler:
         except Exception as error:
             _log_provider_failure("Tidal", "session restore", error)
 
-    async def refresh_tokens(self) -> bool:
+    async def refresh_tokens(self, *, force: bool = False) -> bool:
+        """Refresh expiring credentials, or force renewal after an API rejection."""
         if not self.session:
             return False
         async with self._refresh_lock:
-            try:
-                expiry_time = await self._run_blocking(lambda: self.session.expiry_time, timeout=5.0)
-                if expiry_time:
-                    expiry_aware = _ensure_aware(expiry_time)
-                    if _utc_now() + timedelta(hours=2) <= expiry_aware:
-                        return True
-            except Exception:
-                pass
+            if not force:
+                try:
+                    expiry_time = await self._run_blocking(lambda: self.session.expiry_time, timeout=5.0)
+                    if expiry_time:
+                        expiry_aware = _ensure_aware(expiry_time)
+                        if _utc_now() + timedelta(hours=2) <= expiry_aware:
+                            return True
+                except Exception:
+                    pass
+            self._login_cache = False
+            self._login_cache_time = asyncio.get_running_loop().time()
             log.info("Refreshing Tidal tokens...")
             try:
-                request = getattr(self.session, "request", None)
-                refresh_method = getattr(request, "refresh_token", None)
+                refresh_method = getattr(self.session, "token_refresh", None)
                 if not callable(refresh_method):
                     log.error("Installed tidalapi session does not expose token refresh support")
                     return False
-                await self._run_blocking(refresh_method, timeout=15.0)
-                log.info("Token refreshed via request.refresh_token")
-                def _get_state():
-                    return (
-                        self.session.expiry_time, self.session.token_type,
-                        self.session.access_token, self.session.refresh_token,
-                    )
-                expiry_time, token_type, access, refresh = await self._run_blocking(_get_state, timeout=5.0)
-                expiry_aware = _ensure_aware(expiry_time) if expiry_time else None
-                snapshot = TokenSnapshot(
-                    token_type=token_type,
-                    access_token=access,
-                    refresh_token=refresh,
-                    expiry_time=int(expiry_aware.timestamp()) if expiry_aware else 0,
-                )
-                if not snapshot.is_complete:
-                    raise RuntimeError("Tidal token refresh returned an incomplete credential set")
+
+                def _refresh() -> TokenSnapshot:
+                    refresh_token = self.session.refresh_token
+                    if not isinstance(refresh_token, str) or not refresh_token.strip():
+                        raise RuntimeError("Tidal session has no refresh token")
+                    if not refresh_method(refresh_token):
+                        raise RuntimeError("Tidal rejected the token refresh")
+                    return self._session_token_snapshot()
+
+                snapshot = await self._run_blocking(_refresh, timeout=15.0)
                 await self.tokens.replace(snapshot)
                 self._login_cache = True
                 self._login_cache_time = asyncio.get_running_loop().time()
+                log.info("Tidal tokens refreshed successfully")
                 return True
             except Exception as error:
                 _log_provider_failure("Tidal", "token refresh", error)

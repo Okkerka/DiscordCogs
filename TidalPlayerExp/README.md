@@ -56,6 +56,14 @@ in its voice channel. `tidalsetup doctor` is owner-only and checks local version
 voice readiness, FFmpeg features, YouTube dependencies, cached TIDAL login state,
 and voice ownership. It does not connect, fetch media, or revalidate credentials.
 
+If voice connects but a track is skipped, run `tidalsetup doctor` immediately
+after the failure, without reloading. `FFmpeg last failure` gives the most recent
+startup failure across the cog's sessions (for example `http_403`, `tls_error`,
+or `process_signal_11`) and its exit code. The same safe category is logged;
+raw FFmpeg output, signed stream URLs, and request headers are never logged or
+saved. Executable availability and encoder support alone do not prove that the
+host can reach a media server or decode that particular source.
+
 To return to the original cog:
 
 ```text

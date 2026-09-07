@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import io
 import os
 import shutil
 import subprocess
@@ -657,7 +658,7 @@ async def test_create_uses_safe_exact_argv_and_copy_transcode_matrix(
         )
     assert kwargs["stdin"] is subprocess.DEVNULL
     assert kwargs["stdout"] is subprocess.PIPE
-    assert kwargs["stderr"] is subprocess.DEVNULL
+    assert kwargs["stderr"] is subprocess.PIPE
     assert kwargs["shell"] is False
     assert kwargs["creationflags"] == (
         subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -906,9 +907,22 @@ async def test_timeout_during_priming_cleans_process(
     ffmpeg_module: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     entered = threading.Event()
+    priming_finished = threading.Event()
+    original_prime = ffmpeg_module._FFmpegAudioSource.prime
+
+    def prime(source):
+        try:
+            original_prime(source)
+        finally:
+            priming_finished.set()
+
+    monkeypatch.setattr(ffmpeg_module._FFmpegAudioSource, "prime", prime)
 
     class BlockingStream(_PacketStream):
-        pass
+        def close(self):
+            super().close()
+            # Ensure the worker observes our SIGTERM before reporting the timeout.
+            assert priming_finished.wait(1)
 
     class BlockingOggStream:
         def __init__(self, stream: BlockingStream) -> None:
@@ -923,7 +937,7 @@ async def test_timeout_during_priming_cleans_process(
 
     monkeypatch.setattr(ffmpeg_module.discord.oggparse, "OggStream", BlockingOggStream)
     monkeypatch.setattr(ffmpeg_module, "_PRIME_TIMEOUT_SECONDS", 0.02)
-    process = _Process(())
+    process = _Process((), returncode=None)
     process.stdout = BlockingStream(())
     factory, _, _ = _factory(ffmpeg_module, tmp_path, lambda _argv, **_kwargs: process)
 
@@ -932,6 +946,8 @@ async def test_timeout_during_priming_cleans_process(
 
     assert entered.is_set()
     assert process.stdout.closed
+    assert process.terminate_calls == 1
+    assert factory.last_failure == "prime_timeout (exit=unknown)"
 
 
 @pytest.mark.asyncio
@@ -1028,3 +1044,146 @@ assert process.poll() is not None
     ):
         pytest.skip("packaged imageio-ffmpeg is unavailable")
     assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("stderr", "returncode", "reason"), [
+    (b"[https] HTTP error 403 Forbidden https://private.example/?token=secret", 1, "http_403"),
+    (b"[tls] Error in the pull function. Authorization: Bearer secret", 1, "tls_error"),
+    (b"Failed to resolve hostname private.example: secret", 1, "dns_error"),
+    (b"Protocol 'https' not on whitelist 'secret'!", 1, "protocol_blocked"),
+    (b"https://private.example: Protocol not found", 1, "protocol_unavailable"),
+    (b"Error opening input: Invalid data found when processing input secret", 1, "invalid_media"),
+    (b"Unrecognized option 'secret'", 1, "unsupported_option"),
+    (b"Unknown encoder 'secret'", 1, "codec_unavailable"),
+    (b"Connection timed out secret", 1, "network_timeout"),
+    (b"private provider text and secret", 1, "no_audio"),
+    (b"", -11, "process_signal_11"),
+], ids=["403", "tls", "dns", "whitelist", "protocol", "media", "option", "codec", "timeout", "unknown", "crash"])
+async def test_failed_start_reports_safe_ffmpeg_cause_without_provider_output(
+    ffmpeg_module, tmp_path, caplog, stderr, returncode, reason,
+):
+    process = _Process((), returncode=returncode)
+    process.stderr = io.BytesIO(stderr)
+    factory, _, _ = _factory(ffmpeg_module, tmp_path, lambda *_args, **_kwargs: process)
+    source = ResolvedSource("https://private.example/?token=secret", {})
+    with pytest.raises(PlaybackStartError) as caught:
+        await factory.create(source)
+    report = factory.last_failure
+    assert reason in report and f"exit={returncode}" in report
+    assert reason in caplog.text
+    for exposed in (report, caplog.text, _error_surface(caught.value)):
+        assert "secret" not in exposed and "private.example" not in exposed
+    assert process.stdout.closed and process.stderr.closed
+    await factory.close()
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_stderr_is_drained_but_never_retained_as_unbounded_text(ffmpeg_module, tmp_path):
+    class NoisyStream:
+        closed = False
+        total_read = 0
+
+        def read(self, size):
+            assert 0 < size <= 4096
+            if self.total_read >= 2 * 1024 * 1024:
+                return b""
+            self.total_read += size
+            return b"x" * size
+
+        def close(self):
+            self.closed = True
+
+    process = _Process((), returncode=1)
+    process.stderr = NoisyStream()
+    factory, _, _ = _factory(ffmpeg_module, tmp_path, lambda *_args, **_kwargs: process)
+    with pytest.raises(PlaybackStartError):
+        await factory.create(ResolvedSource("https://media.example/stream", {}))
+    assert process.stderr.total_read == 2 * 1024 * 1024
+    assert process.stderr.closed
+    assert len(factory.last_failure) < 100
+    await factory.close()
+
+
+def test_real_ffmpeg_failure_drains_stderr_and_reaps_reader_without_exposing_url():
+    script = r"""
+import asyncio
+import socket
+import threading
+from TidalPlayerExp.playback import ffmpeg
+from TidalPlayerExp.playback.models import ResolvedSource
+from TidalPlayerExp.playback.errors import PlaybackStartError
+
+async def main():
+    children = []
+    def spawn(*args, **kwargs):
+        child = ffmpeg._default_spawn(*args, **kwargs)
+        children.append(child)
+        return child
+    factory = ffmpeg.FFmpegSourceFactory(spawn=spawn)
+    # An owned, bound but non-listening socket rejects connections locally.
+    with socket.socket() as blocked:
+        blocked.bind(('127.0.0.1', 0))
+        source = ResolvedSource(f'https://127.0.0.1:{blocked.getsockname()[1]}/private-token', {})
+        try:
+            await factory.create(source)
+        except PlaybackStartError:
+            pass
+        else:
+            raise AssertionError('unreachable source started')
+    await factory.close()
+    assert factory.last_failure.startswith('connection_failed '), factory.last_failure
+    assert children and all(child.poll() is not None for child in children)
+    assert all(child.stdout.closed and child.stderr.closed for child in children)
+    assert not any(thread.name == 'tidal_ffmpeg_stderr' for thread in threading.enumerate())
+
+asyncio.run(main())
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script], cwd=Path(__file__).resolve().parents[2],
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "private-token" not in result.stdout + result.stderr
+
+
+def test_stderr_larger_than_pipe_capacity_does_not_deadlock_start():
+    script = r"""
+import asyncio
+import subprocess
+import sys
+import threading
+from TidalPlayerExp.playback.ffmpeg import FFmpegSourceFactory
+from TidalPlayerExp.playback.models import ResolvedSource
+from TidalPlayerExp.playback.errors import PlaybackStartError
+
+async def main():
+    children = []
+    def spawn(_argv, **kwargs):
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import os; os.write(2, b'HTTP error 403 Forbidden\\n' + b'x' * 2097152); raise SystemExit(1)"],
+            **kwargs,
+        )
+        children.append(child)
+        return child
+    factory = FFmpegSourceFactory(spawn=spawn)
+    try:
+        try:
+            await asyncio.wait_for(factory.create(ResolvedSource("https://media.example/test", {})), 10)
+        except PlaybackStartError:
+            pass
+        else:
+            raise AssertionError('empty stream started')
+        assert factory.last_failure == "http_403 (exit=1)"
+        assert all(child.poll() == 1 and child.stderr.closed for child in children)
+        assert not any(thread.name == 'tidal_ffmpeg_stderr' for thread in threading.enumerate())
+    finally:
+        await factory.close()
+
+asyncio.run(main())
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script], cwd=Path(__file__).resolve().parents[2],
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert result.returncode == 0, result.stderr

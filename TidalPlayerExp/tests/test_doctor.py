@@ -102,3 +102,14 @@ async def test_cancelled_doctor_does_not_swallow_cancellation(doctor):
         await doctor.collect_diagnostics(
             bot, backend, factory, tidal_authenticated=None, guild=guild,
         )
+
+
+@pytest.mark.asyncio
+async def test_doctor_reports_last_ffmpeg_failure_separately_from_capabilities(doctor):
+    bot, backend, factory, guild = components()
+    factory.last_failure = "http_403 (exit=1)"
+    report = await doctor.collect_diagnostics(
+        bot, backend, factory, tidal_authenticated=None, guild=guild,
+    )
+    assert "FFmpeg: 7.1" in report
+    assert "FFmpeg last failure: http_403 (exit=1)" in report
