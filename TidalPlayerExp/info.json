@@ -1,6 +1,6 @@
 {
     "author": ["Okkerka"],
-    "install_msg": "Native voice experiment (no Lavalink): unload TidalPlayer and Audio before loading TidalPlayerExp. Restart Red after installing voice dependencies, then run `[p]tidalsetup doctor`. YouTube works without a TIDAL login or API key. For TIDAL, run `[p]tidalsetup login`; experimental settings and login are separate from the original cog. See the cog README for switching and rollback.",
+    "install_msg": "Native voice experiment (no Lavalink): unload TidalPlayer and Audio before loading TidalPlayerExp. Load/reload TidalPlayerExp after installing dependencies, then run `[p]tidalsetup doctor`; no server restart is needed. YouTube works without a TIDAL login or API key. For TIDAL, run `[p]tidalsetup login`; experimental settings and login are separate from the original cog. See the cog README for switching and rollback.",
     "name": "TidalPlayerExp",
     "short": "Native TIDAL, YouTube, SoundCloud and Bandcamp audio.",
     "description": "Experimental native Discord voice playback using FFmpeg, without Lavalink. TIDAL catalog matching with original YouTube audio fallback, public SoundCloud and Bandcamp audio, lazy source resolution, playlists, Spotify imports, and interactive playback controls. YouTube, SoundCloud and Bandcamp do not require TIDAL login or API keys. Unload Audio and the original TidalPlayer before loading this cog; public command names overlap.",

@@ -43,6 +43,7 @@ from .playback.interfaces import PlaybackSession
 from .playback.models import PlaybackEntry, SourceKind, SourceReference
 from .playback.ffmpeg import FFmpegSourceFactory
 from .playback.backend import NativePlaybackBackend
+from .playback.voice_runtime import initialize_voice_runtime
 from .providers.tidal_source import CompositeSourceResolver, TidalSourceResolver
 from .providers.public_audio import PublicAudioResolver
 from .providers.youtube_resolver import YouTubeResolver, YouTubeVideoMetadata
@@ -1150,6 +1151,7 @@ class TidalPlayerExp(commands.Cog):
             raise commands.UserFeedbackCheckFailure(
                 "Unload Audio and the original TidalPlayer before loading TidalPlayerExp."
             )
+        await asyncio.to_thread(initialize_voice_runtime)
         await self._migrate_config()
         await self._initialize_apis()
         self._persistent_view = PlayerControllerView(self)

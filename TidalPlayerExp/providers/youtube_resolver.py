@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
+import importlib.metadata
 import importlib.util
 import json
+import logging
 import os
 import signal
 import sys
@@ -15,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+
+from packaging.version import Version
 
 from ..playback import ResolvedSource, SourceKind, SourceReference
 from ..playback.errors import PlaybackUnavailable, SourceResolutionError
@@ -31,12 +36,14 @@ _GRACE_PERIOD = 0.25
 _CLOSE_DEADLINE = 1.0
 _READ_CHUNK = 4096
 _ALLOWED_HEADERS = {"user-agent": "User-Agent", "referer": "Referer", "origin": "Origin"}
+_MIN_YT_DLP_VERSION = Version("2026.8.19")
 _YT_DLP_BOOTSTRAP = (
     "import runpy,sys; sys.path.insert(0,sys.argv[1]); "
     "sys.argv=['yt_dlp',*sys.argv[2:]]; runpy.run_module('yt_dlp',run_name='__main__')"
 )
 
 ProcessFactory = Callable[..., Awaitable[Any]]
+log = logging.getLogger("red.tidalplayerexp.youtube")
 
 
 class _SpawnedAfterClose(Exception):
@@ -152,21 +159,58 @@ def _validated_deno(value: object) -> str:
     return value
 
 
-def _yt_dlp_root() -> str:
-    """Find the target-installed package without importing it in this process."""
+def _yt_dlp_installation() -> tuple[str, str]:
+    """Select the newest compatible installed code, including Downloader's lib.
+
+    Red appends its target directory after global site-packages, so find_spec
+    alone can select an obsolete global copy. Read the package's literal version
+    without importing it: pip --target can leave stale dist-info directories.
+    Only the isolated extractor child receives the selected path.
+    """
+    candidates: list[Path] = []
+    try:
+        candidates.extend(Path(str(dist.locate_file("yt_dlp"))) for dist in importlib.metadata.distributions(name="yt-dlp"))
+    except Exception as error:  # noqa: BLE001 - allow normal discovery if optional metadata is broken
+        log.debug("Extractor metadata discovery failed (%s); trying import path", type(error).__name__)
     try:
         spec = importlib.util.find_spec("yt_dlp")
         locations = spec.submodule_search_locations if spec is not None else None
-        package_dir = next(iter(locations)) if locations else None
-        if not isinstance(package_dir, str):
-            raise TypeError
-        package = Path(package_dir)
-        root = package.parent
-        if not root.is_absolute() or not package.is_dir() or not (package / "__main__.py").is_file():
-            raise ValueError
-        return str(root)
     except Exception:  # noqa: BLE001 - optional dependency discovery is untrusted
-        raise PlaybackUnavailable() from None
+        locations = None
+    if locations:
+        candidates.extend(Path(location) for location in locations)
+
+    selected: tuple[Version, Path] | None = None
+    for package in dict.fromkeys(candidates):
+        try:
+            if not package.is_absolute() or not (package / "__main__.py").is_file():
+                continue
+            with (package / "version.py").open("rb") as stream:
+                source = stream.read(16385)
+            if len(source) > 16384:
+                continue
+            versions = [
+                node.value.value
+                for node in ast.parse(source.decode("utf-8")).body
+                if isinstance(node, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+            ]
+            if len(versions) != 1:
+                continue
+            version = Version(versions[0])
+            if version >= _MIN_YT_DLP_VERSION and (selected is None or version > selected[0]):
+                selected = version, package.parent
+        except (OSError, ValueError, SyntaxError, UnicodeError):
+            continue
+    if selected is None:
+        raise PlaybackUnavailable()
+    return str(selected[1]), str(selected[0])
+
+
+def _yt_dlp_root() -> str:
+    return _yt_dlp_installation()[0]
 
 
 def _validated_dependency_root(value: object) -> str:

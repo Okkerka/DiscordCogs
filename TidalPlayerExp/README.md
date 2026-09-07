@@ -9,8 +9,9 @@ is unchanged; this cog has its own configuration and TIDAL login.
 - Red 3.5.24 or newer on Python 3.11 or newer. Red owns its `discord.py` version;
   do not install a separate Discord library for this cog.
 - The cog requirements from `info.json`, including PyNaCl, davey (Discord DAVE),
-  imageio-ffmpeg, yt-dlp with EJS, and Deno. Downloader installs these. Restart
-  Red after installing voice dependencies: Discord detects them at startup.
+  imageio-ffmpeg, yt-dlp with EJS, and Deno. Downloader installs these. Load or
+  reload the cog after installation; it recovers voice dependencies that Discord
+  missed before Red made Downloader's library directory visible.
 - A host with compatible dependency wheels/binaries, permission to run FFmpeg
   and Deno, and outbound Discord voice and media access. No Lavalink host access
   is required. Some restricted hosting plans cannot run native voice.
@@ -32,7 +33,10 @@ Downloader repository:
 [p]tidalsetup doctor
 ```
 
-Restart Red after dependency installation if doctor says a restart is required.
+No server restart is needed. If doctor reports a dependency as installed but
+unavailable, update/reinstall that dependency and reload the cog. A broken or
+incompatible native library still needs a working wheel for the host; the cog
+never enables voice by skipping crypto imports or encryption checks.
 Both old and experimental cogs use the same commands, so they cannot be loaded
 together. This cog also refuses to share voice ownership with Audio or another
 cog; it never unloads other cogs for you.
@@ -62,7 +66,10 @@ To return to the original cog:
 
 The original cog's saved configuration remains separate. Do not log out merely
 to switch cogs. Update this experiment with `[p]cog update TidalPlayerExp`, update
-its requirements when needed, and restart/reload as appropriate.
+its requirements when needed, then `[p]reload TidalPlayerExp`. The extractor uses
+the newest compatible installed yt-dlp, including Downloader's copy, without
+reordering the bot's global import path. Doctor reports that selected version,
+not an older shadowing global installation. yt-dlp must be 2026.8.19 or newer.
 
 ## Sources and controls
 

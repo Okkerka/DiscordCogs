@@ -15,7 +15,7 @@ def doctor(monkeypatch):
     module = importlib.import_module("TidalPlayerExp.playback.diagnostics")
     monkeypatch.setattr(module, "_version", lambda name: "1.2.3")
     monkeypatch.setattr(module, "_voice_runtime", lambda: (True, True))
-    monkeypatch.setattr(module, "_youtube_readiness", lambda: (True, True))
+    monkeypatch.setattr(module, "_youtube_readiness", lambda: ("2026.8.19", True))
     return module
 
 
@@ -54,7 +54,7 @@ async def test_ffmpeg_failure_does_not_hide_other_diagnostics_or_leak_exception(
         bot, backend, factory, tidal_authenticated=None, guild=guild,
     )
     assert "FFmpeg: unavailable" in report
-    assert "yt-dlp: 1.2.3" in report
+    assert "yt-dlp: 2026.8.19 (ready)" in report
     assert "unload Audio" in report
     assert "Voice: foreign" in report
     assert "not checked" in report
@@ -63,14 +63,16 @@ async def test_ffmpeg_failure_does_not_hide_other_diagnostics_or_leak_exception(
 
 
 @pytest.mark.asyncio
-async def test_installed_voice_packages_need_restart_when_import_flags_false(doctor, monkeypatch):
+async def test_unavailable_voice_packages_do_not_send_owner_into_restart_loop(doctor, monkeypatch):
     monkeypatch.setattr(doctor, "_voice_runtime", lambda: (False, False))
     bot, backend, factory, guild = components()
     report = await doctor.collect_diagnostics(
         bot, backend, factory, tidal_authenticated=False, guild=guild,
     )
-    assert "PyNaCl: 1.2.3 (restart Red required)" in report
-    assert "DAVE: 1.2.3 (restart Red required)" in report
+    assert "PyNaCl: 1.2.3 (installed but unavailable" in report
+    assert "DAVE: 1.2.3 (installed but unavailable" in report
+    assert "reload TidalPlayerExp" in report
+    assert "restart Red" not in report
     assert "tidalsetup login" in report
     assert "Voice: none" in report
 
@@ -79,7 +81,7 @@ async def test_installed_voice_packages_need_restart_when_import_flags_false(doc
 async def test_missing_optional_packages_report_remedy_in_dms(doctor, monkeypatch):
     monkeypatch.setattr(doctor, "_version", lambda name: None)
     monkeypatch.setattr(doctor, "_voice_runtime", lambda: (False, False))
-    monkeypatch.setattr(doctor, "_youtube_readiness", lambda: (False, False))
+    monkeypatch.setattr(doctor, "_youtube_readiness", lambda: (None, False))
     bot, backend, factory, _ = components()
     report = await doctor.collect_diagnostics(
         bot, backend, factory, tidal_authenticated=None,

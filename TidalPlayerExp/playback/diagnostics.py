@@ -34,27 +34,27 @@ def _voice_runtime() -> tuple[bool, bool]:
         return False, False
 
 
-def _youtube_readiness() -> tuple[bool, bool]:
+def _youtube_readiness() -> tuple[str | None, bool]:
     # These filesystem-only helpers do not import yt-dlp or execute/download tools.
-    from ..providers.youtube_resolver import _deno_path, _yt_dlp_root
+    from ..providers.youtube_resolver import _deno_path, _yt_dlp_installation
 
-    ready = []
-    for probe in (_yt_dlp_root, _deno_path):
-        try:
-            probe()
-        except Exception:  # noqa: BLE001 - report readiness without provider error details
-            ready.append(False)
-        else:
-            ready.append(True)
-    return ready[0], ready[1]
+    try:
+        _, version = _yt_dlp_installation()
+    except Exception:  # noqa: BLE001 - independent optional capability probe
+        version = None
+    try:
+        _deno_path()
+    except Exception:  # noqa: BLE001 - report readiness without provider error details
+        return version, False
+    return version, True
 
 
 def _voice_status(version: str | None, ready: bool) -> str:
     if ready:
         return f"{version or 'unknown'} (ready)"
     if version is not None:
-        return f"{version} (restart Red required)"
-    return "missing (install/update cog requirements, then restart Red)"
+        return f"{version} (installed but unavailable; update requirements, then reload TidalPlayerExp)"
+    return "missing (install/update cog requirements, then reload TidalPlayerExp)"
 
 
 async def collect_diagnostics(
@@ -71,7 +71,7 @@ async def collect_diagnostics(
     check. FFmpeg's owned, bounded capability probe is the only executable run.
     """
     nacl_ready, dave_ready = _voice_runtime()
-    youtube_ready, deno_ready = _youtube_readiness()
+    youtube_version, deno_ready = _youtube_readiness()
     lines = [
         f"Python: {platform.python_version()}",
         f"Red: {_version('Red-DiscordBot') or 'unknown'}",
@@ -90,12 +90,15 @@ async def collect_diagnostics(
             f"Opus output {'yes' if capability.passthrough else 'no'})"
         )
     lines.extend([
-        f"yt-dlp: {_version('yt-dlp') or 'missing'} ({'ready' if youtube_ready else 'package unavailable'})",
+        (
+            f"yt-dlp: {_safe_version(youtube_version) if youtube_version else 'missing or outdated'} "
+            f"({'ready' if youtube_version else 'requires 2026.8.19 or newer'})"
+        ),
         f"YouTube EJS: {_version('yt-dlp-ejs') or 'missing; install/update cog requirements'}",
         f"Deno: {_version('deno') or 'missing'} ({'executable ready' if deno_ready else 'executable unavailable'})",
     ])
-    if not youtube_ready or not deno_ready:
-        lines.append("YouTube remedy: install/update cog requirements, then restart Red")
+    if not youtube_version or not deno_ready:
+        lines.append("YouTube remedy: install/update cog requirements, then reload TidalPlayerExp")
     if tidal_authenticated is None:
         auth = "not checked (offline diagnostic)"
     elif tidal_authenticated:
