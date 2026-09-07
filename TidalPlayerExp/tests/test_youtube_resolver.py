@@ -24,6 +24,21 @@ from TidalPlayerExp.providers.youtube_resolver import YouTubeResolver
 VIDEO_ID = "dQw4w9WgXcQ"
 
 
+@pytest.mark.asyncio
+async def test_installed_extractor_accepts_shared_cli_options_without_network():
+    """A real CLI parse catches removed options that process doubles cannot."""
+    resolver = YouTubeResolver()
+    args = resolver._common_args(resolver._deno_locator(), resolver._yt_dlp_locator())
+    args += ["--use-extractors", "^youtube$", "--list-extractors"]
+    try:
+        result = await resolver._run_child(args, deadline=15, ceiling=64 * 1024)
+        assert b"youtube" in result.lower()
+        assert "--netrc" not in args and "--netrc-cmd" not in args
+        assert "yt_dlp" not in sys.modules
+    finally:
+        await resolver.close()
+
+
 class _Stream:
     def __init__(self, data: bytes) -> None:
         self._data = data
@@ -236,8 +251,9 @@ async def test_resolve_uses_canonical_url_explicit_deno_and_safe_child_environme
         f"deno:{deno_path}",
         "--no-cache-dir",
         "--no-update",
-        "--no-netrc",
         "--no-download",
+        "--output-na-placeholder",
+        "null",
         "--quiet",
         "--no-warnings",
         "--no-progress",

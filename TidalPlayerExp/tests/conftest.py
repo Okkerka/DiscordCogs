@@ -1,7 +1,7 @@
 """
 Shared fixtures that stub every optional dependency so tidalplayer.py can
 be imported and instantiated in a plain pytest run without a live Discord
-connection, Redis, Lavalink node, or third-party API credentials.
+connection or third-party API credentials.
 
 Design principle: minimal stubs — only the attributes/methods that the
 current monolith actually accesses at import-time or inside __init__ /
@@ -16,6 +16,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import discord as real_discord
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +117,8 @@ class FakeConfig:
 
 def _make_discord_stub() -> types.ModuleType:
     discord = types.ModuleType("discord")
+    discord.AudioSource = real_discord.AudioSource
+    discord.oggparse = real_discord.oggparse
     discord.Color = MagicMock()
     discord.Color.blue = MagicMock(return_value="blue")
     discord.Color.green = MagicMock(return_value="green")
@@ -198,6 +201,7 @@ def _make_discord_stub() -> types.ModuleType:
     discord.Forbidden = type("Forbidden", (discord.HTTPException,), {})
     discord.NotFound = type("NotFound", (discord.HTTPException,), {})
     discord.Guild = MagicMock
+    discord.Member = type("Member", (), {})
     discord.User = MagicMock
     return discord
 
@@ -246,6 +250,8 @@ def _make_redbot_stub(fake_config: FakeConfig) -> types.ModuleType:
         @staticmethod
         def check(predicate: Any):
             return lambda f: f
+
+        UserFeedbackCheckFailure = type("UserFeedbackCheckFailure", (Exception,), {})
 
         class Cog:
             @staticmethod
@@ -308,13 +314,6 @@ def _make_redbot_stub(fake_config: FakeConfig) -> types.ModuleType:
     redbot.core.utils.views.SetApiView = MagicMock()
 
     return redbot
-
-
-def _make_lavalink_stub() -> types.ModuleType:
-    lavalink = types.ModuleType("lavalink")
-    lavalink.get_player = MagicMock(side_effect=Exception("no player"))
-    lavalink.connect = AsyncMock()
-    return lavalink
 
 
 def _make_tidalapi_stub() -> types.ModuleType:
@@ -394,7 +393,6 @@ def _patch_dependencies():
         "redbot.core.utils": redbot_stub.core.utils,
         "redbot.core.utils.menus": redbot_stub.core.utils.menus,
         "redbot.core.utils.views": redbot_stub.core.utils.views,
-        "lavalink": _make_lavalink_stub(),
         "tidalapi": _make_tidalapi_stub(),
         "tidalapi.media": _make_tidalapi_stub().media,
         "spotipy": _make_spotipy_stub(),
@@ -428,6 +426,10 @@ def fake_bot():
     bot.add_cog = AsyncMock()
     bot.cog_disabled_in_guild = AsyncMock(return_value=False)
     bot.is_owner = AsyncMock(return_value=False)
+    bot.get_cog = MagicMock(return_value=None)
+    bot.get_guild = MagicMock(return_value=None)
+    bot.guilds = []
+    bot.user = types.SimpleNamespace(id=999)
     return bot
 
 
@@ -452,3 +454,39 @@ def event_loop():
     loop = asyncio.new_event_loop()
     yield loop
     loop.close()
+
+
+def make_entry(number=1, *, title=None, artist="Artist"):
+    from TidalPlayerExp.playback.models import PlaybackEntry, SourceKind, SourceReference
+    return PlaybackEntry(str(number), SourceReference(SourceKind.TIDAL, str(number)), None,
+        {"title": title or f"Track {number}", "artist": artist, "album": None,
+         "duration": 120, "quality": "LOSSLESS", "image": None, "share_url": None,
+         "audio_resolution": None, "track_id": number}, 5)
+
+
+class FakePlaybackSession:
+    """Native boundary recorder: no Lavalink-shaped compatibility methods."""
+
+    def __init__(self, current=None, queued=()):
+        self.current = current
+        self.entries = list(queued)
+        self.paused = False
+        self.enqueue = AsyncMock(side_effect=self._enqueue)
+        self.skip = AsyncMock(return_value=True)
+        self.stop = AsyncMock()
+        self.set_paused = AsyncMock(return_value=True)
+
+    def _enqueue(self, entry, **kwargs):
+        self.entries.append(entry)
+        return True
+
+    def snapshot(self):
+        from TidalPlayerExp.playback.models import PlaybackSnapshot
+        return PlaybackSnapshot(self.current, tuple(self.entries), self.paused, 22)
+
+
+@pytest.fixture
+def native_session(cog):
+    session = FakePlaybackSession()
+    cog.backend = types.SimpleNamespace(get=AsyncMock(return_value=session), connect=AsyncMock(return_value=session), close=AsyncMock(), close_guild=AsyncMock())
+    return session

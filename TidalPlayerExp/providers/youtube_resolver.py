@@ -223,6 +223,8 @@ class YouTubeResolver:
         self._state_lock = asyncio.Lock()
 
     def _common_args(self, deno: str, dependency_root: str) -> list[str]:
+        # netrc is opt-in in yt-dlp. Ignore configuration and never enable it;
+        # there is no corresponding --no-netrc CLI option.
         return [
             sys.executable,
             "-I",
@@ -236,8 +238,10 @@ class YouTubeResolver:
             f"deno:{deno}",
             "--no-cache-dir",
             "--no-update",
-            "--no-netrc",
             "--no-download",
+            # Optional projected fields must be JSON null, not yt-dlp's bare NA.
+            "--output-na-placeholder",
+            "null",
             "--quiet",
             "--no-warnings",
             "--no-progress",

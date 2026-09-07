@@ -45,6 +45,8 @@ def test_source_kind_contains_only_stable_provider_kinds() -> None:
         ("TIDAL", "tidal"),
         ("TIDAL_VIDEO", "tidal_video"),
         ("YOUTUBE", "youtube"),
+        ("SOUNDCLOUD", "soundcloud"),
+        ("BANDCAMP", "bandcamp"),
     ]
 
 

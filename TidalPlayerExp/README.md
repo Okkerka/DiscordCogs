@@ -1,6 +1,6 @@
 # TidalPlayerExp
 
-Experimental TIDAL and YouTube playback through native Discord voice. No Java,
+Experimental TIDAL, YouTube, SoundCloud, and Bandcamp playback through native Discord voice. No Java,
 Lavalink server, or Red Audio cog is needed. The original `TidalPlayer` folder
 is unchanged; this cog has its own configuration and TIDAL login.
 
@@ -41,6 +41,7 @@ Join a voice channel and try:
 
 ```text
 [p]tplay <YouTube video URL>
+[p]tplay <SoundCloud track/set or Bandcamp track/album URL>
 [p]tidalsetup login
 [p]tplay <TIDAL URL or song search>
 [p]tqueue
@@ -65,6 +66,18 @@ its requirements when needed, and restart/reload as appropriate.
 
 ## Sources and controls
 
+The player uses explicit provider adapters, not arbitrary website extraction.
+YouTube Music links use the YouTube adapter. Spotify links are catalog imports,
+not direct Spotify audio. Apple Music, Deezer, and Amazon Music are not yet
+implemented: adding them requires a catalog-link adapter and playable matching,
+not treating subscription streams or short previews as full-song audio.
+
+Provider limitations are distinct from the native voice engine. For example,
+[SoundCloud documents off-platform streaming restrictions](https://developers.soundcloud.com/docs/api/),
+and [Apple distinguishes subscription playback from preview assets](https://developer.apple.com/documentation/applemusicapi/songs/attributes-data.dictionary).
+The [yt-dlp supported-sites list](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md)
+is not a guarantee that every site or individual track currently works.
+
 - YouTube video links work without a YouTube API key or TIDAL login. With TIDAL
   authentication, the cog tries a confident catalog match; otherwise it plays
   the original video's audio. If the TIDAL source cannot start, it falls back to
@@ -72,6 +85,14 @@ its requirements when needed, and restart/reload as appropriate.
 - A video URL containing `list=` still plays that video only. Use an explicit
   YouTube `/playlist?list=...` URL to request playlist import. Keyless imports
   are capped at 100 items; the optional Data API path supports up to 1,000.
+- Public SoundCloud tracks/sets and Bandcamp tracks/albums play their original
+  audio without TIDAL login or additional API keys. Collections are capped at
+  100 entries and skip malformed/unavailable metadata. Use full `soundcloud.com`
+  or `artist.bandcamp.com` links; shortened SoundCloud links and custom Bandcamp
+  domains are not supported. Private, premium-only, and identified preview
+  formats are rejected; the cog cannot recover audio a provider withholds.
+  Flat collections can have sparse metadata: SoundCloud set titles may use
+  track URL slugs, and entries without public track URLs are skipped.
 - TIDAL links/search and Spotify-to-TIDAL imports require TIDAL authentication.
   Spotify setup is optional: `[p]tidalsetup spotify` and
   `[p]tidalsetup spotifylogin`. An optional YouTube Data API key can be configured
@@ -85,8 +106,8 @@ its requirements when needed, and restart/reload as appropriate.
 
 Queues hold stable track/video identifiers and display metadata, not expiring
 media URLs. A source is resolved only when it is about to play. Each guild has
-one serial playback worker and one active FFmpeg process; YouTube extraction
-runs in at most two isolated child processes across the cog. No media is saved
+one serial playback worker and one active FFmpeg process; YouTube, SoundCloud,
+and Bandcamp extraction share at most two isolated child processes across the cog. No media is saved
 to disk. This avoids Java/Lavalink overhead but still uses CPU for audio encoding,
 RAM for buffers, and network bandwidth per playing guild. It is not a benchmark
 claim: test concurrent guilds on your actual host.

@@ -189,11 +189,17 @@ class TidalSourceResolver:
 
 
 class CompositeSourceResolver:
-    """Dispatch provider references and own only the YouTube resolver."""
+    """Dispatch references and close the shared extraction worker exactly once."""
 
-    def __init__(self, tidal: TidalSourceResolver, youtube: SourceResolver) -> None:
+    def __init__(
+        self, tidal: TidalSourceResolver, youtube: SourceResolver,
+        *, public_audio: SourceResolver | None = None,
+    ) -> None:
         self._tidal = tidal
         self._youtube = youtube
+        # PublicAudioResolver borrows the same YouTube worker and owns no child
+        # lifecycle separately; closing both would duplicate cleanup ownership.
+        self._public_audio = public_audio
         self._closing_task: asyncio.Task[None] | None = None
         self._closed = False
 
@@ -206,6 +212,8 @@ class CompositeSourceResolver:
             return await self._tidal.resolve(reference)
         if reference.kind is SourceKind.YOUTUBE:
             return await self._youtube.resolve(reference)
+        if reference.kind in (SourceKind.SOUNDCLOUD, SourceKind.BANDCAMP) and self._public_audio is not None:
+            return await self._public_audio.resolve(reference)
         raise SourceResolutionError()
 
     async def close(self) -> None:

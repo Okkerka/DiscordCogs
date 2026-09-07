@@ -11,6 +11,7 @@ from typing import cast
 from urllib.parse import urlsplit
 
 from ..domain.models import TrackMeta
+from ..domain.public_audio_urls import canonical_public_audio_url
 
 
 class SourceKind(StrEnum):
@@ -19,6 +20,8 @@ class SourceKind(StrEnum):
     TIDAL = "tidal"
     TIDAL_VIDEO = "tidal_video"
     YOUTUBE = "youtube"
+    SOUNDCLOUD = "soundcloud"
+    BANDCAMP = "bandcamp"
 
 
 _YOUTUBE_IDENTIFIER = re.compile(r"[A-Za-z0-9_-]{11}\Z")
@@ -100,6 +103,12 @@ class SourceReference:
                 and self.identifier.isdecimal()
                 and any(character != "0" for character in self.identifier)
             )
+        elif self.kind in (SourceKind.SOUNDCLOUD, SourceKind.BANDCAMP):
+            try:
+                provider, content_type, canonical = canonical_public_audio_url(self.identifier)
+                valid = provider == self.kind.value and content_type == "track" and canonical == self.identifier
+            except ValueError:
+                valid = False
         else:
             valid = _YOUTUBE_IDENTIFIER.fullmatch(self.identifier) is not None
         if not valid:

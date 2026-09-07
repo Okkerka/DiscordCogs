@@ -7,11 +7,15 @@ from dataclasses import dataclass
 from enum import StrEnum
 from urllib.parse import parse_qs, urlsplit
 
+from ..domain.public_audio_urls import canonical_public_audio_url
+
 
 class ProviderKind(StrEnum):
     TIDAL = "tidal"
     SPOTIFY = "spotify"
     YOUTUBE = "youtube"
+    SOUNDCLOUD = "soundcloud"
+    BANDCAMP = "bandcamp"
 
 
 @dataclass(frozen=True)
@@ -69,6 +73,12 @@ def parse_provider_url(value: str) -> ProviderURL | None:
     except ValueError as error:
         raise MalformedProviderURL("Malformed provider URL") from error
     host = parts.hostname.lower()
+    if host in {"soundcloud.com", "www.soundcloud.com", "m.soundcloud.com"} or host.endswith(".bandcamp.com"):
+        try:
+            provider, content_type, canonical = canonical_public_audio_url(value)
+        except ValueError:
+            raise MalformedProviderURL("Unsupported public audio URL") from None
+        return ProviderURL(ProviderKind(provider), content_type, canonical)
     path = [segment for segment in parts.path.split("/") if segment]
     if host in {"tidal.com", "www.tidal.com", "listen.tidal.com"}:
         if len(path) == 3 and path[0] == "browse":

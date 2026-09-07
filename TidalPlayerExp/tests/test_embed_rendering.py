@@ -180,6 +180,15 @@ def test_youtube_queue_embed_uses_source_link(make_queue_embed) -> None:
     assert _field_value(embed, "Open in TIDAL") is None
 
 
+@pytest.mark.parametrize("source,label", [("soundcloud", "SoundCloud"), ("bandcamp", "Bandcamp")])
+def test_public_audio_source_labels_do_not_claim_tidal_quality(make_now_playing_embed, source, label):
+    embed = make_now_playing_embed(_make_meta(source=source, quality="Public audio"))
+    assert embed.title == f"Playing from {label}"
+    assert _field_value(embed, "Source") == f"{label} audio"
+    assert _field_value(embed, "Catalog quality") is None
+    assert "Discord Opus" in _footer_text(embed)
+
+
 def test_controller_track_info_is_source_aware(cog) -> None:
     controller = importlib.import_module("TidalPlayerExp.ui.controller")
     url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"

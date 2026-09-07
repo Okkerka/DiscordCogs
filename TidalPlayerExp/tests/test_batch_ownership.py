@@ -23,7 +23,7 @@ async def test_second_batch_in_same_guild_is_rejected(cog) -> None:
         patch.object(type(cog), "check_ready", new=AsyncMock(return_value=True)),
         patch.object(
             type(cog),
-            "_ensure_player",
+            "_prepare_playback_session",
             new=AsyncMock(return_value=SimpleNamespace()),
         ),
         patch.object(

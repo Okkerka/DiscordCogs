@@ -1,4 +1,4 @@
-"""Regression coverage for Tidal-first single-video YouTube playback."""
+"""YouTube admission keeps stable references and delegates playback to the session."""
 
 from __future__ import annotations
 
@@ -6,10 +6,12 @@ import asyncio
 import importlib
 import logging
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from TidalPlayerExp.playback.models import SourceKind, SourceReference
+from TidalPlayerExp.providers.youtube_resolver import YouTubeVideoMetadata
 from TidalPlayerExp.ui.embeds import Messages
 
 
@@ -18,351 +20,267 @@ CANONICAL_URL = f"https://www.youtube.com/watch?v={VIDEO_ID}"
 
 
 def _context(guild_id: int = 71):
-    channel = SimpleNamespace(id=12)
+    channel = SimpleNamespace(
+        id=22, permissions_for=lambda _member: SimpleNamespace(connect=True, speak=True),
+    )
     return SimpleNamespace(
-        guild=SimpleNamespace(id=guild_id),
-        author=SimpleNamespace(voice=SimpleNamespace(channel=channel)),
+        guild=SimpleNamespace(id=guild_id, me=SimpleNamespace(), voice_client=None),
+        author=SimpleNamespace(id=5, voice=SimpleNamespace(channel=channel)),
         channel=channel,
         defer=AsyncMock(),
-        send=AsyncMock(),
+        send=AsyncMock(return_value=SimpleNamespace(
+            id=80, guild=SimpleNamespace(id=guild_id), edit=AsyncMock(), delete=AsyncMock(),
+        )),
     )
 
 
 def _candidate(title: str = "Rivals", artist: str = "AZALI"):
     return SimpleNamespace(
-        id=269931027,
-        name=title,
-        full_name=title,
-        artist=SimpleNamespace(name=artist),
+        id=269931027, name=title, full_name=title,
+        artist=SimpleNamespace(name=artist), album=None, duration=243,
+        audio_quality="HI_RES_LOSSLESS",
     )
 
 
-def _loaded_track(
-    *,
-    title: str = "AZALI - Rivals",
-    author: str = "AZALI",
-    length: int = 243_000,
-    thumbnail: str | None = "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg",
-):
-    return SimpleNamespace(
-        title=title,
-        author=author,
-        length=length,
-        thumbnail=thumbnail,
-        uri=CANONICAL_URL,
+def _video(video_id: str = VIDEO_ID, title: str = "AZALI - Rivals"):
+    return YouTubeVideoMetadata(
+        video_id, title, "AZALI", 243,
+        f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
     )
 
 
-def _player(load_result):
-    player = SimpleNamespace(
-        current=None,
-        queue=[],
-        add=MagicMock(),
-        play=AsyncMock(),
-        load_tracks=AsyncMock(return_value=load_result),
-    )
-    player.add.side_effect = lambda _requester, track: player.queue.append(track)
-    return player
+def _api_payload(title="AZALI - Rivals (Official Audio)", channel="AZALI - Topic"):
+    return {"items": [{"snippet": {
+        "title": title, "channelTitle": channel,
+        "thumbnails": {"high": {"url": f"https://i.ytimg.com/vi/{VIDEO_ID}/hqdefault.jpg"}},
+    }}]}
 
 
 def _youtube_client(payload):
-    request = SimpleNamespace(execute=lambda: payload)
-    videos = SimpleNamespace(list=lambda **_kwargs: request)
-    return SimpleNamespace(videos=lambda: videos)
-
-
-def _api_payload(
-    *, title: str = "AZALI - Rivals (Official Audio)", channel: str = "AZALI - Topic"
-):
-    return {
-        "items": [
-            {
-                "snippet": {
-                    "title": title,
-                    "channelTitle": channel,
-                    "thumbnails": {
-                        "high": {"url": "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"}
-                    },
-                }
-            }
-        ]
-    }
+    execute = Mock(return_value=payload)
+    listing = Mock(return_value=SimpleNamespace(execute=execute))
+    return SimpleNamespace(videos=lambda: SimpleNamespace(list=listing))
 
 
 async def _run_blocking(_handler, operation, **_kwargs):
     return operation()
 
 
+@pytest.fixture
+def youtube_ctx(cog, native_session, monkeypatch):
+    cog.yt = None
+    cog._initialized = True
+    monkeypatch.setattr(type(cog.tidal), "_run_blocking", _run_blocking)
+    monkeypatch.setattr(type(cog.tidal), "is_logged_in", AsyncMock(return_value=False))
+    monkeypatch.setattr(type(cog.tidal), "search", AsyncMock(return_value=[]))
+    cog.youtube_resolver.fetch_metadata = AsyncMock(return_value=_video())
+    cog.youtube_resolver.resolve = AsyncMock(side_effect=AssertionError("Admission must not resolve media"))
+    return _context()
+
+
 @pytest.mark.asyncio
-async def test_confident_tidal_match_avoids_youtube_lavalink_load(cog) -> None:
-    ctx = _context()
-    candidate = _candidate()
-    player = _player(None)
+async def test_keyless_unauthenticated_video_admits_youtube_once(cog, youtube_ctx, native_session):
+    await cog._handle_youtube_video(youtube_ctx, VIDEO_ID)
+
+    cog.youtube_resolver.fetch_metadata.assert_awaited_once_with(SourceReference(SourceKind.YOUTUBE, VIDEO_ID))
+    cog.tidal.search.assert_not_awaited()
+    native_session.enqueue.assert_awaited_once()
+    entry = native_session.entries[0]
+    assert entry.primary == SourceReference(SourceKind.YOUTUBE, VIDEO_ID)
+    assert entry.fallback is None
+    assert entry.meta["source"] == "YouTube"
+    assert entry.meta["duration"] == 243
+    assert entry.meta["share_url"] == CANONICAL_URL
+    assert entry.meta["image"].endswith("hqdefault.jpg")
+    assert entry.requester_id == youtube_ctx.author.id
+    cog.youtube_resolver.resolve.assert_not_awaited()
+    assert not cog._current_meta
+    youtube_ctx.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confident_match_preserves_original_youtube_fallback_metadata(cog, youtube_ctx, native_session):
     cog.yt = _youtube_client(_api_payload())
-    queue_tidal = AsyncMock(return_value=True)
-    get_player = AsyncMock(return_value=player)
+    cog.tidal.is_logged_in.return_value = True
+    cog.tidal.search.return_value = [_candidate()]
 
-    with (
-        patch.object(type(cog.tidal), "_run_blocking", new=_run_blocking),
-        patch.object(type(cog.tidal), "search", new=AsyncMock(return_value=[candidate])),
-        patch.object(type(cog), "_load_and_queue_track", new=queue_tidal),
-        patch.object(type(cog), "_get_player", new=get_player),
-        patch.object(type(cog), "_ensure_vc_connected", new=AsyncMock(return_value=player)),
-    ):
-        await cog._handle_youtube_video(ctx, VIDEO_ID)
+    await cog._handle_youtube_video(youtube_ctx, VIDEO_ID)
 
-    queue_tidal.assert_awaited_once_with(ctx, candidate, player=player)
-    get_player.assert_awaited_once_with(ctx, connect=True)
-    player.load_tracks.assert_not_awaited()
+    entry = native_session.entries[0]
+    assert entry.primary == SourceReference(SourceKind.TIDAL, "269931027")
+    assert entry.meta["title"] == "Rivals"
+    assert entry.fallback == SourceReference(SourceKind.YOUTUBE, VIDEO_ID)
+    assert entry.fallback_meta["title"] == "AZALI - Rivals (Official Audio)"
+    assert entry.fallback_meta["artist"] == "AZALI - Topic"
+    assert entry.fallback_meta["share_url"] == CANONICAL_URL
+    assert entry.fallback_meta["source"] == "YouTube"
+    assert entry.fallback_meta["track_id"] is None
+    assert entry.fallback_meta["audio_resolution"] is None
+    cog.youtube_resolver.fetch_metadata.assert_not_awaited()
+    cog.youtube_resolver.resolve.assert_not_awaited()
+    native_session.enqueue.assert_awaited_once()
+    assert not cog._current_meta
+    youtube_ctx.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_no_confident_match_loads_and_admits_youtube_once(cog) -> None:
-    ctx = _context()
-    loaded = _loaded_track(thumbnail=None)
-    player = _player(SimpleNamespace(tracks=[loaded], load_type="TRACK_LOADED"))
+@pytest.mark.parametrize("payload", [
+    {}, {"items": [{}]}, _api_payload(title={"untrusted": "object"}),
+    _api_payload(channel=["invalid"]), _api_payload(title="[Private video]"),
+])
+async def test_missing_or_malformed_api_metadata_uses_extractor_then_prefers_tidal(
+    cog, youtube_ctx, native_session, payload,
+):
+    cog.yt = _youtube_client(payload)
+    cog.tidal.is_logged_in.return_value = True
+    cog.tidal.search.return_value = [_candidate()]
+
+    await cog._handle_youtube_video(youtube_ctx, VIDEO_ID)
+
+    cog.youtube_resolver.fetch_metadata.assert_awaited_once()
+    assert native_session.entries[0].primary.kind is SourceKind.TIDAL
+    assert native_session.entries[0].fallback_meta["title"] == "AZALI - Rivals"
+    cog.youtube_resolver.resolve.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_api_failure_falls_back_without_exposing_exception(cog, youtube_ctx, native_session, caplog):
     cog.yt = _youtube_client(_api_payload())
-
-    with (
-        patch.object(type(cog.tidal), "_run_blocking", new=_run_blocking),
-        patch.object(type(cog.tidal), "search", new=AsyncMock(return_value=[])),
-        patch.object(type(cog), "_get_player", new=AsyncMock(return_value=player)),
-        patch.object(type(cog), "_ensure_vc_connected", new=AsyncMock(return_value=player)),
-        patch.object(type(cog), "_send_now_playing", new=AsyncMock()),
-    ):
-        await cog._handle_youtube_video(ctx, VIDEO_ID)
-
-    player.load_tracks.assert_awaited_once_with(CANONICAL_URL)
-    player.add.assert_called_once_with(ctx.author, loaded)
-    player.play.assert_awaited_once()
-    meta = cog._current_meta[ctx.guild.id]
-    assert meta["source"] == "YouTube"
-    assert meta["duration"] == 243
-    assert meta["share_url"] == CANONICAL_URL
-    assert meta["image"].endswith("hqdefault.jpg")
-
-
-@pytest.mark.asyncio
-async def test_missing_api_metadata_uses_loaded_metadata_then_prefers_tidal(cog) -> None:
-    ctx = _context()
-    loaded = _loaded_track()
-    player = _player(SimpleNamespace(tracks=[loaded], load_type="TRACK_LOADED"))
-    candidate = _candidate()
-    cog.yt = _youtube_client({"items": [{}]})
-    queue_tidal = AsyncMock(return_value=True)
-
-    with (
-        patch.object(type(cog.tidal), "_run_blocking", new=_run_blocking),
-        patch.object(type(cog.tidal), "search", new=AsyncMock(return_value=[candidate])),
-        patch.object(type(cog), "_get_player", new=AsyncMock(return_value=player)),
-        patch.object(type(cog), "_ensure_vc_connected", new=AsyncMock(return_value=player)),
-        patch.object(type(cog), "_load_and_queue_track", new=queue_tidal),
-    ):
-        await cog._handle_youtube_video(ctx, VIDEO_ID)
-
-    player.load_tracks.assert_awaited_once_with(CANONICAL_URL)
-    queue_tidal.assert_awaited_once_with(ctx, candidate, player=player)
-
-
-@pytest.mark.asyncio
-async def test_youtube_empty_load_sends_source_specific_error(cog) -> None:
-    ctx = _context()
-    player = _player(SimpleNamespace(tracks=[], load_type="NO_MATCHES"))
-    cog.yt = _youtube_client(_api_payload())
-
-    with (
-        patch.object(type(cog.tidal), "_run_blocking", new=_run_blocking),
-        patch.object(type(cog.tidal), "search", new=AsyncMock(return_value=[])),
-        patch.object(type(cog), "_get_player", new=AsyncMock(return_value=player)),
-        patch.object(type(cog), "_ensure_vc_connected", new=AsyncMock(return_value=player)),
-    ):
-        await cog._handle_youtube_video(ctx, VIDEO_ID)
-
-    player.load_tracks.assert_awaited_once()
-    assert ctx.send.await_args.kwargs["embed"].description == Messages.ERROR_YOUTUBE_FAILED
-
-
-@pytest.mark.asyncio
-async def test_youtube_api_cancellation_propagates_without_error_message(cog) -> None:
-    ctx = _context()
-    player = _player(None)
-    cog.yt = _youtube_client(_api_payload())
-
-    async def cancel(_handler, _operation, **_kwargs):
-        raise asyncio.CancelledError
-
-    with (
-        patch.object(type(cog.tidal), "_run_blocking", new=cancel),
-        patch.object(type(cog), "_get_player", new=AsyncMock(return_value=player)),
-        patch.object(type(cog), "_ensure_vc_connected", new=AsyncMock(return_value=player)),
-    ):
-        with pytest.raises(asyncio.CancelledError):
-            await cog._handle_youtube_video(ctx, VIDEO_ID)
-
-    ctx.send.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_youtube_provider_failure_log_excludes_exception_text(cog, caplog) -> None:
-    ctx = _context()
-    secret = "api-key-and-request-url"
-    player = _player(None)
-    player.load_tracks.side_effect = RuntimeError(secret)
-    cog.yt = _youtube_client(_api_payload())
+    cog.yt.videos().list().execute.side_effect = RuntimeError("api-key-and-request-url")
     caplog.set_level(logging.WARNING, logger="red.tidalplayerexp")
 
-    with (
-        patch.object(type(cog.tidal), "_run_blocking", new=_run_blocking),
-        patch.object(type(cog.tidal), "search", new=AsyncMock(return_value=[])),
-        patch.object(type(cog), "_get_player", new=AsyncMock(return_value=player)),
-        patch.object(type(cog), "_ensure_vc_connected", new=AsyncMock(return_value=player)),
-    ):
-        await cog._handle_youtube_video(ctx, VIDEO_ID)
+    await cog._handle_youtube_video(youtube_ctx, VIDEO_ID)
 
+    assert "api-key-and-request-url" not in caplog.text
+    cog.youtube_resolver.fetch_metadata.assert_awaited_once()
+    assert native_session.entries[0].primary.kind is SourceKind.YOUTUBE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["no_match", "search", "metadata", "reference"])
+async def test_optional_tidal_failure_keeps_original_youtube(cog, youtube_ctx, native_session, failure):
+    cog.tidal.is_logged_in.return_value = True
+    candidate = _candidate()
+    cog.tidal.search.return_value = [] if failure == "no_match" else [candidate]
+    if failure == "search":
+        cog.tidal.search.side_effect = RuntimeError("catalog unavailable")
+    elif failure == "metadata":
+        cog._extract_meta = AsyncMock(side_effect=ValueError("malformed metadata"))
+    elif failure == "reference":
+        candidate.id = "invalid"
+
+    await cog._handle_youtube_video(youtube_ctx, VIDEO_ID)
+
+    assert len(native_session.entries) == 1
+    assert native_session.entries[0].primary == SourceReference(SourceKind.YOUTUBE, VIDEO_ID)
+    assert native_session.entries[0].meta["share_url"] == CANONICAL_URL
+    cog.youtube_resolver.resolve.assert_not_awaited()
+    youtube_ctx.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unavailable_title", [None, "[Private video]", "[Deleted video]"])
+async def test_missing_metadata_sends_one_safe_error(cog, youtube_ctx, native_session, caplog, unavailable_title):
+    secret = "signed-stream-url-secret"
+    if unavailable_title is None:
+        cog.youtube_resolver.fetch_metadata.side_effect = RuntimeError(secret)
+    else:
+        cog.youtube_resolver.fetch_metadata.return_value = _video(title=unavailable_title)
+    caplog.set_level(logging.WARNING, logger="red.tidalplayerexp")
+
+    await cog._handle_youtube_video(youtube_ctx, VIDEO_ID)
+
+    native_session.enqueue.assert_not_awaited()
+    youtube_ctx.send.assert_awaited_once()
+    assert youtube_ctx.send.await_args.kwargs["embed"].description == Messages.ERROR_YOUTUBE_FAILED
     assert secret not in caplog.text
-    assert VIDEO_ID in caplog.text
-    assert ctx.send.await_args.kwargs["embed"].description == Messages.ERROR_YOUTUBE_FAILED
+    cog.youtube_resolver.resolve.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_missing_youtube_client_still_uses_direct_fallback(cog) -> None:
-    ctx = _context()
-    loaded = _loaded_track()
-    player = _player(SimpleNamespace(tracks=[loaded], load_type="TRACK_LOADED"))
-    cog.yt = None
+@pytest.mark.parametrize("stage", ["api", "metadata", "search", "enqueue"])
+async def test_cancellation_propagates_without_error(cog, youtube_ctx, native_session, monkeypatch, stage):
+    if stage == "api":
+        cog.yt = _youtube_client(_api_payload())
+        monkeypatch.setattr(type(cog.tidal), "_run_blocking", AsyncMock(side_effect=asyncio.CancelledError))
+    elif stage == "metadata":
+        cog.youtube_resolver.fetch_metadata.side_effect = asyncio.CancelledError
+    elif stage == "search":
+        cog.tidal.is_logged_in.return_value = True
+        cog.tidal.search.side_effect = asyncio.CancelledError
+    else:
+        native_session.enqueue.side_effect = asyncio.CancelledError
 
-    with (
-        patch.object(type(cog.tidal), "search", new=AsyncMock(return_value=[])),
-        patch.object(type(cog), "_get_player", new=AsyncMock(return_value=player)),
-        patch.object(type(cog), "_ensure_vc_connected", new=AsyncMock(return_value=player)),
-        patch.object(type(cog), "_send_now_playing", new=AsyncMock()),
-    ):
-        await cog._handle_youtube_video(ctx, VIDEO_ID)
+    with pytest.raises(asyncio.CancelledError):
+        await cog._handle_youtube_video(youtube_ctx, VIDEO_ID)
 
-    player.load_tracks.assert_awaited_once_with(CANONICAL_URL)
-    assert cog._current_meta[ctx.guild.id]["source"] == "YouTube"
-
-
-@pytest.mark.asyncio
-async def test_youtube_tidal_search_cancellation_propagates(cog) -> None:
-    ctx = _context()
-    player = _player(None)
-    cog.yt = _youtube_client(_api_payload())
-
-    with (
-        patch.object(type(cog.tidal), "_run_blocking", new=_run_blocking),
-        patch.object(
-            type(cog.tidal), "search", new=AsyncMock(side_effect=asyncio.CancelledError)
-        ),
-        patch.object(type(cog), "_get_player", new=AsyncMock(return_value=player)),
-        patch.object(type(cog), "_ensure_vc_connected", new=AsyncMock(return_value=player)),
-    ):
-        with pytest.raises(asyncio.CancelledError):
-            await cog._handle_youtube_video(ctx, VIDEO_ID)
-
-    ctx.send.assert_not_awaited()
+    assert not native_session.entries
+    assert not cog._current_meta
+    youtube_ctx.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_invalid_voice_state_is_rejected_before_youtube_api_lookup(cog) -> None:
-    ctx = _context()
-    ctx.author.voice = None
-    cog.yt = _youtube_client(_api_payload())
-    api_call = AsyncMock(side_effect=AssertionError("provider quota must not be spent"))
-
-    with patch.object(type(cog.tidal), "_run_blocking", new=api_call):
-        await cog._handle_youtube_video(ctx, VIDEO_ID)
-
-    api_call.assert_not_awaited()
-    assert ctx.send.await_args.kwargs["embed"].description == Messages.ERROR_NO_PLAYER
+async def test_invalid_voice_is_rejected_before_metadata(cog, youtube_ctx, native_session):
+    youtube_ctx.author.voice = None
+    await cog._handle_youtube_video(youtube_ctx, VIDEO_ID)
+    cog.youtube_resolver.fetch_metadata.assert_not_awaited()
+    native_session.enqueue.assert_not_awaited()
+    assert "Join a voice channel" in youtube_ctx.send.await_args.kwargs["embed"].description
 
 
 @pytest.mark.asyncio
-async def test_youtube_lavalink_cancellation_propagates(cog) -> None:
-    ctx = _context()
-    player = _player(None)
-    player.load_tracks.side_effect = asyncio.CancelledError
-    cog.yt = _youtube_client(_api_payload())
-
-    with (
-        patch.object(type(cog.tidal), "_run_blocking", new=_run_blocking),
-        patch.object(type(cog.tidal), "search", new=AsyncMock(return_value=[])),
-        patch.object(type(cog), "_get_player", new=AsyncMock(return_value=player)),
-        patch.object(type(cog), "_ensure_vc_connected", new=AsyncMock(return_value=player)),
-    ):
-        with pytest.raises(asyncio.CancelledError):
-            await cog._handle_youtube_video(ctx, VIDEO_ID)
-
-    ctx.send.assert_not_awaited()
+@pytest.mark.parametrize("video_id", ["--exec=untrusted", "https://evil.invalid/", "short"])
+async def test_invalid_id_is_rejected_before_extraction(cog, youtube_ctx, native_session, video_id):
+    await cog._handle_youtube_video(youtube_ctx, video_id)
+    cog.youtube_resolver.fetch_metadata.assert_not_awaited()
+    native_session.enqueue.assert_not_awaited()
+    youtube_ctx.send.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_tplay_dispatches_parsed_youtube_video_id(cog) -> None:
-    ctx = _context()
-    handler = AsyncMock()
+@pytest.mark.parametrize("url,playlist", [
+    (f"https://youtu.be/{VIDEO_ID}", False),
+    (f"https://youtu.be/{VIDEO_ID}?list=PLexample", False),
+    (f"{CANONICAL_URL}&list=PLexample", False),
+    ("https://www.youtube.com/playlist?list=PLexample", True),
+])
+async def test_tplay_routes_explicit_playlist_and_video_links_without_tidal_auth(cog, youtube_ctx, url, playlist):
+    cog.check_ready = AsyncMock(side_effect=AssertionError("YouTube does not require TIDAL auth"))
+    cog._handle_youtube_video = AsyncMock()
+    cog._handle_youtube_playlist = AsyncMock()
 
-    with (
-        patch.object(type(cog), "check_ready", new=AsyncMock(return_value=True)),
-        patch.object(type(cog), "_handle_youtube_video", new=handler),
-    ):
-        await cog.tplay(ctx, query=f"https://youtu.be/{VIDEO_ID}")
+    await cog.tplay(youtube_ctx, query=url)
 
-    handler.assert_awaited_once_with(ctx, VIDEO_ID)
+    selected = cog._handle_youtube_playlist if playlist else cog._handle_youtube_video
+    other = cog._handle_youtube_video if playlist else cog._handle_youtube_playlist
+    selected.assert_awaited_once_with(youtube_ctx, "PLexample" if playlist else VIDEO_ID)
+    other.assert_not_awaited()
+    cog.check_ready.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_shared_admission_preserves_queued_metadata_and_deletes_confirmation(cog) -> None:
+async def test_shared_admission_keeps_entry_metadata_and_deletes_confirmation(cog, youtube_ctx, native_session, monkeypatch):
     module = importlib.import_module(cog.__class__.__module__)
-    ctx = _context()
-    queued_message = SimpleNamespace(delete=AsyncMock())
-    ctx.send.return_value = queued_message
-    loaded = _loaded_track()
-    player = _player(None)
-    player.current = SimpleNamespace(title="Current track")
-    meta = cog._youtube_track_meta(loaded, VIDEO_ID)
+    entry = await cog._youtube_entry(_video(), youtube_ctx.author.id)
+    native_session.current = entry
+    monkeypatch.setattr(module, "QUEUED_EMBED_DELETE_DELAY", 0)
 
-    with patch.object(module, "QUEUED_EMBED_DELETE_DELAY", 0.0):
-        assert await cog._admit_loaded_track(ctx, player, loaded, meta)
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+    assert await cog._admit_entry(youtube_ctx, native_session, entry)
+    await asyncio.gather(*cog._tasks)
 
-    player.play.assert_not_awaited()
-    assert list(cog._queued_meta[ctx.guild.id]) == [meta]
-    queued_message.delete.assert_awaited_once()
+    assert native_session.entries == [entry]
+    youtube_ctx.send.return_value.delete.assert_awaited_once()
+    assert not cog._current_meta
     assert not cog._tasks
 
 
 @pytest.mark.asyncio
-async def test_youtube_play_start_failure_uses_source_specific_error_and_rolls_back(
-    cog, caplog
-) -> None:
-    ctx = _context()
-    loaded = _loaded_track()
-    player = _player(None)
-    secret = "signed-stream-url-secret"
-    player.play.side_effect = RuntimeError(secret)
-    meta = cog._youtube_track_meta(loaded, VIDEO_ID)
-    caplog.set_level(logging.WARNING, logger="red.tidalplayerexp")
-
-    assert not await cog._admit_loaded_track(ctx, player, loaded, meta)
-
-    assert loaded not in player.queue
-    assert ctx.guild.id not in cog._current_meta
-    assert ctx.send.await_args.kwargs["embed"].description == Messages.ERROR_YOUTUBE_FAILED
-    assert secret not in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_cancelled_play_start_rolls_back_and_propagates(cog) -> None:
-    ctx = _context()
-    loaded = _loaded_track()
-    player = _player(None)
-    player.play.side_effect = asyncio.CancelledError
-    meta = cog._youtube_track_meta(loaded, VIDEO_ID)
-
-    with pytest.raises(asyncio.CancelledError):
-        await cog._admit_loaded_track(ctx, player, loaded, meta)
-
-    assert loaded not in player.queue
-    assert ctx.guild.id not in cog._current_meta
-    ctx.send.assert_not_awaited()
+async def test_queue_rejection_emits_one_error_without_publishing_playback(cog, youtube_ctx, native_session):
+    native_session.enqueue.side_effect = None
+    native_session.enqueue.return_value = False
+    await cog._handle_youtube_video(youtube_ctx, VIDEO_ID)
+    native_session.enqueue.assert_awaited_once()
+    assert not native_session.entries
+    assert not cog._current_meta
+    youtube_ctx.send.assert_awaited_once()
+    assert "queue is full" in youtube_ctx.send.await_args.kwargs["embed"].description

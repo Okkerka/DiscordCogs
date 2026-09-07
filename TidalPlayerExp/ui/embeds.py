@@ -19,12 +19,10 @@ class Messages:
         "Not authenticated with Tidal. The bot owner must complete the OAuth flow "
         "(device code auth) before playback is available."
     )
-    ERROR_NO_AUDIO_COG = "Audio cog not loaded. Run: `[p]load audio`"
     ERROR_NO_PLAYER = "No active player. Join a voice channel first."
     ERROR_NO_TRACKS_FOUND = "No tracks found."
     ERROR_INVALID_URL = "Invalid {platform} {content_type} URL"
     ERROR_CONTENT_UNAVAILABLE = "Content unavailable (private/region-locked)"
-    ERROR_LAVALINK_FAILED = "Playback failed: Could not retrieve Tidal stream."
     ERROR_YOUTUBE_FAILED = "Playback failed: Could not retrieve YouTube audio."
     ERROR_STILL_LOADING = "⏳ TidalPlayerExp is still initializing, please wait a moment."
     ERROR_NOT_PLAYING = "Nothing is currently playing."
@@ -44,7 +42,6 @@ class Messages:
     ERROR_NO_SPOTIFY = (
         "Spotify not configured. Use `[p]tidalsetup spotify` to set app credentials."
     )
-    ERROR_NO_YOUTUBE = "YouTube not configured. Set credentials with: `[p]set api youtube api_key,<key>`"
     ERROR_NOT_USER_PLAYLIST = "That playlist is not a user-owned playlist. Use `[p]tpl list` to see your playlists."
     ERROR_PLAYLIST_WRITE_FAILED = "Playlist operation failed."
     ERROR_NO_QUEUE = "The queue is empty."
@@ -54,7 +51,8 @@ class Messages:
 
 
 def display_source(meta: TrackMeta) -> str:
-    return str(meta.get("source") or "Tidal")
+    source = str(meta.get("source") or "Tidal")
+    return {"soundcloud": "SoundCloud", "bandcamp": "Bandcamp"}.get(source.casefold(), source)
 
 
 def source_link_label(meta: TrackMeta) -> str:

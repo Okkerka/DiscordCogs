@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiohttp
 import pytest
 
+from TidalPlayerExp.tests.conftest import make_entry
 from TidalPlayerExp.domain.matching import select_best_tidal_track
 from TidalPlayerExp.ui.controller import _duration
 from TidalPlayerExp.ui.embeds import Messages
@@ -47,45 +48,35 @@ def test_controller_duration_formats_hour_long_tracks() -> None:
 
 
 @pytest.mark.asyncio
-async def test_controller_stop_defers_before_player_io(cog) -> None:
-    events: list[str] = []
+async def test_controller_stop_defers_before_session_io(cog, native_session) -> None:
+    events = []
     interaction = SimpleNamespace(
         guild=SimpleNamespace(id=10),
         response=SimpleNamespace(defer=AsyncMock(side_effect=lambda: events.append("defer"))),
         followup=SimpleNamespace(send=AsyncMock()),
     )
-    player = SimpleNamespace(
-        queue=[],
-        stop=MagicMock(side_effect=lambda: events.append("stop")),
-    )
-    with patch.object(
-        type(cog), "_get_player_for_guild", new=AsyncMock(return_value=player)
-    ):
-        await cog.controller_stop(interaction)
-
-    assert events[:2] == ["defer", "stop"]
+    native_session.stop.side_effect = lambda **kwargs: events.append("stop")
+    await cog.controller_stop(interaction)
+    assert events == ["defer", "stop"]
+    native_session.stop.assert_awaited_once_with(clear_queue=True)
 
 
 @pytest.mark.asyncio
-async def test_controller_pause_defers_before_player_lookup(cog) -> None:
-    events: list[str] = []
+async def test_controller_pause_defers_before_session_lookup(cog) -> None:
+    events = []
     interaction = SimpleNamespace(
         guild=SimpleNamespace(id=11),
-        response=SimpleNamespace(
-            defer=AsyncMock(side_effect=lambda: events.append("defer")),
-            send_message=AsyncMock(),
-        ),
+        response=SimpleNamespace(defer=AsyncMock(side_effect=lambda: events.append("defer"))),
         followup=SimpleNamespace(send=AsyncMock()),
     )
 
-    async def get_player(_self, _guild_id):
-        events.append("player")
+    async def get_session(guild_id):
+        events.append("session")
         return None
 
-    with patch.object(type(cog), "_get_player_for_guild", new=get_player):
-        await cog.controller_toggle_pause(interaction)
-
-    assert events == ["defer", "player"]
+    cog.backend = SimpleNamespace(get=get_session)
+    await cog.controller_toggle_pause(interaction)
+    assert events == ["defer", "session"]
     interaction.followup.send.assert_awaited_once_with(
         "No active player is available.", ephemeral=True
     )
@@ -131,7 +122,7 @@ async def test_deferred_controller_refresh_edits_original_response(cog) -> None:
     with (
         patch.object(type(cog), "_controller_view", new=AsyncMock(return_value=view)),
         patch.object(
-            type(cog), "_get_player_for_guild", new=AsyncMock(return_value=None)
+            type(cog), "_get_session_for_guild", new=AsyncMock(return_value=None)
         ),
     ):
         await cog._refresh_controller(guild_id, interaction)
@@ -273,57 +264,27 @@ def test_provider_failure_logger_never_formats_exception_text(caplog) -> None:
 
 
 @pytest.mark.asyncio
-async def test_autoplay_rejects_same_song_with_a_different_tidal_id(cog) -> None:
-    guild_id = 1
-    cog._remember_track(
-        guild_id,
-        {
-            "title": "Same Song",
-            "artist": "Artist",
-            "album": None,
-            "duration": 120,
-            "quality": "LOSSLESS",
-            "image": None,
-            "share_url": None,
-            "audio_resolution": None,
-            "track_id": 1,
-        },
-    )
+async def test_autoplay_rejects_same_song_with_a_different_tidal_id(cog, native_session) -> None:
+    previous = make_entry(1, title="Same Song")
+    cog._remember_track(1, previous.meta)
+    await cog.config.guild_from_id(1).autoplay_enabled.set(True)
     candidate = SimpleNamespace(id=2, name="Same Song", artist=SimpleNamespace(name="Artist"))
-
-    assert not await cog.queue_autoplay_track(guild_id, SimpleNamespace(), candidate)
+    cog.tidal = SimpleNamespace(is_logged_in=AsyncMock(return_value=True))
+    cog._get_recommendations = AsyncMock(return_value=[candidate])
+    await cog._run_autoplay(1, previous, 0)
+    native_session.enqueue.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_large_queue_metadata_does_not_drop_tracks_before_they_start(cog) -> None:
-    guild = SimpleNamespace(id=42)
-    entries = [
-        {
-            "title": f"Track {index}",
-            "artist": "Artist",
-            "album": None,
-            "duration": 120,
-            "quality": "LOSSLESS",
-            "image": None,
-            "share_url": None,
-            "audio_resolution": None,
-            "track_id": index,
-        }
-        for index in range(30)
-    ]
-    cog._queued_meta[guild.id].extend(entries)
-    cog._refresh_controller = AsyncMock()
+async def test_large_queue_metadata_does_not_drop_tracks_before_they_start(cog, native_session) -> None:
+    entries = [make_entry(index) for index in range(1, 31)]
+    native_session.current = entries[0]
+    native_session.entries = entries[1:]
+    cog._resend_controller_for_track_start = AsyncMock()
     cog._schedule_controller_recommendations = MagicMock()
-
-    await cog.on_red_audio_track_start(
-        guild,
-        SimpleNamespace(title="Track 0", author="Artist"),
-        requester=SimpleNamespace(),
-    )
-
-    assert cog._current_meta[guild.id] == entries[0]
-    assert len(cog._queued_meta[guild.id]) == 29
-    assert cog._queued_meta[guild.id].maxlen is None
+    await cog.track_started(42, entries[0])
+    assert cog._current_meta[42] == entries[0].meta
+    assert native_session.snapshot().queued == tuple(entries[1:])
 
 
 @pytest.mark.asyncio
@@ -355,49 +316,25 @@ async def test_fallback_recommendations_remove_alternate_tidal_ids_for_same_song
 
 
 @pytest.mark.asyncio
-async def test_batch_playback_initialises_controller_state_with_current_track(cog) -> None:
-    class Player:
-        def __init__(self) -> None:
-            self.current = None
-            self.queue = []
-
-        def add(self, _requester, track) -> None:
-            self.queue.append(track)
-
-        async def play(self) -> None:
-            self.current = self.queue[0]
-
-    guild_id = 77
-    meta = {
-        "title": "Track",
-        "artist": "Artist",
-        "album": None,
-        "duration": 120,
-        "quality": "LOSSLESS",
-        "image": None,
-        "share_url": None,
-        "audio_resolution": None,
-        "track_id": 77,
-    }
+async def test_batch_controller_state_is_initialized_only_after_playback_starts(cog, native_session) -> None:
+    meta = make_entry(77).meta
     ctx = SimpleNamespace(
-        guild=SimpleNamespace(id=guild_id),
-        author=SimpleNamespace(),
+        guild=SimpleNamespace(id=77),
+        author=SimpleNamespace(id=5),
         channel=SimpleNamespace(id=10),
     )
-    loaded = SimpleNamespace()
-
-    with patch.object(type(cog), "_load_lavalink_track", new=AsyncMock(return_value=loaded)):
-        queued, skipped = await cog._queue_resolved_chunk(
-            ctx,
-            Player(),
-            [(SimpleNamespace(id=77), meta)],
-            asyncio.Event(),
-        )
-
+    queued, skipped = await cog._queue_resolved_chunk(
+        ctx, native_session, [(SimpleNamespace(id=77), meta)], asyncio.Event(),
+    )
     assert (queued, skipped) == (1, 0)
-    assert cog._current_meta[guild_id] == meta
-    assert cog._controller_meta[guild_id] == meta
-    assert cog._playback_channels[guild_id] == ctx.channel
+    assert not cog._current_meta
+    assert not cog._controller_meta
+    native_session.current = native_session.entries.pop(0)
+    cog._resend_controller_for_track_start = AsyncMock()
+    cog._schedule_controller_recommendations = MagicMock()
+    await cog.track_started(77, native_session.current)
+    assert cog._current_meta[77] == meta
+    assert cog._controller_meta[77] == meta
 
 
 @pytest.mark.asyncio
@@ -450,15 +387,16 @@ async def test_youtube_import_handles_a_malformed_api_response_without_crashing(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("payload", [{}, {"items": [{}]}])
-async def test_youtube_playlist_rejects_missing_metadata_before_fetching_tracks(
-    cog, payload
+async def test_youtube_playlist_missing_decorative_metadata_allows_keyless_fallback(
+    cog, native_session, payload
 ) -> None:
     request = SimpleNamespace(execute=lambda: payload)
     playlists = SimpleNamespace(list=lambda **_kwargs: request)
     cog.yt = SimpleNamespace(playlists=lambda: playlists)
-    ctx = SimpleNamespace(send=AsyncMock())
+    from TidalPlayerExp.tests.test_youtube_fallback import _context
+    ctx = _context()
     fetch_tracks = AsyncMock(return_value=[])
-    process_tracks = AsyncMock()
+    cog.youtube_resolver.fetch_playlist = AsyncMock(return_value=())
 
     async def run_blocking(_handler, operation, **_kwargs):
         return operation()
@@ -466,43 +404,41 @@ async def test_youtube_playlist_rejects_missing_metadata_before_fetching_tracks(
     with (
         patch.object(type(cog.tidal), "_run_blocking", new=run_blocking),
         patch.object(type(cog), "_fetch_all_youtube_tracks", new=fetch_tracks),
-        patch.object(type(cog), "_process_track_list", new=process_tracks),
+        patch.object(type(cog), "_prepare_playback_session", new=AsyncMock(return_value=native_session)),
     ):
         await cog._handle_youtube_playlist(ctx, "PL123")
 
-    fetch_tracks.assert_not_awaited()
-    process_tracks.assert_not_awaited()
-    assert ctx.send.await_args.kwargs["embed"].description == Messages.ERROR_FETCH_FAILED
+    fetch_tracks.assert_awaited_once_with("PL123")
+    cog.youtube_resolver.fetch_playlist.assert_awaited_once_with("PL123", 100)
+    native_session.enqueue.assert_not_awaited()
+    assert "Queued 0/0" in ctx.send.return_value.edit.await_args.kwargs["embed"].description
 
 
 @pytest.mark.asyncio
-async def test_finished_autoplay_task_does_not_remove_a_newer_task(cog) -> None:
+async def test_finished_autoplay_task_does_not_remove_a_newer_task(cog, native_session) -> None:
     guild_id = 101
     await cog.config.guild_from_id(guild_id).autoplay_enabled.set(True)
-    cog._current_meta[guild_id] = {"track_id": 1, "title": "Track", "artist": "Artist"}
-    recommendations_started = asyncio.Event()
-    release_recommendations = asyncio.Event()
+    cog.tidal = SimpleNamespace(is_logged_in=AsyncMock(return_value=True))
+    started, release = asyncio.Event(), asyncio.Event()
 
-    async def get_recommendations(_cog, _guild_id, _meta):
-        recommendations_started.set()
-        await release_recommendations.wait()
+    async def recommendations(*args):
+        started.set()
+        await release.wait()
         return []
 
-    player = SimpleNamespace(queue=[], current=None)
-    with patch.object(type(cog), "_get_recommendations", new=get_recommendations):
-        first_task = asyncio.create_task(cog._run_autoplay(guild_id, player))
-        cog._autoplay_tasks[guild_id] = first_task
-        await recommendations_started.wait()
-
-        replacement_task = asyncio.create_task(asyncio.Event().wait())
-        cog._autoplay_tasks[guild_id] = replacement_task
-        release_recommendations.set()
-        try:
-            await first_task
-            assert cog._autoplay_tasks[guild_id] is replacement_task
-        finally:
-            replacement_task.cancel()
-            await asyncio.gather(replacement_task, return_exceptions=True)
+    cog._get_recommendations = recommendations
+    first = asyncio.create_task(cog._run_autoplay(guild_id, make_entry(), 0))
+    cog._autoplay_tasks[guild_id] = first
+    await started.wait()
+    replacement = asyncio.create_task(asyncio.Event().wait())
+    cog._autoplay_tasks[guild_id] = replacement
+    release.set()
+    try:
+        await first
+        assert cog._autoplay_tasks[guild_id] is replacement
+    finally:
+        replacement.cancel()
+        await asyncio.gather(replacement, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -522,8 +458,8 @@ async def test_controller_stop_cancels_recommendation_work(cog) -> None:
     )
 
     try:
-        with patch.object(type(cog), "_get_player_for_guild", new=AsyncMock(return_value=None)):
-            await cog.controller_stop(interaction)
+        cog.backend = SimpleNamespace(get=AsyncMock(return_value=None))
+        await cog.controller_stop(interaction)
         await asyncio.sleep(0)
 
         assert recommendation_task.cancelled()
@@ -539,53 +475,37 @@ async def test_controller_stop_cancels_recommendation_work(cog) -> None:
 
 
 @pytest.mark.asyncio
-async def test_recommendation_cannot_queue_a_song_already_in_the_queue(cog) -> None:
-    guild_id = 103
-    cog._queued_meta[guild_id].append(
-        {"track_id": 2, "title": "Suggested", "artist": "Artist"}
-    )
+async def test_recommendation_cannot_queue_a_song_already_in_the_queue(cog, native_session) -> None:
+    native_session.entries = [make_entry(2, title="Suggested")]
     interaction = SimpleNamespace(
-        guild=SimpleNamespace(id=guild_id),
-        user=SimpleNamespace(),
+        guild=SimpleNamespace(id=103), user=SimpleNamespace(id=5),
         response=SimpleNamespace(is_done=MagicMock(return_value=True)),
         followup=SimpleNamespace(send=AsyncMock()),
     )
-    player = SimpleNamespace()
     candidate = SimpleNamespace(id=2, name="Suggested", artist=SimpleNamespace(name="Artist"))
-
-    with (
-        patch.object(type(cog), "_get_player_for_guild", new=AsyncMock(return_value=player)),
-        patch.object(type(cog), "_load_lavalink_track", new=AsyncMock()) as load_track,
-    ):
-        assert not await cog.queue_recommendation(interaction, candidate)
-
-    load_track.assert_not_awaited()
+    cog._extract_meta = AsyncMock()
+    assert not await cog.queue_recommendation(interaction, candidate)
+    cog._extract_meta.assert_not_awaited()
+    native_session.enqueue.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_suggested_queue_confirmation_is_scheduled_for_deletion(cog) -> None:
-    guild_id = 104
+async def test_suggested_queue_confirmation_is_scheduled_for_deletion(cog, native_session) -> None:
     queued_message = SimpleNamespace()
     interaction = SimpleNamespace(
-        guild=SimpleNamespace(id=guild_id),
-        user=SimpleNamespace(),
+        guild=SimpleNamespace(id=104), user=SimpleNamespace(id=5),
         response=SimpleNamespace(is_done=MagicMock(return_value=True)),
         followup=SimpleNamespace(send=AsyncMock(return_value=queued_message)),
     )
-    player = SimpleNamespace(add=MagicMock())
-    meta = {"track_id": 2, "title": "Suggested", "artist": "Artist", "album": None}
+    meta = make_entry(2, title="Suggested").meta
     candidate = SimpleNamespace(id=2, name="Suggested", artist=SimpleNamespace(name="Artist"))
-    loaded = SimpleNamespace()
-
     with (
-        patch.object(type(cog), "_get_player_for_guild", new=AsyncMock(return_value=player)),
         patch.object(type(cog), "_extract_meta", new=AsyncMock(return_value=meta)),
-        patch.object(type(cog), "_load_lavalink_track", new=AsyncMock(return_value=loaded)),
         patch.object(type(cog), "_delete_after", new=AsyncMock()) as delete_after,
     ):
         assert await cog.queue_recommendation(interaction, candidate)
-        await asyncio.sleep(0)
-
+        await asyncio.gather(*cog._tasks)
+    assert native_session.entries[0].primary.identifier == "2"
     interaction.followup.send.assert_awaited_once()
     delete_after.assert_awaited_once_with(queued_message, 60.0)
 

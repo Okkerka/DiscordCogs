@@ -148,22 +148,22 @@ class TestCheckReady:
         ctx.send.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_returns_false_when_lavalink_unavailable(self, cog):
+    async def test_ready_does_not_require_a_voice_connection(self, cog):
         cog._initialized = True
         ctx = self._make_ctx()
         mod = sys.modules[MODULE_NAME]
         with (
             patch.object(mod, "TIDALAPI_AVAILABLE", True),
             patch.object(type(cog.tidal), "is_logged_in", AsyncMock(return_value=True)),
-            patch.object(mod, "LAVALINK_AVAILABLE", False),
         ):
             result = await cog.check_ready(ctx)
-        assert result is False
-        ctx.send.assert_called_once()
+        assert result is True
+        ctx.send.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_tplay_defers_before_readiness_checks(cog) -> None:
+    cog._initialized = True
     ctx = SimpleNamespace(defer=AsyncMock())
 
     async def check_ready(_self, _ctx):
@@ -209,22 +209,19 @@ async def test_tidalsetup_youtube_opens_red_secure_token_view(cog) -> None:
 
 
 @pytest.mark.asyncio
-async def test_queue_title_reports_displayed_and_total_tracks(cog) -> None:
+async def test_queue_title_reports_displayed_and_total_tracks(cog, native_session) -> None:
+    from TidalPlayerExp.tests.conftest import make_entry
     current_mod = importlib.import_module(cog.__class__.__module__)
     queue = [
-        SimpleNamespace(title=f"Track {index}", author="Artist")
-        for index in range(current_mod.MAX_ITEMS + 7)
+        make_entry(index)
+        for index in range(1, current_mod.MAX_ITEMS + 8)
     ]
-    ctx = SimpleNamespace(send=AsyncMock())
+    native_session.entries = queue
+    ctx = SimpleNamespace(guild=SimpleNamespace(id=1), send=AsyncMock())
     menu = SimpleNamespace(start=AsyncMock())
 
     with (
         patch.object(type(cog), "check_ready", new=AsyncMock(return_value=True)),
-        patch.object(
-            type(cog),
-            "_get_player",
-            new=AsyncMock(return_value=SimpleNamespace(queue=queue)),
-        ),
         patch.object(current_mod, "SimpleMenu", return_value=menu) as menu_factory,
     ):
         await cog.tqueue(ctx)

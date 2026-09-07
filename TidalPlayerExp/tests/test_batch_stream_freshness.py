@@ -1,47 +1,37 @@
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from TidalPlayerExp.tests.conftest import make_entry
+
 
 @pytest.mark.asyncio
-async def test_batch_resolves_each_stream_immediately_before_its_load(cog) -> None:
-    events: list[str] = []
+async def test_batch_admits_stable_references_in_order_without_resolving_streams(cog, native_session) -> None:
     first = SimpleNamespace(id=1)
     second = SimpleNamespace(id=2)
-    metas = [
-        {"track_id": 1, "title": "One", "artist": "A", "album": None},
-        {"track_id": 2, "title": "Two", "artist": "B", "album": None},
-    ]
+    metas = [make_entry(1, title="One", artist="A").meta, make_entry(2, title="Two", artist="B").meta]
 
-    async def stream(_handler, track):
-        events.append(f"stream:{track.id}")
-        return f"https://stream/{track.id}"
-
-    async def load(url):
-        events.append(f"load:{url.rsplit('/', 1)[-1]}")
-        return SimpleNamespace(tracks=[SimpleNamespace()])
-
-    player = SimpleNamespace(
-        queue=[], current=object(), add=MagicMock(), load_tracks=load
-    )
     ctx = SimpleNamespace(
         guild=SimpleNamespace(id=9),
-        author=SimpleNamespace(),
+        author=SimpleNamespace(id=5),
         channel=SimpleNamespace(),
     )
 
-    with patch.object(type(cog.tidal), "get_stream_url", new=stream):
+    with patch.object(type(cog.tidal), "get_stream_url", new=AsyncMock()) as stream:
         queued, skipped = await cog._queue_resolved_chunk(
             ctx,
-            player,
+            native_session,
             [(first, metas[0]), (second, metas[1])],
             asyncio.Event(),
         )
 
     assert (queued, skipped) == (2, 0)
-    assert events == ["stream:1", "load:1", "stream:2", "load:2"]
+    assert [entry.primary.identifier for entry in native_session.entries] == ["1", "2"]
+    assert len({entry.entry_id for entry in native_session.entries}) == 2
+    stream.assert_not_awaited()
+    assert not cog._current_meta
 
 
 @pytest.mark.asyncio

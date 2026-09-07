@@ -12,7 +12,6 @@ from collections.abc import Awaitable
 from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from itertools import islice
 from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlsplit
 
@@ -39,21 +38,22 @@ from .ui.embeds import (
     error_embed as _error_embed, make_queue_embed, success_embed as _success_embed,
 )
 from .ui.controller import PlayerControllerView
-from .providers.audio import RedAudioGateway
-from .providers.errors import PlaybackUnavailable
+from .playback.errors import PlaybackUnavailable
+from .playback.interfaces import PlaybackSession
+from .playback.models import PlaybackEntry, SourceKind, SourceReference
+from .playback.ffmpeg import FFmpegSourceFactory
+from .playback.backend import NativePlaybackBackend
+from .providers.tidal_source import CompositeSourceResolver, TidalSourceResolver
+from .providers.public_audio import PublicAudioResolver
+from .providers.youtube_resolver import YouTubeResolver, YouTubeVideoMetadata
 from .providers.tokens import TokenRepository, TokenService, TokenSnapshot
-from .providers.urls import MalformedProviderURL, ProviderKind, parse_provider_url
+from .providers.urls import MalformedProviderURL, ProviderKind, ProviderURL, parse_provider_url
 
 logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
 
 _CACHE_MISS = object()
 
-try:
-    import lavalink
-    LAVALINK_AVAILABLE = True
-except ImportError:
-    lavalink = None
-    LAVALINK_AVAILABLE = False
+
 
 try:
     import tidalapi
@@ -116,8 +116,6 @@ MAX_ITEMS = 1000
 RATELIMIT_BACKOFF_BASE = 2.0
 RATELIMIT_BACKOFF_MAX = 30.0
 RATELIMIT_MAX_RETRIES = 4
-VC_RECONNECT_RETRIES = 2
-VC_RECONNECT_DELAY = 3.0
 QUEUE_PAGE_SIZE = 10
 TPL_LIST_PAGE_SIZE = 15
 SEARCH_BATCH_SIZE = 8
@@ -128,10 +126,6 @@ RECOMMENDATION_SEARCH_CONCURRENCY = 1  # Leave Tidal API capacity for playback r
 RECOMMENDATION_LOOKUP_CONCURRENCY = 2  # Reserve at least one Tidal API slot for foreground commands.
 LASTFM_REQUEST_TIMEOUT = 20.0
 RECENT_TRACK_HISTORY = 50
-LAVALINK_NODE_READY_MAX_ATTEMPTS = 3
-LAVALINK_NODE_READY_RETRY_DELAY = 2.0
-LAVALINK_SLOW_LOAD_WARNING_DELAY = 10.0
-LAVALINK_LOAD_HARD_TIMEOUT = 60.0
 SPOTIFY_REDIRECT_URI = "http://127.0.0.1:2402/callback"
 SPOTIFY_OAUTH_SCOPE = "playlist-read-private playlist-read-collaborative"
 SPOTIFY_LOGIN_TTL = 600.0
@@ -1084,13 +1078,13 @@ class TidalPlayerExp(commands.Cog):
 
     __slots__ = (
         "bot", "config", "tidal", "sp", "yt", "_tasks", "_guild_locks",
-        "_cancel_events", "_last_progress_edit", "_initialized", "_current_meta", "audio", "tokens",
+        "_cancel_events", "_last_progress_edit", "_initialized", "_current_meta", "backend", "tokens",
         "_controller_messages", "_playback_channels", "_controller_meta", "_recent_track_ids",
         "_recent_track_signatures", "_autoplay_tasks",
         "_recommendation_cache", "_recommendation_tasks", "_recommendation_task_sources",
-        "_controller_recommendation_tasks", "_controller_last_refresh", "_queued_meta",
-        "_recommendation_lookup_slots", "_lastfm_session", "_lavalink_load_tasks",
-        "_persistent_view", "_controller_views",
+        "_controller_recommendation_tasks", "_controller_last_refresh", "_current_entries",
+        "_recommendation_lookup_slots", "_lastfm_session", "youtube_resolver", "source_factory", "_closing", "_guild_generations",
+        "_persistent_view", "_controller_views", "_stop_generations", "public_audio_resolver",
         "_spotify_auth_manager", "_spotify_refresh_token", "_spotify_login_states",
         "_spotify_login_views", "_spotify_auth_lock",
     )
@@ -1102,7 +1096,18 @@ class TidalPlayerExp(commands.Cog):
         self.config.register_guild(**GUILD_DEFAULTS)
         self.tokens = TokenService(TokenRepository(self.config))
         self.tidal = TidalHandler(bot, self.tokens)
-        self.audio = RedAudioGateway(lavalink if LAVALINK_AVAILABLE else None)
+        self.youtube_resolver = YouTubeResolver()
+        self.public_audio_resolver = PublicAudioResolver(self.youtube_resolver)
+        self.source_factory = FFmpegSourceFactory()
+        resolver = CompositeSourceResolver(
+            TidalSourceResolver(self.tidal), self.youtube_resolver,
+            public_audio=self.public_audio_resolver,
+        )
+        self.backend = NativePlaybackBackend(bot, resolver, self.source_factory, self)
+        self._closing = False
+        self._guild_generations: Dict[int, int] = defaultdict(int)
+        self._stop_generations: Dict[int, int] = defaultdict(int)
+        self._current_entries: Dict[int, PlaybackEntry] = {}
         self.sp: Optional[Any] = None
         self._spotify_auth_manager: Optional[Any] = None
         self._spotify_refresh_token: Optional[str] = None
@@ -1132,15 +1137,19 @@ class TidalPlayerExp(commands.Cog):
         self._recommendation_task_sources: Dict[int, str] = {}
         self._controller_recommendation_tasks: Dict[int, asyncio.Task[None]] = {}
         self._controller_last_refresh: Dict[int, float] = {}
-        # Metadata must cover every track currently in Red Audio's queue. A bounded
-        # deque silently desynchronises controller/autoplay state for large imports.
-        self._queued_meta: Dict[int, Deque[TrackMeta]] = defaultdict(deque)
+
+
         self._recommendation_lookup_slots = asyncio.Semaphore(RECOMMENDATION_LOOKUP_CONCURRENCY)
         self._lastfm_session: aiohttp.ClientSession | None = None
-        self._lavalink_load_tasks: Dict[Tuple[int, str], asyncio.Task[Any | None]] = {}
         self._initialized: bool = False
 
     async def cog_load(self) -> None:
+        if self.bot.get_cog("Audio") is not None or self.bot.get_cog("TidalPlayer") is not None:
+            await self.backend.close()
+            await self.tidal.unload()
+            raise commands.UserFeedbackCheckFailure(
+                "Unload Audio and the original TidalPlayer before loading TidalPlayerExp."
+            )
         await self._migrate_config()
         await self._initialize_apis()
         self._persistent_view = PlayerControllerView(self)
@@ -1159,11 +1168,11 @@ class TidalPlayerExp(commands.Cog):
             log.warning(f"Config migration check failed (non-fatal): {e}")
 
     async def cog_unload(self) -> None:
+        self._closing = True
         for ev in self._cancel_events.values():
             ev.set()
         tasks = {
             *self._tasks,
-            *self._lavalink_load_tasks.values(),
             *self._autoplay_tasks.values(),
             *self._recommendation_tasks.values(),
             *self._controller_recommendation_tasks.values(),
@@ -1173,7 +1182,14 @@ class TidalPlayerExp(commands.Cog):
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         await self._close_lastfm_session()
-        await self.tidal.unload()
+        for resource, cleanup in (
+            ("Native voice", self.backend.close),
+            ("Tidal", self.tidal.unload),
+        ):
+            try:
+                await cleanup()
+            except Exception as error:
+                _log_provider_failure(resource, "cog unload", error)
 
         for guild_id in tuple(self._controller_views):
             self._stop_controller_view(guild_id)
@@ -1190,7 +1206,6 @@ class TidalPlayerExp(commands.Cog):
         self._spotify_login_views.clear()
         self.yt = None
         self._tasks.clear()
-        self._lavalink_load_tasks.clear()
         self._guild_locks.clear()
         self._cancel_events.clear()
         self._autoplay_tasks.clear()
@@ -1204,7 +1219,7 @@ class TidalPlayerExp(commands.Cog):
         self._recent_track_ids.clear()
         self._recent_track_signatures.clear()
         self._current_meta.clear()
-        self._queued_meta.clear()
+        self._current_entries.clear()
         self._last_progress_edit.clear()
         self._controller_last_refresh.clear()
         log.info("TidalPlayerExp cog unloaded")
@@ -1241,13 +1256,20 @@ class TidalPlayerExp(commands.Cog):
         guild_id: int,
         view: PlayerControllerView,
         operation: Callable[[PlayerControllerView], Awaitable[Any]],
+        *, still_current: Callable[[], Awaitable[bool]] | None = None,
     ) -> Any:
+        if still_current is not None and not await still_current():
+            view.stop()
+            return None
         self._stop_controller_view(guild_id)
         try:
             result = await operation(view)
         except BaseException:
             view.stop()
             raise
+        if still_current is not None and not await still_current():
+            view.stop()
+            return None
         self._controller_views[guild_id] = view
         return result
 
@@ -1284,6 +1306,7 @@ class TidalPlayerExp(commands.Cog):
 
     @commands.Cog.listener()
     async def on_guild_remove(self, guild: discord.Guild) -> None:
+        self._stop_generations[guild.id] += 1
         cancel_event = self._cancel_events.pop(guild.id, None)
         if cancel_event is not None:
             cancel_event.set()
@@ -1298,109 +1321,88 @@ class TidalPlayerExp(commands.Cog):
         self._current_meta.pop(guild.id, None)
         self._last_progress_edit.pop(guild.id, None)
         self._controller_last_refresh.pop(guild.id, None)
-        self._cancel_lavalink_loads(guild.id)
+        self._guild_generations[guild.id] += 1
+        self._current_entries.pop(guild.id, None)
+        await self.backend.close_guild(guild.id)
 
     @commands.Cog.listener()
-    async def on_red_audio_queue_end(
-        self,
-        guild: discord.Guild,
-        track: Any,
-        requester: Any,
-    ) -> None:
-        """Start Tidal Track Radio when Red Audio finishes the queue."""
-        if await self.bot.cog_disabled_in_guild(self, guild):
-            return
-        guild_id = guild.id
-
-        autoplay_enabled = await self.config.guild_from_id(guild_id).autoplay_enabled()
-        stale_message = None
-        async with self._guild_locks[guild_id]:
-            current = self._current_meta.get(guild_id)
-            if current is None:
-                return
-            stale_message = self._controller_messages.pop(guild_id, None)
-            self._stop_controller_view(guild_id)
-            if autoplay_enabled and guild_id not in self._playback_channels:
-                channel = getattr(stale_message, "channel", None)
-                if channel is not None:
-                    self._playback_channels[guild_id] = channel
-            if not autoplay_enabled:
-                self._current_meta.pop(guild_id, None)
-                self._controller_meta.pop(guild_id, None)
-            else:
-                self._remember_track(guild_id, current)
-
-        if stale_message is not None:
-            await _delete_message_safe(stale_message)
-        if not autoplay_enabled:
-            return
-
-        player = await self._get_player_for_guild(guild_id)
-        if player is not None:
-            self._schedule_autoplay(guild_id, player)
+    async def on_cog_add(self, cog: commands.Cog) -> None:
+        if getattr(cog, "qualified_name", None) == "Audio":
+            for guild in self.bot.guilds:
+                try:
+                    await self.on_guild_remove(guild)
+                except Exception as error:
+                    _log_provider_failure("Native voice", "guild cleanup", error)
 
     @commands.Cog.listener()
-    async def on_red_audio_track_start(
-        self,
-        guild: discord.Guild,
-        track: Any,
-        requester: Any,
-    ) -> None:
-        """Advance cog metadata when Red Audio starts one of our queued tracks."""
-        if await self.bot.cog_disabled_in_guild(self, guild):
+    async def on_voice_state_update(self, member: discord.Member, before: Any, after: Any) -> None:
+        if member.id != getattr(self.bot.user, "id", None) or before.channel is None:
             return
+        if after.channel is None:
+            await self.on_guild_remove(member.guild)
+            return
+        session = await self.backend.get(member.guild.id)
+        if session is not None and after.channel.id != session.snapshot().channel_id:
+            await self.on_guild_remove(member.guild)
 
-        guild_id = guild.id
-        updated_meta: TrackMeta | None = None
-        async with self._guild_locks[guild_id]:
-            current = self._current_meta.get(guild_id)
-            if current is not None and self._lavalink_track_matches_meta(track, current):
-                return
+    async def _entry_is_current(self, guild_id: int, entry_id: str) -> bool:
+        if self._closing:
+            return False
+        session = await self.backend.get(guild_id)
+        current = session.snapshot().current if session is not None else None
+        return current is not None and current.entry_id == entry_id
 
-            queued = self._queued_meta.get(guild_id)
-            if not queued:
-                return
-
-            match_index = next(
-                (
-                    index
-                    for index, candidate in enumerate(queued)
-                    if self._lavalink_track_matches_meta(track, candidate)
-                ),
-                None,
-            )
-            if match_index is None:
-                log.debug(
-                    "Ignoring unrecognised Red Audio track start in guild %s: %r by %r",
-                    guild_id,
-                    getattr(track, "title", None),
-                    getattr(track, "author", None),
-                )
-                return
-
-            updated_meta = queued[match_index]
-            del queued[match_index]
-            self._current_meta[guild_id] = updated_meta
-            self._controller_meta[guild_id] = updated_meta
-            self._remember_track(guild_id, updated_meta)
-            self._recommendation_cache.pop(guild_id, None)
-
+    async def track_started(self, guild_id: int, entry: PlaybackEntry) -> None:
+        """Publish the effective entry only after playback actually starts."""
+        if not await self._entry_is_current(guild_id, entry.entry_id):
+            return
+        previous = self._current_entries.get(guild_id)
+        if previous is not None and previous.entry_id == entry.entry_id:
+            return
+        self._guild_generations[guild_id] += 1
+        self._cancel_guild_background_tasks(guild_id)
+        self._current_entries[guild_id] = entry
+        self._current_meta[guild_id] = entry.meta
+        self._controller_meta[guild_id] = entry.meta
+        self._remember_track(guild_id, entry.meta)
         await self._resend_controller_for_track_start(guild_id=guild_id)
-        self._schedule_controller_recommendations(guild_id)
+        if await self._entry_is_current(guild_id, entry.entry_id):
+            self._schedule_controller_recommendations(guild_id)
 
+    async def track_failed(self, guild_id: int, entry: PlaybackEntry, reason: str) -> None:
+        """One sanitized error; the session owns advancement."""
+        if self._closing:
+            return
+        channel = self._playback_channels.get(guild_id)
+        if channel is not None:
+            try:
+                await channel.send(embed=_error_embed("Could not start this track. It was skipped."))
+            except discord.HTTPException:
+                log.debug("Could not send playback failure in guild %s", guild_id)
+
+    async def queue_ended(self, guild_id: int, previous: PlaybackEntry | None) -> None:
+        if self._closing:
+            return
+        session = await self.backend.get(guild_id)
+        if session is None or session.snapshot().current or session.snapshot().queued:
+            return
+        generation = self._guild_generations[guild_id]
+        message = self._controller_messages.pop(guild_id, None)
+        self._stop_controller_view(guild_id)
+        self._current_entries.pop(guild_id, None)
+        self._current_meta.pop(guild_id, None)
+        self._controller_meta.pop(guild_id, None)
+        if message is not None:
+            await _delete_message_safe(message)
+        if previous is not None and generation == self._guild_generations[guild_id] and not self._closing:
+            self._schedule_autoplay(guild_id, previous, generation)
 
     async def check_ready(self, ctx: commands.Context) -> bool:
-        if not LAVALINK_AVAILABLE:
-            await ctx.send(embed=_error_embed("Audio playback is currently unavailable."))
-            return False
         if not self._initialized:
             await ctx.send(embed=_error_embed(Messages.ERROR_STILL_LOADING))
             return False
         if not TIDALAPI_AVAILABLE:
             await ctx.send(embed=_error_embed(Messages.ERROR_NO_TIDALAPI))
-            return False
-        if not self.audio or not self.audio.available:
-            await ctx.send(embed=_error_embed(Messages.ERROR_NO_AUDIO_COG))
             return False
         if not await self.tidal.is_logged_in():
             await ctx.send(embed=_error_embed(Messages.ERROR_NOT_AUTHENTICATED))
@@ -1682,26 +1684,7 @@ class TidalPlayerExp(commands.Cog):
                     meta["audio_resolution"] = f"HI-RES LOSSLESS ({bit_depth}-bit / {khz}kHz)"
         return meta
 
-    def _queued_count(self, player: Any) -> int:
-        queue = getattr(player, "queue", None)
-        if queue is None:
-            return 0
-        try:
-            return len(queue)
-        except Exception:
-            return 0
 
-    @staticmethod
-    def _remove_from_queue(player: Any, track: Any) -> None:
-        """Best-effort rollback when playback cannot start after queueing a track."""
-        queue = getattr(player, "queue", None)
-        remove = getattr(queue, "remove", None)
-        if not callable(remove):
-            return
-        try:
-            remove(track)
-        except (ValueError, AttributeError):
-            pass
 
     @staticmethod
     def _track_signature(title: Any, artist: Any) -> str:
@@ -1736,94 +1719,56 @@ class TidalPlayerExp(commands.Cog):
             or (signature and signature in self._recent_track_signatures[guild_id])
         )
 
-    def _is_current_or_queued_track(
-        self,
-        guild_id: int,
-        track_id: str,
-        signature: str,
-    ) -> bool:
-        """Check the active track and pending metadata for one song identity."""
-        current = self._current_meta.get(guild_id)
-        queued = self._queued_meta.get(guild_id, ())
-        for meta in (current,):
-            if meta is None:
-                continue
-            candidate_id = str(meta.get("track_id") or "")
-            candidate_signature = self._meta_track_signature(meta)
-            if (track_id and track_id == candidate_id) or (
-                signature and signature == candidate_signature
-            ):
-                return True
-        for meta in queued:
-            candidate_id = str(meta.get("track_id") or "")
-            candidate_signature = self._meta_track_signature(meta)
-            if (track_id and track_id == candidate_id) or (
-                signature and signature == candidate_signature
-            ):
-                return True
-        return False
-
-    @staticmethod
-    def _lavalink_track_matches_meta(track: Any, meta: TrackMeta) -> bool:
-        """Match the metadata we set on a Lavalink track without trusting IDs."""
-        actual_title = str(getattr(track, "title", "") or "").casefold().strip()
-        expected_title = str(meta.get("title") or "").casefold().strip()
-        if not actual_title or actual_title != expected_title:
+    async def _is_current_or_queued_track(self, guild_id: int, track_id: str, signature: str) -> bool:
+        session = await self.backend.get(guild_id)
+        if session is None:
             return False
-
-        artist = str(meta.get("artist") or "").strip()
-        album = str(meta.get("album") or "").strip()
-        expected_author = f"{artist} - {album}" if album else artist
-        actual_author = str(getattr(track, "author", "") or "").casefold().strip()
-        return bool(expected_author) and actual_author == expected_author.casefold()
+        snapshot = session.snapshot()
+        return any(
+            entry is not None and (
+                (track_id and track_id == str(entry.meta.get("track_id") or ""))
+                or (signature and signature == self._meta_track_signature(entry.meta))
+            )
+            for entry in (*snapshot.queued, snapshot.current)
+        )
 
     def _format_duration(self, seconds: int) -> str:
         return format_duration(seconds)
 
-    async def _get_player(self, ctx: commands.Context, connect: bool = False) -> Optional[Any]:
-        if not self.audio.available or not ctx.guild:
+    async def _get_session_for_guild(self, guild_id: int) -> PlaybackSession | None:
+        return await self.backend.get(guild_id)
+
+    async def _prepare_playback_session(self, ctx: commands.Context) -> PlaybackSession | None:
+        if self._closing or ctx.guild is None:
+            return None
+        stop_generation = self._stop_generations[ctx.guild.id]
+        channel = getattr(getattr(ctx.author, "voice", None), "channel", None)
+        if channel is None:
+            await ctx.send(embed=_error_embed("Join a voice channel first."))
+            return None
+        if self.bot.get_cog("Audio") is not None:
+            await ctx.send(embed=_error_embed("Unload Audio before using native playback."))
+            return None
+        permissions = channel.permissions_for(ctx.guild.me)
+        if not permissions.connect or not permissions.speak:
+            await ctx.send(embed=_error_embed("I need Connect and Speak permissions in your voice channel."))
+            return None
+        session = await self.backend.get(ctx.guild.id)
+        if session is not None and session.snapshot().channel_id != channel.id:
+            await ctx.send(embed=_error_embed("Join my voice channel to queue music."))
+            return None
+        if session is None and ctx.guild.voice_client is not None:
+            await ctx.send(embed=_error_embed("Another cog owns this server's voice connection."))
             return None
         try:
-            voice_channel = None
-            if connect and getattr(ctx.author, "voice", None):
-                voice_channel = getattr(ctx.author.voice, "channel", None)
-            return await self.audio.get_player(ctx.guild.id, voice_channel)
+            session = await self.backend.connect(ctx.guild, channel)
         except PlaybackUnavailable:
+            await ctx.send(embed=_error_embed("Could not connect native voice. Check permissions and tidalsetup doctor."))
             return None
-        return None
-
-    async def _ensure_player(self, ctx: commands.Context) -> Optional[Any]:
-        player = await self._get_player(ctx, connect=True)
-        if not player:
-            await ctx.send(embed=_error_embed(Messages.ERROR_NO_PLAYER))
-        return player
-
-    async def _ensure_vc_connected(self, ctx: commands.Context, player: Any) -> Optional[Any]:
-        if player is not None:
-            guild_me = ctx.guild.me if ctx.guild is not None else None
-            bot_voice = getattr(guild_me, "voice", None)
-            bot_channel = getattr(bot_voice, "channel", None)
-            user_voice = getattr(ctx.author, "voice", None)
-            user_channel = getattr(user_voice, "channel", None)
-            if bot_channel is not None and user_channel is not None and bot_channel.id != user_channel.id:
-                log.info("Refused playback request from a different voice channel in guild %s", ctx.guild.id)
-                return None
-            return player
-        for attempt in range(VC_RECONNECT_RETRIES):
-            await asyncio.sleep(VC_RECONNECT_DELAY)
-            new_player = await self._get_player(ctx, connect=True)
-            if new_player is not None:
-                log.info("Reconnected to VC (attempt %d)", attempt + 1)
-                return new_player
-        log.warning("Could not reconnect to VC, stopping queue")
-        return None
-
-    def _cancel_lavalink_loads(self, guild_id: int) -> None:
-        """Cancel outstanding REST loads when a guild's player is discarded."""
-        for key, task in tuple(self._lavalink_load_tasks.items()):
-            if key[0] == guild_id:
-                task.cancel()
-                self._lavalink_load_tasks.pop(key, None)
+        if self._closing or stop_generation != self._stop_generations[ctx.guild.id]:
+            return None
+        self._playback_channels[ctx.guild.id] = ctx.channel
+        return session
 
     def _cancel_guild_background_tasks(self, guild_id: int) -> None:
         """Cancel provider work that is no longer useful after a guild stop/removal."""
@@ -1840,515 +1785,224 @@ class TidalPlayerExp(commands.Cog):
         self._recommendation_cache.pop(guild_id, None)
 
     @staticmethod
-    def _lavalink_node_ready_state(player: Any) -> str:
-        node = getattr(player, "node", None)
-        ready = getattr(node, "available", None)
-        return str(bool(ready)).lower() if ready is not None else "unknown"
-
-    @staticmethod
-    def _lavalink_load_result_type(results: Any) -> str:
-        load_type = getattr(results, "load_type", None) or getattr(results, "loadType", None)
-        value = getattr(load_type, "value", load_type)
-        return str(value) if value is not None else "unknown"
-
-    @staticmethod
-    def _is_lavalink_node_not_ready(error: RuntimeError) -> bool:
-        return "node not ready" in str(error).casefold()
-
-    async def _load_lavalink_track(
-        self,
-        player: Any,
-        tidal_track: Any,
-        guild_id: int,
-        *,
-        initial_stream_url: str | None = None,
-    ) -> Any | None:
-        """Load one track, coalescing duplicate concurrent guild requests."""
-        track_id = str(getattr(tidal_track, "id", "") or "")
-        if not track_id:
-            return await self._load_lavalink_track_once(
-                player, tidal_track, guild_id, initial_stream_url=initial_stream_url
-            )
-
-        task_key = (guild_id, track_id)
-        task = self._lavalink_load_tasks.get(task_key)
-        if task is None:
-            task = asyncio.create_task(
-                self._load_lavalink_track_once(
-                    player, tidal_track, guild_id, initial_stream_url=initial_stream_url
-                ),
-                name=f"tidalplayer-lavalink-load-{guild_id}-{track_id}",
-            )
-            self._lavalink_load_tasks[task_key] = task
-
-            def _cleanup(completed: asyncio.Task[Any | None]) -> None:
-                if self._lavalink_load_tasks.get(task_key) is completed:
-                    self._lavalink_load_tasks.pop(task_key, None)
-
-            task.add_done_callback(_cleanup)
-        return await asyncio.shield(task)
-
-    async def _load_lavalink_track_once(
-        self,
-        player: Any,
-        tidal_track: Any,
-        guild_id: int,
-        *,
-        initial_stream_url: str | None = None,
-    ) -> Any | None:
-        """Load one track without multiplying stream or LavaLink REST requests.
-
-        ``player.load_tracks`` owns the REST-client timeout.  Adding a shorter
-        outer ``wait_for`` cancels healthy LavaLink requests before that client
-        can return, which turns slow-but-valid track loads into false failures.
-        """
-        stream_url = initial_stream_url
-        track_id = getattr(tidal_track, "id", None)
-        node_ready_attempt = 0
-        loop = asyncio.get_running_loop()
-        if not stream_url:
-            stream_resolution_started = loop.time()
-            stream_url = await self.tidal.get_stream_url(tidal_track)
-            log.info(
-                "Resolved Tidal stream URL for track %s in guild %s in %.2fs.",
-                track_id,
-                guild_id,
-                loop.time() - stream_resolution_started,
-            )
-        if not stream_url:
-            log.warning("No playable Tidal stream URL for track %s in guild %s", track_id, guild_id)
-            return None
-        while True:
-            load_started = loop.time()
-            node_ready = self._lavalink_node_ready_state(player)
-            try:
-                load_task = asyncio.create_task(
-                    player.load_tracks(stream_url),
-                    name=f"tidalplayer-lavalink-rest-{guild_id}-{track_id}",
-                )
-                try:
-                    done, _ = await asyncio.wait(
-                        (load_task,), timeout=LAVALINK_SLOW_LOAD_WARNING_DELAY
-                    )
-                    if not done:
-                        log.warning(
-                            "Lavalink is still loading Tidal track %s in guild %s after %.2fs "
-                            "(node_ready=%s); continuing to wait for the REST client.",
-                            track_id,
-                            guild_id,
-                            loop.time() - load_started,
-                            node_ready,
-                        )
-                        remaining = max(
-                            0.0, LAVALINK_LOAD_HARD_TIMEOUT - (loop.time() - load_started)
-                        )
-                        done, _ = await asyncio.wait((load_task,), timeout=remaining)
-                        if not done:
-                            load_task.cancel()
-                            try:
-                                await load_task
-                            except asyncio.CancelledError:
-                                pass
-                            raise asyncio.TimeoutError
-                    results = await load_task
-                except BaseException:
-                    if not load_task.done():
-                        load_task.cancel()
-                    raise
-            except RuntimeError as error:
-                if not self._is_lavalink_node_not_ready(error):
-                    log.warning(
-                        "Lavalink failed loading Tidal track %s in guild %s after %.2fs "
-                        "(node_ready=%s, error=%s)",
-                        track_id,
-                        guild_id,
-                        loop.time() - load_started,
-                        node_ready,
-                        type(error).__name__,
-                    )
-                    return None
-                node_ready_attempt += 1
-                if node_ready_attempt >= LAVALINK_NODE_READY_MAX_ATTEMPTS:
-                    log.warning(
-                        "Lavalink node stayed unavailable while loading Tidal track %s in guild %s "
-                        "after %s readiness check(s) (node_ready=%s, elapsed=%.2fs)",
-                        track_id,
-                        guild_id,
-                        node_ready_attempt,
-                        node_ready,
-                        loop.time() - load_started,
-                    )
-                    return None
-                log.warning(
-                    "Lavalink node is not ready for Tidal track %s in guild %s; "
-                    "waiting before retrying (%s/%s, node_ready=%s, elapsed=%.2fs)",
-                    track_id,
-                    guild_id,
-                    node_ready_attempt,
-                    LAVALINK_NODE_READY_MAX_ATTEMPTS - 1,
-                    node_ready,
-                    loop.time() - load_started,
-                )
-                await asyncio.sleep(LAVALINK_NODE_READY_RETRY_DELAY)
-                continue
-            except asyncio.TimeoutError:
-                log.warning(
-                    "Lavalink timed out loading Tidal track %s in guild %s after %.2fs "
-                    "(node_ready=%s); not retrying",
-                    track_id,
-                    guild_id,
-                    loop.time() - load_started,
-                    node_ready,
-                )
-                return None
-            except Exception as error:
-                log.warning(
-                    "Lavalink failed loading Tidal track %s in guild %s after %.2fs "
-                    "(node_ready=%s, error=%s)",
-                    track_id,
-                    guild_id,
-                    loop.time() - load_started,
-                    node_ready,
-                    type(error).__name__,
-                )
-                return None
-
-            tracks = getattr(results, "tracks", None) or []
-            if tracks:
-                log.info(
-                    "Lavalink loaded Tidal track %s in guild %s in %.2fs "
-                    "(node_ready=%s, tracks=%s).",
-                    track_id,
-                    guild_id,
-                    loop.time() - load_started,
-                    node_ready,
-                    len(tracks),
-                )
-                return tracks[0]
-            log.warning(
-                "Lavalink returned no tracks for Tidal track %s in guild %s after %.2fs "
-                "(node_ready=%s, load_type=%s)",
-                track_id,
-                guild_id,
-                loop.time() - load_started,
-                node_ready,
-                self._lavalink_load_result_type(results),
-            )
-            return None
+    def _tidal_entry(track: Any, meta: TrackMeta, requester_id: int | None, *, kind: SourceKind | None = None) -> PlaybackEntry:
+        if kind is None:
+            kind = SourceKind.TIDAL_VIDEO if getattr(track, "video_quality", None) is not None else SourceKind.TIDAL
+        return PlaybackEntry(secrets.token_hex(12), SourceReference(kind, str(track.id)), None, meta, requester_id)
 
     async def _queue_resolved_chunk(
-        self,
-        ctx: commands.Context,
-        player: Any,
-        resolved_chunk: List[Optional[Tuple[Any, TrackMeta]]],
-        cancel_event: asyncio.Event,
+        self, ctx: commands.Context, session: PlaybackSession,
+        resolved_chunk: List[Optional[Tuple[Any, TrackMeta]]], cancel_event: asyncio.Event,
     ) -> Tuple[int, int]:
         queued = skipped = 0
-        for res in resolved_chunk:
-            if cancel_event.is_set():
+        for result in resolved_chunk:
+            if cancel_event.is_set() or self._closing or await self.backend.get(ctx.guild.id) is not session:
                 break
-            if res is None:
+            if result is None:
                 skipped += 1
                 continue
-            track, meta = res
-            loaded_track = await self._load_lavalink_track(
-                player, track, ctx.guild.id
-            )
-            if loaded_track:
-                loaded_track.title = truncate(meta["title"], 100)
-                loaded_track.author = (
-                    f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
-                )
-                async with self._guild_locks[ctx.guild.id]:
-                    if cancel_event.is_set():
-                        break
-                    queue = getattr(player, "queue", None)
-                    try:
-                        was_idle = not bool(getattr(player, "current", None)) and (
-                            len(queue) == 0 if queue is not None else True
-                        )
-                    except TypeError:
-                        was_idle = not bool(getattr(player, "current", None))
-                    try:
-                        player.add(ctx.author, loaded_track)
-                        if was_idle:
-                            await player.play()
-                            self._current_meta[ctx.guild.id] = meta
-                            self._controller_meta[ctx.guild.id] = meta
-                            self._playback_channels[ctx.guild.id] = ctx.channel
-                            self._remember_track(ctx.guild.id, meta)
-                        else:
-                            self._queued_meta[ctx.guild.id].append(meta)
-                    except Exception:
-                        self._remove_from_queue(player, loaded_track)
-                        log.exception("Could not queue a batch track in guild %s", ctx.guild.id)
-                        skipped += 1
-                        continue
-                    queued += 1
+            track, meta = result
+            try:
+                entry = self._tidal_entry(track, meta, ctx.author.id)
+                accepted = await session.enqueue(entry)
+            except (ValueError, PlaybackUnavailable):
+                accepted = False
+            if accepted:
+                self._guild_generations[ctx.guild.id] += 1
+                queued += 1
             else:
                 skipped += 1
         return queued, skipped
 
-    async def _load_and_queue_track(
-        self,
-        ctx: commands.Context,
-        tidal_track: Any,
-        show_embed: bool = True,
-        skip_audio_res: bool = True,
-        *,
-        player: Any | None = None,
-    ) -> bool:
-        if not ctx.guild:
+    async def _admit_entry(self, ctx: commands.Context, session: PlaybackSession, entry: PlaybackEntry, *, show_embed: bool = True, stop_generation: int | None = None) -> bool:
+        if self._closing or await self.backend.get(ctx.guild.id) is not session:
             return False
-        self._playback_channels[ctx.guild.id] = ctx.channel
-        meta = await self._extract_meta(tidal_track, skip_audio_res=skip_audio_res)
-        if player is None:
-            player = await self._prepare_playback_player(ctx)
-        if player is None:
+        if stop_generation is not None and stop_generation != self._stop_generations[ctx.guild.id]:
             return False
-        loaded_track = await self._load_lavalink_track(player, tidal_track, ctx.guild.id)
-        if not loaded_track:
-            log.error(
-                "Lavalink could not load a playable track for guild %s from resolved stream URL.",
-                ctx.guild.id,
-            )
-            await ctx.send(embed=_error_embed(Messages.ERROR_LAVALINK_FAILED))
-            return False
-        return await self._admit_loaded_track(
-            ctx, player, loaded_track, meta, show_embed=show_embed
-        )
-
-    async def _prepare_playback_player(self, ctx: commands.Context) -> Any | None:
-        if not getattr(ctx.author, "voice", None) or getattr(ctx.author.voice, "channel", None) is None:
-            await ctx.send(embed=_error_embed(Messages.ERROR_NO_PLAYER))
-            return None
-        player = await self._get_player(ctx, connect=True)
-        if not player:
-            await ctx.send(embed=_error_embed(Messages.ERROR_NO_PLAYER))
-            return None
-        player = await self._ensure_vc_connected(ctx, player)
-        if not player:
-            await ctx.send(embed=_error_embed(Messages.ERROR_NO_PLAYER))
-            return None
-        return player
-
-    async def _admit_loaded_track(
-        self,
-        ctx: commands.Context,
-        player: Any,
-        loaded_track: Any,
-        meta: TrackMeta,
-        *,
-        show_embed: bool = True,
-    ) -> bool:
-        if not ctx.guild:
-            return False
-        loaded_track.title = truncate(meta["title"], 100)
-        loaded_track.author = f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
-        guild_id = ctx.guild.id
-        started_playback = False
-        async with self._guild_locks[guild_id]:
-            queue = getattr(player, "queue", None)
-            try:
-                was_idle = not bool(getattr(player, "current", None)) and (
-                    len(queue) == 0 if queue is not None else True
-                )
-            except TypeError:
-                was_idle = not bool(getattr(player, "current", None))
-            player.add(ctx.author, loaded_track)
-            if was_idle:
-                try:
-                    await player.play()
-                except asyncio.CancelledError:
-                    self._remove_from_queue(player, loaded_track)
-                    raise
-                except Exception as error:
-                    self._remove_from_queue(player, loaded_track)
-                    _log_provider_failure(
-                        "Lavalink", f"playback start in guild {guild_id}", error
-                    )
-                    failure = (
-                        Messages.ERROR_YOUTUBE_FAILED
-                        if str(meta.get("source") or "").casefold() == "youtube"
-                        else Messages.ERROR_LAVALINK_FAILED
-                    )
-                    await ctx.send(embed=_error_embed(failure))
-                    return False
-                self._current_meta[guild_id] = meta
-                started_playback = True
-            else:
-                self._queued_meta[guild_id].append(meta)
-        if started_playback:
+        snapshot = session.snapshot()
+        was_waiting = snapshot.current is not None or bool(snapshot.queued)
+        if not await session.enqueue(entry):
             if show_embed:
-                try:
-                    await self._send_now_playing(ctx, meta)
-                except Exception:
-                    log.exception("Now playing controller failed for guild %s", guild_id)
-            return True
-        if show_embed:
+                await ctx.send(embed=_error_embed("The queue is full or the voice session ended."))
+            return False
+        self._guild_generations[ctx.guild.id] += 1
+        self._playback_channels[ctx.guild.id] = ctx.channel
+        if was_waiting and show_embed:
             try:
-                queued_msg = await ctx.send(embed=self._make_queued_embed(meta))
-                task = asyncio.create_task(self._delete_after(queued_msg, QUEUED_EMBED_DELETE_DELAY))
+                message = await ctx.send(embed=self._make_queued_embed(entry.meta))
+                task = asyncio.create_task(self._delete_after(message, QUEUED_EMBED_DELETE_DELAY))
                 self._tasks.add(task)
             except discord.HTTPException:
-                log.warning("Could not send queued embed for guild %s", ctx.guild.id)
+                log.debug("Could not send queued confirmation in guild %s", ctx.guild.id)
         return True
+
+    async def _load_and_queue_track(
+        self, ctx: commands.Context, tidal_track: Any, show_embed: bool = True,
+        skip_audio_res: bool = True, *, session: PlaybackSession | None = None,
+        kind: SourceKind | None = None,
+    ) -> bool:
+        stop_generation = self._stop_generations[ctx.guild.id]
+        if session is None:
+            session = await self._prepare_playback_session(ctx)
+        if session is None:
+            return False
+        meta = await self._extract_meta(tidal_track, skip_audio_res=skip_audio_res)
+        if kind is SourceKind.TIDAL_VIDEO:
+            meta["share_url"] = make_tidal_url("video", tidal_track.id)
+        try:
+            entry = self._tidal_entry(tidal_track, meta, ctx.author.id, kind=kind)
+        except (TypeError, ValueError):
+            await ctx.send(embed=_error_embed(Messages.ERROR_FETCH_FAILED))
+            return False
+        return await self._admit_entry(ctx, session, entry, show_embed=show_embed, stop_generation=stop_generation)
 
     @staticmethod
     def _youtube_watch_url(video_id: str) -> str:
         return f"https://www.youtube.com/watch?v={video_id}"
 
-    async def _youtube_video_metadata(
-        self, video_id: str
-    ) -> Tuple[str, str, Optional[str]] | None:
-        if self.yt is None:
-            return None
-        loop = asyncio.get_running_loop()
-        started = loop.time()
-        try:
-            response = await self.tidal._run_blocking(
-                self.yt.videos().list(
-                    part="snippet", id=video_id, maxResults=1
-                ).execute,
-                timeout=15.0,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            _log_provider_failure("YouTube", f"video metadata {video_id}", error)
-            return None
-
-        items = response.get("items") if isinstance(response, dict) else None
-        snippet = items[0].get("snippet") if isinstance(items, list) and items and isinstance(items[0], dict) else None
-        if not isinstance(snippet, dict):
-            log.warning("YouTube video metadata %s was missing or malformed.", video_id)
-            return None
-        title = str(snippet.get("title") or "").strip()
-        channel = str(snippet.get("channelTitle") or "").strip()
-        if not title or not channel or title.casefold() in YOUTUBE_SKIP_TITLES:
-            log.warning("YouTube video metadata %s was unavailable.", video_id)
-            return None
+    @staticmethod
+    def _youtube_snippet_metadata(video_id: str, snippet: Any) -> YouTubeVideoMetadata:
+        if not isinstance(snippet, dict) or not isinstance(snippet.get("title"), str):
+            raise ValueError("Invalid video metadata")
+        title = snippet["title"].strip()
+        channel = snippet.get("videoOwnerChannelTitle") or snippet.get("channelTitle")
+        if channel is not None and not isinstance(channel, str):
+            raise ValueError("Invalid video metadata")
+        if not title or title.casefold() in YOUTUBE_SKIP_TITLES:
+            raise ValueError("Unavailable video")
         thumbnail = None
         thumbnails = snippet.get("thumbnails")
         if isinstance(thumbnails, dict):
             for quality in ("maxres", "standard", "high", "medium", "default"):
-                candidate = thumbnails.get(quality)
-                if isinstance(candidate, dict) and candidate.get("url"):
-                    thumbnail = str(candidate["url"])
+                value = thumbnails.get(quality)
+                if isinstance(value, dict) and isinstance(value.get("url"), str):
+                    thumbnail = value["url"]
                     break
-        log.info(
-            "Retrieved YouTube metadata for video %s in %.2fs.",
-            video_id,
-            loop.time() - started,
-        )
-        return title, channel, thumbnail
+        return YouTubeVideoMetadata(video_id, title, channel, None, thumbnail)
 
-    async def _load_youtube_track(
-        self, player: Any, video_id: str, guild_id: int
-    ) -> Any | None:
-        loop = asyncio.get_running_loop()
-        started = loop.time()
-        node_ready = self._lavalink_node_ready_state(player)
-        try:
-            results = await player.load_tracks(self._youtube_watch_url(video_id))
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            _log_provider_failure(
-                "Lavalink", f"YouTube video {video_id} load in guild {guild_id}", error
-            )
-            return None
-        tracks = self.tidal._extract_tracks(results)
-        elapsed = loop.time() - started
-        result_type = self._lavalink_load_result_type(results)
-        if not tracks:
-            log.warning(
-                "Lavalink returned no tracks for YouTube video %s in guild %s after %.2fs "
-                "(node_ready=%s, load_type=%s).",
-                video_id,
-                guild_id,
-                elapsed,
-                node_ready,
-                result_type,
-            )
-            return None
-        log.info(
-            "Lavalink loaded YouTube video %s in guild %s in %.2fs "
-            "(node_ready=%s, load_type=%s, tracks=%s).",
-            video_id,
-            guild_id,
-            elapsed,
-            node_ready,
-            result_type,
-            len(tracks),
-        )
-        return tracks[0]
+    async def _youtube_video_metadata(self, video_id: str) -> YouTubeVideoMetadata:
+        reference = SourceReference(SourceKind.YOUTUBE, video_id)
+        if self.yt is not None:
+            try:
+                response = await self.tidal._run_blocking(
+                    self.yt.videos().list(part="snippet", id=video_id, maxResults=1).execute, timeout=15.0,
+                )
+                return self._youtube_snippet_metadata(video_id, response["items"][0]["snippet"])
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                _log_provider_failure("YouTube", "metadata API", error)
+        metadata = await self.youtube_resolver.fetch_metadata(reference)
+        if metadata.title.casefold() in YOUTUBE_SKIP_TITLES:
+            raise ValueError("Unavailable video")
+        return metadata
 
-    def _youtube_track_meta(
-        self,
-        track: Any,
-        video_id: str,
-        fallback_thumbnail: str | None = None,
-    ) -> TrackMeta:
-        try:
-            duration = max(0, int(getattr(track, "length", 0) or 0) // 1000)
-        except (TypeError, ValueError):
-            duration = 0
+    @staticmethod
+    def _youtube_track_meta(video: YouTubeVideoMetadata) -> TrackMeta:
         return {
-            "title": str(getattr(track, "title", None) or "Unknown YouTube video"),
-            "artist": str(getattr(track, "author", None) or "Unknown artist"),
-            "album": None,
-            "duration": duration,
-            "quality": "YouTube",
-            "image": getattr(track, "thumbnail", None) or fallback_thumbnail,
-            "share_url": self._youtube_watch_url(video_id),
-            "audio_resolution": None,
-            "track_id": None,
-            "source": "YouTube",
+            "title": video.title, "artist": video.channel or "YouTube",
+            "album": None, "duration": video.duration or 0, "quality": "YouTube audio",
+            "image": video.thumbnail, "share_url": f"https://www.youtube.com/watch?v={video.video_id}",
+            "audio_resolution": None, "track_id": None, "source": "YouTube",
         }
 
-    async def _handle_youtube_video(self, ctx: commands.Context, video_id: str) -> None:
-        if ctx.guild is None:
-            return
-        player = await self._prepare_playback_player(ctx)
-        if player is None:
-            return
-        metadata = await self._youtube_video_metadata(video_id)
-        loaded_track = None
-        if metadata is None:
-            loaded_track = await self._load_youtube_track(player, video_id, ctx.guild.id)
-            if loaded_track is None:
-                await ctx.send(embed=_error_embed(Messages.ERROR_YOUTUBE_FAILED))
-                return
-            metadata = (
-                str(getattr(loaded_track, "title", None) or ""),
-                str(getattr(loaded_track, "author", None) or ""),
-                getattr(loaded_track, "thumbnail", None),
-            )
-
-        title, channel, _thumbnail = metadata
-        filter_remixes = await self.config.guild(ctx.guild).filter_remixes()
+    async def _youtube_entry(self, video: YouTubeVideoMetadata, requester_id: int | None) -> PlaybackEntry:
+        reference = SourceReference(SourceKind.YOUTUBE, video.video_id)
+        meta = self._youtube_track_meta(video)
         try:
-            results = await self.tidal.search(
-                f"{title} {channel}".strip(), filter_remixes=filter_remixes
-            )
+            if TIDALAPI_AVAILABLE and await self.tidal.is_logged_in():
+                results = await asyncio.wait_for(
+                    self.tidal.search(f"{video.title} {video.channel or ''}", filter_remixes=False), 15.0,
+                )
+                match = select_confident_youtube_tidal_track(video.title, video.channel or "", results)
+                if match is not None:
+                    tidal_meta = await self._extract_meta(match, skip_audio_res=True)
+                    return PlaybackEntry(
+                        secrets.token_hex(12), SourceReference(SourceKind.TIDAL, str(match.id)),
+                        reference, tidal_meta, requester_id, fallback_meta=meta,
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            _log_provider_failure("Tidal", f"YouTube video {video_id} match", error)
-            results = []
-        tidal_track = select_confident_youtube_tidal_track(title, channel, results)
-        if tidal_track is not None:
-            await self._load_and_queue_track(ctx, tidal_track, player=player)
-            return
+            _log_provider_failure("Tidal", "optional YouTube matching", error)
+        return PlaybackEntry(secrets.token_hex(12), reference, None, meta, requester_id)
 
-        if loaded_track is None:
-            loaded_track = await self._load_youtube_track(player, video_id, ctx.guild.id)
-        if loaded_track is None:
+    async def _handle_youtube_video(self, ctx: commands.Context, video_id: str) -> None:
+        stop_generation = self._stop_generations[ctx.guild.id]
+        session = await self._prepare_playback_session(ctx)
+        if session is None:
+            return
+        try:
+            video = await self._youtube_video_metadata(video_id)
+            entry = await self._youtube_entry(video, ctx.author.id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            _log_provider_failure("YouTube", "video metadata", error)
             await ctx.send(embed=_error_embed(Messages.ERROR_YOUTUBE_FAILED))
             return
-        meta = self._youtube_track_meta(loaded_track, video_id, _thumbnail)
-        await self._admit_loaded_track(ctx, player, loaded_track, meta)
+        await self._admit_entry(ctx, session, entry, stop_generation=stop_generation)
+
+    async def _handle_public_audio(self, ctx: commands.Context, parsed: ProviderURL) -> None:
+        """Queue public SoundCloud/Bandcamp references without TIDAL authentication."""
+        guild_id = ctx.guild.id
+        stop_generation = self._stop_generations[guild_id]
+        session = await self._prepare_playback_session(ctx)
+        if session is None:
+            return
+        kind = SourceKind(parsed.provider.value)
+        label = "SoundCloud" if kind is SourceKind.SOUNDCLOUD else "Bandcamp"
+        cancel = None
+        if parsed.content_type != "track":
+            cancel = self._claim_batch(guild_id)
+            if cancel is None:
+                await ctx.send(embed=_error_embed(Messages.ERROR_BATCH_IN_PROGRESS))
+                return
+        try:
+            if parsed.content_type == "track":
+                item = await self.public_audio_resolver.fetch_metadata(
+                    SourceReference(kind, parsed.identifier),
+                )
+                entry = PlaybackEntry(secrets.token_hex(12), item.reference, None, item.meta, ctx.author.id)
+                await self._admit_entry(ctx, session, entry, stop_generation=stop_generation)
+                return
+
+            message = await ctx.send(embed=discord.Embed(title=f"Importing {label} collection", color=COLOR_BLUE))
+            items = await self.public_audio_resolver.fetch_collection(parsed.identifier, 100)
+            total = len(items)
+            queued = skipped = 0
+            interrupted = False
+            for item in items:
+                if (cancel.is_set() or self._closing or stop_generation != self._stop_generations[guild_id]
+                        or await self.backend.get(guild_id) is not session):
+                    interrupted = True
+                    break
+                entry = PlaybackEntry(secrets.token_hex(12), item.reference, None, item.meta, ctx.author.id)
+                if not await self._admit_entry(ctx, session, entry, show_embed=False, stop_generation=stop_generation):
+                    skipped = total - queued
+                    break
+                queued += 1
+                if queued % SEARCH_BATCH_SIZE == 0:
+                    await self._edit_progress_message(message, discord.Embed(
+                        title=f"Importing {label} collection",
+                        description=f"Queued {queued}/{total}. Skipped {skipped}.", color=COLOR_BLUE,
+                    ))
+            status = "Cancelled" if interrupted or cancel.is_set() else "Finished"
+            await message.edit(embed=discord.Embed(
+                title=f"{status} importing {label} collection",
+                description=f"Queued {queued}/{total}. Skipped {skipped}.", color=COLOR_BLUE,
+            ))
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            _log_provider_failure(label, "public audio import", error)
+            await ctx.send(embed=_error_embed(
+                f"Could not read playable public audio from this {label} link. "
+                "Private, preview-only, or unavailable releases are not supported."
+            ))
+        finally:
+            if cancel is not None:
+                self._release_batch(guild_id, cancel)
 
     async def _lastfm_similar_tracks(
         self, artist: str, title: str, limit: int = 25,
@@ -2570,9 +2224,9 @@ class TidalPlayerExp(commands.Cog):
             message = self._controller_messages.get(guild_id)
             if message is None:
                 return
-            player = await self._get_player_for_guild(guild_id)
+            player = await self._get_session_for_guild(guild_id)
             view = await self._controller_view(
-                guild_id, paused=bool(getattr(player, "paused", False)) if player else False,
+                guild_id, paused=player.snapshot().paused if player else False,
             )
             await self._activate_controller_view(
                 guild_id, view, lambda active_view: message.edit(view=active_view)
@@ -2604,69 +2258,36 @@ class TidalPlayerExp(commands.Cog):
         from .ui.embeds import make_queue_embed
         return make_queue_embed(meta)
 
-    async def _send_now_playing(self, ctx: commands.Context, meta: TrackMeta) -> None:
-        if ctx.guild is None:
-            return
-        guild_id = ctx.guild.id
-        self._playback_channels[guild_id] = ctx.channel
-        self._controller_meta[guild_id] = meta
-        self._remember_track(guild_id, meta)
-        try:
-            view = await self._controller_view(guild_id)
-        except Exception:
-            log.exception("Could not build controller view for guild %s", guild_id)
-            return
-        # Guard: a LayoutView with no top-level children causes Discord error 50006
-        if not view.children:
-            log.error(
-                "Controller view for guild %s has no children — aborting send to avoid 50006",
-                guild_id,
-            )
-            return
-        previous = self._controller_messages.pop(guild_id, None)
-        self._stop_controller_view(guild_id)
-        if previous is not None:
-            try:
-                await previous.delete()
-            except (discord.HTTPException, discord.Forbidden, discord.NotFound):
-                pass
-        try:
-            self._controller_messages[guild_id] = await self._activate_controller_view(
-                guild_id, view, lambda active_view: ctx.send(view=active_view)
-            )
-        except discord.HTTPException:
-            log.exception("Could not send controller message for guild %s", guild_id)
-        else:
-            self._schedule_controller_recommendations(guild_id)
-
     async def _resend_controller_for_track_start(self, *, guild_id: int) -> None:
-        """Replace the controller when Red Audio advances to a queued track."""
+        entry = self._current_entries.get(guild_id)
+        if entry is None or not await self._entry_is_current(guild_id, entry.entry_id):
+            return
         previous = self._controller_messages.pop(guild_id, None)
         self._stop_controller_view(guild_id)
         channel = self._playback_channels.get(guild_id)
-        if channel is None and previous is not None:
-            channel = previous.channel
         if previous is not None:
-            try:
-                await previous.delete()
-            except (discord.HTTPException, discord.Forbidden, discord.NotFound):
-                pass
-        if channel is None:
-            log.debug("No playback channel is available to resend controller for guild %s", guild_id)
+            await _delete_message_safe(previous)
+        if channel is None or not await self._entry_is_current(guild_id, entry.entry_id):
             return
-        player = await self._get_player_for_guild(guild_id)
-        paused = bool(getattr(player, "paused", False)) if player else False
+        session = await self.backend.get(guild_id)
+        if session is None:
+            return
+        view = await self._controller_view(guild_id, session.snapshot().paused)
+        if not await self._entry_is_current(guild_id, entry.entry_id):
+            view.stop()
+            return
         try:
-            view = await self._controller_view(guild_id, paused)
-            if not view.children:
-                log.error("Empty controller view on track start in guild %s", guild_id)
-                return
-            self._controller_messages[guild_id] = await self._activate_controller_view(
-                guild_id, view, lambda active_view: channel.send(view=active_view)
-            )
+            message = await channel.send(view=view)
         except discord.HTTPException:
-            log.exception("Could not resend controller message for guild %s", guild_id)
-
+            view.stop()
+            return
+        if not await self._entry_is_current(guild_id, entry.entry_id):
+            view.stop()
+            await _delete_message_safe(message)
+            return
+        self._stop_controller_view(guild_id)
+        self._controller_views[guild_id] = view
+        self._controller_messages[guild_id] = message
 
     def _remember_track(self, guild_id: int, meta: TrackMeta) -> None:
         track_id = str(meta.get("track_id") or "")
@@ -2678,125 +2299,20 @@ class TidalPlayerExp(commands.Cog):
         if signature and (not recent_signatures or recent_signatures[-1] != signature):
             recent_signatures.append(signature)
 
-    async def _get_player_for_guild(self, guild_id: int) -> Any | None:
-        try:
-            return await self.audio.get_player(guild_id)
-        except PlaybackUnavailable:
-            return None
-
     async def controller_skip(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "This control can only be used in a server.", ephemeral=True
-                )
             return
-
-        guild_id = interaction.guild.id
-        # Resolve old message and channel BEFORE any pops, so we never lose the reference
-        old_message = interaction.message or self._controller_messages.get(guild_id)
-        channel: discord.abc.Messageable | None = interaction.channel or (
-            old_message.channel if old_message is not None else None
-        )
-        if channel is not None:
-            self._playback_channels[guild_id] = channel
-
-        # Acknowledge immediately so Discord's 3-second interaction window doesn't expire
-        try:
-            await interaction.response.defer()
-        except Exception:
-            pass
-
-        no_active_player = False
-        skip_error: Exception | None = None
-        next_meta = None
-        async with self._guild_locks[guild_id]:
-            player = await self._get_player_for_guild(guild_id)
-            if player is None or not getattr(player, "current", None):
-                no_active_player = True
-            else:
-                queued = self._queued_meta.get(guild_id)
-                next_meta = queued[0] if queued else None
-                try:
-                    await player.skip()
-                except Exception as error:
-                    skip_error = error
-                else:
-                    if next_meta is not None and queued and queued[0] is next_meta:
-                        queued.popleft()
-                        self._current_meta[guild_id] = next_meta
-                        self._controller_meta[guild_id] = next_meta
-                    elif next_meta is None:
-                        autoplay_enabled = await self.config.guild_from_id(
-                            guild_id
-                        ).autoplay_enabled()
-                        if not autoplay_enabled:
-                            self._current_meta.pop(guild_id, None)
-                            self._controller_meta.pop(guild_id, None)
-
-        if no_active_player:
-            await interaction.followup.send(
-                embed=_error_embed(Messages.ERROR_NOT_PLAYING), ephemeral=True
-            )
-            return
-
-        if skip_error is not None:
-            _log_provider_failure("Red Audio", f"skip in guild {guild_id}", skip_error)
-            try:
-                await interaction.followup.send("Could not skip the current track.", ephemeral=True)
-            except Exception:
-                pass
-            return
-
-        # Remove stale panel reference and delete the message
-        self._controller_messages.pop(guild_id, None)
-        self._stop_controller_view(guild_id)
-        if old_message is not None:
-            try:
-                await old_message.delete()
-            except (discord.HTTPException, discord.Forbidden, discord.NotFound):
-                pass
-
-        if next_meta is None:
-            return
-
-        # Resend a fresh controller panel so the user gets instant feedback.
-        # Use interaction.followup.send() (webhook) so the Components V2 flag is
-        # carried correctly. Fall back to channel.send() only if followup is unavailable.
-        try:
-            view = await self._controller_view(guild_id)
-            if not view.children:
-                log.error("Empty controller view after skip in guild %s — not sending", guild_id)
-                return
-            try:
-                msg = await self._activate_controller_view(
-                    guild_id,
-                    view,
-                    lambda active_view: interaction.followup.send(
-                        view=active_view, wait=True
-                    ),
-                )
-                self._controller_messages[guild_id] = msg
-            except discord.HTTPException:
-                log.exception("followup.send failed after skip in guild %s, trying channel.send", guild_id)
-                if channel is not None:
-                    view = await self._controller_view(guild_id)
-                    msg = await self._activate_controller_view(
-                        guild_id,
-                        view,
-                        lambda active_view: channel.send(view=active_view),
-                    )
-                    self._controller_messages[guild_id] = msg
-            self._schedule_controller_recommendations(guild_id)
-        except Exception:
-            log.exception("Could not resend controller after skip in guild %s", guild_id)
+        await interaction.response.defer()
+        session = await self.backend.get(interaction.guild.id)
+        if session is None or not await session.skip():
+            await interaction.followup.send("Nothing is playing.", ephemeral=True)
 
     async def can_control_player(self, interaction: discord.Interaction) -> bool:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             return False
-        bot_voice = interaction.guild.me.voice if interaction.guild.me is not None else None
-        user_voice = interaction.user.voice
-        return bool(bot_voice and bot_voice.channel and user_voice and user_voice.channel and bot_voice.channel.id == user_voice.channel.id)
+        session = await self.backend.get(interaction.guild.id)
+        user_channel = getattr(getattr(interaction.user, "voice", None), "channel", None)
+        return session is not None and user_channel is not None and session.snapshot().channel_id == user_channel.id
 
     async def can_change_guild_settings(self, interaction: discord.Interaction) -> bool:
         """Allow bot owners or members with Manage Guild to change shared settings."""
@@ -2816,9 +2332,26 @@ class TidalPlayerExp(commands.Cog):
             if now - last < CONTROLLER_REFRESH_COOLDOWN:
                 return
             self._controller_last_refresh[guild_id] = now
-        player = await self._get_player_for_guild(guild_id)
-        paused = bool(getattr(player, "paused", False)) if player else False
+        generation = self._stop_generations[guild_id]
+        player = await self._get_session_for_guild(guild_id)
+        entry = player.snapshot().current if player else None
+        entry_id = entry.entry_id if entry else None
+        message = self._controller_messages.get(guild_id)
+
+        async def still_current() -> bool:
+            if self._closing or generation != self._stop_generations[guild_id]:
+                return False
+            current_player = await self._get_session_for_guild(guild_id)
+            if current_player is not player:
+                return False
+            current = current_player.snapshot().current if current_player else None
+            return (current.entry_id if current else None) == entry_id
+
+        paused = player.snapshot().paused if player else False
         view = await self._controller_view(guild_id, paused)
+        if not await still_current():
+            view.stop()
+            return
         if interaction is not None:
             if interaction.response.is_done():
                 await self._activate_controller_view(
@@ -2827,6 +2360,7 @@ class TidalPlayerExp(commands.Cog):
                     lambda active_view: interaction.edit_original_response(
                         view=active_view
                     ),
+                    still_current=still_current,
                 )
             else:
                 await self._activate_controller_view(
@@ -2835,14 +2369,18 @@ class TidalPlayerExp(commands.Cog):
                     lambda active_view: interaction.response.edit_message(
                         view=active_view
                     ),
+                    still_current=still_current,
                 )
+            if not await still_current():
+                return
             if interaction.message is not None:
                 self._controller_messages[guild_id] = interaction.message
             self._controller_last_refresh[guild_id] = now
-        elif (message := self._controller_messages.get(guild_id)) is not None:
+        elif message is not None:
             try:
                 await self._activate_controller_view(
-                    guild_id, view, lambda active_view: message.edit(view=active_view)
+                    guild_id, view, lambda active_view: message.edit(view=active_view),
+                    still_current=still_current,
                 )
             except (discord.HTTPException, discord.Forbidden, discord.NotFound):
                 pass
@@ -2866,268 +2404,118 @@ class TidalPlayerExp(commands.Cog):
     async def controller_toggle_pause(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
             return
-        guild_id = interaction.guild.id
         await interaction.response.defer()
-        async with self._guild_locks[guild_id]:
-            player = await self._get_player_for_guild(guild_id)
-            if player is None or not callable(getattr(player, "pause", None)):
-                await interaction.followup.send("No active player is available.", ephemeral=True)
-                return
-            result = player.pause(not bool(getattr(player, "paused", False)))
-            if asyncio.iscoroutine(result):
-                await result
-        await self._refresh_controller(guild_id, interaction)
+        session = await self.backend.get(interaction.guild.id)
+        if session is None or not await session.set_paused(not session.snapshot().paused):
+            await interaction.followup.send("No active player is available.", ephemeral=True)
+            return
+        await self._refresh_controller(interaction.guild.id, interaction)
 
     async def controller_stop(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
             return
         guild_id = interaction.guild.id
         await interaction.response.defer()
-        async with self._guild_locks[guild_id]:
-            self._cancel_guild_background_tasks(guild_id)
-            self._cancel_lavalink_loads(guild_id)
-            player = await self._get_player_for_guild(guild_id)
-            if player is not None:
-                queue = getattr(player, "queue", None)
-                if callable(getattr(queue, "clear", None)):
-                    queue.clear()
-                if callable(getattr(player, "stop", None)):
-                    result = player.stop()
-                    if asyncio.iscoroutine(result):
-                        await result
-            self._queued_meta.pop(guild_id, None)
-            self._current_meta.pop(guild_id, None)
-            self._controller_meta.pop(guild_id, None)
-            old_msg = self._controller_messages.pop(guild_id, None)
-            self._stop_controller_view(guild_id)
-        # edit_message with embed=None + embeds=[] conflicts — delete the panel
-        # and send a plain ephemeral confirmation instead.
-        if old_msg is not None:
-            try:
-                await old_msg.delete()
-            except (discord.HTTPException, discord.Forbidden, discord.NotFound):
-                pass
-        try:
-            await interaction.followup.send("⏹ Playback stopped. Queue cleared.", ephemeral=True)
-        except Exception:
-            pass
+        self._stop_generations[guild_id] += 1
+        self._guild_generations[guild_id] += 1
+        event = self._cancel_events.get(guild_id)
+        if event is not None:
+            event.set()
+        self._cancel_guild_background_tasks(guild_id)
+        session = await self.backend.get(guild_id)
+        if session is not None:
+            await session.stop(clear_queue=True)
+        self._current_entries.pop(guild_id, None)
+        self._current_meta.pop(guild_id, None)
+        self._controller_meta.pop(guild_id, None)
+        old_message = self._controller_messages.pop(guild_id, None)
+        self._stop_controller_view(guild_id)
+        if old_message is not None:
+            await _delete_message_safe(old_message)
+        await interaction.followup.send("⏹ Playback stopped. Queue cleared.", ephemeral=True)
 
     async def queue_recommendation(self, interaction: discord.Interaction, tidal_track: Any) -> bool:
         if interaction.guild is None:
             return False
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         guild_id = interaction.guild.id
-        player = await self._get_player_for_guild(guild_id)
-        if player is None:
+        stop_generation = self._stop_generations[guild_id]
+        session = await self.backend.get(guild_id)
+        if session is None:
             return False
         selected_id = str(getattr(tidal_track, "id", "") or "")
-        selected_signature = self._tidal_track_signature(tidal_track)
-        if not selected_id or self._is_current_or_queued_track(
-            guild_id, selected_id, selected_signature
-        ):
-            log.warning("Refused duplicate suggested track %s in guild %s", selected_id, guild_id)
+        signature = self._tidal_track_signature(tidal_track)
+        if not selected_id or await self._is_current_or_queued_track(guild_id, selected_id, signature):
             return False
         try:
             meta = await self._extract_meta(tidal_track, skip_audio_res=True)
-            loaded = await self._load_lavalink_track(player, tidal_track, guild_id)
-            if loaded is None:
+            entry = self._tidal_entry(tidal_track, meta, interaction.user.id)
+            if await self.backend.get(guild_id) is not session or self._closing:
                 return False
-            loaded.title = truncate(meta["title"], 100)
-            loaded.author = f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
-            async with self._guild_locks[guild_id]:
-                if self._is_current_or_queued_track(
-                    guild_id, selected_id, self._meta_track_signature(meta)
-                ):
-                    log.warning("Refused duplicate suggested track %s in guild %s", selected_id, guild_id)
-                    return False
-                player.add(interaction.user, loaded)
-                self._queued_meta[guild_id].append(meta)
-            try:
-                if not interaction.response.is_done():
-                    await interaction.response.defer()
-                queued_message = await interaction.followup.send(
-                    embed=make_queue_embed(meta), ephemeral=False, wait=True
-                )
-                if queued_message is not None:
-                    task = asyncio.create_task(
-                        self._delete_after(queued_message, QUEUED_EMBED_DELETE_DELAY)
-                    )
-                    self._tasks.add(task)
-            except Exception:
-                log.exception("Could not send queue confirmation for suggested track %s", selected_id)
-            log.info("Queued suggested Tidal track %s in guild %s", selected_id, guild_id)
+            if await self._is_current_or_queued_track(guild_id, selected_id, signature):
+                return False
+            if self._closing or stop_generation != self._stop_generations[guild_id]:
+                return False
+            if not await session.enqueue(entry):
+                return False
+            self._guild_generations[guild_id] += 1
+            message = await interaction.followup.send(embed=make_queue_embed(meta), wait=True)
+            if message is not None:
+                task = asyncio.create_task(self._delete_after(message, QUEUED_EMBED_DELETE_DELAY))
+                self._tasks.add(task)
             return True
-        except Exception:
-            log.exception("Could not queue suggested Tidal track %s", selected_id)
-            return False
-
-    async def _run_autoplay(self, guild_id: int, player: Any) -> None:
-        """Queue the first playable, non-current Last.fm recommendation."""
-        try:
-            async with self._guild_locks[guild_id]:
-                if not await self.config.guild_from_id(guild_id).autoplay_enabled():
-                    return
-                queued_count = self._queued_count(player)
-                if queued_count:
-                    log.info("Autoplay skipped for guild %s: queue already has %d tracks.", guild_id, queued_count)
-                    return
-                meta = self._current_meta.get(guild_id)
-                if meta is None:
-                    log.warning("Autoplay skipped for guild %s: current metadata is missing.", guild_id)
-                    return
-                current_id = str(meta.get("track_id") or "")
-            # Provider lookups must not hold the guild playback lock. They can take
-            # several seconds and would otherwise block skip, stop, and user queues.
-            candidates = await self._get_recommendations(guild_id, meta)
-            if not candidates:
-                log.info("Autoplay found no similar-song candidates for guild %s.", guild_id)
-                return
-            for track in candidates:
-                async with self._guild_locks[guild_id]:
-                    if self._queued_count(player):
-                        log.info("Autoplay stopped for guild %s: a track was queued by a user.", guild_id)
-                        return
-                    if self._is_recent_autoplay_track(guild_id, track):
-                        log.info("Autoplay skipped a recently played duplicate in guild %s.", guild_id)
-                        continue
-                candidate_id = str(getattr(track, "id", "") or "")
-                if not candidate_id or candidate_id == current_id:
-                    log.warning("Autoplay rejected current track %s as a candidate.", candidate_id)
-                    continue
-                try:
-                    if await self.queue_autoplay_track(
-                        guild_id, player, track, source_track_id=current_id, start_immediately=True,
-                    ):
-                        log.info("Autoplay queued candidate %s for guild %s.", candidate_id, guild_id)
-                        return
-                except Exception:
-                    log.exception("Autoplay candidate %s failed for guild %s.", candidate_id, guild_id)
-            log.warning("Autoplay could not load any of %s similar-song candidates for guild %s.", len(candidates), guild_id)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            log.exception("Autoplay failed for guild %s", guild_id)
+        except (PlaybackUnavailable, ValueError):
+            return False
+        except discord.HTTPException:
+            return True
+
+    async def _autoplay_allowed(self, guild_id: int, session: PlaybackSession, generation: int) -> bool:
+        if self._closing or generation != self._guild_generations[guild_id]:
+            return False
+        if not await self.config.guild_from_id(guild_id).autoplay_enabled():
+            return False
+        if await self.backend.get(guild_id) is not session:
+            return False
+        snapshot = session.snapshot()
+        return not snapshot.current and not snapshot.queued and generation == self._guild_generations[guild_id]
+
+    async def _run_autoplay(self, guild_id: int, previous: PlaybackEntry, generation: int) -> None:
+        try:
+            session = await self.backend.get(guild_id)
+            if session is None or not await self._autoplay_allowed(guild_id, session, generation):
+                return
+            if not TIDALAPI_AVAILABLE or not await self.tidal.is_logged_in():
+                return
+            candidates = await self._get_recommendations(guild_id, previous.meta)
+            for track in candidates:
+                if not await self._autoplay_allowed(guild_id, session, generation):
+                    return
+                if self._is_recent_autoplay_track(guild_id, track):
+                    continue
+                meta = await self._extract_meta(track, skip_audio_res=True)
+                if not await self._autoplay_allowed(guild_id, session, generation):
+                    return
+                entry = self._tidal_entry(track, meta, None)
+                if await session.enqueue(entry):
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            _log_provider_failure("Tidal", "autoplay", error)
         finally:
-            task = asyncio.current_task()
-            if task is not None and self._autoplay_tasks.get(guild_id) is task:
+            if self._autoplay_tasks.get(guild_id) is asyncio.current_task():
                 self._autoplay_tasks.pop(guild_id, None)
 
-    async def queue_autoplay_track(
-        self,
-        guild_id: int,
-        player: Any,
-        tidal_track: Any,
-        *,
-        source_track_id: str | None = None,
-        start_immediately: bool = False,
-    ) -> bool:
-        selected_id = str(getattr(tidal_track, "id", "") or "")
-        current_meta = self._current_meta.get(guild_id) or {}
-        if (
-            not selected_id
-            or selected_id == str(current_meta.get("track_id") or "")
-            or self._is_recent_autoplay_track(guild_id, tidal_track)
-        ):
-            log.warning("Autoplay refused duplicate source track %s in guild %s", selected_id, guild_id)
-            return False
-        try:
-            async with self._guild_locks[guild_id]:
-                if not await self.config.guild_from_id(guild_id).autoplay_enabled():
-                    return False
-                if self._queued_count(player):
-                    return False
-                if self._is_recent_autoplay_track(guild_id, tidal_track):
-                    return False
-                if source_track_id is not None:
-                    active_id = str((self._current_meta.get(guild_id) or {}).get("track_id") or "")
-                    if active_id != source_track_id:
-                        return False
-            meta = await self._extract_meta(tidal_track, skip_audio_res=True)
-            loaded = await self._load_lavalink_track(player, tidal_track, guild_id)
-            if loaded is None:
-                return False
-            loaded.title = truncate(meta["title"], 100)
-            loaded.author = f"{meta['artist']} - {meta['album']}" if meta.get("album") else meta["artist"]
-            guild = self.bot.get_guild(guild_id)
-            channel = None
-            started_playback = False
-            async with self._guild_locks[guild_id]:
-                if not await self.config.guild_from_id(guild_id).autoplay_enabled():
-                    return False
-                current_meta = self._current_meta.get(guild_id) or {}
-                if selected_id == str(current_meta.get("track_id") or ""):
-                    return False
-                if self._is_recent_autoplay_meta(guild_id, meta):
-                    log.info("Autoplay refused a recently played song in guild %s.", guild_id)
-                    return False
-                if source_track_id is not None:
-                    active_id = str(current_meta.get("track_id") or "")
-                    if active_id != source_track_id:
-                        return False
-                if self._queued_count(player):
-                    return False
-                old_message = self._controller_messages.get(guild_id)
-                if (last_channel := self._playback_channels.get(guild_id)) is not None:
-                    channel = last_channel
-                elif old_message is not None:
-                    channel = old_message.channel
-                elif guild is not None:
-                    channel = guild.system_channel
-                player.add(guild.me if guild is not None else None, loaded)
-                if start_immediately:
-                    try:
-                        await player.play()
-                    except Exception:
-                        self._remove_from_queue(player, loaded)
-                        raise
-                    self._current_meta[guild_id] = meta
-                    self._controller_meta[guild_id] = meta
-                    self._remember_track(guild_id, meta)
-                    started_playback = True
-                else:
-                    self._queued_meta[guild_id].append(meta)
-
-            if channel is not None:
-                try:
-                    queued_message = await channel.send(
-                        embed=make_queue_embed(meta, title="Autoplay song queued")
-                    )
-                    task = asyncio.create_task(
-                        self._delete_after(queued_message, QUEUED_EMBED_DELETE_DELAY)
-                    )
-                    self._tasks.add(task)
-                except (discord.HTTPException, discord.Forbidden):
-                    log.warning("Could not announce autoplay track %s in guild %s", selected_id, guild_id)
-
-            if started_playback:
-                if channel is not None:
-                    previous = self._controller_messages.pop(guild_id, None)
-                    self._stop_controller_view(guild_id)
-                    if previous is not None:
-                        try:
-                            await previous.delete()
-                        except (discord.HTTPException, discord.Forbidden, discord.NotFound):
-                            pass
-                    view = await self._controller_view(guild_id)
-                    self._controller_messages[guild_id] = await self._activate_controller_view(
-                        guild_id,
-                        view,
-                        lambda active_view: channel.send(view=active_view),
-                    )
-                    self._schedule_controller_recommendations(guild_id)
-                log.info("Autoplay started Tidal track %s in guild %s", selected_id, guild_id)
-            else:
-                log.info("Autoplay queued Tidal track %s in guild %s", selected_id, guild_id)
-            return True
-        except Exception:
-            log.exception("Autoplay could not queue Tidal track %s in guild %s", selected_id, guild_id)
-            return False
-
-
-    def _schedule_autoplay(self, guild_id: int, player: Any) -> None:
+    def _schedule_autoplay(self, guild_id: int, previous: PlaybackEntry, generation: int) -> None:
         task = self._autoplay_tasks.get(guild_id)
         if task is None or task.done():
-            log.info("Scheduling autoplay for guild %s", guild_id)
-            self._autoplay_tasks[guild_id] = asyncio.create_task(self._run_autoplay(guild_id, player), name=f"tidalplayer-autoplay-{guild_id}")
+            self._autoplay_tasks[guild_id] = asyncio.create_task(
+                self._run_autoplay(guild_id, previous, generation),
+                name=f"tidalplayerexp-autoplay-{guild_id}",
+            )
 
     async def _interactive_select(self, ctx: commands.Context, tracks: List[Any]) -> Optional[Any]:
         if not tracks:
@@ -3252,7 +2640,8 @@ class TidalPlayerExp(commands.Cog):
         all_items: List[Any] = []
         page_token: Optional[str] = None
         seen_page_tokens: set[str] = set()
-        while True:
+        raw_count = 0
+        while raw_count < MAX_ITEMS:
             if page_token:
                 if page_token in seen_page_tokens:
                     log.warning(
@@ -3274,7 +2663,9 @@ class TidalPlayerExp(commands.Cog):
             if not isinstance(items, list):
                 log.warning("YouTube returned malformed playlist items for playlist %s.", playlist_id)
                 break
-            for item in items:
+            remaining = MAX_ITEMS - raw_count
+            raw_count += max(1, len(items))
+            for item in items[:remaining]:
                 if not isinstance(item, dict):
                     continue
                 snippet = item.get("snippet")
@@ -3333,7 +2724,7 @@ class TidalPlayerExp(commands.Cog):
         if not await self.check_ready(ctx):
             return
         filter_remixes = await self.config.guild(ctx.guild).filter_remixes()
-        player = await self._ensure_player(ctx)
+        player = await self._prepare_playback_session(ctx)
         if not player:
             return
         guild_id = ctx.guild.id
@@ -3358,8 +2749,7 @@ class TidalPlayerExp(commands.Cog):
             for chunk_start in range(0, total, SEARCH_BATCH_SIZE):
                 if cancel_event.is_set():
                     break
-                player = await self._ensure_vc_connected(ctx, player)
-                if player is None:
+                if await self.backend.get(guild_id) is not player or self._closing:
                     break
                 chunk_items = items[chunk_start:chunk_start + SEARCH_BATCH_SIZE]
                 tasks = [
@@ -3417,7 +2807,7 @@ class TidalPlayerExp(commands.Cog):
     async def _handle_video(self, ctx: commands.Context, vid: str) -> None:
         v = await self.tidal.get_video(vid)
         if v:
-            await self._load_and_queue_track(ctx, v)
+            await self._load_and_queue_track(ctx, v, kind=SourceKind.TIDAL_VIDEO)
         else:
             await ctx.send(embed=_error_embed(Messages.ERROR_NO_TRACKS_FOUND))
 
@@ -3458,12 +2848,18 @@ class TidalPlayerExp(commands.Cog):
     async def tplay(self, ctx: commands.Context, *, query: str):
         """Play Tidal content, provider links, or a Tidal search result."""
         await ctx.defer()
-        if not await self.check_ready(ctx):
-            return
         try:
             provider_url = parse_provider_url(query)
         except MalformedProviderURL:
             await ctx.send(embed=_error_embed(Messages.ERROR_INVALID_URL.format(platform="provider", content_type="link")))
+            return
+        if self._closing or not self._initialized:
+            await ctx.send(embed=_error_embed(Messages.ERROR_STILL_LOADING))
+            return
+        if provider_url is None or provider_url.provider in {ProviderKind.TIDAL, ProviderKind.SPOTIFY}:
+            if not await self.check_ready(ctx):
+                return
+        if await self._prepare_playback_session(ctx) is None:
             return
         if provider_url is not None:
             if provider_url.provider is ProviderKind.TIDAL:
@@ -3482,6 +2878,8 @@ class TidalPlayerExp(commands.Cog):
                     "track": self._handle_spotify_track,
                 }
                 await handlers[provider_url.content_type](ctx, query)
+            elif provider_url.provider in {ProviderKind.SOUNDCLOUD, ProviderKind.BANDCAMP}:
+                await self._handle_public_audio(ctx, provider_url)
             elif provider_url.content_type == "playlist":
                 await self._handle_youtube_playlist(ctx, provider_url.identifier)
             else:
@@ -3598,36 +2996,68 @@ class TidalPlayerExp(commands.Cog):
             await ctx.send(embed=_error_embed(Messages.ERROR_FETCH_FAILED))
 
     async def _handle_youtube_playlist(self, ctx: commands.Context, playlist_id: str) -> None:
-        if not self.yt:
-            await ctx.send(embed=_error_embed(Messages.ERROR_NO_YOUTUBE))
+        session = await self._prepare_playback_session(ctx)
+        if session is None:
             return
+        guild_id = ctx.guild.id
+        cancel = self._claim_batch(guild_id)
+        if cancel is None:
+            await ctx.send(embed=_error_embed(Messages.ERROR_BATCH_IN_PROGRESS))
+            return
+        queued = skipped = 0
         try:
-            pl_resp = await self.tidal._run_blocking(
-                self.yt.playlists().list(part="snippet", id=playlist_id, maxResults=1).execute, timeout=15.0
-            )
-            metadata_items = pl_resp.get("items") if isinstance(pl_resp, dict) else None
-            if (
-                not isinstance(metadata_items, list)
-                or not metadata_items
-                or not isinstance(metadata_items[0], dict)
-            ):
-                raise ValueError("YouTube playlist metadata is unavailable")
-            snippet = metadata_items[0].get("snippet")
-            if not isinstance(snippet, dict) or not snippet.get("title"):
-                raise ValueError("YouTube playlist metadata is malformed")
-            title = str(snippet["title"])
-            thumbnails = snippet.get("thumbnails")
-            high_thumbnail = thumbnails.get("high") if isinstance(thumbnails, dict) else None
-            thumb = high_thumbnail.get("url") if isinstance(high_thumbnail, dict) else None
-            items = await self._fetch_all_youtube_tracks(playlist_id)
-            await self._process_track_list(
-                ctx, items, title,
-                lambda item: item.get("snippet", {}).get("title"),
-                color=COLOR_RED, thumbnail_url=thumb,
-            )
+            message = await ctx.send(embed=discord.Embed(title="Importing YouTube playlist", color=COLOR_RED))
+            videos: list[YouTubeVideoMetadata] = []
+            if self.yt is not None:
+                try:
+                    items = await self._fetch_all_youtube_tracks(playlist_id)
+                    for item in items:
+                        try:
+                            snippet = item["snippet"]
+                            videos.append(self._youtube_snippet_metadata(snippet["resourceId"]["videoId"], snippet))
+                        except (KeyError, TypeError, ValueError):
+                            continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    _log_provider_failure("YouTube", "playlist API", error)
+            if not videos and not cancel.is_set():
+                videos = list(await self.youtube_resolver.fetch_playlist(playlist_id, 100))
+            deduplicated: dict[str, YouTubeVideoMetadata] = {}
+            for video in videos:
+                if video.title.casefold() not in YOUTUBE_SKIP_TITLES:
+                    deduplicated.setdefault(video.video_id, video)
+            videos = list(deduplicated.values())[:MAX_ITEMS]
+            total = len(videos)
+            for start in range(0, total, SEARCH_BATCH_SIZE):
+                if cancel.is_set() or self._closing or await self.backend.get(guild_id) is not session:
+                    break
+                entries = await asyncio.gather(*(self._youtube_entry(video, ctx.author.id) for video in videos[start:start + SEARCH_BATCH_SIZE]))
+                for entry in entries:
+                    if cancel.is_set() or self._closing or await self.backend.get(guild_id) is not session:
+                        break
+                    if not await self._admit_entry(ctx, session, entry, show_embed=False):
+                        skipped = total - queued
+                        break
+                    queued += 1
+                if skipped:
+                    break
+                await self._edit_progress_message(message, discord.Embed(
+                    title="Importing YouTube playlist",
+                    description=f"Queued {queued}/{total}. Skipped {skipped}.", color=COLOR_RED,
+                ))
+            status = "Cancelled" if cancel.is_set() else "Finished"
+            await message.edit(embed=discord.Embed(
+                title=f"{status} importing YouTube playlist",
+                description=f"Queued {queued}/{total}. Skipped {skipped}.", color=COLOR_RED,
+            ))
+        except asyncio.CancelledError:
+            raise
         except Exception as error:
             _log_provider_failure("YouTube", "playlist import", error)
             await ctx.send(embed=_error_embed(Messages.ERROR_FETCH_FAILED))
+        finally:
+            self._release_batch(guild_id, cancel)
 
     @commands.hybrid_command(name="tsearch")
     @commands.guild_only()
@@ -3647,70 +3077,45 @@ class TidalPlayerExp(commands.Cog):
     @commands.hybrid_command(name="tnowplaying")
     @commands.guild_only()
     async def tnowplaying(self, ctx: commands.Context):
-        """Resend the now-playing controller panel."""
+        """Resend the current native playback controller."""
         if ctx.guild is None:
             return
-        guild_id = ctx.guild.id
-        self._playback_channels[guild_id] = ctx.channel
-        meta = self._current_meta.get(guild_id)
-        if not meta:
+        session = await self.backend.get(ctx.guild.id)
+        current = session.snapshot().current if session is not None else None
+        if current is None:
             await ctx.send(embed=_error_embed(Messages.ERROR_NOT_PLAYING))
             return
-        # Delete the previous controller panel before resending.
-        previous = self._controller_messages.pop(guild_id, None)
-        self._stop_controller_view(guild_id)
-        if previous is not None:
-            try:
-                await previous.delete()
-            except (discord.HTTPException, discord.Forbidden, discord.NotFound):
-                pass
-        player = await self._get_player_for_guild(guild_id)
-        paused = bool(getattr(player, "paused", False)) if player else False
-        try:
-            view = await self._controller_view(guild_id, paused)
-            self._controller_messages[guild_id] = await self._activate_controller_view(
-                guild_id, view, lambda active_view: ctx.send(view=active_view)
-            )
-        except discord.HTTPException:
-            log.exception("Could not resend controller message for guild %s", guild_id)
-        else:
-            self._schedule_controller_recommendations(guild_id)
+        self._playback_channels[ctx.guild.id] = ctx.channel
+        self._current_entries[ctx.guild.id] = current
+        self._current_meta[ctx.guild.id] = current.meta
+        self._controller_meta[ctx.guild.id] = current.meta
+        await self._resend_controller_for_track_start(guild_id=ctx.guild.id)
 
     @commands.hybrid_command(name="tqueue")
     @commands.guild_only()
     async def tqueue(self, ctx: commands.Context):
-        """Show the current queue."""
-        if not await self.check_ready(ctx):
-            return
-        player = await self._get_player(ctx)
-        if not player:
+        """Show the native queue independently of TIDAL login."""
+        session = await self.backend.get(ctx.guild.id)
+        if session is None:
             await ctx.send(embed=_error_embed(Messages.ERROR_NO_PLAYER))
             return
-        queue = getattr(player, "queue", None)
-        if not queue or not len(queue):
+        queue = session.snapshot().queued
+        if not queue:
             await ctx.send(embed=_error_embed(Messages.ERROR_NO_QUEUE))
             return
-        total_count = len(queue)
-        queue_list = list(islice(queue, MAX_ITEMS))
-        queue_title = (
-            f"Queue ({total_count} tracks)"
-            if total_count <= MAX_ITEMS
-            else f"Queue (first {len(queue_list)} of {total_count} tracks)"
-        )
-        pages = []
-        for start in range(0, len(queue_list), QUEUE_PAGE_SIZE):
-            chunk = queue_list[start:start + QUEUE_PAGE_SIZE]
-            desc = "\n".join(
-                f"`{start + i + 1}.` {truncate(getattr(t, 'title', 'Unknown'), 60)} "
-                f"\u2014 {truncate(getattr(t, 'author', 'Unknown'), 40)}"
-                for i, t in enumerate(chunk)
-            )
-            embed = discord.Embed(
-                title=queue_title,
-                description=desc,
+        queue_list = queue[:MAX_ITEMS]
+        title = f"Queue ({len(queue)} tracks)" if len(queue) <= MAX_ITEMS else f"Queue (first {len(queue_list)} of {len(queue)} tracks)"
+        pages = [
+            discord.Embed(
+                title=title,
+                description="\n".join(
+                    f"`{start + i + 1}.` {truncate(entry.meta['title'], 60)} — {truncate(entry.meta['artist'], 40)}"
+                    for i, entry in enumerate(queue_list[start:start + QUEUE_PAGE_SIZE])
+                ),
                 color=COLOR_BLUE,
             )
-            pages.append(embed)
+            for start in range(0, len(queue_list), QUEUE_PAGE_SIZE)
+        ]
         if len(pages) == 1:
             await ctx.send(embed=pages[0])
         else:
@@ -3856,6 +3261,17 @@ class TidalPlayerExp(commands.Cog):
     @commands.is_owner()
     async def tidalsetup(self, ctx: commands.Context):
         """Configure Tidal, Spotify, and YouTube access (bot owner only)."""
+
+    @tidalsetup.command(name="doctor")
+    @commands.is_owner()
+    async def tidalsetup_doctor(self, ctx: commands.Context) -> None:
+        """Check native voice dependencies without accessing credentials."""
+        from .playback.diagnostics import collect_diagnostics
+        report = await collect_diagnostics(
+            self.bot, self.backend, self.source_factory,
+            tidal_authenticated=self.tidal._login_cache, guild=ctx.guild,
+        )
+        await ctx.send(report.replace("[p]", ctx.clean_prefix))
 
     @tidalsetup.command(name="spotify")
     @commands.is_owner()
