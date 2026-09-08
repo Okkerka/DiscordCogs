@@ -138,6 +138,16 @@ is not a guarantee that every site or individual track currently works.
   authentication, the cog tries a confident catalog match; otherwise it plays
   the original video's audio. If the TIDAL source cannot start, it falls back to
   that same YouTube video. A fallback displays the YouTube title and link.
+- TIDAL media links accept `/browse/`, a trailing `/u` share suffix, and ordinary
+  trailing slashes. YouTube watch, `youtu.be`, mobile, Music, Shorts, Live and
+  embed links are supported, including `youtube-nocookie.com` video embeds.
+  Time/tracking parameters do not change which video is queued; they do not
+  seek playback. Channel/profile pages and arbitrary redirect links are not media
+  links, and unavailable or region-restricted content can still fail.
+- YouTube duration comes from `contentDetails` in the existing metadata API
+  request, or from the extractor without an API key. If flat playlist metadata
+  lacks duration, it is filled in when audio is resolved. Unknown/live duration
+  displays `Unknown`, not `00:00`; hour-long recordings use `h:mm:ss`.
 - A video URL containing `list=` still plays that video only. Use an explicit
   YouTube `/playlist?list=...` URL to request playlist import. Keyless imports
   are capped at 100 items; the optional Data API path supports up to 1,000.
@@ -145,8 +155,13 @@ is not a guarantee that every site or individual track currently works.
   audio without TIDAL login or additional API keys. Collections are capped at
   100 entries and skip malformed/unavailable metadata. Use full `soundcloud.com`
   or `artist.bandcamp.com` links; shortened SoundCloud links and custom Bandcamp
-  domains are not supported. Private, premium-only, and identified preview
-  formats are rejected; the cog cannot recover audio a provider withholds.
+  domains are not supported. SoundCloud private **track** share links ending in
+  `/s-...` are supported when SoundCloud grants access through the supplied token.
+  The token stays in the in-memory playback reference, is omitted from logs and
+  object representations, and is never included in queue/controller links.
+  Your original Discord message still contains whatever link you submitted.
+  Private playlists, premium-only, DRM-protected, and identified preview formats
+  remain unsupported; the cog cannot recover audio a provider withholds.
   Flat collections can have sparse metadata: SoundCloud set titles may use
   track URL slugs, and entries without public track URLs are skipped.
 - TIDAL links/search and Spotify-to-TIDAL imports require TIDAL authentication.
@@ -163,8 +178,12 @@ is not a guarantee that every site or individual track currently works.
 Queues hold stable track/video identifiers and display metadata, not expiring
 media URLs. A source is resolved only when it is about to play. Each guild has
 one serial playback worker and one active FFmpeg process; YouTube, SoundCloud,
-and Bandcamp extraction share at most two isolated child processes across the cog. No media is saved
-to disk. This avoids Java/Lavalink overhead but still uses CPU for audio encoding,
+and Bandcamp extraction share at most two isolated child processes across the cog.
+No songs are downloaded or cached to disk: yt-dlp runs with downloads and caching
+disabled, and FFmpeg outputs audio through a pipe to Discord. There is no song
+download folder to periodically clear. FFmpeg's small diagnostic temporary file
+is automatically deleted; repair archives are also removed after installation or
+failure. This avoids Java/Lavalink overhead but still uses CPU for audio encoding,
 RAM for buffers, and network bandwidth per playing guild. It is not a benchmark
 claim: test concurrent guilds on your actual host.
 
@@ -178,7 +197,7 @@ its optional YouTube fallback. Three consecutive failed entries stop automatic
 queue progression. Idle empty sessions disconnect after approximately two
 minutes. Source startup, extraction, and cleanup have bounded deadlines.
 
-Private, age/login-restricted, removed, region-blocked, or rate-limited videos
+Private YouTube, age/login-restricted, removed, region-blocked, or rate-limited videos
 can still fail. Provider changes may require owner-driven dependency updates.
 There is no cookie/login restriction bypass or DRM decryption. Encrypted or
 segmented TIDAL track manifests are unsupported by the direct-stream adapter.

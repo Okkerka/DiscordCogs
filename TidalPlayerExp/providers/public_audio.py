@@ -9,7 +9,10 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from ..domain.models import TrackMeta
-from ..domain.public_audio_urls import canonical_public_audio_url, parse_public_audio_url
+from ..domain.public_audio_urls import (
+    canonical_public_audio_url,
+    parse_public_audio_url,
+)
 from ..playback.errors import SourceResolutionError
 from ..playback.models import PlaybackEntry, ResolvedSource, SourceKind, SourceReference
 from .youtube_resolver import (

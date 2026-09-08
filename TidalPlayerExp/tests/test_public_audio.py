@@ -13,7 +13,6 @@ from TidalPlayerExp.playback import SourceKind, SourceReference, SourceResolutio
 from TidalPlayerExp.providers.urls import MalformedProviderURL, parse_provider_url
 from TidalPlayerExp.providers.youtube_resolver import YouTubeResolver
 
-
 SOUNDCLOUD = "https://soundcloud.com/artist/recording"
 BANDCAMP = "https://artist.bandcamp.com/track/recording"
 

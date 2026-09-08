@@ -11,7 +11,10 @@ from typing import cast
 from urllib.parse import urlsplit
 
 from ..domain.models import TrackMeta
-from ..domain.public_audio_urls import canonical_public_audio_url, valid_soundcloud_secret
+from ..domain.public_audio_urls import (
+    canonical_public_audio_url,
+    valid_soundcloud_secret,
+)
 
 
 class SourceKind(StrEnum):

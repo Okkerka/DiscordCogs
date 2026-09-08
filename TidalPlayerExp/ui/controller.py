@@ -6,7 +6,13 @@ from typing import TYPE_CHECKING, Any
 
 import discord
 
-from .embeds import display_duration, display_source, source_link_label, source_quality_field
+from ..domain.normalization import format_duration
+from .embeds import (
+    display_duration,
+    display_source,
+    source_link_label,
+    source_quality_field,
+)
 
 if TYPE_CHECKING:
     from ..domain.models import TrackMeta
@@ -15,6 +21,10 @@ if TYPE_CHECKING:
 
 def _short(value: str, limit: int = 100) -> str:
     return value if len(value) <= limit else value[: limit - 1] + "…"
+
+
+def _duration(seconds: int) -> str:
+    return format_duration(max(0, int(seconds or 0)))
 
 
 def _track_info(meta: TrackMeta, *, autoplay_enabled: bool) -> str:

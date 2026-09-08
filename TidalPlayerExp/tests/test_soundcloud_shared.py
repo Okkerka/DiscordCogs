@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 from dataclasses import replace
-
-import pytest
 from unittest.mock import AsyncMock
 
+import pytest
+
 from TidalPlayerExp.domain.public_audio_urls import parse_public_audio_url
-from TidalPlayerExp.playback.models import SourceKind, SourceReference
 from TidalPlayerExp.playback.errors import SourceResolutionError
+from TidalPlayerExp.playback.models import SourceKind, SourceReference
 from TidalPlayerExp.providers.urls import parse_provider_url
-from TidalPlayerExp.tests.test_public_audio import SOUNDCLOUD, _metadata, _resolver, _source
+from TidalPlayerExp.tests.test_public_audio import (
+    SOUNDCLOUD,
+    _metadata,
+    _resolver,
+    _source,
+)
 
 TOKEN = "s-TestSecret123"
 SHARE = f"{SOUNDCLOUD}/{TOKEN}"

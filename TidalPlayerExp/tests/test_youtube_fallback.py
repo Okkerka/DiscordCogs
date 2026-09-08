@@ -14,7 +14,6 @@ from TidalPlayerExp.playback.models import SourceKind, SourceReference
 from TidalPlayerExp.providers.youtube_resolver import YouTubeVideoMetadata
 from TidalPlayerExp.ui.embeds import Messages
 
-
 VIDEO_ID = "dQw4w9WgXcQ"
 CANONICAL_URL = f"https://www.youtube.com/watch?v={VIDEO_ID}"
 
