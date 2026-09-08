@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import secrets
 from collections.abc import Awaitable
 from collections import OrderedDict, defaultdict, deque
@@ -19,6 +20,7 @@ import aiohttp
 import discord
 from redbot.core import Config, app_commands, commands
 from redbot.core.bot import Red
+from redbot.core.data_manager import cog_data_path
 from redbot.core.utils.menus import SimpleMenu
 from redbot.core.utils.views import SetApiView
 
@@ -41,12 +43,13 @@ from .ui.controller import PlayerControllerView
 from .playback.errors import PlaybackUnavailable
 from .playback.interfaces import PlaybackSession
 from .playback.models import PlaybackEntry, SourceKind, SourceReference
-from .playback.ffmpeg import FFmpegSourceFactory
+from .playback.ffmpeg import FFmpegSourceFactory, _default_locator as _default_ffmpeg_locator
+from .playback.runtime_repair import DENO_VERSION, ManagedRuntime, RuntimeRepairError
 from .playback.backend import NativePlaybackBackend
 from .playback.voice_runtime import initialize_voice_runtime
 from .providers.tidal_source import CompositeSourceResolver, TidalSourceResolver
 from .providers.public_audio import PublicAudioResolver
-from .providers.youtube_resolver import YouTubeResolver, YouTubeVideoMetadata
+from .providers.youtube_resolver import YouTubeResolver, YouTubeVideoMetadata, _deno_path
 from .providers.tokens import TokenRepository, TokenService, TokenSnapshot
 from .providers.urls import MalformedProviderURL, ProviderKind, ProviderURL, parse_provider_url
 
@@ -1107,6 +1110,7 @@ class TidalPlayerExp(commands.Cog):
         "_persistent_view", "_controller_views", "_stop_generations", "public_audio_resolver",
         "_spotify_auth_manager", "_spotify_refresh_token", "_spotify_login_states",
         "_spotify_login_views", "_spotify_auth_lock",
+        "runtime",
     )
 
     def __init__(self, bot: Red):
@@ -1116,9 +1120,10 @@ class TidalPlayerExp(commands.Cog):
         self.config.register_guild(**GUILD_DEFAULTS)
         self.tokens = TokenService(TokenRepository(self.config))
         self.tidal = TidalHandler(bot, self.tokens)
-        self.youtube_resolver = YouTubeResolver()
+        self.runtime = ManagedRuntime(cog_data_path(self) / "native-runtime")
+        self.youtube_resolver = YouTubeResolver(deno_locator=self._native_deno_path)
         self.public_audio_resolver = PublicAudioResolver(self.youtube_resolver)
-        self.source_factory = FFmpegSourceFactory()
+        self.source_factory = FFmpegSourceFactory(locator=self._native_ffmpeg_path)
         resolver = CompositeSourceResolver(
             TidalSourceResolver(self.tidal), self.youtube_resolver,
             public_audio=self.public_audio_resolver,
@@ -1163,6 +1168,16 @@ class TidalPlayerExp(commands.Cog):
         self._lastfm_session: aiohttp.ClientSession | None = None
         self._initialized: bool = False
 
+    def _native_ffmpeg_path(self) -> str:
+        """Respect an administrator override, then use an explicitly repaired runtime."""
+        if os.environ.get("IMAGEIO_FFMPEG_EXE"):
+            return _default_ffmpeg_locator()
+        return self.runtime.locate("ffmpeg") or _default_ffmpeg_locator()
+
+    def _native_deno_path(self) -> str:
+        """Find Deno without downloading or changing Downloader's libraries."""
+        return self.runtime.locate("deno") or _deno_path()
+
     async def cog_load(self) -> None:
         if self.bot.get_cog("Audio") is not None or self.bot.get_cog("TidalPlayer") is not None:
             await self.backend.close()
@@ -1204,6 +1219,7 @@ class TidalPlayerExp(commands.Cog):
             await asyncio.gather(*tasks, return_exceptions=True)
         await self._close_lastfm_session()
         for resource, cleanup in (
+            ("Native runtime repair", self.runtime.close),
             ("Native voice", self.backend.close),
             ("Tidal", self.tidal.unload),
         ):
@@ -3291,8 +3307,55 @@ class TidalPlayerExp(commands.Cog):
         report = await collect_diagnostics(
             self.bot, self.backend, self.source_factory,
             tidal_authenticated=self.tidal._login_cache, guild=ctx.guild,
+            deno_locator=self._native_deno_path,
+            managed_deno_version=DENO_VERSION if self.runtime.locate("deno") else None,
         )
         await ctx.send(report.replace("[p]", ctx.clean_prefix))
+
+    @tidalsetup.command(name="repair")
+    @commands.is_owner()
+    async def tidalsetup_repair(self, ctx: commands.Context) -> None:
+        """Install and validate pinned FFmpeg and Deno in persistent cog data.
+
+        Bot owner only. Downloads approximately 150-190 MB on supported hosts.
+        No server access is required. Wait for completion, then reload this cog.
+        Playback and doctor never trigger this installation automatically.
+        """
+        if self._closing:
+            await ctx.send("TidalPlayerExp is unloading; load it before requesting repair.")
+            return
+        await ctx.send(
+            "Checking/installing the cog-local FFmpeg and Deno runtime. "
+            "This can take a few minutes; please wait before reloading the cog."
+        )
+        try:
+            await self.runtime.repair()
+        except RuntimeRepairError as error:
+            # Never quote download URLs, local paths, or child-process output.
+            code = error.code
+            safe_code = (
+                code if isinstance(code, str) and code.isascii()
+                and code.replace("_", "").isalnum() and len(code) <= 64
+                else "runtime_error"
+            )
+            log.warning("Native runtime repair failed (%s).", safe_code)
+            await ctx.send(
+                f"Native runtime repair failed ({safe_code}); the previous runtime was not replaced. "
+                "Check available disk space, outbound HTTPS access, and executable permissions."
+            )
+            return
+        except Exception as error:
+            _log_provider_failure("Native runtime", "repair", error)
+            await ctx.send("Native runtime repair failed; no successful installation was confirmed.")
+            return
+        message = (
+            "FFmpeg and Deno passed validation. Run "
+            f"`{ctx.clean_prefix}reload TidalPlayerExp`, then `{ctx.clean_prefix}tidalsetup doctor` "
+            "and retry playback. No bot or server restart is needed."
+        )
+        if os.environ.get("IMAGEIO_FFMPEG_EXE"):
+            message += " An administrator's IMAGEIO_FFMPEG_EXE override still takes precedence over managed FFmpeg."
+        await ctx.send(message)
 
     @tidalsetup.command(name="spotify")
     @commands.is_owner()

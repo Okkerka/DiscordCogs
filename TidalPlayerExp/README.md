@@ -16,9 +16,10 @@ is unchanged; this cog has its own configuration and TIDAL login.
   and Deno, and outbound Discord voice and media access. No Lavalink host access
   is required. Some restricted hosting plans cannot run native voice.
 
-FFmpeg is normally supplied by imageio-ffmpeg. An administrator may select a
-local executable with `IMAGEIO_FFMPEG_EXE`; otherwise the cog checks its packaged
-binary, Conda location, then `PATH`. Playback never installs or updates binaries.
+FFmpeg is initially supplied by imageio-ffmpeg. An administrator may select a
+local executable with `IMAGEIO_FFMPEG_EXE`; otherwise an explicitly repaired
+cog-local runtime takes precedence over the packaged binary, Conda location,
+and `PATH`. Playback never installs or updates binaries.
 
 ## Install, switch, and test
 
@@ -63,6 +64,46 @@ or `process_signal_11`) and its exit code. The same safe category is logged;
 raw FFmpeg output, signed stream URLs, and request headers are never logged or
 saved. Executable availability and encoder support alone do not prove that the
 host can reach a media server or decode that particular source.
+
+### Repair without server access
+
+Bot owners can install a persistent FFmpeg/Deno pair entirely through Discord:
+
+```text
+[p]tidalsetup repair
+```
+
+Wait for the success message, then run:
+
+```text
+[p]reload TidalPlayerExp
+[p]tidalsetup doctor
+[p]tplay <YouTube or TIDAL URL>
+```
+
+This is intended for a crashing bundled FFmpeg (such as
+`process_signal_11 (exit=-11)`) or a Deno executable that disappears after cog
+updates. Red's pip target updates can replace Downloader's shared `bin` folder;
+the repaired pair lives separately in this cog's persistent data folder and
+survives code updates and reloads. No SSH, root access, server restart, or extra
+`pipinstall` command is needed for these two binaries.
+
+Repair uses pinned [BtbN FFmpeg 8.1 builds](https://github.com/BtbN/FFmpeg-Builds/releases/tag/autobuild-2026-08-31-13-27)
+and [official Deno 2.9.6 builds](https://github.com/denoland/deno/releases/tag/v2.9.6).
+It verifies SHA-256 checksums before extraction or execution, checks FFmpeg Opus
+encoding and Deno execution, and activates the pair only after validation.
+Failed or cancelled repairs leave the previously active pair unchanged. Normal
+playback and `doctor` never download, install, or change executable permissions.
+
+Supported repair platforms are Linux x86-64/ARM64 with glibc 2.28 or newer and
+Windows x86-64. Other platforms retain normal dependency discovery. Allow
+outbound HTTPS to GitHub release downloads, permission to execute files in cog
+data, and enough disk space for staging (roughly 150 MB of downloads on Linux,
+190 MB on Windows; leave about 1 GB free). A matching healthy runtime is reused.
+Previous installed generations are retained so an in-use binary is not deleted.
+An explicit `IMAGEIO_FFMPEG_EXE` setting still takes precedence and is not changed
+by repair. Local validation does not guarantee the host can reach every media
+provider; retry playback after reloading to verify the original problem.
 
 To return to the original cog:
 

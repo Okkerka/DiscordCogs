@@ -6,6 +6,7 @@ import importlib
 import importlib.metadata
 import platform
 import re
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -34,16 +35,20 @@ def _voice_runtime() -> tuple[bool, bool]:
         return False, False
 
 
-def _youtube_readiness() -> tuple[str | None, bool]:
+def _youtube_readiness(*, deno_locator: Callable[[], str] | None = None) -> tuple[str | None, bool]:
     # These filesystem-only helpers do not import yt-dlp or execute/download tools.
-    from ..providers.youtube_resolver import _deno_path, _yt_dlp_installation
+    from ..providers.youtube_resolver import (
+        _deno_path,
+        _validated_deno,
+        _yt_dlp_installation,
+    )
 
     try:
         _, version = _yt_dlp_installation()
     except Exception:  # noqa: BLE001 - independent optional capability probe
         version = None
     try:
-        _deno_path()
+        _validated_deno((deno_locator or _deno_path)())
     except Exception:  # noqa: BLE001 - report readiness without provider error details
         return version, False
     return version, True
@@ -64,6 +69,8 @@ async def collect_diagnostics(
     *,
     tidal_authenticated: bool | None,
     guild: Any = None,
+    deno_locator: Callable[[], str] | None = None,
+    managed_deno_version: str | None = None,
 ) -> str:
     """Report local readiness without exposing credentials, media URLs, or paths.
 
@@ -71,7 +78,9 @@ async def collect_diagnostics(
     check. FFmpeg's owned, bounded capability probe is the only executable run.
     """
     nacl_ready, dave_ready = _voice_runtime()
-    youtube_version, deno_ready = _youtube_readiness()
+    youtube_version, deno_ready = (
+        _youtube_readiness() if deno_locator is None else _youtube_readiness(deno_locator=deno_locator)
+    )
     lines = [
         f"Python: {platform.python_version()}",
         f"Red: {_version('Red-DiscordBot') or 'unknown'}",
@@ -94,16 +103,24 @@ async def collect_diagnostics(
         r"[a-z][a-z0-9_]{0,63} \(exit=(?:-?[0-9]{1,10}|unknown)\)", last_failure,
     ):
         lines.append(f"FFmpeg last failure: {last_failure}")
+        if last_failure.startswith("process_signal_"):
+            lines.append("FFmpeg remedy: binary crashed; use [p]tidalsetup repair, then reload TidalPlayerExp")
     lines.extend([
         (
             f"yt-dlp: {_safe_version(youtube_version) if youtube_version else 'missing or outdated'} "
             f"({'ready' if youtube_version else 'requires 2026.8.19 or newer'})"
         ),
         f"YouTube EJS: {_version('yt-dlp-ejs') or 'missing; install/update cog requirements'}",
-        f"Deno: {_version('deno') or 'missing'} ({'executable ready' if deno_ready else 'executable unavailable'})",
+        (
+            f"Deno: {_safe_version(managed_deno_version) if managed_deno_version else _version('deno') or 'missing'} "
+            f"({'managed; ' if managed_deno_version else ''}"
+            f"{'executable ready' if deno_ready else 'executable unavailable'})"
+        ),
     ])
     if not youtube_version or not deno_ready:
         lines.append("YouTube remedy: install/update cog requirements, then reload TidalPlayerExp")
+    if not deno_ready:
+        lines.append("Deno remedy: [p]tidalsetup repair installs a persistent cog-local executable")
     if tidal_authenticated is None:
         auth = "not checked (offline diagnostic)"
     elif tidal_authenticated:

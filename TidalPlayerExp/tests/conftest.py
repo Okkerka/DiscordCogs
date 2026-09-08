@@ -307,6 +307,7 @@ def _make_redbot_stub(fake_config: FakeConfig) -> types.ModuleType:
     redbot.core.bot = types.ModuleType("redbot.core.bot")
     redbot.core.bot.Red = _FakeRed
 
+
     redbot.core.utils = types.ModuleType("redbot.core.utils")
     redbot.core.utils.menus = types.ModuleType("redbot.core.utils.menus")
     redbot.core.utils.menus.SimpleMenu = MagicMock()
@@ -434,7 +435,7 @@ def fake_bot():
 
 
 @pytest.fixture()
-def cog(fake_bot):
+def cog(fake_bot, monkeypatch, tmp_path):
     """Return a freshly constructed TidalPlayerExp cog (no cog_load called)."""
     # Force removal of cached module so each test fixture gets a fresh import
     sys.modules.pop("TidalPlayerExp.tidalplayer", None)
@@ -446,6 +447,7 @@ def cog(fake_bot):
     if cog_root not in _sys.path:
         _sys.path.insert(0, cog_root)
     mod = importlib.import_module("TidalPlayerExp.tidalplayer")
+    monkeypatch.setattr(mod, "cog_data_path", lambda cog: tmp_path / "cog-data", raising=False)
     return mod.TidalPlayerExp(fake_bot)
 
 

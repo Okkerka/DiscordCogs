@@ -113,3 +113,39 @@ async def test_doctor_reports_last_ffmpeg_failure_separately_from_capabilities(d
     )
     assert "FFmpeg: 7.1" in report
     assert "FFmpeg last failure: http_403 (exit=1)" in report
+
+
+@pytest.mark.asyncio
+async def test_crashed_ffmpeg_reports_owner_repair_instead_of_dependency_reinstall(doctor):
+    bot, backend, factory, guild = components()
+    factory.last_failure = "process_signal_11 (exit=-11)"
+    report = await doctor.collect_diagnostics(
+        bot, backend, factory, tidal_authenticated=None, guild=guild,
+    )
+    assert "tidalsetup repair" in report
+
+
+def test_managed_deno_is_ready_even_after_downloader_binary_disappears(monkeypatch, tmp_path):
+    module = importlib.import_module("TidalPlayerExp.playback.diagnostics")
+    youtube = importlib.import_module("TidalPlayerExp.providers.youtube_resolver")
+    binary = tmp_path / "deno"
+    binary.write_bytes(b"managed executable")
+    binary.chmod(0o755)
+    monkeypatch.setattr(youtube, "_yt_dlp_installation", lambda: ("/lib", "2026.8.19"))
+
+    def missing():
+        raise FileNotFoundError("Downloader removed bin")
+
+    monkeypatch.setattr(youtube, "_deno_path", missing)
+    assert module._youtube_readiness(deno_locator=lambda: str(binary)) == ("2026.8.19", True)
+    assert module._youtube_readiness(deno_locator=lambda: str(tmp_path / "missing")) == ("2026.8.19", False)
+
+
+@pytest.mark.asyncio
+async def test_doctor_reports_managed_deno_version_instead_of_stale_pip_metadata(doctor):
+    bot, backend, factory, guild = components()
+    report = await doctor.collect_diagnostics(
+        bot, backend, factory, tidal_authenticated=None, guild=guild,
+        managed_deno_version="2.9.6",
+    )
+    assert "Deno: 2.9.6 (managed; executable ready)" in report
