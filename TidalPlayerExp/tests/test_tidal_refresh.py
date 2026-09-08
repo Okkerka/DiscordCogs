@@ -6,11 +6,45 @@ import asyncio
 import json
 import subprocess
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_result", [True, False, RuntimeError("old credentials")])
+async def test_login_check_cannot_restore_or_invalidate_session_after_logout(cog, old_result):
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    release = threading.Event()
+
+    def old_login_check():
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(timeout=2)
+        if isinstance(old_result, Exception):
+            raise old_result
+        return old_result
+
+    cog.tidal.session = SimpleNamespace(check_login=old_login_check)
+    cog.tidal.invalidate_login_cache()
+    pending = asyncio.create_task(cog.tidal.is_logged_in())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await cog.tidal.logout()
+        # Also cover a new successful login while the old SDK call winds down.
+        expected_login = old_result is not True
+        cog.tidal._login_cache = expected_login
+        cog.tidal._login_cache_time = loop.time()
+        release.set()
+        assert await pending is False
+        assert await cog.tidal.is_logged_in() is expected_login
+    finally:
+        release.set()
+        await asyncio.gather(pending, return_exceptions=True)
+        await cog.tidal.unload()
 
 
 def _credentials(expiry: datetime) -> dict:

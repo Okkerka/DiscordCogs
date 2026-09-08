@@ -406,6 +406,10 @@ class TidalHandler:
             def _cleanup(completed: asyncio.Task[Any]) -> None:
                 if self._inflight.get(inflight_key) is completed:
                     self._inflight.pop(inflight_key, None)
+                # All waiters may have left; never leak an unobserved provider
+                # exception (which can contain credentials) to asyncio's logger.
+                if not completed.cancelled():
+                    completed.exception()
 
             task.add_done_callback(_cleanup)
         # Do not let cancellation of one Discord command cancel the shared request.
@@ -427,7 +431,12 @@ class TidalHandler:
             self._executor_slots.release()
             raise
 
-        future.add_done_callback(lambda _: self._executor_slots.release())
+        def _completed(completed: asyncio.Future[Any]) -> None:
+            self._executor_slots.release()
+            if not completed.cancelled():
+                completed.exception()
+
+        future.add_done_callback(_completed)
         # Shielding is deliberate: cancelling the waiter must not falsely free
         # a worker while its synchronous provider request is still running.
         return await asyncio.wait_for(asyncio.shield(future), timeout=remaining)
@@ -593,22 +602,33 @@ class TidalHandler:
         self._login_cache_time = 0.0
 
     async def is_logged_in(self) -> bool:
-        if not self.session:
+        session = self.session
+        if not session:
             return False
         now = asyncio.get_running_loop().time()
         if self._login_cache is not None and (now - self._login_cache_time) < LOGIN_CACHE_TTL:
             return self._login_cache
         for attempt in range(LOGIN_CHECK_RETRIES):
+            if session is not self.session:
+                return False
             try:
-                result = bool(await self._run_blocking(self.session.check_login, timeout=LOGIN_CHECK_TIMEOUT))
+                result = bool(await self._run_blocking(session.check_login, timeout=LOGIN_CHECK_TIMEOUT))
+                # Logout replaces the session, but cannot interrupt its SDK
+                # worker. A late result must not authenticate the new session.
+                if session is not self.session:
+                    return False
                 self._login_cache = result
                 self._login_cache_time = asyncio.get_running_loop().time()
                 return result
             except asyncio.TimeoutError:
+                if session is not self.session:
+                    return False
                 log.warning(f"Timed out checking Tidal login (attempt {attempt + 1}/{LOGIN_CHECK_RETRIES})")
                 if attempt < LOGIN_CHECK_RETRIES - 1:
                     await asyncio.sleep(2)
             except Exception:
+                if session is not self.session:
+                    return False
                 self._login_cache = False
                 self._login_cache_time = asyncio.get_running_loop().time()
                 return False
@@ -671,7 +691,7 @@ class TidalHandler:
                 self._set_cached("search", cache_key, filtered, 600.0)
                 return filtered
             except asyncio.TimeoutError:
-                log.warning(f"Tidal search timeout for '{query}'")
+                log.warning("Tidal catalog search timed out")
                 return []
             except Exception as error:
                 _log_provider_failure("Tidal", "catalog search", error)
@@ -698,8 +718,8 @@ class TidalHandler:
                 if res:
                     self._set_cached("isrc", isrc, res, 3600.0)
                 return res
-            except Exception as e:
-                log.debug(f"ISRC lookup failed for {isrc}: {e}")
+            except Exception as error:
+                _log_provider_failure("Tidal", "ISRC lookup", error)
                 return None
 
     async def get_track(self, track_id: str) -> Optional[Any]:
@@ -721,8 +741,8 @@ class TidalHandler:
             except asyncio.TimeoutError:
                 log.warning(f"Tidal get_track timeout for id {track_id}")
                 return None
-            except Exception as e:
-                log.debug(f"Failed to fetch track {track_id}: {e}")
+            except Exception as error:
+                _log_provider_failure("Tidal", "track lookup", error)
                 return None
 
     async def get_track_radio(self, track_id: str) -> List[Any]:
@@ -780,8 +800,8 @@ class TidalHandler:
                 if res:
                     self._set_cached("video", video_id, res, 3600.0)
                 return res
-            except Exception as e:
-                log.debug(f"Failed to fetch video {video_id}: {e}")
+            except Exception as error:
+                _log_provider_failure("Tidal", "video lookup", error)
                 return None
 
     async def get_album(self, album_id: str) -> Optional[Any]:
@@ -843,8 +863,8 @@ class TidalHandler:
             try:
                 result = await self._run_with_backoff(album.similar, timeout=10.0)
                 return list(result) if result else []
-            except Exception as e:
-                log.debug(f"get_similar_albums failed: {e}")
+            except Exception as error:
+                _log_provider_failure("Tidal", "similar albums lookup", error)
                 return []
 
     async def get_album_review(self, album: Any) -> Optional[str]:
@@ -873,8 +893,8 @@ class TidalHandler:
                         return list(val() if callable(val) else val)
                     return []
                 return await self._run_with_backoff(_fetch, timeout=15.0)
-            except Exception as e:
-                log.debug(f"get_user_playlists failed: {e}")
+            except Exception as error:
+                _log_provider_failure("Tidal", "user playlists lookup", error)
                 return []
 
     async def get_user_playlist_by_id(self, playlist_id: str) -> Optional[Any]:
@@ -897,8 +917,8 @@ class TidalHandler:
             if str(creator_id) != str(user_id):
                 return None
             return pl
-        except Exception as e:
-            log.debug(f"get_user_playlist_by_id failed for {playlist_id}: {e}")
+        except Exception as error:
+            _log_provider_failure("Tidal", "playlist ownership lookup", error)
             return None
 
     async def create_user_playlist(self, name: str, description: str = "") -> Optional[Any]:
@@ -1200,8 +1220,8 @@ class TidalPlayerExp(commands.Cog):
                 await self.config.clear_raw("youtube_api_key")
                 await self.config._schema_version.set(SCHEMA_VERSION)
                 log.info("TidalPlayerExp: config migrated to schema v3 (cleared legacy API keys)")
-        except Exception as e:
-            log.warning(f"Config migration check failed (non-fatal): {e}")
+        except Exception as error:
+            log.warning("Config migration check failed (non-fatal; %s)", type(error).__name__)
 
     async def cog_unload(self) -> None:
         self._closing = True
@@ -1313,8 +1333,8 @@ class TidalPlayerExp(commands.Cog):
     async def cog_command_error(self, ctx: commands.Context, error: Exception) -> None:
         if isinstance(error, commands.CommandInvokeError):
             log.error(
-                f"Unhandled error in command {ctx.command}: {error.original}",
-                exc_info=error.original,
+                "Unhandled error in command %s (%s)",
+                ctx.command, type(error.original).__name__,
             )
             await ctx.send(embed=_error_embed("An unexpected error occurred. Please try again later."))
 
@@ -1327,8 +1347,8 @@ class TidalPlayerExp(commands.Cog):
     ) -> None:
         if isinstance(error, app_commands.CommandInvokeError):
             log.error(
-                f"Unhandled error in app command {interaction.command}: {error.original}",
-                exc_info=error.original,
+                "Unhandled error in app command %s (%s)",
+                interaction.command, type(error.original).__name__,
             )
             if not interaction.response.is_done():
                 await interaction.response.send_message(
@@ -2226,8 +2246,8 @@ class TidalPlayerExp(commands.Cog):
             recommendations = await asyncio.shield(task)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            log.exception("Could not load recommendations for guild %s", guild_id)
+        except Exception as error:
+            log.warning("Could not load recommendations for guild %s (%s)", guild_id, type(error).__name__)
             recommendations = []
         finally:
             if task.done() and self._recommendation_tasks.get(guild_id) is task:
@@ -2279,8 +2299,8 @@ class TidalPlayerExp(commands.Cog):
             raise
         except (discord.HTTPException, discord.Forbidden, discord.NotFound):
             log.debug("Could not update controller recommendations for guild %s", guild_id)
-        except Exception:
-            log.exception("Could not update controller recommendations for guild %s", guild_id)
+        except Exception as error:
+            log.warning("Could not update controller recommendations for guild %s (%s)", guild_id, type(error).__name__)
         finally:
             task = asyncio.current_task()
             if task is not None and self._controller_recommendation_tasks.get(guild_id) is task:

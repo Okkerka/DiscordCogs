@@ -1,9 +1,98 @@
 import asyncio
+import gc
 import importlib
 import threading
 from unittest.mock import patch
 
 import pytest
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("abandonment", ["timeout", "cancel"])
+async def test_abandoned_worker_failure_is_retrieved(cog, monkeypatch, abandonment) -> None:
+    loop = asyncio.get_running_loop()
+    reports = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: reports.append(context))
+    submitted = []
+    started = asyncio.Event()
+
+    def submit(_executor, _func):
+        future = loop.create_future()
+        submitted.append(future)
+        started.set()
+        return future
+
+    async def exercise():
+        with monkeypatch.context() as scoped:
+            scoped.setattr(loop, "run_in_executor", submit)
+            waiter = asyncio.create_task(cog.tidal._run_blocking(lambda: None, timeout=0.02))
+            await started.wait()
+            if abandonment == "cancel":
+                waiter.cancel()
+            with pytest.raises((asyncio.TimeoutError, asyncio.CancelledError)):
+                await waiter
+            submitted.pop().set_exception(RuntimeError("provider secret_token=private"))
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+    try:
+        await exercise()
+        gc.collect()
+        assert reports == []
+        # Late failure must release the worker, not leave capacity occupied.
+        assert await cog.tidal._run_blocking(lambda: 42) == 42
+    finally:
+        loop.set_exception_handler(previous_handler)
+        await cog.tidal.unload()
+
+
+@pytest.mark.asyncio
+async def test_abandoned_shared_request_failure_is_retrieved(cog) -> None:
+    loop = asyncio.get_running_loop()
+    reports = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: reports.append(context))
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def fail():
+        started.set()
+        await release.wait()
+        raise RuntimeError("provider secret_token=private")
+
+    async def exercise():
+        waiter = asyncio.create_task(cog.tidal._coalesce("test", "one", fail))
+        await started.wait()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    try:
+        await exercise()
+        gc.collect()
+        assert cog.tidal._inflight == {}
+        assert reports == []
+    finally:
+        loop.set_exception_handler(previous_handler)
+        await cog.tidal.unload()
+
+
+@pytest.mark.asyncio
+async def test_active_waiters_still_receive_provider_errors(cog) -> None:
+    def fail():
+        raise ValueError("provider failure")
+
+    async def shared():
+        return await cog.tidal._run_blocking(fail)
+
+    try:
+        with pytest.raises(ValueError, match="provider failure"):
+            await cog.tidal._coalesce("test", "one", shared)
+    finally:
+        await cog.tidal.unload()
 
 
 @pytest.mark.asyncio
