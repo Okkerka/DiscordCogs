@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
 from typing import cast
 from urllib.parse import urlsplit
 
 from ..domain.models import TrackMeta
-from ..domain.public_audio_urls import canonical_public_audio_url
+from ..domain.public_audio_urls import canonical_public_audio_url, valid_soundcloud_secret
 
 
 class SourceKind(StrEnum):
@@ -92,10 +92,15 @@ class SourceReference:
 
     kind: SourceKind
     identifier: str
+    secret_token: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, SourceKind) or not isinstance(self.identifier, str):
             raise ValueError("Source reference is invalid")  # noqa: TRY004 - stable invariant error
+        if self.secret_token is not None and (
+            self.kind is not SourceKind.SOUNDCLOUD or not valid_soundcloud_secret(self.secret_token)
+        ):
+            raise ValueError("Source share token is invalid")
 
         if self.kind in (SourceKind.TIDAL, SourceKind.TIDAL_VIDEO):
             valid = (

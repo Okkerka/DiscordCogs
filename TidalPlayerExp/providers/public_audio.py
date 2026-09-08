@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from ..domain.models import TrackMeta
-from ..domain.public_audio_urls import canonical_public_audio_url
+from ..domain.public_audio_urls import canonical_public_audio_url, parse_public_audio_url
 from ..playback.errors import SourceResolutionError
 from ..playback.models import PlaybackEntry, ResolvedSource, SourceKind, SourceReference
 from .youtube_resolver import (
@@ -46,9 +46,10 @@ def _duration(value: object) -> int | None:
     return max(1, int(value)) if value else None
 
 
-def _public(payload: Mapping[str, object]) -> None:
+def _public(payload: Mapping[str, object], *, shared: bool = False) -> None:
     availability = _optional(payload.get("availability"))
-    if availability not in (None, "public", "unlisted") or payload.get("has_drm") is True:
+    allowed = (None, "public", "unlisted", "private") if shared else (None, "public", "unlisted")
+    if availability not in allowed or payload.get("has_drm") is True:
         raise ValueError("Audio is not publicly playable")
 
 
@@ -110,14 +111,18 @@ class PublicAudioResolver:
         return output
 
     @staticmethod
-    def _metadata(payload: object, kind: SourceKind, *, flat: bool = False) -> PublicAudioMetadata:
+    def _metadata(
+        payload: object, kind: SourceKind, *, flat: bool = False, secret_token: str | None = None,
+    ) -> PublicAudioMetadata:
         if not isinstance(payload, Mapping):
             raise TypeError("Invalid metadata")
-        _public(payload)
+        _public(payload, shared=kind is SourceKind.SOUNDCLOUD and secret_token is not None)
         raw_url = payload.get("webpage_url") or payload.get("url")
         if not isinstance(raw_url, str):
             raise TypeError("Invalid public audio URL")
-        provider, content_type, url = canonical_public_audio_url(raw_url)
+        provider, content_type, url, returned_token = parse_public_audio_url(raw_url)
+        if returned_token is not None and returned_token != secret_token:
+            raise ValueError("Unexpected SoundCloud share token")
         if provider != kind.value or content_type != "track":
             raise ValueError("Unexpected public audio source")
         title = payload.get("title")
@@ -137,23 +142,38 @@ class PublicAudioResolver:
         if album is not None and not isinstance(album, str):
             raise ValueError("Invalid album")
         thumbnail = _optional(payload.get("thumbnail"))
+
+        def display(value: str, limit: int) -> str:
+            # A provider must not echo a credential into public text fields.
+            return _safe_display(value.replace(secret_token, "[redacted]") if secret_token else value, limit)
+
+        if secret_token and isinstance(thumbnail, str) and secret_token in thumbnail:
+            thumbnail = None
         meta: TrackMeta = {
-            "title": _safe_display(title, 200), "artist": _safe_display(artist, 100),
-            "album": _safe_display(album, 200) if album else None,
+            "title": display(title, 200), "artist": display(artist, 100),
+            "album": display(album, 200) if album else None,
             "duration": _duration(payload.get("duration")) or 0,
-            "quality": "Public audio", "audio_resolution": None, "track_id": None,
+            "quality": "Shared audio" if secret_token else "Public audio", "audio_resolution": None, "track_id": None,
             "image": _valid_https_url(thumbnail, limit=2048) if thumbnail else None,
-            "share_url": url, "source": kind.value,
+            "share_url": None if secret_token else url, "source": kind.value,
         }
-        return PublicAudioMetadata(SourceReference(kind, url), meta)
+        return PublicAudioMetadata(SourceReference(kind, url, secret_token=secret_token), meta)
+
+    @staticmethod
+    def _request_url(reference: SourceReference) -> str:
+        if reference.secret_token is not None:
+            return f"{reference.identifier}/{reference.secret_token}"
+        return reference.identifier
 
     async def fetch_metadata(self, reference: SourceReference) -> PublicAudioMetadata:
         """Read display data without retaining or queueing a signed media URL."""
         self._reference(reference)
-        output = await self._extract(reference.identifier, reference.kind)
+        output = await self._extract(self._request_url(reference), reference.kind)
         result = None
         try:
-            result = self._metadata(self._worker._parse_document(output), reference.kind)
+            result = self._metadata(
+                self._worker._parse_document(output), reference.kind, secret_token=reference.secret_token,
+            )
             if result.reference != reference:
                 result = None
         except Exception:  # noqa: BLE001 - metadata is an untrusted provider response
@@ -165,17 +185,19 @@ class PublicAudioResolver:
     async def resolve(self, reference: SourceReference) -> ResolvedSource:
         """Resolve only a public, full-length audio format at playback time."""
         self._reference(reference)
-        output = await self._extract(reference.identifier, reference.kind, media=True)
+        output = await self._extract(self._request_url(reference), reference.kind, media=True)
         result = None
         try:
             payload = self._worker._parse_document(output)
             if not isinstance(payload, dict):
                 raise TypeError("Invalid source")
-            _public(payload)
+            _public(payload, shared=reference.kind is SourceKind.SOUNDCLOUD and reference.secret_token is not None)
             raw_url = payload.get("webpage_url")
             if not isinstance(raw_url, str):
                 raise TypeError("Invalid public audio URL")
-            provider, content_type, url = canonical_public_audio_url(raw_url)
+            provider, content_type, url, returned_token = parse_public_audio_url(raw_url)
+            if returned_token is not None and returned_token != reference.secret_token:
+                raise ValueError("Unexpected SoundCloud share token")
             if provider != reference.kind.value or content_type != "track" or url != reference.identifier:
                 raise ValueError("Unexpected public audio source")
             format_id = payload.get("format_id")

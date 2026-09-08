@@ -9,7 +9,9 @@ import importlib.metadata
 import importlib.util
 import json
 import logging
+import math
 import os
+import re
 import signal
 import sys
 import unicodedata
@@ -37,6 +39,7 @@ _CLOSE_DEADLINE = 1.0
 _READ_CHUNK = 4096
 _ALLOWED_HEADERS = {"user-agent": "User-Agent", "referer": "Referer", "origin": "Origin"}
 _MIN_YT_DLP_VERSION = Version("2026.8.19")
+_API_DURATION = re.compile(r"P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?\Z", re.ASCII)
 _YT_DLP_BOOTSTRAP = (
     "import runpy,sys; sys.path.insert(0,sys.argv[1]); "
     "sys.argv=['yt_dlp',*sys.argv[2:]]; runpy.run_module('yt_dlp',run_name='__main__')"
@@ -98,6 +101,30 @@ def _positive_int(value: object) -> int | None:
     return value
 
 
+def _duration_seconds(value: object) -> int | None:
+    """Normalize extractor seconds without treating live/unknown zero as failure."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ValueError
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError
+    return max(1, int(value)) if value else None
+
+
+def parse_youtube_api_duration(value: object) -> int | None:
+    """Read YouTube contentDetails.duration (ISO 8601 days/hours/minutes/seconds)."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value) > 64:
+        raise ValueError
+    match = _API_DURATION.fullmatch(value)
+    if match is None or not any(match.groups()) or value.endswith("T"):
+        raise ValueError
+    seconds = sum(int(part or 0) * scale for part, scale in zip(match.groups(), (86400, 3600, 60, 1)))
+    return seconds or None
+
+
 @dataclass(frozen=True, slots=True)
 class YouTubeVideoMetadata:
     """Safe display metadata; playback URLs and headers are intentionally absent."""
@@ -116,7 +143,7 @@ class YouTubeVideoMetadata:
         object.__setattr__(self, "title", _safe_display(self.title, _MAX_TITLE))
         if self.channel is not None:
             object.__setattr__(self, "channel", _safe_display(self.channel, _MAX_CHANNEL))
-        object.__setattr__(self, "duration", _positive_int(self.duration))
+        object.__setattr__(self, "duration", _duration_seconds(self.duration))
         if self.thumbnail is not None:
             object.__setattr__(self, "thumbnail", _valid_https_url(self.thumbnail, limit=_MAX_THUMBNAIL))
 
@@ -655,7 +682,7 @@ class YouTubeResolver:
                 codec=codec,
                 sample_rate=_positive_int(payload.get("asr")),
                 channels=_positive_int(payload.get("audio_channels")),
-                duration=_positive_int(payload.get("duration")),
+                duration=_duration_seconds(payload.get("duration")),
             )
         except Exception:  # noqa: BLE001 - malformed provider mappings are untrusted
             raise ValueError from None
@@ -758,4 +785,4 @@ class YouTubeResolver:
                 raise PlaybackUnavailable() from None
 
 
-__all__ = ["YouTubeResolver", "YouTubeVideoMetadata"]
+__all__ = ["YouTubeResolver", "YouTubeVideoMetadata", "parse_youtube_api_duration"]

@@ -307,7 +307,6 @@ def _make_redbot_stub(fake_config: FakeConfig) -> types.ModuleType:
     redbot.core.bot = types.ModuleType("redbot.core.bot")
     redbot.core.bot.Red = _FakeRed
 
-
     redbot.core.utils = types.ModuleType("redbot.core.utils")
     redbot.core.utils.menus = types.ModuleType("redbot.core.utils.menus")
     redbot.core.utils.menus.SimpleMenu = MagicMock()

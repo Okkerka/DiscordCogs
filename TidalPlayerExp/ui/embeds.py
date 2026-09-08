@@ -69,6 +69,14 @@ def source_quality_field(meta: TrackMeta) -> tuple[str, str]:
     return "Catalog quality", str(meta.get("audio_resolution") or QUALITY_LABELS.get(quality, quality))
 
 
+def display_duration(meta: TrackMeta) -> str:
+    """Do not describe missing or live-stream duration as a zero-length song."""
+    duration = meta.get("duration")
+    if isinstance(duration, bool) or not isinstance(duration, int) or duration <= 0:
+        return "Unknown"
+    return format_duration(duration)
+
+
 def error_embed(message: str) -> discord.Embed:
     return discord.Embed(description=message, color=COLOR_RED)
 
@@ -94,7 +102,7 @@ def make_now_playing_embed(meta: TrackMeta, autoplay_enabled: bool = False) -> d
             value=f"[Listen]({meta['share_url']})",
             inline=True,
         )
-    embed.set_footer(text=f"Duration: {format_duration(meta['duration'])} · Delivery: Discord Opus")
+    embed.set_footer(text=f"Duration: {display_duration(meta)} · Delivery: Discord Opus")
     if meta.get("image"):
         embed.set_thumbnail(url=meta["image"])
     return embed
@@ -104,7 +112,7 @@ def make_queue_embed(meta: TrackMeta, *, title: str = "Song added to the queue")
     track_title = str(meta.get("title") or "Unknown track")
     artist = str(meta.get("artist") or "Unknown artist")
     album = str(meta.get("album") or "")
-    duration = format_duration(int(meta.get("duration") or 0))
+    duration = display_duration(meta)
     share_url = meta.get("share_url")
 
     lines = [f"**{track_title}**", artist]

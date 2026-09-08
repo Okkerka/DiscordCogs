@@ -463,11 +463,15 @@ def test_rejects_unsafe_or_missing_selected_archive_member(kind, failure, tmp_pa
 
     member = "archive/bin/ffmpeg"
     entries = {} if failure in ("symlink", "missing") else {member: b"binary"}
+    link = member if failure in ("symlink", "duplicate") else None
     if kind == "tar.xz":
-        body = _tar_xz(entries, symlink=(member, "../../../outside") if failure != "missing" else None)
+        body = _tar_xz(entries, symlink=(link, "../../../outside") if link else None)
+    elif failure == "duplicate":
+        # A regular entry followed by a symlink is still an invalid duplicate.
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            body = _zip(entries, symlink=link)
     else:
-        # For duplicate, a regular entry followed by a symlink is still invalid.
-        body = _zip(entries, symlink=member if failure != "missing" else None)
+        body = _zip(entries, symlink=link)
     if failure == "oversized":
         body = _tar_xz(entries) if kind == "tar.xz" else _zip(entries)
         monkeypatch.setattr(runtime_repair, "_BINARY_LIMIT", 3)
@@ -567,7 +571,7 @@ async def test_extraction_cancellation_joins_worker_before_removing_staging(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["exit", "output", "timeout"])
 async def test_probe_bounds_failure_and_reaps_child(failure, monkeypatch):
-    child = _FakeProcess(returncode=-11 if failure == "exit" else 0, output=b"x" * 8193)
+    child = _FakeProcess(returncode=-11 if failure == "exit" else 0, output=b"" if failure == "exit" else b"x" * 8193)
     if failure == "timeout":
         child.stdout = asyncio.StreamReader()
         monkeypatch.setattr(runtime_repair, "_PROBE_TIMEOUT", 0.01)

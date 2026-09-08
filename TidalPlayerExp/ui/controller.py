@@ -6,8 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import discord
 
-from ..domain.normalization import format_duration
-from .embeds import display_source, source_link_label, source_quality_field
+from .embeds import display_duration, display_source, source_link_label, source_quality_field
 
 if TYPE_CHECKING:
     from ..domain.models import TrackMeta
@@ -18,16 +17,12 @@ def _short(value: str, limit: int = 100) -> str:
     return value if len(value) <= limit else value[: limit - 1] + "…"
 
 
-def _duration(seconds: int) -> str:
-    return format_duration(max(0, int(seconds or 0)))
-
-
 def _track_info(meta: TrackMeta, *, autoplay_enabled: bool) -> str:
     title = str(meta.get("title") or "Unknown track")
     artist = str(meta.get("artist") or "Unknown artist")
     album = str(meta.get("album") or "Unknown album")
     quality_label, quality = source_quality_field(meta)
-    duration = _duration(int(meta.get("duration") or 0))
+    duration = display_duration(meta)
     source_url = meta.get("share_url")
     autoplay_state = "On" if autoplay_enabled else "Off"
     info = (

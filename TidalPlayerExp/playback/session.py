@@ -317,17 +317,21 @@ class NativePlaybackSession:
             meta=cast(TrackMeta, metadata),
         )
 
-    async def _create(self, entry: PlaybackEntry) -> _OwnedAudio:
+    async def _create(self, entry: PlaybackEntry) -> tuple[PlaybackEntry, _OwnedAudio]:
         resolved = await asyncio.wait_for(
             self._resolver.resolve(entry.primary), self._resolve_timeout
         )
+        # Flat playlist/API metadata can omit duration. Publish the actual
+        # resolved duration without mutating the queue entry or known values.
+        if entry.meta["duration"] <= 0 and resolved.duration is not None:
+            entry = replace(entry, meta={**entry.meta, "duration": resolved.duration})
         # Shield creation so cancellation cannot leave the factory constructing
         # an unaccounted source while the successor starts another one.
         creation = asyncio.create_task(
             asyncio.wait_for(self._factory.create(resolved), self._create_timeout)
         )
         try:
-            return _OwnedAudio(await asyncio.shield(creation))
+            return entry, _OwnedAudio(await asyncio.shield(creation))
         except asyncio.CancelledError:
             try:
                 audio = await creation
@@ -349,7 +353,7 @@ class NativePlaybackSession:
             try:
                 if not self._owned() or not self._voice_client.is_connected():
                     return None
-                return effective, await self._create(effective)
+                return await self._create(effective)
             except Exception as error:  # noqa: BLE001 - retry with fresh resolution, never retain signed errors
                 log.warning("Playback preparation failed (%s)", type(error).__name__)
         return None

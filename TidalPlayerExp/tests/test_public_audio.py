@@ -43,7 +43,7 @@ def test_public_audio_urls_canonicalize_only_supported_shapes(url, kind, content
         "https://soundcloud.com.evil.test/artist/recording",
         "https://soundcloud.com/artist",
         "https://soundcloud.com/artist/likes",
-        "https://soundcloud.com/artist/recording/s-secret",
+        "https://soundcloud.com/artist/recording/s-",
         SOUNDCLOUD + "?secret_token=s-secret",
         SOUNDCLOUD + "?%73ecret_token=s-secret",
         "https://soundcloud.com/artist/../recording",

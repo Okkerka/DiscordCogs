@@ -163,6 +163,44 @@ def setup(**kwargs):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("known_duration, resolved_duration, expected", [(0, 243, 243), (180, 243, 180), (0, None, 0)])
+@pytest.mark.parametrize("use_fallback", [False, True])
+async def test_playback_publishes_missing_youtube_duration_without_overwriting_known_metadata(
+    known_duration, resolved_duration, expected, use_fallback,
+):
+    voice, factory, sink = Voice(), Factory(), Sink()
+
+    class DurationResolver(Resolver):
+        async def resolve(self, reference):
+            await super().resolve(reference)
+            return ResolvedSource("https://example.com/audio", {}, duration=resolved_duration)
+
+    resolver = DurationResolver()
+    reference = SourceReference(SourceKind.YOUTUBE, "dQw4w9WgXcQ")
+    youtube_meta = {**entry().meta, "duration": known_duration, "source": "YouTube", "track_id": None}
+    original = (
+        replace(entry(), fallback=reference, fallback_meta=youtube_meta)
+        if use_fallback else replace(entry(), primary=reference, meta=youtube_meta)
+    )
+    if use_fallback:
+        resolver.fail.add(SourceKind.TIDAL)
+    session = NativePlaybackSession(1, voice, resolver, factory, sink)
+    try:
+        assert await session.enqueue(original)
+        await sink.expect("started")
+        current = session.snapshot().current
+        assert current.primary == reference
+        assert current.meta["duration"] == expected
+        assert sink.started[0].meta["duration"] == expected
+        assert current.entry_id == original.entry_id
+        assert current.meta["source"].casefold() == "youtube"
+        assert youtube_meta["duration"] == known_duration
+        assert (original.fallback_meta if use_fallback else original.meta)["duration"] == known_duration
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_fifo_pause_resume_and_threaded_duplicate_end():
     session, voice, resolver, factory, sink = setup()
     assert await session.enqueue(entry(1))

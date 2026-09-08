@@ -212,6 +212,16 @@ def test_controller_track_info_defaults_to_tidal(cog) -> None:
     assert f"[Open in TIDAL]({url})" in info
 
 
+@pytest.mark.parametrize("duration", [None, 0, -1])
+def test_unknown_duration_does_not_claim_zero_length(cog, make_now_playing_embed, make_queue_embed, duration) -> None:
+    controller = importlib.import_module("TidalPlayerExp.ui.controller")
+    meta = _make_meta(duration=duration, source="YouTube")
+
+    assert "**Duration:** Unknown" in controller._track_info(meta, autoplay_enabled=False)
+    assert "Duration: Unknown" in _footer_text(make_now_playing_embed(meta))
+    assert "Duration: Unknown" in _footer_text(make_queue_embed(meta))
+
+
 def test_youtube_embed_never_inherits_tidal_quality(make_now_playing_embed) -> None:
     embed = make_now_playing_embed(
         _make_meta(source="YouTube", quality="HI_RES_LOSSLESS", audio_resolution="24-bit / 96kHz")

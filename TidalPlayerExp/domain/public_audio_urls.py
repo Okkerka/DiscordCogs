@@ -11,6 +11,39 @@ _SLUG = re.compile(r"[A-Za-z0-9_-]+\Z")
 _PROFILE_PAGES = frozenset({"albums", "sets", "likes", "reposts", "tracks", "popular-tracks", "followers", "following"})
 _RESERVED_ARTISTS = frozenset({"discover", "search", "charts", "you", "stream", "upload", "settings", "signin", "terms", "pages"})
 _TRACKING_KEYS = frozenset({"from", "si", "ref", "ref_id", "fbclid", "gclid", "in"})
+_SOUNDCLOUD_SECRET = re.compile(r"s-[A-Za-z0-9]{1,128}\Z")
+
+
+def valid_soundcloud_secret(value: object) -> bool:
+    """Validate a supplied share token, not a login or arbitrary query string."""
+    return isinstance(value, str) and _SOUNDCLOUD_SECRET.fullmatch(value) is not None
+
+
+def parse_public_audio_url(value: str) -> tuple[str, str, str, str | None]:
+    """Separate an explicit SoundCloud track share token from its public identity.
+
+    Tokens are supported only in /artist/track/s-token links. Collection tokens,
+    credentials, arbitrary query parameters and redirect hosts remain rejected.
+    """
+    if not isinstance(value, str) or len(value) > 2048 or any(
+        character.isspace() or ord(character) < 32 for character in value
+    ):
+        raise ValueError("Unsupported public audio URL")
+    try:
+        parts = urlsplit(value)
+        segments = parts.path.removesuffix("/").split("/")
+        if parts.hostname in _SOUNDCLOUD_HOSTS and len(segments) == 4 and segments[2] != "sets":
+            token = segments[-1]
+            if not valid_soundcloud_secret(token):
+                raise ValueError("Invalid SoundCloud share link")
+            base = parts._replace(path="/".join(segments[:-1])).geturl()
+            provider, content_type, canonical = canonical_public_audio_url(base)
+            if content_type != "track":
+                raise ValueError("Invalid SoundCloud share link")
+            return provider, content_type, canonical, token
+    except ValueError:
+        raise ValueError("Unsupported public audio URL") from None
+    return (*canonical_public_audio_url(value), None)
 
 
 def canonical_public_audio_url(value: str) -> tuple[str, str, str]:

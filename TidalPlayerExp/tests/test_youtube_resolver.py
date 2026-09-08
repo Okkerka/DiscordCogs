@@ -334,6 +334,58 @@ async def test_metadata_is_normalized_bounded_and_has_no_media_fields(tmp_path) 
     assert "http_headers" not in next(value for value in metadata_args if value.startswith("{"))
 
 
+@pytest.mark.parametrize("value, expected", [
+    ("PT4M3S", 243), ("PT1H2M3S", 3723), ("P1DT2H3M4S", 93784),
+    ("PT42S", 42), ("PT0S", None), (None, None),
+])
+def test_api_duration_parses_supported_video_lengths(value, expected) -> None:
+    from TidalPlayerExp.providers import youtube_resolver
+
+    assert youtube_resolver.parse_youtube_api_duration(value) == expected
+
+
+@pytest.mark.parametrize("value", [True, 123, "", "PT", "P", "-PT3S", "PT3Mgarbage", "P1Y", "PT" + "9" * 100 + "S"])
+def test_api_duration_rejects_malformed_or_unbounded_values(value) -> None:
+    from TidalPlayerExp.providers import youtube_resolver
+
+    with pytest.raises(ValueError):
+        youtube_resolver.parse_youtube_api_duration(value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value, expected", [(243.75, 243), (0, None), (None, None)])
+async def test_extractor_metadata_accepts_fractional_and_unknown_durations(tmp_path, value, expected) -> None:
+    resolver = _resolver_for({"id": VIDEO_ID, "title": "Video", "duration": value}, tmp_path)
+    try:
+        assert (await resolver.fetch_metadata(_reference())).duration == expected
+    finally:
+        await resolver.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [True, -1, "123", float("nan"), float("inf")])
+async def test_extractor_metadata_rejects_invalid_durations(tmp_path, value) -> None:
+    resolver = _resolver_for({"id": VIDEO_ID, "title": "Video", "duration": value}, tmp_path)
+    try:
+        with pytest.raises(SourceResolutionError):
+            await resolver.fetch_metadata(_reference())
+    finally:
+        await resolver.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value, expected", [(243.75, 243), (0, None), (None, None)])
+async def test_resolved_source_accepts_fractional_and_unknown_durations(tmp_path, value, expected) -> None:
+    resolver = _resolver_for({
+        "url": "https://audio.example/stream", "http_headers": {},
+        "acodec": "opus", "vcodec": "none", "duration": value,
+    }, tmp_path)
+    try:
+        assert (await resolver.resolve(_reference())).duration == expected
+    finally:
+        await resolver.close()
+
+
 @pytest.mark.asyncio
 async def test_playlist_caps_before_extraction_and_skips_invalid_entries(tmp_path) -> None:
     entries = [

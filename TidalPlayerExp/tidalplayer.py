@@ -49,7 +49,7 @@ from .playback.backend import NativePlaybackBackend
 from .playback.voice_runtime import initialize_voice_runtime
 from .providers.tidal_source import CompositeSourceResolver, TidalSourceResolver
 from .providers.public_audio import PublicAudioResolver
-from .providers.youtube_resolver import YouTubeResolver, YouTubeVideoMetadata, _deno_path
+from .providers.youtube_resolver import YouTubeResolver, YouTubeVideoMetadata, _deno_path, parse_youtube_api_duration
 from .providers.tokens import TokenRepository, TokenService, TokenSnapshot
 from .providers.urls import MalformedProviderURL, ProviderKind, ProviderURL, parse_provider_url
 
@@ -1898,7 +1898,9 @@ class TidalPlayerExp(commands.Cog):
         return f"https://www.youtube.com/watch?v={video_id}"
 
     @staticmethod
-    def _youtube_snippet_metadata(video_id: str, snippet: Any) -> YouTubeVideoMetadata:
+    def _youtube_snippet_metadata(
+        video_id: str, snippet: Any, *, duration: int | None = None,
+    ) -> YouTubeVideoMetadata:
         if not isinstance(snippet, dict) or not isinstance(snippet.get("title"), str):
             raise ValueError("Invalid video metadata")
         title = snippet["title"].strip()
@@ -1915,16 +1917,20 @@ class TidalPlayerExp(commands.Cog):
                 if isinstance(value, dict) and isinstance(value.get("url"), str):
                     thumbnail = value["url"]
                     break
-        return YouTubeVideoMetadata(video_id, title, channel, None, thumbnail)
+        return YouTubeVideoMetadata(video_id, title, channel, duration, thumbnail)
 
     async def _youtube_video_metadata(self, video_id: str) -> YouTubeVideoMetadata:
         reference = SourceReference(SourceKind.YOUTUBE, video_id)
         if self.yt is not None:
             try:
                 response = await self.tidal._run_blocking(
-                    self.yt.videos().list(part="snippet", id=video_id, maxResults=1).execute, timeout=15.0,
+                    self.yt.videos().list(part="snippet,contentDetails", id=video_id, maxResults=1).execute, timeout=15.0,
                 )
-                return self._youtube_snippet_metadata(video_id, response["items"][0]["snippet"])
+                item = response["items"][0]
+                return self._youtube_snippet_metadata(
+                    video_id, item["snippet"],
+                    duration=parse_youtube_api_duration(item.get("contentDetails", {}).get("duration")),
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -1998,7 +2004,7 @@ class TidalPlayerExp(commands.Cog):
         try:
             if parsed.content_type == "track":
                 item = await self.public_audio_resolver.fetch_metadata(
-                    SourceReference(kind, parsed.identifier),
+                    SourceReference(kind, parsed.identifier, secret_token=parsed.secret_token),
                 )
                 entry = PlaybackEntry(secrets.token_hex(12), item.reference, None, item.meta, ctx.author.id)
                 await self._admit_entry(ctx, session, entry, stop_generation=stop_generation)
@@ -2034,8 +2040,9 @@ class TidalPlayerExp(commands.Cog):
         except Exception as error:
             _log_provider_failure(label, "public audio import", error)
             await ctx.send(embed=_error_embed(
-                f"Could not read playable public audio from this {label} link. "
-                "Private, preview-only, or unavailable releases are not supported."
+                f"Could not read playable audio from this {label} link. "
+                "SoundCloud private tracks need a valid shared link; preview-only, "
+                "premium-only, or unavailable releases cannot be played."
             ))
         finally:
             if cancel is not None:

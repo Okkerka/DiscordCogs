@@ -53,7 +53,7 @@ def _api_payload(title="AZALI - Rivals (Official Audio)", channel="AZALI - Topic
     return {"items": [{"snippet": {
         "title": title, "channelTitle": channel,
         "thumbnails": {"high": {"url": f"https://i.ytimg.com/vi/{VIDEO_ID}/hqdefault.jpg"}},
-    }}]}
+    }, "contentDetails": {"duration": "PT4M3S"}}]}
 
 
 def _youtube_client(payload):
@@ -116,11 +116,39 @@ async def test_confident_match_preserves_original_youtube_fallback_metadata(cog,
     assert entry.fallback_meta["source"] == "YouTube"
     assert entry.fallback_meta["track_id"] is None
     assert entry.fallback_meta["audio_resolution"] is None
+    assert entry.fallback_meta["duration"] == 243
     cog.youtube_resolver.fetch_metadata.assert_not_awaited()
     cog.youtube_resolver.resolve.assert_not_awaited()
     native_session.enqueue.assert_awaited_once()
     assert not cog._current_meta
     youtube_ctx.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_api_duration_is_requested_and_retained_without_second_extraction(cog, youtube_ctx, native_session):
+    cog.yt = _youtube_client(_api_payload())
+
+    await cog._handle_youtube_video(youtube_ctx, VIDEO_ID)
+
+    assert native_session.entries[0].meta["duration"] == 243
+    cog.yt.videos().list.assert_called_once_with(part="snippet,contentDetails", id=VIDEO_ID, maxResults=1)
+    cog.youtube_resolver.fetch_metadata.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_nonmusic_youtube_video_keeps_original_when_catalog_results_are_unrelated(
+    cog, youtube_ctx, native_session,
+):
+    cog.youtube_resolver.fetch_metadata.return_value = _video(title="An Autumn Flip is Coming to Europe...")
+    cog.tidal.is_logged_in.return_value = True
+    cog.tidal.search.return_value = [_candidate(title="Autumn", artist="Another Artist")]
+
+    await cog._handle_youtube_video(youtube_ctx, VIDEO_ID)
+
+    entry = native_session.entries[0]
+    assert entry.primary == SourceReference(SourceKind.YOUTUBE, VIDEO_ID)
+    assert entry.fallback is None
+    assert entry.meta["title"] == "An Autumn Flip is Coming to Europe..."
 
 
 @pytest.mark.asyncio
