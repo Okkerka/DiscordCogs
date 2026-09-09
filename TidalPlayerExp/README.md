@@ -173,6 +173,9 @@ is not a guarantee that every site or individual track currently works.
   with `[p]tidalsetup youtube`.
 - Use the now-playing panel to pause/resume, skip, stop, choose a suggestion, or
   toggle autoplay. Autoplay generates TIDAL tracks only and needs TIDAL login.
+- Slash `/tplay` acknowledges queue admission even for the first song, clearing
+  Discord's thinking indicator; the player panel is published separately when
+  audio starts. The short acknowledgement is deleted after one minute.
 - `[p]tstop` cancels a running playlist **import**, leaving admitted tracks alone.
   The controller's **Stop** button stops playback and clears the queue.
 

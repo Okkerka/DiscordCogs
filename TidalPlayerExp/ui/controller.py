@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 import discord
 
 from ..domain.normalization import format_duration
+from .display import clamp_text, escape_display, safe_display_url
 from .embeds import (
     display_duration,
     display_source,
@@ -20,7 +21,7 @@ if TYPE_CHECKING:
 
 
 def _short(value: str, limit: int = 100) -> str:
-    return value if len(value) <= limit else value[: limit - 1] + "…"
+    return clamp_text(value, limit)
 
 
 def _duration(seconds: int) -> str:
@@ -28,25 +29,27 @@ def _duration(seconds: int) -> str:
 
 
 def _track_info(meta: TrackMeta, *, autoplay_enabled: bool) -> str:
-    title = str(meta.get("title") or "Unknown track")
-    artist = str(meta.get("artist") or "Unknown artist")
-    album = str(meta.get("album") or "Unknown album")
+    # These budgets also reserve space for next-up text and controller labels
+    # within Discord's 4000-character Components V2 message budget.
+    title = escape_display(meta.get("title") or "Unknown track", 512)
+    artist = escape_display(meta.get("artist") or "Unknown artist")
+    album = escape_display(meta.get("album") or "Unknown album")
     quality_label, quality = source_quality_field(meta)
     duration = display_duration(meta)
-    source_url = meta.get("share_url")
+    source_url = safe_display_url(meta.get("share_url"))
     autoplay_state = "On" if autoplay_enabled else "Off"
     info = (
-        f"## Playing from {display_source(meta)}\n"
+        f"## Playing from {escape_display(display_source(meta), 64)}\n"
         f"### {title}\n"
         f"**{artist}**\n"
         f"*{album}*\n\n"
-        f"**{quality_label}:** {quality}\n"
+        f"**{quality_label}:** {escape_display(quality)}\n"
         "**Delivery:** Discord Opus\n"
         f"**Autoplay:** {autoplay_state}\n"
         f"**Duration:** {duration}"
     )
     if source_url:
-        info += f"\n[Open in {source_link_label(meta)}]({source_url})"
+        info += f"\n[Open in {escape_display(source_link_label(meta), 64)}]({source_url})"
     return info
 
 
@@ -81,11 +84,11 @@ class PlayerControllerView(discord.ui.LayoutView):
 
     def _build_layout(self) -> None:
         title = str(self.meta.get("title") or "Unknown track")
-        image_url = self.meta.get("image")
+        image_url = safe_display_url(self.meta.get("image"), 2048)
         autoplay_state = "On" if self.autoplay_enabled else "Off"
         info = _track_info(self.meta, autoplay_enabled=self.autoplay_enabled)
-        next_title = str(self.next_up.get("title") or "")
-        next_artist = str(self.next_up.get("artist") or "")
+        next_title = escape_display(self.next_up.get("title") or "", 512)
+        next_artist = escape_display(self.next_up.get("artist") or "")
         if next_title:
             info += f"\n\n**Next up:** {next_title} — {next_artist or 'Unknown artist'}"
 
@@ -95,7 +98,7 @@ class PlayerControllerView(discord.ui.LayoutView):
                 discord.ui.Section(
                     discord.ui.TextDisplay(info),
                     accessory=discord.ui.Thumbnail(
-                        media=image_url, description=f"Album art for {title}"
+                        media=image_url, description=clamp_text(f"Album art for {title}", 1024)
                     ),
                 )
             )

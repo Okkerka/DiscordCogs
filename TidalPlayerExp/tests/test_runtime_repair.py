@@ -4,8 +4,11 @@ import asyncio
 import hashlib
 import io
 import json
+import os
 import stat
+import subprocess
 import tarfile
+import time
 import zipfile
 from dataclasses import replace
 from pathlib import Path
@@ -584,3 +587,235 @@ async def test_probe_bounds_failure_and_reaps_child(failure, monkeypatch):
         await runtime_repair._probe(Path("unused"))
     assert error.value.code == "probe_failed"
     assert child.returncode is not None
+
+
+def _retention_generation(root: Path, number: int, *, age: int) -> Path:
+    generation = root / f"runtime-{number:032x}"
+    generation.mkdir(parents=True)
+    (generation / "ffmpeg").write_bytes(b"ffmpeg")
+    (generation / "deno").write_bytes(b"deno")
+    (generation / "runtime.json").write_text('{"ffmpeg": "ffmpeg", "deno": "deno"}')
+    timestamp = time.time() - age
+    os.utime(generation, (timestamp, timestamp))
+    return generation
+
+
+@pytest.mark.asyncio
+async def test_cleanup_keeps_active_newest_backup_and_in_use_generation(tmp_path):
+    root = tmp_path / "runtime"
+    active = _retention_generation(root, 1, age=500)
+    backup = _retention_generation(root, 2, age=100)
+    protected = _retention_generation(root, 3, age=300)
+    obsolete = _retention_generation(root, 4, age=400)
+    (root / "active").write_text(active.name)
+
+    await runtime_repair.ManagedRuntime(root).cleanup(protected_paths=(protected / "ffmpeg",))
+
+    assert active.is_dir() and backup.is_dir() and protected.is_dir()
+    assert not obsolete.exists()
+    assert (root / "active").read_text() == active.name
+
+
+@pytest.mark.asyncio
+async def test_cleanup_removes_only_abandoned_owned_staging_and_markers(tmp_path):
+    root = tmp_path / "runtime"
+    root.mkdir()
+    stale = root / ".staging-abcdefgh"
+    stale.mkdir()
+    (stale / "ffmpeg.download").write_bytes(b"partial")
+    recent = root / ".staging-12345678"
+    recent.mkdir()
+    unknown = root / ".staging-user-data"
+    unknown.mkdir()
+    marker = root / (".active-" + "a" * 32)
+    marker.write_text("unfinished")
+    for path in (stale, marker, unknown):
+        timestamp = time.time() - 172800
+        os.utime(path, (timestamp, timestamp))
+
+    await runtime_repair.ManagedRuntime(root).cleanup(protected_paths=())
+
+    assert not stale.exists() and not marker.exists()
+    assert recent.is_dir() and unknown.is_dir()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker", [None, "../../outside", "runtime-" + "f" * 32])
+async def test_cleanup_preserves_generations_without_trusted_active_marker(tmp_path, marker):
+    root = tmp_path / "runtime"
+    generations = [_retention_generation(root, number, age=number) for number in range(1, 4)]
+    if marker is not None:
+        (root / "active").write_text(marker)
+
+    await runtime_repair.ManagedRuntime(root).cleanup(protected_paths=())
+
+    assert all(generation.is_dir() for generation in generations)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_preserves_candidates_with_unexpected_files_or_subdirectories(tmp_path):
+    root = tmp_path / "runtime"
+    active, backup, unknown, nested = [
+        _retention_generation(root, number, age=number * 100) for number in range(1, 5)
+    ]
+    (root / "active").write_text(active.name)
+    (unknown / "private-data").write_bytes(b"keep")
+    (nested / "nested").mkdir()
+
+    await runtime_repair.ManagedRuntime(root).cleanup(protected_paths=())
+
+    assert (unknown / "ffmpeg").read_bytes() == b"ffmpeg"
+    assert (unknown / "private-data").read_bytes() == b"keep"
+    assert (nested / "ffmpeg").read_bytes() == b"ffmpeg"
+    assert (nested / "nested").is_dir()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["root", "ancestor", "generation", "file"])
+async def test_cleanup_never_follows_symlinks(tmp_path, boundary):
+    root = tmp_path / "runtime"
+    active, backup, obsolete = [
+        _retention_generation(root, number, age=number * 100) for number in range(1, 4)
+    ]
+    (root / "active").write_text(active.name)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "ffmpeg"
+    sentinel.write_bytes(b"keep")
+    try:
+        if boundary == "root":
+            alias = tmp_path / "alias"
+            alias.symlink_to(root, target_is_directory=True)
+            root = alias
+        elif boundary == "ancestor":
+            alias = tmp_path / "alias"
+            alias.symlink_to(tmp_path, target_is_directory=True)
+            root = alias / "runtime"
+        elif boundary == "generation":
+            linked = root / ("runtime-" + "f" * 32)
+            linked.symlink_to(outside, target_is_directory=True)
+        else:
+            (obsolete / "ffmpeg").unlink()
+            (obsolete / "ffmpeg").symlink_to(sentinel)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege unavailable")
+        raise
+
+    await runtime_repair.ManagedRuntime(root).cleanup(protected_paths=())
+
+    assert sentinel.read_bytes() == b"keep"
+    assert active.is_dir() and backup.is_dir()
+    if boundary != "generation":
+        assert obsolete.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_cancellation_joins_worker_and_excludes_repair(tmp_path, monkeypatch):
+    import threading
+
+    runtime = runtime_repair.ManagedRuntime(tmp_path / "runtime")
+    entered = asyncio.Event()
+    finished = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def blocked_cleanup(protected_paths, stop):
+        loop.call_soon_threadsafe(entered.set)
+        assert stop.wait(timeout=5)
+        finished.set()
+
+    monkeypatch.setattr(runtime, "_cleanup", blocked_cleanup, raising=False)
+    task = asyncio.create_task(runtime.cleanup(protected_paths=()))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    with pytest.raises(runtime_repair.RuntimeRepairError, match="busy"):
+        await runtime.repair()
+    await runtime.close()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert finished.is_set()
+    with pytest.raises(runtime_repair.RuntimeRepairError, match="closed"):
+        await runtime.cleanup(protected_paths=())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protection", ["normalized", "root"])
+async def test_cleanup_normalizes_protected_paths_and_honors_protected_root(tmp_path, protection):
+    root = tmp_path / "runtime"
+    active, backup, in_use = [
+        _retention_generation(root, number, age=number * 100) for number in range(1, 4)
+    ]
+    (root / "active").write_text(active.name)
+    path = root if protection == "root" else root / "unused" / ".." / in_use.name / "ffmpeg"
+
+    await runtime_repair.ManagedRuntime(root).cleanup(protected_paths=(path,))
+
+    assert (in_use / "ffmpeg").read_bytes() == b"ffmpeg"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_reports_file_errors_with_fixed_diagnostic(tmp_path, monkeypatch):
+    root = tmp_path / "runtime"
+    active, backup, obsolete = [
+        _retention_generation(root, number, age=number * 100) for number in range(1, 4)
+    ]
+    (root / "active").write_text(active.name)
+    unlink = Path.unlink
+
+    def locked(path, *args, **kwargs):
+        if path.parent == obsolete:
+            raise PermissionError("private path or locked executable")
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", locked)
+    with pytest.raises(runtime_repair.RuntimeRepairError, match="^cleanup_failed$"):
+        await runtime_repair.ManagedRuntime(root).cleanup(protected_paths=())
+    assert (active / "ffmpeg").read_bytes() == b"ffmpeg"
+    assert (backup / "ffmpeg").read_bytes() == b"ffmpeg"
+
+
+@pytest.mark.asyncio
+async def test_repair_never_prunes_generations_that_players_might_still_use(
+    tmp_path, successful_boundaries, monkeypatch,
+):
+    runtime = runtime_repair.ManagedRuntime(tmp_path / "runtime")
+    bundle, _calls = successful_boundaries
+    installed = []
+    for number in range(3):
+        changed = replace(bundle, platform=f"updated-{number}")
+        monkeypatch.setattr(runtime_repair, "_platform_bundle", lambda: changed)
+        await runtime.repair()
+        installed.append(Path(runtime.locate("ffmpeg")))
+    assert len(set(installed)) == 3
+    assert all(path.read_bytes() == b"ffmpeg binary" for path in installed)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction boundary")
+@pytest.mark.parametrize("boundary", ["root", "generation"])
+async def test_cleanup_preserves_windows_junction_targets(tmp_path, boundary):
+    root = tmp_path / "runtime"
+    active, backup, obsolete = [
+        _retention_generation(root, number, age=number * 100) for number in range(1, 4)
+    ]
+    (root / "active").write_text(active.name)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "ffmpeg").write_bytes(b"keep")
+    alias = tmp_path / "alias" if boundary == "root" else root / ("runtime-" + "f" * 32)
+    target = root if boundary == "root" else outside
+    subprocess.run(
+        ["cmd.exe", "/c", "mklink", "/J", str(alias), str(target)],
+        check=True, capture_output=True,
+    )
+    try:
+        await runtime_repair.ManagedRuntime(alias if boundary == "root" else root).cleanup(
+            protected_paths=(),
+        )
+        assert (outside / "ffmpeg").read_bytes() == b"keep"
+        assert (active / "ffmpeg").read_bytes() == b"ffmpeg"
+        if boundary == "root":
+            assert (obsolete / "ffmpeg").read_bytes() == b"ffmpeg"
+        assert alias.is_dir()
+    finally:
+        # Removing the junction itself does not traverse or remove its target.
+        alias.rmdir()

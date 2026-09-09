@@ -40,29 +40,6 @@ class _ConfigValue:
         return self.__call__().__await__()
 
 
-class _ConfigContext:
-    """Model Red's awaitable global-group context and its shared write lock."""
-
-    def __init__(self, config: FakeConfig) -> None:
-        self._config = config
-
-    def __await__(self):
-        return self._config._read_all().__await__()
-
-    async def __aenter__(self) -> dict[str, Any]:
-        await self._config._global_lock.acquire()
-        self._data = await self._config._read_all()
-        self._original = deepcopy(self._data)
-        return self._data
-
-    async def __aexit__(self, *_exc: object) -> None:
-        try:
-            if self._data != self._original:
-                await self._config.set(self._data)
-        finally:
-            self._config._global_lock.release()
-
-
 class FakeGuildConfig:
     def __init__(self) -> None:
         self._filter_remixes = _ConfigValue(True)
@@ -123,10 +100,10 @@ class FakeConfig:
     def guild_from_id(self, guild_id: int) -> FakeGuildConfig:
         return self.guild(guild_id)
 
-    def all(self) -> _ConfigContext:
-        return _ConfigContext(self)
+    def get_lock(self) -> asyncio.Lock:
+        return self._global_lock
 
-    async def _read_all(self) -> dict[str, Any]:
+    async def all(self) -> dict[str, Any]:
         return {
             key: deepcopy(value._value)
             for key, value in vars(self).items()

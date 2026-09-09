@@ -211,6 +211,22 @@ async def test_track_fallback_uses_current_stream_manifest_shape() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("direct_url", [None, "", "http://audio.example/insecure", "https://user:secret@audio.example/stream"])
+async def test_track_falls_back_when_direct_url_is_missing_or_invalid(direct_url: object) -> None:
+    track = _DirectTrack(
+        direct_url,
+        stream=_Stream(_BTSManifest(["https://audio.example/fallback.flac"])),
+    )
+    resolver = TidalSourceResolver(_HandlerFake(tracks=[track]))
+
+    source = await resolver.resolve(SourceReference(SourceKind.TIDAL, "123"))
+
+    assert source.url == "https://audio.example/fallback.flac"
+    assert source.codec == "flac"
+    assert source.sample_rate == 96_000
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "manifest",
     [

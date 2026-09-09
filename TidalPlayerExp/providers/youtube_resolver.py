@@ -431,29 +431,33 @@ class YouTubeResolver:
         return bytes(output)
 
     async def _run_child(self, args: list[str], *, deadline: float, ceiling: int) -> bytes:
-        await self._slots.acquire()
         child: Any | None = None
+        slot_acquired = False
         slot_handed_off = False
-        try:
-            child = await self._spawn(args)
-            running_child = child
 
-            async def _read_and_wait() -> bytes:
-                output = await self._read_stdout(running_child, ceiling)
-                returncode = await running_child.wait()
+        try:
+            async with asyncio.timeout(deadline) as timeout:
+                await self._slots.acquire()
+                slot_acquired = True
+                try:
+                    child = await self._spawn(args)
+                except _SpawnCancelled:
+                    # The late factory/registration owns the slot. timeout only
+                    # translates the base CancelledError, not this ownership marker.
+                    slot_handed_off = True
+                    if timeout.expired():
+                        raise asyncio.TimeoutError() from None
+                    raise
+                output = await self._read_stdout(child, ceiling)
+                returncode = await child.wait()
                 if returncode != 0:
                     raise RuntimeError
                 return output
-
-            return await asyncio.wait_for(_read_and_wait(), timeout=deadline)
         except asyncio.TimeoutError:
             raise PlaybackUnavailable() from None
         except _SpawnedAfterClose as error:
             child = error.child
             raise PlaybackUnavailable() from None
-        except _SpawnCancelled:
-            slot_handed_off = True
-            raise
         except asyncio.CancelledError:
             raise
         except (PlaybackUnavailable, SourceResolutionError):
@@ -464,7 +468,7 @@ class YouTubeResolver:
             if child is not None:
                 reaped = await self._cleanup_child(child, release_slot=True)
                 slot_handed_off = slot_handed_off or not reaped
-            if not slot_handed_off and child is None:
+            if slot_acquired and not slot_handed_off and child is None:
                 self._slots.release()
 
     async def _cleanup_child(self, child: Any, *, release_slot: bool) -> bool:

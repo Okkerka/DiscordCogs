@@ -715,9 +715,68 @@ async def test_two_child_capacity_and_cancelled_waiter_reap_before_release(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_deadline_includes_waiting_for_child_capacity() -> None:
+    async def factory(*args: object, **kwargs: object) -> _Process:
+        raise AssertionError("a timed-out waiter must never spawn a child")
+
+    resolver = YouTubeResolver(process_factory=factory)
+    await resolver._slots.acquire()
+    await resolver._slots.acquire()
+    task = asyncio.create_task(resolver._run_child([], deadline=0.01, ceiling=1024))
+    try:
+        done, _ = await asyncio.wait({task}, timeout=0.3)
+        assert task in done, "the deadline must expire while child capacity is occupied"
+        with pytest.raises(PlaybackUnavailable):
+            await task
+        assert resolver._slots._value == 0
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        resolver._slots.release()
+        resolver._slots.release()
+        await resolver.close()
+
+
+@pytest.mark.asyncio
+async def test_deadline_during_spawn_retains_late_child_and_slot_until_reaped() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    process = _DeferredReapProcess()
+
+    async def factory(*args: object, **kwargs: object) -> _DeferredReapProcess:
+        started.set()
+        await release.wait()
+        return process
+
+    resolver = YouTubeResolver(process_factory=factory)
+    task = asyncio.create_task(resolver._run_child([], deadline=0.01, ceiling=1024))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        done, _ = await asyncio.wait({task}, timeout=0.3)
+        assert task in done, "the deadline must expire while the factory is pending"
+        with pytest.raises(PlaybackUnavailable):
+            await task
+        assert resolver._slots._value == 1
+        release.set()
+        await asyncio.sleep(0.05)
+        assert resolver._slots._value == 1
+        assert process in resolver._children or process in resolver._reapers
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        release.set()
+        process.reaped.set()
+        await resolver.close()
+    assert resolver._slots._value == 2
+    assert not resolver._children
+    assert not resolver._reapers
+
+
+@pytest.mark.asyncio
 async def test_timeout_terminates_owned_child_before_releasing_capacity(tmp_path, monkeypatch) -> None:
     module = __import__("TidalPlayerExp.providers.youtube_resolver", fromlist=["YouTubeResolver"])
-    monkeypatch.setattr(module, "_VIDEO_DEADLINE", 0.01)
+    # Include setup time so this test exercises timeout with a registered child.
+    monkeypatch.setattr(module, "_VIDEO_DEADLINE", 0.2)
     process = _RunningProcess()
     deno = tmp_path / "deno"
     deno.write_bytes(b"")
@@ -734,7 +793,7 @@ async def test_timeout_terminates_owned_child_before_releasing_capacity(tmp_path
 @pytest.mark.asyncio
 async def test_timeout_retains_slot_and_close_until_child_is_confirmed_reaped(tmp_path, monkeypatch) -> None:
     module = __import__("TidalPlayerExp.providers.youtube_resolver", fromlist=["YouTubeResolver"])
-    monkeypatch.setattr(module, "_VIDEO_DEADLINE", 0.01)
+    monkeypatch.setattr(module, "_VIDEO_DEADLINE", 0.2)
     processes = [_DeferredReapProcess(), _DeferredReapProcess()]
     calls: list = []
     deno = tmp_path / "deno"
@@ -922,7 +981,7 @@ async def test_close_before_cancelled_registration_adoption_does_not_release_slo
 @pytest.mark.asyncio
 async def test_close_reports_bounded_cleanup_failure_without_orphaning_reaper(tmp_path, monkeypatch) -> None:
     module = __import__("TidalPlayerExp.providers.youtube_resolver", fromlist=["YouTubeResolver"])
-    monkeypatch.setattr(module, "_VIDEO_DEADLINE", 0.01)
+    monkeypatch.setattr(module, "_VIDEO_DEADLINE", 0.2)
     monkeypatch.setattr(module, "_CLOSE_DEADLINE", 0.01)
     process = _DeferredReapProcess()
     deno = tmp_path / "deno"
@@ -1008,7 +1067,7 @@ async def test_windows_helper_reap_failure_retains_child_slot_and_close(tmp_path
         helper_calls.append(args)
         return helpers[len(helper_calls) - 1]
 
-    monkeypatch.setattr(module, "_VIDEO_DEADLINE", 0.01)
+    monkeypatch.setattr(module, "_VIDEO_DEADLINE", 0.2)
     monkeypatch.setattr(module.os, "name", "nt")
     monkeypatch.setenv("SystemRoot", str(system_root))
     monkeypatch.setattr(module.asyncio, "create_subprocess_exec", helper_factory)

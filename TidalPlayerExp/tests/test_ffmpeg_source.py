@@ -217,62 +217,68 @@ def test_default_locator_uses_packaged_files_without_upstream_probe(
 
 
 def test_default_probe_times_out_and_reaps_hung_candidate(
-    ffmpeg_module: Any, tmp_path: Path
+    ffmpeg_module: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    marker = tmp_path / "hung-probe.pid"
-    script = (
-        "import os, pathlib, sys, time; "
-        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
-        "time.sleep(60)"
-    )
+    spawned: list[subprocess.Popen[bytes]] = []
+    original_popen = subprocess.Popen
+
+    def record_spawn(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+        process = original_popen(*args, **kwargs)
+        spawned.append(process)
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", record_spawn)
     started = time.monotonic()
 
     with pytest.raises(subprocess.TimeoutExpired):
         ffmpeg_module._default_probe(
-            (sys.executable, "-c", script, str(marker)), timeout=0.2
+            (sys.executable, "-c", "import time; time.sleep(60)"), timeout=0.2
         )
 
     elapsed = time.monotonic() - started
-    assert marker.is_file()
-    pid = int(marker.read_text())
+    assert len(spawned) == 1
     assert elapsed < 2
-    assert not _pid_exists(pid)
+    assert spawned[0].returncode is not None
+    assert not _pid_exists(spawned[0].pid)
 
 
 @pytest.mark.asyncio
 async def test_close_accounts_for_timed_out_owned_probe(
-    ffmpeg_module: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ffmpeg_module: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    marker = tmp_path / "factory-probe.pid"
-    script = (
-        "import os, pathlib, sys, time; "
-        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
-        "time.sleep(60)"
-    )
+    spawned: list[subprocess.Popen[bytes]] = []
+    started = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    original_popen = subprocess.Popen
+
+    def record_spawn(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+        process = original_popen(*args, **kwargs)
+        spawned.append(process)
+        loop.call_soon_threadsafe(started.set)
+        return process
 
     def hung_probe(_argv: Sequence[str], timeout: float) -> bytes:
         return ffmpeg_module._default_probe(
-            (sys.executable, "-c", script, str(marker)), timeout
+            (sys.executable, "-c", "import time; time.sleep(60)"), timeout
         )
 
     monkeypatch.setattr(ffmpeg_module, "_PROBE_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(subprocess, "Popen", record_spawn)
     factory = ffmpeg_module.FFmpegSourceFactory(
         locator=lambda: sys.executable,
         probe=hung_probe,
     )
     checking = asyncio.create_task(factory.check())
-    for _ in range(100):
-        if marker.is_file():
-            break
-        await asyncio.sleep(0.01)
-    assert marker.is_file()
+    await asyncio.wait_for(started.wait(), timeout=2)
 
     await factory.close()
     await factory.close()
     with pytest.raises(PlaybackUnavailable):
         await checking
 
-    assert not _pid_exists(int(marker.read_text()))
+    assert len(spawned) == 1
+    assert spawned[0].returncode is not None
+    assert not _pid_exists(spawned[0].pid)
     with pytest.raises(PlaybackUnavailable):
         await factory.check()
 

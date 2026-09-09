@@ -4,6 +4,7 @@ import discord
 
 from ..domain.models import TrackMeta
 from ..domain.normalization import QUALITY_LABELS, format_duration
+from .display import clamp_text, escape_display, safe_display_url
 
 COLOR_BLUE = discord.Color.blue()
 COLOR_GREEN = discord.Color.green()
@@ -78,59 +79,60 @@ def display_duration(meta: TrackMeta) -> str:
 
 
 def error_embed(message: str) -> discord.Embed:
-    return discord.Embed(description=message, color=COLOR_RED)
+    return discord.Embed(description=clamp_text(message, 4096), color=COLOR_RED)
 
 
 def success_embed(message: str) -> discord.Embed:
-    return discord.Embed(description=message, color=COLOR_GREEN)
+    return discord.Embed(description=clamp_text(message, 4096), color=COLOR_GREEN)
 
 
 def make_now_playing_embed(meta: TrackMeta, autoplay_enabled: bool = False) -> discord.Embed:
-    description = [f"**{meta['title']}**", meta["artist"]]
+    description = [f"**{escape_display(meta.get('title') or 'Unknown track', 512)}**",
+                   escape_display(meta.get("artist") or "Unknown artist")]
     if meta.get("album"):
-        description.append(f"_{meta['album']}_")
+        description.append(f"_{escape_display(meta['album'])}_")
     embed = discord.Embed(
-        title=f"Playing from {display_source(meta)}",
+        title=f"Playing from {escape_display(display_source(meta), 64)}",
         description="\n".join(description),
         color=COLOR_BLUE,
     )
     quality_label, quality = source_quality_field(meta)
-    embed.add_field(name=quality_label, value=quality, inline=True)
-    if meta.get("share_url"):
+    embed.add_field(name=quality_label, value=escape_display(quality), inline=True)
+    if share_url := safe_display_url(meta.get("share_url")):
         embed.add_field(
-            name=f"Open in {source_link_label(meta)}",
-            value=f"[Listen]({meta['share_url']})",
+            name=f"Open in {escape_display(source_link_label(meta), 64)}",
+            value=f"[Listen]({share_url})",
             inline=True,
         )
     embed.set_footer(text=f"Duration: {display_duration(meta)} · Delivery: Discord Opus")
-    if meta.get("image"):
-        embed.set_thumbnail(url=meta["image"])
+    if image := safe_display_url(meta.get("image"), 2048):
+        embed.set_thumbnail(url=image)
     return embed
 
 def make_queue_embed(meta: TrackMeta, *, title: str = "Song added to the queue") -> discord.Embed:
     """Compact embed shown when a track is added to the queue."""
-    track_title = str(meta.get("title") or "Unknown track")
-    artist = str(meta.get("artist") or "Unknown artist")
-    album = str(meta.get("album") or "")
+    track_title = escape_display(meta.get("title") or "Unknown track", 512)
+    artist = escape_display(meta.get("artist") or "Unknown artist")
+    album = escape_display(meta.get("album") or "")
     duration = display_duration(meta)
-    share_url = meta.get("share_url")
+    share_url = safe_display_url(meta.get("share_url"))
 
     lines = [f"**{track_title}**", artist]
     if album:
         lines.append(f"_{album}_")
 
     embed = discord.Embed(
-        title=title,
+        title=clamp_text(title, 256),
         description="\n".join(lines),
         color=COLOR_PURPLE,
     )
     embed.set_footer(text=f"Duration: {duration}")
     if share_url:
         embed.add_field(
-            name=f"Open in {source_link_label(meta)}",
+            name=f"Open in {escape_display(source_link_label(meta), 64)}",
             value=f"[Listen]({share_url})",
             inline=True,
         )
-    if meta.get("image"):
-        embed.set_thumbnail(url=meta["image"])
+    if image := safe_display_url(meta.get("image"), 2048):
+        embed.set_thumbnail(url=image)
     return embed

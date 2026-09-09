@@ -136,7 +136,9 @@ class TidalSourceResolver:
         if callable(get_url):
             url = await self._provider_call(get_url)
             if url is not _FAILED:
-                return self._source(url, codec=codec, duration=duration)
+                source = self._source(url, codec=codec, duration=duration)
+                if source is not None:
+                    return source
 
         details = await self._provider_call(lambda: _manifest_details(track))
         if details is _FAILED or not isinstance(details, tuple) or len(details) != 3:

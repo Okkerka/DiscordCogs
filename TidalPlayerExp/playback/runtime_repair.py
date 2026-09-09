@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -34,6 +34,11 @@ _BINARY_LIMIT = 256 * 1024 * 1024
 _LICENSE_LIMIT = 1024 * 1024
 _ARCHIVE_LIMIT = 1024 * 1024 * 1024
 _PROBE_TIMEOUT = 15
+_STAGING_MAX_AGE = 24 * 60 * 60
+_RUNTIME_FILES = frozenset({
+    "ffmpeg", "ffmpeg.exe", "deno", "deno.exe", "runtime.json", "FFMPEG-LICENSE.txt",
+    "ffmpeg.download", "deno.download",
+})
 _T = TypeVar("_T")
 Tool = Literal["ffmpeg", "deno"]
 
@@ -46,7 +51,7 @@ class RuntimeRepairError(Exception):
             "invalid_tool", "unsupported_platform", "closed", "busy",
             "download_failed", "download_size", "checksum_mismatch",
             "archive_invalid", "archive_member_invalid", "extracted_too_large",
-            "probe_failed", "activation_failed",
+            "probe_failed", "activation_failed", "cleanup_failed",
         }
         self.code = code if code in allowed else "activation_failed"
         super().__init__(self.code)
@@ -125,6 +130,19 @@ def _platform_bundle() -> _Bundle:
 
 def _regular(path: Path) -> bool:
     return not path.is_symlink() and path.is_file()
+
+
+def _plain(path: Path, *, directory: bool) -> bool:
+    """Reject symlinks and Windows junctions/reparse points without following them."""
+    info = path.lstat()
+    return (
+        not getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        and (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode))
+    )
+
+
+def _plain_directory_chain(path: Path) -> bool:
+    return all(_plain(parent, directory=True) for parent in (*reversed(path.parents), path))
 
 
 def _digest(path: Path, check: Callable[[], None]) -> str:
@@ -343,6 +361,92 @@ class ManagedRuntime:
             await task
         finally:
             self._task = None
+
+    async def cleanup(self, *, protected_paths: Collection[Path]) -> None:
+        """Keep active tools, one newest backup, and every explicitly protected path.
+
+        Call before starting playback/extraction, or supply ALL executable paths
+        still used by children or queued work. Repair never prunes generations:
+        a child can outlive the marker that originally selected its executable.
+        Unknown files, linked directories and invalid active markers fail closed.
+        Abandoned staging/marker files are eligible only after 24 hours.
+        """
+        if self._closed:
+            raise RuntimeRepairError("closed")
+        if self._task is not None:
+            raise RuntimeRepairError("busy")
+        try:
+            protected = tuple(Path(path).resolve() for path in protected_paths)
+        except (OSError, RuntimeError) as exc:
+            raise RuntimeRepairError("cleanup_failed") from exc
+        task = asyncio.create_task(_worker(partial(self._cleanup, protected)))
+        self._task = task
+        try:
+            await task
+        finally:
+            self._task = None
+
+    def _cleanup(self, protected_paths: tuple[Path, ...], stop: threading.Event) -> None:
+        root = self.directory
+        try:
+            if not root.exists() or not _plain_directory_chain(root):
+                return
+            children = list(root.iterdir())
+            generations = [
+                path for path in children
+                if re.fullmatch(r"runtime-[0-9a-f]{32}", path.name)
+                and _plain(path, directory=True)
+            ]
+            marker = root / "active"
+            active: Path | None = None
+            if marker.exists() and _plain(marker, directory=False) and marker.stat().st_size <= 80:
+                name = marker.read_bytes().decode("ascii").strip()
+                if re.fullmatch(r"runtime-[0-9a-f]{32}", name) and root / name in generations:
+                    active = root / name
+            retained = {active} if active is not None else set(generations)
+            backups = [path for path in generations if path != active]
+            if backups:
+                retained.add(max(backups, key=lambda path: (path.stat().st_mtime_ns, path.name)))
+            cutoff = time.time() - _STAGING_MAX_AGE
+            for candidate in children:
+                if stop.is_set():
+                    return
+                if candidate in retained or any(
+                    path == candidate or candidate in path.parents or path in candidate.parents
+                    for path in protected_paths
+                ):
+                    continue
+                is_generation = candidate in generations
+                is_staging = re.fullmatch(r"\.staging-[a-z0-9_]{8}", candidate.name)
+                is_marker = re.fullmatch(r"\.active-[0-9a-f]{32}", candidate.name)
+                if not (is_generation or is_staging or is_marker):
+                    continue
+                if not is_generation and candidate.lstat().st_mtime > cutoff:
+                    continue
+                # All installer-owned directories are flat. Reject an entire
+                # candidate with unknown contents; never recurse into any tree.
+                if is_marker:
+                    files = [candidate] if _plain(candidate, directory=False) else []
+                elif _plain(candidate, directory=True):
+                    files = list(candidate.iterdir())
+                    if any(
+                        path.name not in _RUNTIME_FILES or not _plain(path, directory=False)
+                        for path in files
+                    ):
+                        continue
+                else:
+                    continue
+                for path in files:
+                    if stop.is_set():
+                        return
+                    if not _plain_directory_chain(path.parent) or not _plain(path, directory=False):
+                        break
+                    path.unlink()
+                else:
+                    if not is_marker and not stop.is_set() and _plain_directory_chain(candidate):
+                        candidate.rmdir()
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise RuntimeRepairError("cleanup_failed") from exc
 
     async def close(self) -> None:
         """Stop repairs before cog unload; existing activated binaries stay on disk."""

@@ -13,6 +13,7 @@ from collections.abc import Awaitable
 from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from itertools import islice
 from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlsplit
 
@@ -42,6 +43,7 @@ from .ui.embeds import (
 from .ui.controller import PlayerControllerView
 from .playback.errors import PlaybackUnavailable
 from .playback.interfaces import PlaybackSession
+from .playback.requests import current_request, playback_request, request_is_cancelled
 from .playback.models import PlaybackEntry, SourceKind, SourceReference
 from .playback.ffmpeg import FFmpegSourceFactory, _default_locator as _default_ffmpeg_locator
 from .playback.runtime_repair import DENO_VERSION, ManagedRuntime, RuntimeRepairError
@@ -1207,6 +1209,10 @@ class TidalPlayerExp(commands.Cog):
                 "Unload Audio and the original TidalPlayer before loading TidalPlayerExp."
             )
         await asyncio.to_thread(initialize_voice_runtime)
+        try:
+            await self.runtime.cleanup(protected_paths=())
+        except RuntimeRepairError as error:
+            log.warning("Native runtime cleanup deferred (%s)", error.code)
         await self._migrate_config()
         await self._initialize_apis()
         self._persistent_view = PlayerControllerView(self)
@@ -1486,6 +1492,11 @@ class TidalPlayerExp(commands.Cog):
         log.info(f"TidalPlayerExp fully initialized in {elapsed:.2f}s")
 
     async def _initialize_spotify(self) -> None:
+        async with self._spotify_commit_lock:
+            await self._initialize_spotify_locked()
+
+    async def _initialize_spotify_locked(self) -> None:
+        """Initialize while holding the shared credential commit boundary."""
         async with self._spotify_auth_lock:
             self.sp = None
             self._spotify_auth_manager = None
@@ -1524,12 +1535,13 @@ class TidalPlayerExp(commands.Cog):
                             timeout=15.0,
                         )
                         self._spotify_auth_manager = oauth
-                        self._spotify_refresh_token = str(validated["refresh_token"])
-                        if self._spotify_refresh_token != stored_refresh_token:
+                        refresh_token = str(validated["refresh_token"])
+                        if refresh_token != stored_refresh_token:
                             await self.bot.set_shared_api_tokens(
                                 "spotify",
-                                refresh_token=self._spotify_refresh_token,
+                                refresh_token=refresh_token,
                             )
+                        self._spotify_refresh_token = refresh_token
                         return
 
                 self.sp = await self.tidal._run_blocking(
@@ -1649,7 +1661,7 @@ class TidalPlayerExp(commands.Cog):
                 "spotify",
                 refresh_token=str(token_info["refresh_token"]),
             )
-            await self._initialize_spotify()
+            await self._initialize_spotify_locked()
             if self._spotify_auth_manager is None or self.sp is None:
                 raise RuntimeError("Spotify session could not activate after authorization.")
 
@@ -1666,6 +1678,7 @@ class TidalPlayerExp(commands.Cog):
         timeout: float,
     ) -> Any:
         client = self.sp
+        oauth = self._spotify_auth_manager
         if client is None:
             raise RuntimeError("Spotify client is unavailable")
         result = await self.tidal._run_blocking(
@@ -1673,18 +1686,20 @@ class TidalPlayerExp(commands.Cog):
             timeout=timeout,
         )
 
-        oauth = self._spotify_auth_manager
         if oauth is not None:
             try:
-                token_info = oauth.cache_handler.get_cached_token()
-                if isinstance(token_info, dict) and token_info.get("refresh_token"):
-                    refresh_token = str(token_info["refresh_token"])
-                    if refresh_token != self._spotify_refresh_token:
-                        self._spotify_refresh_token = refresh_token
-                        await self.bot.set_shared_api_tokens(
-                            "spotify",
-                            refresh_token=refresh_token,
-                        )
+                async with self._spotify_commit_lock:
+                    if self._closing or self.sp is not client or self._spotify_auth_manager is not oauth:
+                        return result
+                    token_info = oauth.cache_handler.get_cached_token()
+                    if isinstance(token_info, dict) and token_info.get("refresh_token"):
+                        refresh_token = str(token_info["refresh_token"])
+                        if refresh_token != self._spotify_refresh_token:
+                            await self.bot.set_shared_api_tokens(
+                                "spotify",
+                                refresh_token=refresh_token,
+                            )
+                            self._spotify_refresh_token = refresh_token
             except Exception as error:
                 _log_provider_failure("Spotify", "token persistence", error)
         return result
@@ -1808,6 +1823,9 @@ class TidalPlayerExp(commands.Cog):
     async def _prepare_playback_session(self, ctx: commands.Context) -> PlaybackSession | None:
         if self._closing or ctx.guild is None:
             return None
+        if request_is_cancelled(self, ctx):
+            await ctx.send(embed=_error_embed("Playback request cancelled. Please try again."))
+            return None
         stop_generation = self._stop_generations[ctx.guild.id]
         channel = getattr(getattr(ctx.author, "voice", None), "channel", None)
         if channel is None:
@@ -1833,6 +1851,7 @@ class TidalPlayerExp(commands.Cog):
             await ctx.send(embed=_error_embed("Could not connect native voice. Check permissions and tidalsetup doctor."))
             return None
         if self._closing or stop_generation != self._stop_generations[ctx.guild.id]:
+            await ctx.send(embed=_error_embed("Playback request cancelled. Please try again."))
             return None
         self._playback_channels[ctx.guild.id] = ctx.channel
         return session
@@ -1879,12 +1898,16 @@ class TidalPlayerExp(commands.Cog):
                 queued += 1
             else:
                 skipped += 1
+                cancel_event.set()
+                break
         return queued, skipped
 
     async def _admit_entry(self, ctx: commands.Context, session: PlaybackSession, entry: PlaybackEntry, *, show_embed: bool = True, stop_generation: int | None = None) -> bool:
-        if self._closing or await self.backend.get(ctx.guild.id) is not session:
-            return False
-        if stop_generation is not None and stop_generation != self._stop_generations[ctx.guild.id]:
+        if (self._closing or await self.backend.get(ctx.guild.id) is not session
+                or request_is_cancelled(self, ctx)
+                or (stop_generation is not None and stop_generation != self._stop_generations[ctx.guild.id])):
+            if show_embed:
+                await ctx.send(embed=_error_embed("Playback request cancelled or voice session changed. Please try again."))
             return False
         snapshot = session.snapshot()
         was_waiting = snapshot.current is not None or bool(snapshot.queued)
@@ -1894,7 +1917,9 @@ class TidalPlayerExp(commands.Cog):
             return False
         self._guild_generations[ctx.guild.id] += 1
         self._playback_channels[ctx.guild.id] = ctx.channel
-        if was_waiting and show_embed:
+        # A separately posted player panel does not complete a deferred slash
+        # response. Acknowledge the first slash request as well as queued tracks.
+        if show_embed and (was_waiting or getattr(ctx, "interaction", None) is not None):
             try:
                 message = await ctx.send(embed=self._make_queued_embed(entry.meta))
                 task = asyncio.create_task(self._delete_after(message, QUEUED_EMBED_DELETE_DELAY))
@@ -1909,6 +1934,9 @@ class TidalPlayerExp(commands.Cog):
         kind: SourceKind | None = None,
     ) -> bool:
         stop_generation = self._stop_generations[ctx.guild.id]
+        if request_is_cancelled(self, ctx):
+            await ctx.send(embed=_error_embed("Playback request cancelled. Please try again."))
+            return False
         if session is None:
             session = await self._prepare_playback_session(ctx)
         if session is None:
@@ -2000,6 +2028,7 @@ class TidalPlayerExp(commands.Cog):
             _log_provider_failure("Tidal", "optional YouTube matching", error)
         return PlaybackEntry(secrets.token_hex(12), reference, None, meta, requester_id)
 
+    @playback_request()
     async def _handle_youtube_video(self, ctx: commands.Context, video_id: str) -> None:
         stop_generation = self._stop_generations[ctx.guild.id]
         session = await self._prepare_playback_session(ctx)
@@ -2016,6 +2045,7 @@ class TidalPlayerExp(commands.Cog):
             return
         await self._admit_entry(ctx, session, entry, stop_generation=stop_generation)
 
+    @playback_request()
     async def _handle_public_audio(self, ctx: commands.Context, parsed: ProviderURL) -> None:
         """Queue public SoundCloud/Bandcamp references without TIDAL authentication."""
         guild_id = ctx.guild.id
@@ -2353,36 +2383,39 @@ class TidalPlayerExp(commands.Cog):
         from .ui.embeds import make_queue_embed
         return make_queue_embed(meta)
 
-    async def _resend_controller_for_track_start(self, *, guild_id: int) -> None:
+    async def _resend_controller_for_track_start(
+        self, *, guild_id: int, ctx: commands.Context | None = None,
+    ) -> bool:
         entry = self._current_entries.get(guild_id)
         if entry is None or not await self._entry_is_current(guild_id, entry.entry_id):
-            return
+            return False
         previous = self._controller_messages.pop(guild_id, None)
         self._stop_controller_view(guild_id)
         channel = self._playback_channels.get(guild_id)
         if previous is not None:
             await _delete_message_safe(previous)
         if channel is None or not await self._entry_is_current(guild_id, entry.entry_id):
-            return
+            return False
         session = await self.backend.get(guild_id)
         if session is None:
-            return
+            return False
         view = await self._controller_view(guild_id, session.snapshot().paused)
         if not await self._entry_is_current(guild_id, entry.entry_id):
             view.stop()
-            return
+            return False
         try:
-            message = await channel.send(view=view)
+            message = await (ctx.send(view=view) if ctx is not None else channel.send(view=view))
         except discord.HTTPException:
             view.stop()
-            return
+            return False
         if not await self._entry_is_current(guild_id, entry.entry_id):
             view.stop()
             await _delete_message_safe(message)
-            return
+            return False
         self._stop_controller_view(guild_id)
         self._controller_views[guild_id] = view
         self._controller_messages[guild_id] = message
+        return True
 
     def _remember_track(self, guild_id: int, meta: TrackMeta) -> None:
         track_id = str(meta.get("track_id") or "")
@@ -2804,6 +2837,7 @@ class TidalPlayerExp(commands.Cog):
             _log_provider_failure("Tidal", "batch track resolution", error)
             return None
 
+    @playback_request(batch=True)
     async def _process_track_list(
         self,
         ctx: commands.Context,
@@ -2823,7 +2857,8 @@ class TidalPlayerExp(commands.Cog):
         if not player:
             return
         guild_id = ctx.guild.id
-        cancel_event = self._claim_batch(guild_id)
+        request = current_request(self, ctx)
+        cancel_event = request.batch if request is not None else self._claim_batch(guild_id)
         if cancel_event is None:
             await ctx.send(embed=_error_embed(Messages.ERROR_BATCH_IN_PROGRESS))
             return
@@ -2892,6 +2927,7 @@ class TidalPlayerExp(commands.Cog):
         finally:
             self._release_batch(guild_id, cancel_event)
 
+    @playback_request()
     async def _handle_track(self, ctx: commands.Context, tid: str) -> None:
         t = await self.tidal.get_track(tid)
         if t:
@@ -2899,6 +2935,7 @@ class TidalPlayerExp(commands.Cog):
         else:
             await ctx.send(embed=_error_embed(Messages.ERROR_NO_TRACKS_FOUND))
 
+    @playback_request()
     async def _handle_video(self, ctx: commands.Context, vid: str) -> None:
         v = await self.tidal.get_video(vid)
         if v:
@@ -2906,6 +2943,7 @@ class TidalPlayerExp(commands.Cog):
         else:
             await ctx.send(embed=_error_embed(Messages.ERROR_NO_TRACKS_FOUND))
 
+    @playback_request(batch=True)
     async def _handle_album(self, ctx: commands.Context, aid: str) -> None:
         alb = await self.tidal.get_album(aid)
         if not alb:
@@ -2921,6 +2959,7 @@ class TidalPlayerExp(commands.Cog):
         tracks, thumb = await asyncio.gather(self.tidal.get_items(alb), _get_thumb())
         await self._process_track_list(ctx, tracks, getattr(alb, "name", aid), lambda t: t, thumbnail_url=thumb)
 
+    @playback_request(batch=True)
     async def _handle_playlist(self, ctx: commands.Context, pid: str) -> None:
         pl = await self.tidal.get_playlist(pid)
         if not pl:
@@ -2929,6 +2968,7 @@ class TidalPlayerExp(commands.Cog):
         tracks = await self.tidal.get_items(pl)
         await self._process_track_list(ctx, tracks, getattr(pl, "name", pid), lambda t: t)
 
+    @playback_request(batch=True)
     async def _handle_mix(self, ctx: commands.Context, mid: str) -> None:
         mix = await self.tidal.get_mix(mid)
         if not mix:
@@ -2940,6 +2980,7 @@ class TidalPlayerExp(commands.Cog):
 
     @commands.hybrid_command(name="tplay")
     @commands.guild_only()
+    @playback_request()
     async def tplay(self, ctx: commands.Context, *, query: str):
         """Play Tidal content, provider links, or a Tidal search result."""
         await ctx.defer()
@@ -3003,6 +3044,7 @@ class TidalPlayerExp(commands.Cog):
         else:
             await self._load_and_queue_track(ctx, results[0])
 
+    @playback_request(batch=True)
     async def _handle_spotify_playlist(self, ctx: commands.Context, url: str) -> None:
         if not self.sp:
             await ctx.send(embed=_error_embed(Messages.ERROR_NO_SPOTIFY))
@@ -3035,6 +3077,7 @@ class TidalPlayerExp(commands.Cog):
             _log_provider_failure("Spotify", "playlist import", error)
             await ctx.send(embed=_error_embed(Messages.ERROR_FETCH_FAILED))
 
+    @playback_request()
     async def _handle_spotify_track(self, ctx: commands.Context, url: str) -> None:
         if not self.sp:
             await ctx.send(embed=_error_embed(Messages.ERROR_NO_SPOTIFY))
@@ -3066,6 +3109,7 @@ class TidalPlayerExp(commands.Cog):
             _log_provider_failure("Spotify", "track import", error)
             await ctx.send(embed=_error_embed(Messages.ERROR_FETCH_FAILED))
 
+    @playback_request(batch=True)
     async def _handle_spotify_album(self, ctx: commands.Context, url: str) -> None:
         if not self.sp:
             await ctx.send(embed=_error_embed(Messages.ERROR_NO_SPOTIFY))
@@ -3090,6 +3134,7 @@ class TidalPlayerExp(commands.Cog):
             _log_provider_failure("Spotify", "album import", error)
             await ctx.send(embed=_error_embed(Messages.ERROR_FETCH_FAILED))
 
+    @playback_request()
     async def _handle_youtube_playlist(self, ctx: commands.Context, playlist_id: str) -> None:
         session = await self._prepare_playback_session(ctx)
         if session is None:
@@ -3156,8 +3201,10 @@ class TidalPlayerExp(commands.Cog):
 
     @commands.hybrid_command(name="tsearch")
     @commands.guild_only()
+    @playback_request()
     async def tsearch(self, ctx: commands.Context, *, query: str):
         """Search Tidal and choose from top results."""
+        await ctx.defer()
         if not await self.check_ready(ctx):
             return
         filter_remixes = await self.config.guild(ctx.guild).filter_remixes()
@@ -3175,6 +3222,7 @@ class TidalPlayerExp(commands.Cog):
         """Resend the current native playback controller."""
         if ctx.guild is None:
             return
+        await ctx.defer()
         session = await self.backend.get(ctx.guild.id)
         current = session.snapshot().current if session is not None else None
         if current is None:
@@ -3184,7 +3232,8 @@ class TidalPlayerExp(commands.Cog):
         self._current_entries[ctx.guild.id] = current
         self._current_meta[ctx.guild.id] = current.meta
         self._controller_meta[ctx.guild.id] = current.meta
-        await self._resend_controller_for_track_start(guild_id=ctx.guild.id)
+        if not await self._resend_controller_for_track_start(guild_id=ctx.guild.id, ctx=ctx):
+            await ctx.send(embed=_error_embed("Could not refresh the player panel. Playback may have changed."))
 
     @commands.hybrid_command(name="tqueue")
     @commands.guild_only()
@@ -3504,7 +3553,7 @@ class TidalPlayerExp(commands.Cog):
             self._clear_spotify_login(owner_id)
         async with self._spotify_commit_lock:
             await self.bot.remove_shared_api_tokens("spotify", "refresh_token")
-            await self._initialize_spotify()
+            await self._initialize_spotify_locked()
         await ctx.send(embed=_success_embed("Spotify user session logged out."))
 
     @tidalsetup.command(name="youtube")

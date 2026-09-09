@@ -208,7 +208,7 @@ async def test_spotify_oauth_exchange_persists_token_and_activates_client(cog) -
 
     with (
         patch.object(type(cog), "_new_spotify_oauth", return_value=oauth),
-        patch.object(type(cog), "_initialize_spotify", new=activate),
+        patch.object(type(cog), "_initialize_spotify_locked", new=activate),
         patch.object(type(cog.tidal), "_run_blocking", new=_run_now),
         patch("asyncio.get_running_loop") as get_loop,
     ):
@@ -391,7 +391,7 @@ async def test_spotify_callback_modal_does_not_echo_unexpected_exception_text(co
 async def test_spotifylogout_removes_only_user_token_and_keeps_app_credentials(cog) -> None:
     ctx = SimpleNamespace(send=AsyncMock())
 
-    with patch.object(type(cog), "_initialize_spotify", new=AsyncMock()) as initialize:
+    with patch.object(type(cog), "_initialize_spotify_locked", new=AsyncMock()) as initialize:
         await cog.tidalsetup_spotifylogout(ctx)
 
     cog.bot.remove_shared_api_tokens.assert_awaited_once_with("spotify", "refresh_token")

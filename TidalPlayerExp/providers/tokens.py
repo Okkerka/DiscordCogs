@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable
-from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -54,14 +53,12 @@ class TokenSnapshot:
         }
 
 
-class ConfigGroupContext(
-    AbstractAsyncContextManager[dict[str, Any]], Awaitable[dict[str, Any]], Protocol
-):
-    """Red's global values support both reads and locked read-modify-write."""
-
-
 class ConfigLike(Protocol):
-    def all(self) -> ConfigGroupContext: ...
+    def all(self) -> Awaitable[dict[str, Any]]: ...
+
+    def get_lock(self) -> asyncio.Lock: ...
+
+    async def set(self, value: dict[str, Any]) -> None: ...
 
 
 class TokenRepository:
@@ -80,16 +77,19 @@ class TokenRepository:
     async def replace(self, snapshot: TokenSnapshot) -> None:
         if not snapshot.is_complete:
             raise ValueError("OAuth snapshot must contain all fields")
-        async with self._lock:
+        async with self._lock, self._config.get_lock():
             # Persist one credential generation in a single group write while
-            # retaining schema metadata and other global settings.
-            async with self._config.all() as data:
-                data.update(snapshot.as_mapping())
+            # retaining other settings. Own the lock explicitly: Red's all()
+            # context can retain its lock if the initial storage read raises.
+            data = await self._config.all()
+            data.update(snapshot.as_mapping())
+            await self._config.set(data)
 
     async def clear(self) -> None:
-        async with self._lock:
-            async with self._config.all() as data:
-                data.update(dict.fromkeys(self._FIELDS))
+        async with self._lock, self._config.get_lock():
+            data = await self._config.all()
+            data.update(dict.fromkeys(self._FIELDS))
+            await self._config.set(data)
 
 
 class TokenService:
