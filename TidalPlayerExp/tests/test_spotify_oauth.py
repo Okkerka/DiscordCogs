@@ -238,7 +238,9 @@ def test_spotify_playlist_item_supports_current_item_field(cog) -> None:
     }
 
     module = __import__(cog.__class__.__module__, fromlist=["unused"])
-    assert module._spotify_item_to_query(item) == "isrc:USAAA0000001"
+    candidate = module._spotify_item_to_query(item)
+    assert candidate.isrc == "USAAA0000001"
+    assert candidate.query == "Track Artist"
 
 
 @pytest.mark.asyncio

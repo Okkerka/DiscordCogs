@@ -8,6 +8,7 @@ from typing import Any
 from rapidfuzz import fuzz
 
 from .identity import normalize_identity_text
+from .candidates import NormalizedCandidate
 
 _OFFICIAL_MARKERS = frozenset({"official", "audio", "video", "lyrics", "visualizer", "hd", "4k"})
 _OFFICIAL_MUSIC_VIDEO_RE = re.compile(r"\bofficial music video\b")
@@ -111,13 +112,31 @@ def select_confident_youtube_tidal_track(
     return best_track
 
 
-def select_best_tidal_track(query: str, tracks: Iterable[Any], *, minimum_score: float = 88.0) -> Any | None:
-    normalized_query = _normalize(query)
+def select_best_tidal_track(query: str | NormalizedCandidate, tracks: Iterable[Any], *, minimum_score: float = 88.0) -> Any | None:
+    """Match external recordings without letting a title subset hide a wrong artist."""
+    structured = query if isinstance(query, NormalizedCandidate) else None
+    normalized_query = _normalize(structured.query if structured else query)
     if not normalized_query:
         return None
     best_track: Any | None = None
     best_score = 0.0
     for track in tracks:
+        title, artist = _normalize(_title(track)), _normalize(_artist(track))
+        if not title:
+            continue
+        if structured:
+            if not artist or not any(_normalize(value) == artist for value in structured.artists):
+                continue
+            if _recording_variants(structured.title) != _recording_variants(_title(track)):
+                continue
+            if _identity_title(structured.title) != _identity_title(_title(track)):
+                continue
+            duration = getattr(track, "duration", None)
+            if (structured.duration and isinstance(duration, (int, float)) and duration > 0
+                    and abs(duration - structured.duration) > max(10, structured.duration * .05)):
+                continue
+        elif normalized_query != title and not _artist_is_explicit(artist, normalized_query, ""):
+            continue
         title_score = fuzz.token_set_ratio(normalized_query, _normalize(_title(track)))
         combined_score = fuzz.token_set_ratio(normalized_query, _normalize(f"{_title(track)} {_artist(track)}"))
         score = (title_score * 0.55) + (combined_score * 0.45)

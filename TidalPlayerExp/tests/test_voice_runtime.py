@@ -46,13 +46,14 @@ elif mode == 'broken':
 
 from TidalPlayerExp.tidalplayer import TidalPlayerExp
 
-async def noop():
+async def noop(**kwargs):
     pass
 
 async def main():
     # Config and provider initialization are unrelated to local voice loading.
     cog = SimpleNamespace(
         bot=SimpleNamespace(get_cog=lambda name: None, add_view=lambda view: None),
+        runtime=SimpleNamespace(cleanup=noop),
         _migrate_config=noop, _initialize_apis=noop,
     )
     await TidalPlayerExp.cog_load(cog)

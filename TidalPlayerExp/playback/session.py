@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
+import random
+import secrets
 import threading
+import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
@@ -119,6 +123,12 @@ class NativePlaybackSession:
         self._closed = False
         self._running = False
         self._failures = 0
+        self._volume = 100
+        self._repeat = "off"
+        self._next_entry: PlaybackEntry | None = None
+        self._pause_on_start = False
+        self._started_at: float | None = None
+        self._paused_at: float | None = None
         self._runner: asyncio.Task[None] | None = None
         self._cleanup_barrier: asyncio.Future[list[object]] | None = None
         self._close_task: asyncio.Task[None] | None = None
@@ -139,26 +149,128 @@ class NativePlaybackSession:
         """Return detached immutable state; all mutations occur on the event loop."""
         channel_id = self._voice_client.channel.id if self._owned() else None
         return PlaybackSnapshot(
-            self._current, tuple(self._queue), self._paused, channel_id
+            self._current, tuple(self._queue), self._paused, channel_id,
+            self._volume, self._repeat, self._position(), self._failures >= 3 and not self._running,
         )
+
+    def _position(self) -> float:
+        if self._current is None:
+            return 0.0
+        elapsed = 0.0 if self._started_at is None else (self._paused_at or time.monotonic()) - self._started_at
+        return max(0.0, self._current.start_time + elapsed)
 
     def _owned(self) -> bool:
         return self._voice_client.guild.voice_client is self._voice_client
 
     async def enqueue(
-        self, entry: PlaybackEntry, *, start_if_idle: bool = True
+        self, entry: PlaybackEntry, *, start_if_idle: bool = True, next_up: bool = False
     ) -> bool:
         """Admit one waiting entry promptly without awaiting media preparation."""
         async with self._lock:
             if self._closed or len(self._queue) >= self._capacity:
                 return False
-            self._queue.append(entry)
+            if next_up:
+                self._queue.appendleft(entry)
+            else:
+                self._queue.append(entry)
             self._failures = 0
             if start_if_idle:
                 self._running = True
                 if self._runner is None or self._runner.done():
                     self._runner = asyncio.create_task(self._run())
             return True
+
+    async def remove(self, index: int) -> PlaybackEntry | None:
+        """Remove a one-based waiting position, never the current track."""
+        async with self._lock:
+            if self._closed or isinstance(index, bool) or not isinstance(index, int) or not 1 <= index <= len(self._queue):
+                return None
+            removed = self._queue[index - 1]
+            del self._queue[index - 1]
+            return removed
+
+    async def clear_queue(self) -> int:
+        """Clear waiting tracks without interrupting current audio."""
+        async with self._lock:
+            count = len(self._queue)
+            self._queue.clear()
+            return count
+
+    async def move(self, index: int, destination: int) -> bool:
+        """Move between one-based waiting positions atomically."""
+        async with self._lock:
+            if self._closed or any(isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= len(self._queue) for value in (index, destination)):
+                return False
+            moved = self._queue[index - 1]
+            del self._queue[index - 1]
+            self._queue.insert(destination - 1, moved)
+            return True
+
+    async def shuffle_queue(self) -> bool:
+        """Shuffle waiting tracks, leaving playback untouched."""
+        async with self._lock:
+            if self._closed or len(self._queue) < 2:
+                return False
+            items = list(self._queue)
+            random.shuffle(items)
+            self._queue = deque(items)
+            return True
+
+    async def set_repeat(self, mode: str) -> None:
+        """Repeat successful tracks only; skips and failures never repeat."""
+        if mode not in {"off", "track", "queue"}:
+            raise ValueError("Repeat must be off, track, or queue")
+        async with self._lock:
+            self._repeat = mode
+
+    async def resume_queue(self) -> bool:
+        """Explicitly retry waiting tracks after the repeated-failure guard halted."""
+        async with self._lock:
+            if self._closed or self._running or self._current is not None or not self._queue:
+                return False
+            self._failures = 0
+            self._running = True
+            if self._runner is None or self._runner.done():
+                self._runner = asyncio.create_task(self._restart(self._cleanup_barrier, None))
+            return True
+
+    def _replace_current(self, position: float) -> Awaitable[object] | None:
+        """Called under the state lock; the predecessor retains source cleanup."""
+        assert self._current is not None
+        current, paused = self._current, self._paused
+        self._interrupt()
+        self._next_entry = replace(current, entry_id=secrets.token_hex(12), start_time=position)
+        self._pause_on_start = paused
+        self._running = True
+        self._runner = asyncio.create_task(self._restart(self._cleanup_barrier, None))
+        return self._cleanup_barrier
+
+    async def seek(self, seconds: float) -> bool:
+        """Restart the same finite track at an absolute offset, preserving its queue."""
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or seconds < 0:
+            return False
+        async with self._lock:
+            if self._closed or self._current is None or not 0 <= seconds < self._current.meta["duration"]:
+                return False
+            barrier = self._replace_current(float(seconds))
+        await self._wait_predecessor(barrier)
+        return True
+
+    async def set_volume(self, percent: int) -> None:
+        """Set 0–150 percent gain, rebuffering current audio at its existing position."""
+        if isinstance(percent, bool) or not isinstance(percent, int) or not 0 <= percent <= 150:
+            raise ValueError("Volume must be between 0 and 150")
+        async with self._lock:
+            if self._closed:
+                raise PlaybackUnavailable()
+            if percent == self._volume:
+                return
+            self._volume = percent
+            barrier = None
+            if self._current is not None:
+                position = self._position() if self._current.meta["duration"] > 0 else 0.0
+                barrier = self._replace_current(position)
+        await self._wait_predecessor(barrier)
 
     async def set_paused(self, paused: bool) -> bool:
         """Pause or resume only an active source owned by this session."""
@@ -168,8 +280,13 @@ class NativePlaybackSession:
             try:
                 if paused:
                     self._voice_client.pause()
+                    if not self._paused:
+                        self._paused_at = time.monotonic()
                 else:
                     self._voice_client.resume()
+                    if self._paused_at is not None and self._started_at is not None:
+                        self._started_at += time.monotonic() - self._paused_at
+                    self._paused_at = None
             except Exception as error:  # noqa: BLE001 - voice boundary may raise arbitrary errors
                 log.warning("Voice pause failed (%s)", type(error).__name__)
                 return False
@@ -193,6 +310,9 @@ class NativePlaybackSession:
             except Exception as error:  # noqa: BLE001 - still clean the owned source on stop failure
                 log.warning("Voice stop failed (%s)", type(error).__name__)
         self._current = None
+        self._next_entry = None
+        self._pause_on_start = False
+        self._started_at = self._paused_at = None
         # Register the dependency now, not inside the successor coroutine: a
         # successor can be cancelled before its first instruction executes.
         pending: list[Awaitable[object]] = []
@@ -242,6 +362,8 @@ class NativePlaybackSession:
         async with self._lock:
             if clear_queue:
                 self._queue.clear()
+            self._repeat = "off"
+            self._failures = 0
             self._running = False
             previous = self._interrupt()
             barrier = self._cleanup_barrier
@@ -332,6 +454,7 @@ class NativePlaybackSession:
         resolved = await asyncio.wait_for(
             self._resolver.resolve(entry.primary), self._resolve_timeout
         )
+        resolved = replace(resolved, start_time=entry.start_time, volume=self._volume)
         # Flat playlist/API metadata can omit duration. Publish the actual
         # resolved duration without mutating the queue entry or known values.
         if entry.meta["duration"] <= 0 and resolved.duration is not None:
@@ -392,14 +515,15 @@ class NativePlaybackSession:
                 if self._closed or not self._running:
                     return
                 generation = self._generation
-                if not self._queue:
+                if not self._queue and self._next_entry is None:
                     self._running = False
                     self._current = None
                     ended = previous
                     entry = None
                 else:
                     ended = None
-                    entry = self._queue.popleft()
+                    entry = self._next_entry if self._next_entry is not None else self._queue.popleft()
+                    self._next_entry = None
                     self._current = entry
                     self._generation += 1
                     generation = self._generation
@@ -434,6 +558,12 @@ class NativePlaybackSession:
                                 audio,
                                 after=self._after_callback(generation, completion),
                             )
+                            self._started_at = time.monotonic()
+                            if self._pause_on_start:
+                                self._voice_client.pause()
+                                self._paused = True
+                                self._paused_at = self._started_at
+                            self._pause_on_start = False
                     if not failed:
                         await self._notify("started", entry, generation)
                         if self._generation != generation:
@@ -457,9 +587,16 @@ class NativePlaybackSession:
                     return
                 self._current = None
                 self._paused = False
+                self._started_at = self._paused_at = None
                 self._failures = self._failures + 1 if failed else 0
                 if self._failures >= 3:
                     self._running = False
+                elif not failed and self._repeat != "off":
+                    repeated = replace(entry, entry_id=secrets.token_hex(12), start_time=0)
+                    if self._repeat == "track":
+                        self._next_entry = repeated
+                    elif len(self._queue) < self._capacity:
+                        self._queue.append(repeated)
             if failed:
                 await self._notify("failed", entry, generation)
                 previous = None

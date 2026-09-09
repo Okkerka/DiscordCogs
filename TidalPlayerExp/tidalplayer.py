@@ -28,6 +28,7 @@ from redbot.core.utils.views import SetApiView
 from .config_schema import COG_IDENTIFIER, GLOBAL_DEFAULTS, GUILD_DEFAULTS, SCHEMA_VERSION
 from .domain.models import PageResult as _PageResult
 from .domain.models import TrackMeta
+from .domain.candidates import NormalizedCandidate
 from .domain.matching import select_best_tidal_track, select_confident_youtube_tidal_track
 from .domain.identity import normalize_identity_text, recording_signature
 from .domain.normalization import (
@@ -135,6 +136,7 @@ RECENT_TRACK_HISTORY = 50
 SPOTIFY_REDIRECT_URI = "http://127.0.0.1:2402/callback"
 SPOTIFY_OAUTH_SCOPE = "playlist-read-private playlist-read-collaborative"
 SPOTIFY_LOGIN_TTL = 600.0
+YOUTUBE_MATCH_TIMEOUT = 8.0
 
 
 _CACHE_CAPS: Dict[str, int] = {
@@ -158,21 +160,19 @@ def _is_tidal_track(obj: Any) -> bool:
     )
 
 
-def _spotify_item_to_query(item: dict) -> str:
+def _spotify_item_to_query(item: dict) -> NormalizedCandidate:
     track = item.get("item") or item.get("track") or {}
-    isrc = (track.get("external_ids") or {}).get("isrc")
-    if isrc:
-        return f"isrc:{isrc}"
-    artists = " ".join(a.get("name", "") for a in track.get("artists", []) if a.get("name"))
-    return f"{track.get('name', '')} {artists}".strip()
+    return _spotify_album_item_to_query(track)
 
 
-def _spotify_album_item_to_query(item: dict) -> str:
+def _spotify_album_item_to_query(item: dict) -> NormalizedCandidate:
     isrc = (item.get("external_ids") or {}).get("isrc")
-    if isrc:
-        return f"isrc:{isrc}"
-    artists = " ".join(a.get("name", "") for a in item.get("artists", []) if a.get("name"))
-    return f"{item.get('name', '')} {artists}".strip()
+    artists = tuple(a["name"] for a in item.get("artists", []) if isinstance(a.get("name"), str) and a["name"])
+    duration = item.get("duration_ms")
+    return NormalizedCandidate(str(item.get("name") or ""), artists,
+        isrc=isrc if isinstance(isrc, str) else None,
+        duration=int(duration / 1000) if isinstance(duration, (int, float)) and duration > 0 else None,
+        source="spotify")
 
 
 class SpotifyLoginError(ValueError):
@@ -714,11 +714,16 @@ class TidalHandler:
                 def _fetch():
                     if hasattr(self.session, "get_tracks_by_isrc"):
                         results = self.session.get_tracks_by_isrc(isrc)
-                        return results[0] if results else None
-                    return None
+                        if isinstance(results, (list, tuple)):
+                            return results[0] if results else None
+                    return _CACHE_MISS
                 res = await self._run_with_backoff(_fetch, timeout=10.0)
+                if res is _CACHE_MISS:
+                    return None
                 if res:
                     self._set_cached("isrc", isrc, res, 3600.0)
+                elif res is None:
+                    self._set_cached("isrc", isrc, None, 30.0)
                 return res
             except Exception as error:
                 _log_provider_failure("Tidal", "ISRC lookup", error)
@@ -791,6 +796,9 @@ class TidalHandler:
             log.warning("Tidal Track Radio returned no usable tracks for %s.", track_id)
         return tracks
     async def get_video(self, video_id: str) -> Optional[Any]:
+        return await self._coalesce("video", video_id, lambda: self._get_video_uncached(video_id))
+
+    async def _get_video_uncached(self, video_id: str) -> Optional[Any]:
         if not self.session or not hasattr(self.session, "video"):
             return None
         cached = self._get_cached("video", video_id)
@@ -807,6 +815,9 @@ class TidalHandler:
                 return None
 
     async def get_album(self, album_id: str) -> Optional[Any]:
+        return await self._coalesce("album", album_id, lambda: self._get_album_uncached(album_id))
+
+    async def _get_album_uncached(self, album_id: str) -> Optional[Any]:
         if not self.session:
             return None
         cached = self._get_cached("album", album_id)
@@ -822,6 +833,9 @@ class TidalHandler:
                 return None
 
     async def get_playlist(self, playlist_id: str) -> Optional[Any]:
+        return await self._coalesce("playlist", playlist_id, lambda: self._get_playlist_uncached(playlist_id))
+
+    async def _get_playlist_uncached(self, playlist_id: str) -> Optional[Any]:
         if not self.session:
             return None
         cached = self._get_cached("playlist", playlist_id)
@@ -837,6 +851,9 @@ class TidalHandler:
                 return None
 
     async def get_mix(self, mix_id: str) -> Optional[Any]:
+        return await self._coalesce("mix", mix_id, lambda: self._get_mix_uncached(mix_id))
+
+    async def _get_mix_uncached(self, mix_id: str) -> Optional[Any]:
         if not self.session:
             return None
         cached = self._get_cached("mix", mix_id)
@@ -969,10 +986,10 @@ class TidalHandler:
         def _fetch():
             if hasattr(container, "tracks"):
                 val = container.tracks
-                return list(val() if callable(val) else val)
+                return list(islice(val() if callable(val) else val, MAX_ITEMS))
             if hasattr(container, "items"):
                 val = container.items
-                return list(val() if callable(val) else val)
+                return list(islice(val() if callable(val) else val, MAX_ITEMS))
             return []
         async with self.api_semaphore:
             try:
@@ -995,17 +1012,18 @@ class TidalHandler:
             async with self.api_semaphore:
                 try:
                     def _fetch(o: int = offset, sparse: Optional[bool] = _sparse_supported) -> _PageResult:
+                        limit = min(PAGINATION_LIMIT, MAX_ITEMS - o)
                         if sparse is False:
                             return _PageResult(
-                                items=list(container.items(limit=PAGINATION_LIMIT, offset=o)),
+                                items=list(islice(container.items(limit=limit, offset=o), limit)),
                                 sparse_supported=None,
                             )
                         try:
-                            result = list(container.items(limit=PAGINATION_LIMIT, offset=o, sparse_album=True))
+                            result = list(islice(container.items(limit=limit, offset=o, sparse_album=True), limit))
                             return _PageResult(items=result, sparse_supported=True)
                         except TypeError:
                             return _PageResult(
-                                items=list(container.items(limit=PAGINATION_LIMIT, offset=o)),
+                                items=list(islice(container.items(limit=limit, offset=o), limit)),
                                 sparse_supported=False,
                             )
                     page: _PageResult = await self._run_with_backoff(_fetch, timeout=25.0)
@@ -1712,8 +1730,10 @@ class TidalPlayerExp(commands.Cog):
         key = tokens.get("api_key")
         if key:
             try:
+                from .providers.google_transport import IsolatedHttpRequest
                 self.yt = await self.tidal._run_blocking(
-                    lambda: build("youtube", "v3", developerKey=key, cache_discovery=False),
+                    lambda: build("youtube", "v3", developerKey=key, cache_discovery=False,
+                                  requestBuilder=IsolatedHttpRequest),
                     timeout=15.0,
                 )
             except Exception as error:
@@ -2011,17 +2031,16 @@ class TidalPlayerExp(commands.Cog):
         reference = SourceReference(SourceKind.YOUTUBE, video.video_id)
         meta = self._youtube_track_meta(video)
         try:
-            if TIDALAPI_AVAILABLE and await self.tidal.is_logged_in():
-                results = await asyncio.wait_for(
-                    self.tidal.search(f"{video.title} {video.channel or ''}", filter_remixes=False), 15.0,
-                )
-                match = select_confident_youtube_tidal_track(video.title, video.channel or "", results)
-                if match is not None:
-                    tidal_meta = await self._extract_meta(match, skip_audio_res=True)
-                    return PlaybackEntry(
-                        secrets.token_hex(12), SourceReference(SourceKind.TIDAL, str(match.id)),
-                        reference, tidal_meta, requester_id, fallback_meta=meta,
-                    )
+            async with asyncio.timeout(YOUTUBE_MATCH_TIMEOUT):
+                if TIDALAPI_AVAILABLE and await self.tidal.is_logged_in():
+                    results = await self.tidal.search(f"{video.title} {video.channel or ''}", filter_remixes=False)
+                    match = select_confident_youtube_tidal_track(video.title, video.channel or "", results)
+                    if match is not None:
+                        tidal_meta = await self._extract_meta(match, skip_audio_res=True)
+                        return PlaybackEntry(
+                            secrets.token_hex(12), SourceReference(SourceKind.TIDAL, str(match.id)),
+                            reference, tidal_meta, requester_id, fallback_meta=meta,
+                        )
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -2191,7 +2210,7 @@ class TidalPlayerExp(commands.Cog):
                     continue
                 if not results:
                     continue
-                track = select_best_tidal_track(f"{artist} {title}", results)
+                track = select_best_tidal_track(NormalizedCandidate(title, (artist,), source="lastfm"), results)
                 if track is None:
                     continue
                 track_id = str(getattr(track, "id", "") or "")
@@ -2718,11 +2737,11 @@ class TidalPlayerExp(commands.Cog):
             offset += 100
         return all_items[:MAX_ITEMS]
 
-    async def _fetch_all_spotify_album_tracks(self, album_id: str) -> Tuple[List[Any], str]:
+    async def _fetch_all_spotify_album_tracks(self, album_id: str, album_meta: dict | None = None) -> Tuple[List[Any], str]:
         all_items: List[Any] = []
         album_name = album_id
         try:
-            alb = await self._run_spotify(
+            alb = album_meta if album_meta is not None else await self._run_spotify(
                 lambda client: client.album(album_id),
                 timeout=15.0,
             )
@@ -2822,11 +2841,13 @@ class TidalPlayerExp(commands.Cog):
             if _is_tidal_track(query):
                 track = query
             else:
+                if isinstance(query, NormalizedCandidate) and query.isrc:
+                    track = await self.tidal.get_track_by_isrc(query.isrc)
                 if isinstance(query, str) and ISRC_PATTERN.match(query):
                     isrc = ISRC_PATTERN.match(query).group(1).upper()
                     track = await self.tidal.get_track_by_isrc(isrc)
                 if not track:
-                    results = await self.tidal.search(query, filter_remixes=filter_remixes)
+                    results = await self.tidal.search(query.query if isinstance(query, NormalizedCandidate) else query, filter_remixes=filter_remixes)
                     if results:
                         track = select_best_tidal_track(query, results)
             if not track:
@@ -3099,10 +3120,11 @@ class TidalPlayerExp(commands.Cog):
                     await self._load_and_queue_track(ctx, track)
                     return
             filter_remixes = await self.config.guild(ctx.guild).filter_remixes()
-            query = f"{item['name']} {' '.join(a['name'] for a in item.get('artists', []))}"
-            results = await self.tidal.search(query, filter_remixes=filter_remixes)
-            if results:
-                await self._load_and_queue_track(ctx, results[0])
+            candidate = _spotify_album_item_to_query(item)
+            results = await self.tidal.search(candidate.query, filter_remixes=filter_remixes)
+            matched = select_best_tidal_track(candidate, results)
+            if matched:
+                await self._load_and_queue_track(ctx, matched)
             else:
                 await ctx.send(embed=_error_embed(Messages.ERROR_NO_TRACKS_FOUND))
         except Exception as error:
@@ -3124,7 +3146,7 @@ class TidalPlayerExp(commands.Cog):
                 lambda client: client.album(album_id),
                 timeout=15.0,
             )
-            items, album_name = await self._fetch_all_spotify_album_tracks(album_id)
+            items, album_name = await self._fetch_all_spotify_album_tracks(album_id, album_meta)
             thumb = album_meta.get("images", [{}])[0].get("url") if album_meta.get("images") else None
             await self._process_track_list(
                 ctx, items, album_name,

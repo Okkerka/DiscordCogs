@@ -565,6 +565,8 @@ class FFmpegSourceFactory:
         ]
         if headers is not None:
             argv.extend(("-headers", headers))
+        if source.start_time:
+            argv.extend(("-ss", f"{source.start_time:.3f}"))
         argv.extend(
             (
                 "-i",
@@ -581,6 +583,13 @@ class FFmpegSourceFactory:
         if copied:
             argv.extend(("-c:a", "copy"))
         else:
+            if source.volume != 100:
+                # The limiter prevents amplification above full scale; disable
+                # its automatic makeup gain so quiet settings stay quiet.
+                gain = f"volume={source.volume / 100:.2f}"
+                if source.volume > 100:
+                    gain += ",alimiter=limit=1:level=false:latency=true"
+                argv.extend(("-af", gain))
             argv.extend(
                 (
                     "-c:a",
@@ -705,6 +714,8 @@ class FFmpegSourceFactory:
             and source.codec.lower() == "opus"
             and source.sample_rate == 48_000
             and source.channels == 2
+            and source.volume == 100
+            and source.start_time == 0
         )
         if not capability.passthrough or (not copied and not capability.libopus):
             raise PlaybackUnavailable()

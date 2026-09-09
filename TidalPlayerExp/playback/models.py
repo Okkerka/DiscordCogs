@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -25,6 +26,7 @@ class SourceKind(StrEnum):
     YOUTUBE = "youtube"
     SOUNDCLOUD = "soundcloud"
     BANDCAMP = "bandcamp"
+    ATTACHMENT = "attachment"
 
 
 _YOUTUBE_IDENTIFIER = re.compile(r"[A-Za-z0-9_-]{11}\Z")
@@ -111,6 +113,8 @@ class SourceReference:
                 and self.identifier.isdecimal()
                 and any(character != "0" for character in self.identifier)
             )
+        elif self.kind is SourceKind.ATTACHMENT:
+            valid = re.fullmatch(r"[0-9a-f]{32}", self.identifier) is not None
         elif self.kind in (SourceKind.SOUNDCLOUD, SourceKind.BANDCAMP):
             try:
                 provider, content_type, canonical = canonical_public_audio_url(self.identifier)
@@ -138,6 +142,8 @@ class ResolvedSource:
     sample_rate: int | None = None
     channels: int | None = None
     duration: int | None = None
+    start_time: float = 0.0
+    volume: int = 100
 
     def __post_init__(self) -> None:
         if not isinstance(self.url, str):
@@ -162,6 +168,10 @@ class ResolvedSource:
         _validate_positive(self.sample_rate, "Sample rate")
         _validate_positive(self.channels, "Channel count")
         _validate_positive(self.duration, "Duration")
+        if not isinstance(self.start_time, (int, float)) or isinstance(self.start_time, bool) or not math.isfinite(self.start_time) or self.start_time < 0:
+            raise ValueError("Playback offset is invalid")
+        if isinstance(self.volume, bool) or not isinstance(self.volume, int) or not 0 <= self.volume <= 150:
+            raise ValueError("Volume must be between 0 and 150")
 
     def __repr__(self) -> str:
         """Return a constant representation that cannot expose media details."""
@@ -179,8 +189,11 @@ class PlaybackEntry:
     meta: TrackMeta
     requester_id: int | None
     fallback_meta: TrackMeta | None = None
+    start_time: float = 0.0
 
     def __post_init__(self) -> None:
+        if not isinstance(self.start_time, (int, float)) or isinstance(self.start_time, bool) or not math.isfinite(self.start_time) or self.start_time < 0:
+            raise ValueError("Playback offset is invalid")
         if not isinstance(self.entry_id, str) or not self.entry_id or len(self.entry_id) > 64:
             raise ValueError("Playback entry identifier is invalid")
         if self.fallback == self.primary:
@@ -206,6 +219,10 @@ class PlaybackSnapshot:
     queued: tuple[PlaybackEntry, ...]
     paused: bool
     channel_id: int | None
+    volume: int = 100
+    repeat: str = "off"
+    position: float = 0.0
+    halted: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "queued", tuple(self.queued))
