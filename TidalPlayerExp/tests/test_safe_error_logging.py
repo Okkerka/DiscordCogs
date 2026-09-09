@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import gc
 import importlib
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-
 
 SECRET = "https://provider.invalid/audio?secret_token=private-credential"
 
@@ -79,6 +80,44 @@ async def test_recommendation_failure_log_does_not_include_provider_url(cog, cap
     assert SECRET not in caplog.text
     assert "RuntimeError" in caplog.text
     assert all(record.exc_info is None for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_replaced_abandoned_recommendation_task_retrieves_late_failure(cog) -> None:
+    loop = asyncio.get_running_loop()
+    reports = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: reports.append(context))
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def candidates(*args):
+        if not started.is_set():
+            started.set()
+            await release.wait()
+            raise RuntimeError(SECRET)
+        return []
+
+    cog._radio_candidates = candidates
+
+    async def exercise():
+        meta = {"track_id": "123"}
+        waiter = asyncio.create_task(cog._get_recommendations(1, meta))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert await cog._get_recommendations(1, meta) == []
+
+    try:
+        await exercise()
+        gc.collect()
+        assert reports == []
+    finally:
+        release.set()
+        loop.set_exception_handler(previous_handler)
 
 
 @pytest.mark.asyncio

@@ -12,11 +12,12 @@ from __future__ import annotations
 import asyncio
 import sys
 import types
+from copy import deepcopy
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
 import discord as real_discord
+import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -37,6 +38,29 @@ class _ConfigValue:
 
     def __await__(self):
         return self.__call__().__await__()
+
+
+class _ConfigContext:
+    """Model Red's awaitable global-group context and its shared write lock."""
+
+    def __init__(self, config: FakeConfig) -> None:
+        self._config = config
+
+    def __await__(self):
+        return self._config._read_all().__await__()
+
+    async def __aenter__(self) -> dict[str, Any]:
+        await self._config._global_lock.acquire()
+        self._data = await self._config._read_all()
+        self._original = deepcopy(self._data)
+        return self._data
+
+    async def __aexit__(self, *_exc: object) -> None:
+        try:
+            if self._data != self._original:
+                await self._config.set(self._data)
+        finally:
+            self._config._global_lock.release()
 
 
 class FakeGuildConfig:
@@ -70,6 +94,7 @@ class FakeConfig:
         self.expiry_time = _ConfigValue(None)
         self._schema_version = _ConfigValue(3)
         self._guild_configs: dict[int, FakeGuildConfig] = {}
+        self._global_lock = asyncio.Lock()
 
     # Config.get_conf factory
     @classmethod
@@ -98,14 +123,23 @@ class FakeConfig:
     def guild_from_id(self, guild_id: int) -> FakeGuildConfig:
         return self.guild(guild_id)
 
-    async def all(self) -> dict[str, Any]:
+    def all(self) -> _ConfigContext:
+        return _ConfigContext(self)
+
+    async def _read_all(self) -> dict[str, Any]:
         return {
-            "token_type": await self.token_type(),
-            "access_token": await self.access_token(),
-            "refresh_token": await self.refresh_token(),
-            "expiry_time": await self.expiry_time(),
-            "_schema_version": await self._schema_version(),
+            key: deepcopy(value._value)
+            for key, value in vars(self).items()
+            if isinstance(value, _ConfigValue)
         }
+
+    async def set(self, data: dict[str, Any]) -> None:
+        for key, value in data.items():
+            existing = getattr(self, key, None)
+            if isinstance(existing, _ConfigValue):
+                existing._value = deepcopy(value)
+            else:
+                setattr(self, key, _ConfigValue(deepcopy(value)))
 
     async def clear_raw(self, *_args: Any) -> None:
         pass

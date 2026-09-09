@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+
 import pytest
 
 from TidalPlayerExp.providers.tokens import TokenRepository, TokenService, TokenSnapshot
+from TidalPlayerExp.tests.conftest import FakeConfig, _ConfigValue
 
 
 # ---------------------------------------------------------------------------
@@ -21,20 +23,9 @@ _COMPLETE = {
 }
 
 
-class _FakeField:
-    def __init__(self, value: Any = None) -> None:
-        self._value = value
-
-    async def __call__(self) -> Any:
-        return self._value
-
-    async def set(self, value: Any) -> None:
-        self._value = value
-
-
-class _BlockingField(_FakeField):
-    def __init__(self, started: asyncio.Event, release: asyncio.Event) -> None:
-        super().__init__()
+class _BlockingField(_ConfigValue):
+    def __init__(self, value: Any, started: asyncio.Event, release: asyncio.Event) -> None:
+        super().__init__(value)
         self.started = started
         self.release = release
 
@@ -44,21 +35,40 @@ class _BlockingField(_FakeField):
         self._value = value
 
 
-class _FakeConfigGroup:
+class _FakeConfigGroup(FakeConfig):
     def __init__(self, data: dict[str, Any] | None = None) -> None:
-        defaults = data or {}
-        self.token_type = _FakeField(defaults.get("token_type"))
-        self.access_token = _FakeField(defaults.get("access_token"))
-        self.refresh_token = _FakeField(defaults.get("refresh_token"))
-        self.expiry_time = _FakeField(defaults.get("expiry_time"))
+        super().__init__()
+        for key, value in (data or {}).items():
+            setattr(self, key, _ConfigValue(value))
 
-    async def all(self) -> dict[str, Any]:
-        return {
-            "token_type": await self.token_type(),
-            "access_token": await self.access_token(),
-            "refresh_token": await self.refresh_token(),
-            "expiry_time": await self.expiry_time(),
-        }
+
+class _FailingField(_ConfigValue):
+    async def set(self, value: Any) -> None:
+        raise OSError("persistence unavailable")
+
+
+class _FailingConfigGroup(_FakeConfigGroup):
+    def __init__(self, data: dict[str, Any]) -> None:
+        super().__init__(data)
+        self.access_token = _FailingField(data["access_token"])
+
+    async def set(self, data: dict[str, Any]) -> None:
+        raise OSError("persistence unavailable")
+
+
+class _BlockingConfigGroup(_FakeConfigGroup):
+    def __init__(self, data: dict[str, Any] | None = None) -> None:
+        super().__init__(data)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.access_token = _BlockingField(
+            self.access_token._value, self.started, self.release
+        )
+
+    async def set(self, data: dict[str, Any]) -> None:
+        self.started.set()
+        await self.release.wait()
+        await super().set(data)
 
 
 # ---------------------------------------------------------------------------
@@ -159,22 +169,73 @@ class TestTokenRepository:
 
     @pytest.mark.asyncio
     async def test_load_waits_for_complete_token_replacement(self) -> None:
-        started = asyncio.Event()
-        release = asyncio.Event()
-        config = _FakeConfigGroup()
-        config.token_type = _BlockingField(started, release)
+        config = _BlockingConfigGroup()
         repository = TokenRepository(config)
         snapshot = TokenSnapshot(**_COMPLETE)
 
         replace_task = asyncio.create_task(repository.replace(snapshot))
-        await started.wait()
+        await asyncio.wait_for(config.started.wait(), timeout=1)
         load_task = asyncio.create_task(repository.load())
         await asyncio.sleep(0)
 
         assert not load_task.done()
-        release.set()
+        config.release.set()
         await replace_task
         assert await load_task == snapshot
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["replace", "clear"])
+    async def test_failed_write_keeps_previous_credentials(self, operation: str) -> None:
+        previous = {**_COMPLETE, "_schema_version": 3, "other": {"enabled": True}}
+        config = _FailingConfigGroup(previous)
+        repository = TokenRepository(config)
+        replacement = TokenSnapshot("Other", "new-acc", "new-ref", 12345)
+
+        with pytest.raises(OSError, match="persistence unavailable"):
+            if operation == "replace":
+                await repository.replace(replacement)
+            else:
+                await repository.clear()
+
+        assert await config.all() == previous
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["replace", "clear"])
+    async def test_cancelled_write_keeps_previous_credentials(self, operation: str) -> None:
+        previous = {**_COMPLETE, "_schema_version": 3, "other": {"enabled": True}}
+        config = _BlockingConfigGroup(previous)
+        repository = TokenRepository(config)
+        replacement = TokenSnapshot("Other", "new-acc", "new-ref", 12345)
+        operation_task = asyncio.create_task(
+            repository.replace(replacement) if operation == "replace" else repository.clear()
+        )
+        await asyncio.wait_for(config.started.wait(), timeout=1)
+
+        operation_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await operation_task
+
+        assert await config.all() == previous
+        config.release.set()
+        await asyncio.wait_for(repository.clear(), timeout=1)
+        assert await repository.load() is None
+
+    @pytest.mark.asyncio
+    async def test_replace_and_clear_preserve_other_global_settings(self) -> None:
+        config = _FakeConfigGroup({"_schema_version": 3, "other": {"enabled": True}})
+        repository = TokenRepository(config)
+
+        await repository.replace(TokenSnapshot(**_COMPLETE))
+        assert await config.all() == {
+            **_COMPLETE, "_schema_version": 3, "other": {"enabled": True}
+        }
+
+        await repository.clear()
+        assert await config.all() == {
+            "token_type": None, "access_token": None,
+            "refresh_token": None, "expiry_time": None,
+            "_schema_version": 3, "other": {"enabled": True},
+        }
 
 
 # ---------------------------------------------------------------------------

@@ -407,6 +407,31 @@ async def test_queue_end_sink_can_enqueue_autoplay():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["stop", "skip"])
+async def test_immediate_close_preserves_cleanup_of_unstarted_successor(operation):
+    session, voice, _resolver, factory, _sink = setup()
+    factory.gate = asyncio.Event()
+    await session.enqueue(entry())
+    await asyncio.wait_for(factory.entered.wait(), timeout=1)
+    interrupted = asyncio.create_task(getattr(session, operation)())
+    closing = asyncio.create_task(session.close())
+    try:
+        # No yield between interrupt and close: the restart coroutine has not
+        # entered its try/finally when close cancels it.
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(closing), timeout=0.02)
+        assert voice.disconnects == 0
+    finally:
+        factory.gate.set()
+        await asyncio.gather(interrupted, closing)
+    assert session.closed
+    assert voice.disconnects == 1
+    assert not voice.played
+    assert len(factory.sources) == 1
+    assert factory.sources[0].cleanups == 1
+
+
+@pytest.mark.asyncio
 async def test_concurrent_stop_skip_close_drain_pending_creation():
     session, voice, _resolver, factory, _sink = setup()
     factory.gate = asyncio.Event()

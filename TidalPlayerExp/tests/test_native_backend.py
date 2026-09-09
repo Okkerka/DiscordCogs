@@ -6,9 +6,10 @@ import asyncio
 import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from types import MethodType, SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
+import discord
 import pytest
 
 from TidalPlayerExp.playback import backend as backend_module
@@ -23,7 +24,8 @@ from TidalPlayerExp.playback.models import (
 
 
 class Voice:
-    def __init__(self, channel):
+    def __init__(self, client, channel=None):
+        channel = channel or client
         self.channel = channel
         self.guild = channel.guild
         self.connected = True
@@ -72,8 +74,11 @@ class Channel:
         assert member is self.guild.me
         return self.permissions
 
-    async def connect(self, **kwargs):
+    async def connect(self, *, cls=Voice, **kwargs):
         self.calls.append(kwargs)
+        # Discord registers the constructed client before its handshake awaits.
+        self.voice = cls(None, self)
+        self.guild.voice_client = self.voice
         self.started.set()
         try:
             await self.release.wait()
@@ -84,8 +89,6 @@ class Channel:
             await self.release.wait()
         if self.error:
             raise self.error
-        self.voice = Voice(self)
-        self.guild.voice_client = self.voice
         return self.voice
 
 
@@ -111,6 +114,7 @@ class Session:
 @pytest.fixture
 def environment(monkeypatch):
     module = backend_module
+    monkeypatch.setattr(discord, "VoiceClient", Voice)
     monkeypatch.setattr(module, "NativePlaybackSession", Session)
     guild = SimpleNamespace(id=1, me=object(), voice_client=None)
     channel = Channel(guild)
@@ -234,6 +238,101 @@ async def test_cancelled_attempt_cleans_late_client(environment, shutdown):
     await e.backend.close()
     assert e.channel.voice.disconnects == 1
     assert await e.backend.get(1) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shutdown", ["waiter", "guild", "backend"])
+@pytest.mark.parametrize("replaced", [False, True])
+async def test_cancelled_handshake_cleans_only_its_registered_client(environment, shutdown, replaced):
+    e = environment
+    e.channel.release.clear()
+    waiter = asyncio.create_task(e.backend.connect(e.guild, e.channel))
+    await asyncio.wait_for(e.channel.started.wait(), 1)
+    owned = e.channel.voice
+    assert e.guild.voice_client is owned
+    replacement = Voice(e.channel) if replaced else None
+    if replaced:
+        e.guild.voice_client = replacement
+    attempt = e.backend._pending[1].task
+    if shutdown == "waiter":
+        waiter.cancel()
+    elif shutdown == "guild":
+        await e.backend.close_guild(1)
+    else:
+        await e.backend.close()
+    await asyncio.wait_for(asyncio.gather(waiter, attempt, return_exceptions=True), 1)
+    try:
+        assert owned.disconnects == (0 if replaced else 1)
+        assert e.guild.voice_client is replacement
+        if replacement is not None:
+            assert replacement.disconnects == 0
+        elif shutdown != "backend":
+            e.channel.release.set()
+            assert await e.backend.connect(e.guild, e.channel)
+    finally:
+        await e.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_handshake_cleans_registered_client_before_retry(environment):
+    e = environment
+    e.channel.error = OSError("private handshake failure")
+    try:
+        with pytest.raises(PlaybackUnavailable) as caught:
+            await e.backend.connect(e.guild, e.channel)
+        assert caught.value.__context__ is None
+        assert e.channel.voice.disconnects == 1
+        assert e.guild.voice_client is None
+        e.channel.error = None
+        assert await e.backend.connect(e.guild, e.channel)
+    finally:
+        await e.backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interruption", ["cancel", "error", "timeout"])
+async def test_real_discord_connect_cleans_interrupted_handshake(environment, monkeypatch, interruption):
+    """Exercise Discord's actual register-before-handshake contract without I/O."""
+    e = environment
+
+    class HandshakingVoice(Voice, discord.VoiceProtocol):
+        def __init__(self, client, channel):
+            super().__init__(client, channel)
+            channel.voice = self
+
+        async def connect(self, **kwargs):
+            e.channel.started.set()
+            await e.channel.release.wait()
+            if e.channel.error is not None:
+                raise e.channel.error
+
+    monkeypatch.setattr(discord, "VoiceClient", HandshakingVoice)
+    e.channel._get_voice_client_key = lambda: (1, 1)
+    e.channel._state = SimpleNamespace(
+        _get_voice_client=lambda _: e.guild.voice_client,
+        _get_client=lambda: None,
+        _add_voice_client=lambda _, voice: setattr(e.guild, "voice_client", voice),
+    )
+    e.channel.connect = MethodType(discord.abc.Connectable.connect, e.channel)
+    e.channel.release.clear()
+    waiter = asyncio.create_task(e.backend.connect(e.guild, e.channel))
+    await asyncio.wait_for(e.channel.started.wait(), 1)
+    owned = e.guild.voice_client
+    attempt = e.backend._pending[1].task
+    if interruption == "cancel":
+        waiter.cancel()
+    else:
+        e.channel.error = TimeoutError("private") if interruption == "timeout" else OSError("private")
+        e.channel.release.set()
+    await asyncio.wait_for(asyncio.gather(waiter, attempt, return_exceptions=True), 1)
+    try:
+        assert owned.disconnects == 1
+        assert e.guild.voice_client is None
+        e.channel.error = None
+        e.channel.release.set()
+        assert await e.backend.connect(e.guild, e.channel)
+    finally:
+        await e.backend.close()
 
 
 @pytest.mark.asyncio
@@ -444,7 +543,8 @@ async def _real_session_integration():
     backend = NativePlaybackBackend(
         SimpleNamespace(get_cog=lambda _: None), resolver, factory, sink
     )
-    session = await backend.connect(guild, channel)
+    with patch.object(backend_module.discord, "VoiceClient", Voice):
+        session = await backend.connect(guild, channel)
     assert isinstance(session, NativePlaybackSession)
     entry = PlaybackEntry(
         "one",

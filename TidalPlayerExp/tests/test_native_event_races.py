@@ -14,6 +14,48 @@ from TidalPlayerExp.tests.test_native_session import entry
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_stage", ["view", "edit"])
+async def test_recommendation_refresh_cannot_restore_ended_queue_panel(cog, blocked_stage):
+    ready, release = asyncio.Event(), asyncio.Event()
+    previous = entry(1)
+    current = previous
+    session = SimpleNamespace(snapshot=lambda: PlaybackSnapshot(current, (), False, 22))
+    cog.backend = SimpleNamespace(get=AsyncMock(return_value=session))
+    cog._current_entries[1] = previous
+    cog._current_meta[1] = previous.meta
+    cog._controller_meta[1] = previous.meta
+    view = SimpleNamespace(stop=Mock())
+
+    async def make_view(*args, **kwargs):
+        if blocked_stage == "view":
+            ready.set()
+            await release.wait()
+        return view
+
+    async def edit(**kwargs):
+        if blocked_stage == "edit":
+            ready.set()
+            await release.wait()
+
+    message = SimpleNamespace(edit=AsyncMock(side_effect=edit), delete=AsyncMock())
+    cog._controller_messages[1] = message
+    cog._get_recommendations = AsyncMock(return_value=[object()])
+    cog._controller_view = make_view
+    cog._schedule_autoplay = Mock()
+    refresh = asyncio.create_task(cog._refresh_controller_recommendations(1, "id:1"))
+    await asyncio.wait_for(ready.wait(), timeout=1)
+    current = None
+    await cog.queue_ended(1, previous)
+    release.set()
+    await refresh
+    assert 1 not in cog._controller_views
+    assert 1 not in cog._controller_messages
+    view.stop.assert_called_once()
+    if blocked_stage == "view":
+        message.edit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_stop_cancels_pending_recommendation_admission(cog):
     selected = SimpleNamespace(id=123, name="Song", artist=SimpleNamespace(name="Artist"))
     ready, release = asyncio.Event(), asyncio.Event()

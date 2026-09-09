@@ -10,6 +10,7 @@ from rapidfuzz import fuzz
 from .identity import normalize_identity_text
 
 _OFFICIAL_MARKERS = frozenset({"official", "audio", "video", "lyrics", "visualizer", "hd", "4k"})
+_OFFICIAL_MUSIC_VIDEO_RE = re.compile(r"\bofficial music video\b")
 _RECORDING_VARIANT_PHRASES = (
     "sped up", "slowed down", "cover", "remix", "live", "karaoke",
     "instrumental", "nightcore", "slowed", "reverb", "remastered",
@@ -45,7 +46,19 @@ def _recording_variants(value: str) -> frozenset[str]:
 
 def _identity_title(value: str) -> str:
     normalized = _VARIANT_RE.sub(" ", _normalize(value))
+    normalized = _OFFICIAL_MUSIC_VIDEO_RE.sub(" ", normalized)
     return " ".join(word for word in normalized.split() if word not in _OFFICIAL_MARKERS)
+
+
+def _title_forms(identity: str, artist: str) -> set[str]:
+    """Allow an explicit artist prefix/suffix without dropping song words."""
+    forms = {identity}
+    prefix, suffix = f"{artist} ", f" {artist}"
+    if identity.startswith(prefix):
+        forms.add(identity[len(prefix):])
+    if identity.endswith(suffix):
+        forms.add(identity[:-len(suffix)])
+    return forms
 
 
 def _tokens(value: str) -> frozenset[str]:
@@ -70,7 +83,6 @@ def select_confident_youtube_tidal_track(
     if not normalized_video_title:
         return None
     video_identity = _identity_title(video_title)
-    video_tokens = _tokens(video_identity)
     video_variants = _recording_variants(video_title)
     normalized_channel = _normalize(channel)
     best_track: Any | None = None
@@ -80,12 +92,11 @@ def select_confident_youtube_tidal_track(
         artist = _artist(track)
         normalized_artist = _normalize(artist)
         title_identity = _identity_title(title)
-        title_tokens = _tokens(title_identity)
         if not title_identity or not normalized_artist:
             continue
         if _recording_variants(title) != video_variants:
             continue
-        if not title_tokens or not (title_tokens <= video_tokens or video_tokens <= title_tokens):
+        if not (_title_forms(title_identity, normalized_artist) & _title_forms(video_identity, normalized_artist)):
             continue
         if not _artist_is_explicit(artist, video_title, channel):
             continue

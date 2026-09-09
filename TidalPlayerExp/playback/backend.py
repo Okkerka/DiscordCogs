@@ -7,6 +7,8 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import discord
+
 from .errors import PlaybackUnavailable
 from .interfaces import PlaybackEventSink, SourceResolver
 from .session import NativePlaybackSession
@@ -140,6 +142,18 @@ class NativePlaybackBackend:
         self, guild: Any, channel: Any, attempt: _Connection
     ) -> NativePlaybackSession:
         created: NativePlaybackSession | None = None
+
+        def create_voice(client: discord.Client, connectable: discord.abc.Connectable) -> discord.VoiceClient:
+            nonlocal created
+            voice = discord.VoiceClient(client, connectable)
+            # Connectable.connect registers this client before awaiting the
+            # handshake. Retain its exact identity even if that await is cancelled.
+            created = NativePlaybackSession(
+                guild.id, voice, self._resolver, self._source_factory, self._sink
+            )
+            self._retired.add(created)
+            return voice
+
         try:
             old = self._sessions.get(guild.id)
             if old is not None:
@@ -148,12 +162,11 @@ class NativePlaybackBackend:
             if attempt.invalid or guild.voice_client is not None:
                 raise PlaybackUnavailable()
             voice = await channel.connect(
-                timeout=self._connect_timeout, reconnect=True, self_deaf=True
+                timeout=self._connect_timeout, reconnect=True, self_deaf=True,
+                cls=create_voice,
             )
-            created = NativePlaybackSession(
-                guild.id, voice, self._resolver, self._source_factory, self._sink
-            )
-            self._retired.add(created)
+            if created is None or created.voice_client is not voice:
+                raise PlaybackUnavailable()
             self._validate(guild, channel)
             if (
                 attempt.invalid

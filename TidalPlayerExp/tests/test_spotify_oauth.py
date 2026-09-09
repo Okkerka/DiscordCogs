@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -8,6 +10,142 @@ import pytest
 
 async def _run_now(_handler, operation, **_kwargs):
     return operation()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_operation", ["login", "logout"])
+async def test_spotify_login_commit_and_logout_preserve_operation_order(cog, first_operation) -> None:
+    stored = {"client_id": "client", "client_secret": "secret"}
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def get_tokens(_service):
+        return dict(stored)
+
+    async def store_tokens(_service, **values):
+        if first_operation == "login":
+            entered.set()
+            await release.wait()
+        stored.update(values)
+
+    async def remove_tokens(_service, *keys):
+        if first_operation == "logout":
+            entered.set()
+            await release.wait()
+        for key in keys:
+            stored.pop(key, None)
+
+    cog.bot.get_shared_api_tokens = get_tokens
+    cog.bot.set_shared_api_tokens = store_tokens
+    cog.bot.remove_shared_api_tokens = remove_tokens
+    oauth = SimpleNamespace(
+        get_access_token=lambda *_args, **_kwargs: {"refresh_token": "new-refresh"},
+        validate_token=lambda token_info: token_info,
+    )
+    module = __import__(cog.__class__.__module__, fromlist=["unused"])
+    pending = []
+    with (
+        patch.object(type(cog), "_new_spotify_oauth", return_value=oauth),
+        patch.object(type(cog.tidal), "_run_blocking", new=_run_now),
+        patch.object(module.spotipy, "Spotify", return_value=object()),
+    ):
+        def start_login():
+            cog._spotify_login_states[42] = (
+                "expected", asyncio.get_running_loop().time() + 600,
+            )
+            return asyncio.create_task(cog._complete_spotify_login(
+                42, "http://127.0.0.1:2402/callback?code=code&state=expected",
+            ))
+
+        def start_logout():
+            return asyncio.create_task(cog.tidalsetup_spotifylogout(SimpleNamespace(send=AsyncMock())))
+
+        first, second = (start_login, start_logout) if first_operation == "login" else (start_logout, start_login)
+        try:
+            pending.append(first())
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            if first_operation == "login":
+                cog._spotify_login_states[43] = (
+                    "another-pending-login", asyncio.get_running_loop().time() + 600,
+                )
+            pending.append(second())
+            # Let the second command reach the persistence boundary while the
+            # first command's write remains blocked.
+            await asyncio.sleep(0)
+            if first_operation == "login":
+                assert 43 not in cog._spotify_login_states
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*pending), timeout=1)
+        if first_operation == "login":
+            assert stored == {"client_id": "client", "client_secret": "secret"}
+            assert cog._spotify_auth_manager is None
+        else:
+            assert stored["refresh_token"] == "new-refresh"
+            assert cog._spotify_auth_manager is oauth
+        assert cog.sp is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", ["new_login", "logout"])
+async def test_stale_spotify_exchange_cannot_commit_credentials(cog, replacement) -> None:
+    loop = asyncio.get_running_loop()
+    started, release = asyncio.Event(), threading.Event()
+    cog.bot.get_shared_api_tokens.return_value = {"client_id": "client", "client_secret": "secret"}
+    cog._spotify_login_states[42] = ("expected", loop.time() + 600)
+
+    def exchange(*args, **kwargs):
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(timeout=2)
+        return {"refresh_token": "outdated-refresh"}
+
+    oauth = SimpleNamespace(get_access_token=exchange)
+    module = __import__(cog.__class__.__module__, fromlist=["unused"])
+    with (
+        patch.object(type(cog), "_new_spotify_oauth", return_value=oauth),
+        patch.object(type(cog), "_initialize_spotify", new=AsyncMock()) as activate,
+    ):
+        pending = asyncio.create_task(cog._complete_spotify_login(
+            42, "http://127.0.0.1:2402/callback?code=code&state=expected",
+        ))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=1)
+            cog._clear_spotify_login(42)
+            new_state = ("new-state", loop.time() + 600)
+            if replacement == "new_login":
+                cog._spotify_login_states[42] = new_state
+            release.set()
+            with pytest.raises(module.SpotifyLoginError):
+                await pending
+            cog.bot.set_shared_api_tokens.assert_not_awaited()
+            activate.assert_not_awaited()
+            if replacement == "new_login":
+                assert cog._spotify_login_states[42] == new_state
+        finally:
+            release.set()
+            await asyncio.gather(pending, return_exceptions=True)
+            await cog.tidal.unload()
+
+
+@pytest.mark.asyncio
+async def test_spotify_login_expiring_during_exchange_does_not_commit(cog) -> None:
+    cog.bot.get_shared_api_tokens.return_value = {"client_id": "client", "client_secret": "secret"}
+    cog._spotify_login_states[42] = ("expected", 1_600.0)
+    oauth = SimpleNamespace(get_access_token=MagicMock(return_value={"refresh_token": "late"}))
+    module = __import__(cog.__class__.__module__, fromlist=["unused"])
+    with (
+        patch.object(type(cog), "_new_spotify_oauth", return_value=oauth),
+        patch.object(type(cog), "_initialize_spotify", new=AsyncMock()) as activate,
+        patch.object(type(cog.tidal), "_run_blocking", new=_run_now),
+        patch("asyncio.get_running_loop") as get_loop,
+    ):
+        get_loop.return_value.time.side_effect = [1_000.0, 1_601.0]
+        with pytest.raises(module.SpotifyLoginError):
+            await cog._complete_spotify_login(
+                42, "http://127.0.0.1:2402/callback?code=code&state=expected",
+            )
+    cog.bot.set_shared_api_tokens.assert_not_awaited()
+    activate.assert_not_awaited()
+    assert 42 not in cog._spotify_login_states
 
 
 @pytest.mark.asyncio

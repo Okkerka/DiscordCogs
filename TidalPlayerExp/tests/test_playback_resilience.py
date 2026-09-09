@@ -102,6 +102,57 @@ def test_youtube_tidal_match_selects_best_eligible_candidate_instead_of_first() 
     assert select_confident_youtube_tidal_track("AZALI - Rivals", "AZALI", [weaker, stronger]) is stronger
 
 
+@pytest.mark.parametrize(
+    "video_title",
+    ["Lana Del Rey - Love Song (Official Audio)", "Love Song"],
+)
+@pytest.mark.parametrize("exact_first", [False, True])
+def test_youtube_tidal_match_prefers_complete_title_regardless_of_catalog_order(
+    video_title: str, exact_first: bool,
+) -> None:
+    shorter = _tidal_candidate("Love", "Lana Del Rey")
+    exact = _tidal_candidate("Love Song", "Lana Del Rey")
+    candidates = [exact, shorter] if exact_first else [shorter, exact]
+
+    assert select_confident_youtube_tidal_track(video_title, "Lana Del Rey", candidates) is exact
+
+
+@pytest.mark.parametrize(
+    ("video_title", "tidal_title"),
+    [
+        ("Lana Del Rey - Love Song (Official Audio)", "Love"),
+        ("Love Song", "Love"),
+        ("Love", "Love Song"),
+        ("Lana Del Rey - Love Song Extended", "Love Song"),
+        ("Lana Del Rey - Song Love", "Love Song"),
+    ],
+)
+def test_youtube_tidal_match_rejects_incomplete_or_reordered_title(
+    video_title: str, tidal_title: str,
+) -> None:
+    candidate = _tidal_candidate(tidal_title, "Lana Del Rey")
+
+    assert select_confident_youtube_tidal_track(video_title, "Lana Del Rey", [candidate]) is None
+
+
+@pytest.mark.parametrize(
+    ("video_title", "channel", "tidal_title", "artist"),
+    [
+        ("Love Song", "Lana Del Rey - Topic", "Love Song", "Lana Del Rey"),
+        ("Lana Del Rey - Love Song [Official Music Video]", "Record Label", "Love Song", "Lana Del Rey"),
+        ("Love Song - Lana Del Rey", "Record Label", "Love Song", "Lana Del Rey"),
+        ("宇多田ヒカル - 光 (Official Audio)", "宇多田ヒカル", "光", "宇多田ヒカル"),
+        ("光", "宇多田ヒカル", "光", "宇多田ヒカル"),
+    ],
+)
+def test_youtube_tidal_match_preserves_complete_title_with_artist_and_display_markers(
+    video_title: str, channel: str, tidal_title: str, artist: str,
+) -> None:
+    candidate = _tidal_candidate(tidal_title, artist)
+
+    assert select_confident_youtube_tidal_track(video_title, channel, [candidate]) is candidate
+
+
 @pytest.mark.asyncio
 async def test_unverifiable_playlist_owner_is_not_returned_for_write(cog) -> None:
     playlist = SimpleNamespace(creator=None)

@@ -1129,7 +1129,7 @@ class TidalPlayerExp(commands.Cog):
         "_recommendation_lookup_slots", "_lastfm_session", "youtube_resolver", "source_factory", "_closing", "_guild_generations",
         "_persistent_view", "_controller_views", "_stop_generations", "public_audio_resolver",
         "_spotify_auth_manager", "_spotify_refresh_token", "_spotify_login_states",
-        "_spotify_login_views", "_spotify_auth_lock",
+        "_spotify_login_views", "_spotify_auth_lock", "_spotify_commit_lock",
         "runtime",
     )
 
@@ -1159,6 +1159,7 @@ class TidalPlayerExp(commands.Cog):
         self._spotify_login_states: Dict[int, Tuple[str, float]] = {}
         self._spotify_login_views: Dict[int, SpotifyLoginView] = {}
         self._spotify_auth_lock = asyncio.Lock()
+        self._spotify_commit_lock = asyncio.Lock()
         self.yt: Optional[Any] = None
         self._tasks: Set[asyncio.Task] = set()
         self._guild_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -1634,14 +1635,23 @@ class TidalPlayerExp(commands.Cog):
         if not isinstance(token_info, dict) or not token_info.get("refresh_token"):
             raise SpotifyLoginError("Spotify did not return a refreshable token.")
 
-        self._clear_spotify_login(owner_id)
-        await self.bot.set_shared_api_tokens(
-            "spotify",
-            refresh_token=str(token_info["refresh_token"]),
-        )
-        await self._initialize_spotify()
-        if self._spotify_auth_manager is None or self.sp is None:
-            raise RuntimeError("Spotify session could not activate after authorization.")
+        # Serialize persistence and activation with logout so an in-flight
+        # credential write cannot restore authorization after logout returns.
+        async with self._spotify_commit_lock:
+            if self._closing or self._spotify_login_states.get(owner_id) != pending:
+                raise SpotifyLoginError("Spotify login is no longer pending. Start it again.")
+            if asyncio.get_running_loop().time() >= expires_at:
+                self._clear_spotify_login(owner_id)
+                raise SpotifyLoginError("Spotify login expired. Start it again.")
+
+            self._clear_spotify_login(owner_id)
+            await self.bot.set_shared_api_tokens(
+                "spotify",
+                refresh_token=str(token_info["refresh_token"]),
+            )
+            await self._initialize_spotify()
+            if self._spotify_auth_manager is None or self.sp is None:
+                raise RuntimeError("Spotify session could not activate after authorization.")
 
     def _clear_spotify_login(self, owner_id: int) -> None:
         self._spotify_login_states.pop(owner_id, None)
@@ -2239,6 +2249,13 @@ class TidalPlayerExp(commands.Cog):
                 self._radio_candidates(guild_id, meta),
                 name=f"tidalplayer-recommendations-{guild_id}-{source}",
             )
+
+            def _consume_result(completed: asyncio.Task[list[Any]]) -> None:
+                # A cancelled final waiter may leave this task to finish alone.
+                if not completed.cancelled():
+                    completed.exception()
+
+            task.add_done_callback(_consume_result)
             self._recommendation_tasks[guild_id] = task
             self._recommendation_task_sources[guild_id] = source
 
@@ -2276,6 +2293,8 @@ class TidalPlayerExp(commands.Cog):
         self._controller_recommendation_tasks[guild_id] = task
 
     async def _refresh_controller_recommendations(self, guild_id: int, source: str) -> None:
+        generation = self._stop_generations[guild_id]
+        entry = self._current_entries.get(guild_id)
         try:
             meta = self._controller_meta.get(guild_id) or self._current_meta.get(guild_id)
             if self._recommendation_source(meta) != source or meta is None:
@@ -2288,12 +2307,24 @@ class TidalPlayerExp(commands.Cog):
             message = self._controller_messages.get(guild_id)
             if message is None:
                 return
+
+            async def still_current() -> bool:
+                current_meta = self._controller_meta.get(guild_id) or self._current_meta.get(guild_id)
+                return (
+                    not self._closing
+                    and generation == self._stop_generations[guild_id]
+                    and self._current_entries.get(guild_id) is entry
+                    and self._controller_messages.get(guild_id) is message
+                    and self._recommendation_source(current_meta) == source
+                )
+
             player = await self._get_session_for_guild(guild_id)
             view = await self._controller_view(
                 guild_id, paused=player.snapshot().paused if player else False,
             )
             await self._activate_controller_view(
-                guild_id, view, lambda active_view: message.edit(view=active_view)
+                guild_id, view, lambda active_view: message.edit(view=active_view),
+                still_current=still_current,
             )
         except asyncio.CancelledError:
             raise
@@ -3471,8 +3502,9 @@ class TidalPlayerExp(commands.Cog):
         """Remove Spotify user authorization while keeping app credentials."""
         for owner_id in tuple(self._spotify_login_states):
             self._clear_spotify_login(owner_id)
-        await self.bot.remove_shared_api_tokens("spotify", "refresh_token")
-        await self._initialize_spotify()
+        async with self._spotify_commit_lock:
+            await self.bot.remove_shared_api_tokens("spotify", "refresh_token")
+            await self._initialize_spotify()
         await ctx.send(embed=_success_embed("Spotify user session logged out."))
 
     @tidalsetup.command(name="youtube")

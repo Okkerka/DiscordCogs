@@ -138,6 +138,9 @@ is not a guarantee that every site or individual track currently works.
   authentication, the cog tries a confident catalog match; otherwise it plays
   the original video's audio. If the TIDAL source cannot start, it falls back to
   that same YouTube video. A fallback displays the YouTube title and link.
+  Matching requires the complete song title, explicit artist identity, and
+  matching recording variants; a shorter title such as "Love" cannot substitute
+  for "Love Song". Uncertain matches stay on YouTube.
 - TIDAL media links accept `/browse/`, a trailing `/u` share suffix, and ordinary
   trailing slashes. YouTube watch, `youtu.be`, mobile, Music, Shorts, Live and
   embed links are supported, including `youtube-nocookie.com` video embeds.
@@ -196,6 +199,15 @@ Startup retries use fresh source resolution; a primary gets one retry before
 its optional YouTube fallback. Three consecutive failed entries stop automatic
 queue progression. Idle empty sessions disconnect after approximately two
 minutes. Source startup, extraction, and cleanup have bounded deadlines.
+Cancelled voice handshakes retain ownership for cleanup, and stop/close waits
+for pending source creation to finish cleaning up before disconnecting.
+Late controller updates cannot restore a panel after its queue ends.
+
+OAuth credential fields are saved together in one Config group update, without
+changing the stored schema. Login checks discard results from replaced TIDAL
+sessions; Spotify callbacks recheck pending state and expiry after token exchange.
+Error logs identify the failing operation and exception type without formatting
+provider exceptions.
 
 Private YouTube, age/login-restricted, removed, region-blocked, or rate-limited videos
 can still fail. Provider changes may require owner-driven dependency updates.

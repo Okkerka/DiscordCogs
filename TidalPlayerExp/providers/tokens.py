@@ -7,6 +7,8 @@ persisting a half-refreshed OAuth credential set when a provider refresh fails.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -52,8 +54,14 @@ class TokenSnapshot:
         }
 
 
+class ConfigGroupContext(
+    AbstractAsyncContextManager[dict[str, Any]], Awaitable[dict[str, Any]], Protocol
+):
+    """Red's global values support both reads and locked read-modify-write."""
+
+
 class ConfigLike(Protocol):
-    async def all(self) -> dict[str, Any]: ...
+    def all(self) -> ConfigGroupContext: ...
 
 
 class TokenRepository:
@@ -73,19 +81,15 @@ class TokenRepository:
         if not snapshot.is_complete:
             raise ValueError("OAuth snapshot must contain all fields")
         async with self._lock:
-            # Red Config field accessors are intentionally used here because they
-            # are the stable API exposed by the cog runtime. The lock ensures no
-            # competing cog task can observe an in-process partial replacement.
-            await asyncio.gather(
-                self._config.token_type.set(snapshot.token_type),
-                self._config.access_token.set(snapshot.access_token),
-                self._config.refresh_token.set(snapshot.refresh_token),
-                self._config.expiry_time.set(snapshot.expiry_time),
-            )
+            # Persist one credential generation in a single group write while
+            # retaining schema metadata and other global settings.
+            async with self._config.all() as data:
+                data.update(snapshot.as_mapping())
 
     async def clear(self) -> None:
         async with self._lock:
-            await asyncio.gather(*(getattr(self._config, field).set(None) for field in self._FIELDS))
+            async with self._config.all() as data:
+                data.update(dict.fromkeys(self._FIELDS))
 
 
 class TokenService:

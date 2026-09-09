@@ -6,7 +6,7 @@ import asyncio
 import logging
 import threading
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Protocol, cast
 
@@ -120,6 +120,7 @@ class NativePlaybackSession:
         self._running = False
         self._failures = 0
         self._runner: asyncio.Task[None] | None = None
+        self._cleanup_barrier: asyncio.Future[list[object]] | None = None
         self._close_task: asyncio.Task[None] | None = None
 
     @property
@@ -192,10 +193,18 @@ class NativePlaybackSession:
             except Exception as error:  # noqa: BLE001 - still clean the owned source on stop failure
                 log.warning("Voice stop failed (%s)", type(error).__name__)
         self._current = None
+        # Register the dependency now, not inside the successor coroutine: a
+        # successor can be cancelled before its first instruction executes.
+        pending: list[Awaitable[object]] = []
+        if self._cleanup_barrier is not None and not self._cleanup_barrier.done():
+            pending.append(self._cleanup_barrier)
+        if previous is not None and not previous.done():
+            pending.append(previous)
+        self._cleanup_barrier = asyncio.gather(*pending, return_exceptions=True)
         return previous
 
     async def _restart(
-        self, previous: asyncio.Task[None] | None, ended: PlaybackEntry | None
+        self, previous: Awaitable[object] | None, ended: PlaybackEntry | None
     ) -> None:
         try:
             await self._wait_predecessor(previous)
@@ -213,17 +222,18 @@ class NativePlaybackSession:
                 return False
             ended = self._current
             previous = self._interrupt()
+            barrier = self._cleanup_barrier
             self._running = True
-            self._runner = asyncio.create_task(self._restart(previous, ended))
+            self._runner = asyncio.create_task(self._restart(barrier, ended))
         # A sink can reenter skip from the worker itself. It must return so that
         # the old worker can unwind and let its successor run.
         if previous is not asyncio.current_task():
-            await self._wait_predecessor(previous)
+            await self._wait_predecessor(barrier)
             await asyncio.sleep(0)
         return True
 
     @staticmethod
-    async def _wait_predecessor(previous: asyncio.Task[None] | None) -> None:
+    async def _wait_predecessor(previous: Awaitable[object] | None) -> None:
         if previous is not None:
             await asyncio.shield(asyncio.gather(previous, return_exceptions=True))
 
@@ -234,9 +244,10 @@ class NativePlaybackSession:
                 self._queue.clear()
             self._running = False
             previous = self._interrupt()
-            self._runner = asyncio.create_task(self._restart(previous, None))
+            barrier = self._cleanup_barrier
+            self._runner = asyncio.create_task(self._restart(barrier, None))
         if previous is not asyncio.current_task():
-            await self._wait_predecessor(previous)
+            await self._wait_predecessor(barrier)
 
     async def close(self) -> None:
         """Idempotently stop and disconnect only while the client is still owned."""
@@ -250,14 +261,14 @@ class NativePlaybackSession:
                 self._running = False
                 self._queue.clear()
                 previous = self._interrupt()
-                self._close_task = asyncio.create_task(self._finish_close(previous))
+                self._close_task = asyncio.create_task(self._finish_close(self._cleanup_barrier))
             else:
                 previous = self._runner
             close_task = self._close_task
         if previous is not asyncio.current_task():
             await asyncio.shield(close_task)
 
-    async def _finish_close(self, previous: asyncio.Task[None] | None) -> None:
+    async def _finish_close(self, previous: Awaitable[object] | None) -> None:
         await self._wait_predecessor(previous)
         failed = False
         if self._owned():
