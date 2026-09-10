@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 
 import discord
 
-from ..domain.normalization import format_duration
 from ..playback.models import PlaybackEntry, PlaybackSnapshot
 from .display import clamp_text, escape_display
 from .embeds import display_duration
@@ -57,7 +56,7 @@ class QueueView(discord.ui.LayoutView):
         self.page = min(self.page, self._page_count(self.snapshot) - 1)
 
     def _status(self) -> str:
-        states: list[str] = ["Paused" if self.snapshot.paused else "Active" if self.snapshot.current else "Idle"]
+        states: list[str] = ["Paused" if self.snapshot.paused else "Active"]
         for field, label in (("volume", "Volume"), ("repeat", "Repeat"), ("halted", "Halted")):
             value = getattr(self.snapshot, field, None)
             if value is not None:
@@ -65,22 +64,6 @@ class QueueView(discord.ui.LayoutView):
                     value = "On" if value else "Off"
                 states.append(f"{label}: {_display(value, 48)}")
         return " · ".join(states)
-
-    def _remaining(self) -> str:
-        seconds = 0.0
-        unknown = 0
-        for entry in self.snapshot.queued:
-            duration = entry.meta["duration"]
-            seconds += max(0, duration)
-            unknown += duration <= 0
-        if self.snapshot.current is not None:
-            duration = self.snapshot.current.meta["duration"]
-            seconds += max(0, duration - self.snapshot.position)
-            unknown += duration <= 0
-        suffix = f" + {unknown} unknown-length" if unknown else ""
-        if self.snapshot.repeat != "off":
-            suffix += " · Repeat enabled"
-        return f"Remaining: {format_duration(int(seconds))}{suffix}"
 
     @staticmethod
     def _track_line(number: int, entry: PlaybackEntry) -> str:
@@ -93,7 +76,6 @@ class QueueView(discord.ui.LayoutView):
         waiting = self.snapshot.queued
         page_count = self._page_count(self.snapshot)
         lines = ["## Queue", f"{len(waiting)} waiting · Page {self.page + 1}/{page_count} · {self._status()}"]
-        lines.append(self._remaining())
 
         if self.snapshot.current is not None:
             current = self.snapshot.current
@@ -149,15 +131,12 @@ class QueueView(discord.ui.LayoutView):
 
     async def _update(self, interaction: discord.Interaction, *, page: int | None = None) -> None:
         """Serialize button clicks so each edit reflects one authoritative snapshot."""
-        await interaction.response.defer()
         async with self._update_lock:
-            if self.is_finished():
-                return
             self.snapshot = await self._load_snapshot()
             if page is not None:
                 self.page = max(0, page)
             self._build_layout()
-            await interaction.edit_original_response(view=self, allowed_mentions=_MENTIONS_NONE)
+            await interaction.response.edit_message(view=self, allowed_mentions=_MENTIONS_NONE)
 
     async def _back(self, interaction: discord.Interaction) -> None:
         await self._update(interaction, page=self.page - 1)
@@ -171,7 +150,6 @@ class QueueView(discord.ui.LayoutView):
     async def on_timeout(self) -> None:
         """Leave an inert panel behind, then release this short-lived view."""
         async with self._update_lock:
-            self.stop()
             for child in self.walk_children():
                 if isinstance(child, discord.ui.Button):
                     child.disabled = True
@@ -182,3 +160,4 @@ class QueueView(discord.ui.LayoutView):
                     pass
             self.message = None
             self.snapshot = PlaybackSnapshot(None, (), False, None)
+            self.stop()

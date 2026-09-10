@@ -3015,6 +3015,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         name = getattr(mix, "title", None) or getattr(mix, "name", None) or "Tidal Mix"
         await self._process_track_list(ctx, items, name, lambda t: t, COLOR_PURPLE)
 
+
     @commands.hybrid_command(name="play")
     @commands.guild_only()
     @playback_request()
@@ -3026,74 +3027,6 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             return
         if self._closing or not self._initialized:
             await ctx.send(embed=_error_embed(Messages.ERROR_STILL_LOADING))
-            return
-        try:
-            provider_url = parse_provider_url(query)
-        except MalformedProviderURL:
-            await ctx.send(embed=_error_embed(Messages.ERROR_MALFORMED_URL))
-            return
-
-        request = current_request(self, ctx)
-        if request is not None and request.next_up and provider_url is not None and provider_url.content_type not in {"track", "video"}:
-            await self._reply(ctx, "Playnext accepts one track, video, or search. Use play for albums and playlists.")
-            return
-
-        if provider_url is None or provider_url.provider in {ProviderKind.TIDAL, ProviderKind.SPOTIFY}:
-            if not await self.check_ready(ctx):
-                return
-
-        session = await self._prepare_playback_session(ctx)
-        if session is None:
-            return
-
-        if provider_url is None:
-            await self._handle_search(ctx, session, query)
-        else:
-            await self._dispatch_provider_url(ctx, session, provider_url, query)
-
-    @commands.hybrid_command(name="playfile")
-    @commands.guild_only()
-    @playback_request()
-    async def playfile(self, ctx: commands.Context, file: discord.Attachment | None = None):
-        """Play an uploaded audio file (up to 50 MiB). Slash: /playfile file:<upload> or attach via message."""
-        await self._defer(ctx)
-        attachments = getattr(getattr(ctx, "message", None), "attachments", ()) or ()
-        if file is None and not getattr(ctx, "interaction", None) and attachments:
-            if len(attachments) != 1:
-                await self._reply(ctx, "Attach exactly one audio file per playfile request.")
-                return
-            file = attachments[0]
-
-        if file is None:
-            await self._reply(ctx, "Attach an audio file to your command or pass `/playfile file:<attachment>`.")
-            return
-
-        if self._closing or not self._initialized:
-            await ctx.send(embed=_error_embed(Messages.ERROR_STILL_LOADING))
-            return
-
-        try:
-            reference, metadata = self.attachment_resolver.register(file)
-        except ValueError as error:
-            await self._reply(ctx, str(error))
-            return
-
-        session = None
-        admitted = False
-        try:
-            session = await self._prepare_playback_session(ctx)
-            if session is not None:
-                entry = PlaybackEntry(secrets.token_hex(12), reference, None, metadata, ctx.author.id)
-                admitted = await self._admit_entry(ctx, session, entry)
-        finally:
-            if not admitted:
-                snapshot = session.snapshot() if session is not None else None
-                owned = snapshot is not None and (
-                    (snapshot.current is not None and snapshot.current.primary == reference)
-                    or any(item.primary == reference for item in snapshot.queued)
-                )
-                if not owned:
-                    self.attachment_resolver.discard(reference)
             return
         try:
             provider_url = parse_provider_url(query)
@@ -3110,7 +3043,8 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         if provider_url is None or provider_url.provider in {ProviderKind.TIDAL, ProviderKind.SPOTIFY}:
             if not await self.check_ready(ctx):
                 return
-        if await self._prepare_playback_session(ctx) is None:
+        session = await self._prepare_playback_session(ctx)
+        if session is None:
             return
         if provider_url is not None:
             if provider_url.provider is ProviderKind.TIDAL:
@@ -3158,6 +3092,50 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                 await self._load_and_queue_track(ctx, selected)
         else:
             await self._load_and_queue_track(ctx, results[0])
+
+    @commands.hybrid_command(name="playfile")
+    @commands.guild_only()
+    @playback_request()
+    async def playfile(self, ctx: commands.Context, file: discord.Attachment | None = None):
+        """Play an uploaded audio file (up to 50 MiB). Slash: /playfile file:<upload> or attach via message."""
+        await self._defer(ctx)
+        attachments = getattr(getattr(ctx, "message", None), "attachments", ()) or ()
+        if file is None and not getattr(ctx, "interaction", None) and attachments:
+            if len(attachments) != 1:
+                await self._reply(ctx, "Attach exactly one audio file per playfile request.")
+                return
+            file = attachments[0]
+
+        if file is None:
+            await self._reply(ctx, "Attach an audio file to your command or pass `/playfile file:<attachment>`.")
+            return
+
+        if self._closing or not self._initialized:
+            await ctx.send(embed=_error_embed(Messages.ERROR_STILL_LOADING))
+            return
+
+        try:
+            reference, metadata = self.attachment_resolver.register(file)
+        except ValueError as error:
+            await self._reply(ctx, str(error))
+            return
+
+        session = None
+        admitted = False
+        try:
+            session = await self._prepare_playback_session(ctx)
+            if session is not None:
+                entry = PlaybackEntry(secrets.token_hex(12), reference, None, metadata, ctx.author.id)
+                admitted = await self._admit_entry(ctx, session, entry)
+        finally:
+            if not admitted:
+                snapshot = session.snapshot() if session is not None else None
+                owned = snapshot is not None and (
+                    (snapshot.current is not None and snapshot.current.primary == reference)
+                    or any(item.primary == reference for item in snapshot.queued)
+                )
+                if not owned:
+                    self.attachment_resolver.discard(reference)
 
     @playback_request(batch=True)
     async def _handle_spotify_playlist(self, ctx: commands.Context, url: str) -> None:
