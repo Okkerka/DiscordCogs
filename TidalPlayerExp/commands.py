@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 """Shared prefix/slash playback controls; sessions own all queue mutations."""
 from __future__ import annotations
 
@@ -307,3 +308,6 @@ def parse_position(value: str) -> int | None:
     for item in values:
         total = total * 60 + item
     return total
+=======
+""
+>>>>>>> 2cd45fd23fcce02d3a33256e5c38d54cb94d00b2
