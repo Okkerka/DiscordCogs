@@ -16,10 +16,12 @@ class PlaybackCommands:
     """Command mixin using the cog's native backend and existing controller lifecycle."""
 
     async def _defer(self, ctx: commands.Context) -> None:
+        """Defer only interactions so prefix commands don't trigger unnecessary typing."""
         interaction = getattr(ctx, "interaction", None)
-        response = getattr(interaction, "response", None)
-        if response is None or not response.is_done():
-            await ctx.defer()
+        if interaction is not None:
+            response = getattr(interaction, "response", None)
+            if response is not None and not response.is_done():
+                await interaction.response.defer()
 
     async def cog_before_invoke(self, ctx: commands.Context) -> None:
         if getattr(ctx, "interaction", None) is not None:
@@ -56,6 +58,12 @@ class PlaybackCommands:
         self._cancel_guild_background_tasks(guild_id)
         session = await self.backend.get(guild_id)
         if session is not None:
+            if hasattr(self, "attachment_resolver"):
+                for entry in session.snapshot().queued:
+                    self.attachment_resolver.discard(entry.primary)
+                current = session.snapshot().current
+                if current is not None:
+                    self.attachment_resolver.discard(current.primary)
             await session.stop(clear_queue=True)
         self._current_entries.pop(guild_id, None)
         self._current_meta.pop(guild_id, None)
@@ -100,6 +108,8 @@ class PlaybackCommands:
         if removed is None:
             await self._reply(ctx, "Invalid queue position. Use queue; 1 is the next song.")
             return
+        if hasattr(self, "attachment_resolver"):
+            self.attachment_resolver.discard(removed.primary)
         await self._reply(ctx, f"Removed #{index}: {escape_display(removed.meta['title'])}.")
         await self._refresh_controller(ctx.guild.id, force=True)
 
@@ -115,6 +125,9 @@ class PlaybackCommands:
             await self._reply(ctx, "Join the bot's voice channel to clear the queue.")
             return
         self._cancel_imports(ctx.guild.id)
+        if session is not None and hasattr(self, "attachment_resolver"):
+            for track in session.snapshot().queued:
+                self.attachment_resolver.discard(track.primary)
         count = await session.clear_queue() if session is not None else 0
         await self._reply(ctx, f"Cleared {count} waiting track(s). Current playback continues.")
         await self._refresh_controller(ctx.guild.id, force=True)
@@ -266,7 +279,8 @@ class PlaybackCommands:
         await self._defer(ctx)
         await self._reply(ctx,
             "**Native music commands**\n"
-            "`play <link/search>` or `/play file:<upload>` — TIDAL, YouTube, SoundCloud, Bandcamp, Spotify imports, or audio files.\n"
+            "`play <link/search>` — TIDAL, YouTube, SoundCloud, Bandcamp, or Spotify imports.\n"
+            "`playfile` or `/playfile file:<upload>` — Play uploaded audio files directly.\n"
             "`queue` · `now` · `tidalsearch <query>`\n"
             "`pause` · `resume` · `skip` · `stop` (stops audio, clears queue, cancels imports)\n"
             "`remove 1` removes the next waiting song; any valid queue number works. "
