@@ -125,7 +125,7 @@ async def main():
     async def is_owner(user):
         return user.id == 42
     cmd = TidalPlayerExp.tidalsetup_repair
-    assert cmd.name == 'repair' and cmd.parent.name == 'tidalsetup'
+    assert cmd.name == 'repair' and cmd.parent.name == 'setup'
     assert cmd.requires.privilege_level is PrivilegeLevel.BOT_OWNER
     cmd.requires.ready_event.set()
     ctx = SimpleNamespace(

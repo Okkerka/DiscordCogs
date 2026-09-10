@@ -26,6 +26,7 @@ from redbot.core.utils.menus import SimpleMenu
 from redbot.core.utils.views import SetApiView
 
 from .config_schema import COG_IDENTIFIER, GLOBAL_DEFAULTS, GUILD_DEFAULTS, SCHEMA_VERSION
+from .commands import PlaybackCommands
 from .domain.models import PageResult as _PageResult
 from .domain.models import TrackMeta
 from .domain.candidates import NormalizedCandidate
@@ -42,16 +43,19 @@ from .ui.embeds import (
     error_embed as _error_embed, make_queue_embed, success_embed as _success_embed,
 )
 from .ui.controller import PlayerControllerView
+from .ui.queue import QueueView
+from .ui.display import escape_display
 from .playback.errors import PlaybackUnavailable
 from .playback.interfaces import PlaybackSession
 from .playback.requests import current_request, playback_request, request_is_cancelled
-from .playback.models import PlaybackEntry, SourceKind, SourceReference
+from .playback.models import PlaybackEntry, PlaybackSnapshot, SourceKind, SourceReference
 from .playback.ffmpeg import FFmpegSourceFactory, _default_locator as _default_ffmpeg_locator
 from .playback.runtime_repair import DENO_VERSION, ManagedRuntime, RuntimeRepairError
 from .playback.backend import NativePlaybackBackend
 from .playback.voice_runtime import initialize_voice_runtime
 from .providers.tidal_source import CompositeSourceResolver, TidalSourceResolver
 from .providers.public_audio import PublicAudioResolver
+from .providers.attachments import AttachmentResolver
 from .providers.youtube_resolver import YouTubeResolver, YouTubeVideoMetadata, _deno_path, parse_youtube_api_duration
 from .providers.tokens import TokenRepository, TokenService, TokenSnapshot
 from .providers.urls import MalformedProviderURL, ProviderKind, ProviderURL, parse_provider_url
@@ -94,7 +98,8 @@ log = logging.getLogger("red.tidalplayerexp")
 
 __red_end_user_data_statement__ = (
     "This cog stores Tidal and Spotify OAuth credentials globally for the bot owner. "
-    "It does not store data associated with individual Discord users."
+    "Queue requester IDs and signed Discord attachment URLs are temporarily held in memory. "
+    "They are cleared on cog unload; attachment URLs also have bounded expiry. No songs are saved to disk."
 )
 
 
@@ -123,7 +128,6 @@ MAX_ITEMS = 1000
 RATELIMIT_BACKOFF_BASE = 2.0
 RATELIMIT_BACKOFF_MAX = 30.0
 RATELIMIT_MAX_RETRIES = 4
-QUEUE_PAGE_SIZE = 10
 TPL_LIST_PAGE_SIZE = 15
 SEARCH_BATCH_SIZE = 8
 CONTROLLER_REFRESH_COOLDOWN = 3.0   # seconds between background-only controller edits
@@ -1136,7 +1140,7 @@ class TidalHandler:
         return [t for t in tracks if not FILTER_REGEX.search(getattr(t, "name", "") or "")]
 
 
-class TidalPlayerExp(commands.Cog):
+class TidalPlayerExp(PlaybackCommands, commands.Cog):
     """Play music from Tidal with full metadata support."""
 
     __slots__ = (
@@ -1150,7 +1154,7 @@ class TidalPlayerExp(commands.Cog):
         "_persistent_view", "_controller_views", "_stop_generations", "public_audio_resolver",
         "_spotify_auth_manager", "_spotify_refresh_token", "_spotify_login_states",
         "_spotify_login_views", "_spotify_auth_lock", "_spotify_commit_lock",
-        "runtime",
+        "runtime", "attachment_resolver",
     )
 
     def __init__(self, bot: Red):
@@ -1163,10 +1167,12 @@ class TidalPlayerExp(commands.Cog):
         self.runtime = ManagedRuntime(cog_data_path(self) / "native-runtime")
         self.youtube_resolver = YouTubeResolver(deno_locator=self._native_deno_path)
         self.public_audio_resolver = PublicAudioResolver(self.youtube_resolver)
+        self.attachment_resolver = AttachmentResolver()
         self.source_factory = FFmpegSourceFactory(locator=self._native_ffmpeg_path)
         resolver = CompositeSourceResolver(
             TidalSourceResolver(self.tidal), self.youtube_resolver,
             public_audio=self.public_audio_resolver,
+            attachments=self.attachment_resolver,
         )
         self.backend = NativePlaybackBackend(bot, resolver, self.source_factory, self)
         self._closing = False
@@ -1457,8 +1463,17 @@ class TidalPlayerExp(commands.Cog):
             return
         channel = self._playback_channels.get(guild_id)
         if channel is not None:
+            session = await self.backend.get(guild_id)
+            snapshot = session.snapshot() if session is not None else None
+            message = "Could not start this track. It was skipped."
+            if snapshot is not None and snapshot.halted:
+                message = "Playback halted after three consecutive failures. "
+                message += (
+                    f"{len(snapshot.queued)} waiting track(s) remain. Check setup doctor, then use retry or stop."
+                    if snapshot.queued else "Check setup doctor before trying play again."
+                )
             try:
-                await channel.send(embed=_error_embed("Could not start this track. It was skipped."))
+                await channel.send(embed=_error_embed(message), allowed_mentions=discord.AllowedMentions.none())
             except discord.HTTPException:
                 log.debug("Could not send playback failure in guild %s", guild_id)
 
@@ -1866,9 +1881,14 @@ class TidalPlayerExp(commands.Cog):
             await ctx.send(embed=_error_embed("Another cog owns this server's voice connection."))
             return None
         try:
-            session = await self.backend.connect(ctx.guild, channel)
+            async with self._guild_locks[ctx.guild.id]:
+                existing = await self.backend.get(ctx.guild.id)
+                initial_volume = await self.config.guild(ctx.guild).volume() if existing is None else None
+                session = await self.backend.connect(ctx.guild, channel)
+                if type(initial_volume) is int and 0 <= initial_volume <= 150 and initial_volume != 100:
+                    await session.set_volume(initial_volume)
         except PlaybackUnavailable:
-            await ctx.send(embed=_error_embed("Could not connect native voice. Check permissions and tidalsetup doctor."))
+            await ctx.send(embed=_error_embed("Could not connect native voice. Check permissions and setup doctor."))
             return None
         if self._closing or stop_generation != self._stop_generations[ctx.guild.id]:
             await ctx.send(embed=_error_embed("Playback request cancelled. Please try again."))
@@ -1931,7 +1951,9 @@ class TidalPlayerExp(commands.Cog):
             return False
         snapshot = session.snapshot()
         was_waiting = snapshot.current is not None or bool(snapshot.queued)
-        if not await session.enqueue(entry):
+        request = current_request(self, ctx)
+        accepted = await session.enqueue(entry, next_up=True) if request is not None and request.next_up else await session.enqueue(entry)
+        if not accepted:
             if show_embed:
                 await ctx.send(embed=_error_embed("The queue is full or the voice session ended."))
             return False
@@ -1946,6 +1968,8 @@ class TidalPlayerExp(commands.Cog):
                 self._tasks.add(task)
             except discord.HTTPException:
                 log.debug("Could not send queued confirmation in guild %s", ctx.guild.id)
+        if was_waiting:
+            await self._refresh_controller(ctx.guild.id, force=True)
         return True
 
     async def _load_and_queue_track(
@@ -2372,7 +2396,7 @@ class TidalPlayerExp(commands.Cog):
                 guild_id, paused=player.snapshot().paused if player else False,
             )
             await self._activate_controller_view(
-                guild_id, view, lambda active_view: message.edit(view=active_view),
+                guild_id, view, lambda active_view: message.edit(view=active_view, allowed_mentions=discord.AllowedMentions.none()),
                 still_current=still_current,
             )
         except asyncio.CancelledError:
@@ -2392,9 +2416,12 @@ class TidalPlayerExp(commands.Cog):
         meta = self._controller_meta.get(guild_id) or self._current_meta.get(guild_id)
         recommendations = self._cached_recommendations(guild_id, meta)
         autoplay_enabled = await self.config.guild_from_id(guild_id).autoplay_enabled()
+        session = await self.backend.get(guild_id)
+        queued = session.snapshot().queued if session is not None else ()
         return PlayerControllerView(
             self, meta=meta, recommendations=recommendations,
             autoplay_enabled=autoplay_enabled, paused=paused,
+            next_up=queued[0].meta if queued else None,
         )
 
     def _make_queued_embed(self, meta: TrackMeta) -> discord.Embed:
@@ -2423,7 +2450,8 @@ class TidalPlayerExp(commands.Cog):
             view.stop()
             return False
         try:
-            message = await (ctx.send(view=view) if ctx is not None else channel.send(view=view))
+            sender = ctx if ctx is not None else channel
+            message = await sender.send(view=view, allowed_mentions=discord.AllowedMentions.none())
         except discord.HTTPException:
             view.stop()
             return False
@@ -2472,9 +2500,12 @@ class TidalPlayerExp(commands.Cog):
 
     async def _refresh_controller(
         self, guild_id: int, interaction: discord.Interaction | None = None,
+        *, force: bool = False,
     ) -> None:
+        if interaction is None and guild_id not in self._controller_messages:
+            return
         now = asyncio.get_running_loop().time()
-        if interaction is None:
+        if interaction is None and not force:
             last = self._controller_last_refresh.get(guild_id, 0.0)
             if now - last < CONTROLLER_REFRESH_COOLDOWN:
                 return
@@ -2505,7 +2536,7 @@ class TidalPlayerExp(commands.Cog):
                     guild_id,
                     view,
                     lambda active_view: interaction.edit_original_response(
-                        view=active_view
+                        view=active_view, allowed_mentions=discord.AllowedMentions.none()
                     ),
                     still_current=still_current,
                 )
@@ -2514,7 +2545,7 @@ class TidalPlayerExp(commands.Cog):
                     guild_id,
                     view,
                     lambda active_view: interaction.response.edit_message(
-                        view=active_view
+                        view=active_view, allowed_mentions=discord.AllowedMentions.none()
                     ),
                     still_current=still_current,
                 )
@@ -2526,7 +2557,7 @@ class TidalPlayerExp(commands.Cog):
         elif message is not None:
             try:
                 await self._activate_controller_view(
-                    guild_id, view, lambda active_view: message.edit(view=active_view),
+                    guild_id, view, lambda active_view: message.edit(view=active_view, allowed_mentions=discord.AllowedMentions.none()),
                     still_current=still_current,
                 )
             except (discord.HTTPException, discord.Forbidden, discord.NotFound):
@@ -2563,22 +2594,7 @@ class TidalPlayerExp(commands.Cog):
             return
         guild_id = interaction.guild.id
         await interaction.response.defer()
-        self._stop_generations[guild_id] += 1
-        self._guild_generations[guild_id] += 1
-        event = self._cancel_events.get(guild_id)
-        if event is not None:
-            event.set()
-        self._cancel_guild_background_tasks(guild_id)
-        session = await self.backend.get(guild_id)
-        if session is not None:
-            await session.stop(clear_queue=True)
-        self._current_entries.pop(guild_id, None)
-        self._current_meta.pop(guild_id, None)
-        self._controller_meta.pop(guild_id, None)
-        old_message = self._controller_messages.pop(guild_id, None)
-        self._stop_controller_view(guild_id)
-        if old_message is not None:
-            await _delete_message_safe(old_message)
+        await self._stop_playback(guild_id)
         await interaction.followup.send("⏹ Playback stopped. Queue cleared.", ephemeral=True)
 
     async def queue_recommendation(self, interaction: discord.Interaction, tidal_track: Any) -> bool:
@@ -2999,12 +3015,55 @@ class TidalPlayerExp(commands.Cog):
         name = getattr(mix, "title", None) or getattr(mix, "name", None) or "Tidal Mix"
         await self._process_track_list(ctx, items, name, lambda t: t, COLOR_PURPLE)
 
-    @commands.hybrid_command(name="tplay")
+    @commands.hybrid_command(name="play")
     @commands.guild_only()
     @playback_request()
-    async def tplay(self, ctx: commands.Context, *, query: str):
-        """Play Tidal content, provider links, or a Tidal search result."""
-        await ctx.defer()
+    async def tplay(self, ctx: commands.Context, *, query: str | None = None, file: discord.Attachment | None = None):
+        """Play a provider link, search, or uploaded audio file (up to 50 MiB)."""
+        await self._play_request(ctx, query=query, file=file)
+
+    async def _play_request(self, ctx: commands.Context, *, query: str | None = None, file: discord.Attachment | None = None) -> None:
+        await self._defer(ctx)
+        attachments = getattr(getattr(ctx, "message", None), "attachments", ()) or ()
+        if file is None and not getattr(ctx, "interaction", None) and attachments:
+            if len(attachments) != 1:
+                await self._reply(ctx, "Attach one audio file per play request.")
+                return
+            file = attachments[0]
+        if file is not None and query:
+            await self._reply(ctx, "Provide a link/search or an audio file, not both.")
+            return
+        if self._closing or not self._initialized:
+            await ctx.send(embed=_error_embed(Messages.ERROR_STILL_LOADING))
+            return
+        if file is not None:
+            try:
+                reference, metadata = self.attachment_resolver.register(file)
+            except ValueError as error:
+                await self._reply(ctx, str(error))
+                return
+            session = None
+            admitted = False
+            try:
+                session = await self._prepare_playback_session(ctx)
+                if session is not None:
+                    entry = PlaybackEntry(secrets.token_hex(12), reference, None, metadata, ctx.author.id)
+                    admitted = await self._admit_entry(ctx, session, entry)
+            finally:
+                if not admitted:
+                    # Cancellation can arrive after enqueue but during the
+                    # confirmation send. Do not invalidate an owned source.
+                    snapshot = session.snapshot() if session is not None else None
+                    owned = snapshot is not None and (
+                        (snapshot.current is not None and snapshot.current.primary == reference)
+                        or any(item.primary == reference for item in snapshot.queued)
+                    )
+                    if not owned:
+                        self.attachment_resolver.discard(reference)
+            return
+        if not query or not query.strip():
+            await self._reply(ctx, "Use play with a link/search or attach an audio file. See musichelp for commands.")
+            return
         try:
             provider_url = parse_provider_url(query)
         except MalformedProviderURL:
@@ -3012,6 +3071,10 @@ class TidalPlayerExp(commands.Cog):
             return
         if self._closing or not self._initialized:
             await ctx.send(embed=_error_embed(Messages.ERROR_STILL_LOADING))
+            return
+        request = current_request(self, ctx)
+        if request is not None and request.next_up and provider_url is not None and provider_url.content_type not in {"track", "video"}:
+            await self._reply(ctx, "Playnext accepts one track, video, or search. Use play for albums and playlists.")
             return
         if provider_url is None or provider_url.provider in {ProviderKind.TIDAL, ProviderKind.SPOTIFY}:
             if not await self.check_ready(ctx):
@@ -3074,7 +3137,7 @@ class TidalPlayerExp(commands.Cog):
             await ctx.send(
                 embed=_error_embed(
                     "Spotify playlist imports require user OAuth. "
-                    "Use `[p]tidalsetup spotifylogin`."
+                    "Use `[p]setup spotifylogin`."
                 )
             )
             return
@@ -3221,12 +3284,12 @@ class TidalPlayerExp(commands.Cog):
         finally:
             self._release_batch(guild_id, cancel)
 
-    @commands.hybrid_command(name="tsearch")
+    @commands.hybrid_command(name="tidalsearch")
     @commands.guild_only()
     @playback_request()
     async def tsearch(self, ctx: commands.Context, *, query: str):
         """Search Tidal and choose from top results."""
-        await ctx.defer()
+        await self._defer(ctx)
         if not await self.check_ready(ctx):
             return
         filter_remixes = await self.config.guild(ctx.guild).filter_remixes()
@@ -3238,13 +3301,13 @@ class TidalPlayerExp(commands.Cog):
         if selected:
             await self._load_and_queue_track(ctx, selected)
 
-    @commands.hybrid_command(name="tnowplaying")
+    @commands.hybrid_command(name="now")
     @commands.guild_only()
     async def tnowplaying(self, ctx: commands.Context):
         """Resend the current native playback controller."""
         if ctx.guild is None:
             return
-        await ctx.defer()
+        await self._defer(ctx)
         session = await self.backend.get(ctx.guild.id)
         current = session.snapshot().current if session is not None else None
         if current is None:
@@ -3257,45 +3320,19 @@ class TidalPlayerExp(commands.Cog):
         if not await self._resend_controller_for_track_start(guild_id=ctx.guild.id, ctx=ctx):
             await ctx.send(embed=_error_embed("Could not refresh the player panel. Playback may have changed."))
 
-    @commands.hybrid_command(name="tqueue")
+    @commands.hybrid_command(name="queue")
     @commands.guild_only()
     async def tqueue(self, ctx: commands.Context):
         """Show the native queue independently of TIDAL login."""
+        await self._defer(ctx)
         session = await self.backend.get(ctx.guild.id)
-        if session is None:
-            await ctx.send(embed=_error_embed(Messages.ERROR_NO_PLAYER))
-            return
-        queue = session.snapshot().queued
-        if not queue:
-            await ctx.send(embed=_error_embed(Messages.ERROR_NO_QUEUE))
-            return
-        queue_list = queue[:MAX_ITEMS]
-        title = f"Queue ({len(queue)} tracks)" if len(queue) <= MAX_ITEMS else f"Queue (first {len(queue_list)} of {len(queue)} tracks)"
-        pages = [
-            discord.Embed(
-                title=title,
-                description="\n".join(
-                    f"`{start + i + 1}.` {truncate(entry.meta['title'], 60)} — {truncate(entry.meta['artist'], 40)}"
-                    for i, entry in enumerate(queue_list[start:start + QUEUE_PAGE_SIZE])
-                ),
-                color=COLOR_BLUE,
-            )
-            for start in range(0, len(queue_list), QUEUE_PAGE_SIZE)
-        ]
-        if len(pages) == 1:
-            await ctx.send(embed=pages[0])
-        else:
-            await SimpleMenu(pages).start(ctx)
-
-    @commands.hybrid_command(name="tstop")
-    @commands.guild_only()
-    async def tstop(self, ctx: commands.Context):
-        """Stop queueing the current playlist."""
-        if ctx.guild:
-            event = self._cancel_events.get(ctx.guild.id)
-            if event is not None:
-                event.set()
-            await ctx.send(embed=_success_embed(Messages.STATUS_STOPPING))
+        snapshot = session.snapshot() if session is not None else PlaybackSnapshot(None, (), False, None)
+        view = QueueView(self, ctx.guild.id, snapshot)
+        try:
+            view.message = await ctx.send(view=view, allowed_mentions=discord.AllowedMentions.none())
+        except BaseException:
+            view.stop()
+            raise
 
     @commands.hybrid_command(name="tfilter")
     @commands.guild_only()
@@ -3317,10 +3354,11 @@ class TidalPlayerExp(commands.Cog):
         msg = Messages.SUCCESS_INTERACTIVE_DISABLED if current else Messages.SUCCESS_INTERACTIVE_ENABLED
         await ctx.send(embed=_success_embed(msg))
 
-    @commands.group(name="tpl")
+    @commands.hybrid_group(name="tplaylist", fallback="help", invoke_without_command=True)
     @commands.is_owner()
     async def tpl(self, ctx: commands.Context):
         """Manage your Tidal playlists."""
+        await self._reply(ctx, "TIDAL playlists: list, create, add, remove, play. Use help tplaylist for details.")
 
     @tpl.command(name="list")
     @commands.is_owner()
@@ -3336,7 +3374,7 @@ class TidalPlayerExp(commands.Cog):
         for start in range(0, len(playlists), TPL_LIST_PAGE_SIZE):
             chunk = playlists[start:start + TPL_LIST_PAGE_SIZE]
             desc = "\n".join(
-                f"`{start + i + 1}.` {truncate(getattr(p, 'name', 'Unnamed'), 60)}"
+                f"`{start + i + 1}.` {escape_display(getattr(p, 'name', 'Unnamed'), 60)}"
                 for i, p in enumerate(chunk)
             )
             embed = discord.Embed(
@@ -3358,7 +3396,7 @@ class TidalPlayerExp(commands.Cog):
             return
         pl = await self.tidal.create_user_playlist(name)
         if pl:
-            await ctx.send(embed=_success_embed(f"Created playlist: **{truncate(name, 60)}**"))
+            await ctx.send(embed=_success_embed(f"Created playlist: **{escape_display(name, 60)}**"), allowed_mentions=discord.AllowedMentions.none())
         else:
             await ctx.send(embed=_error_embed(Messages.ERROR_PLAYLIST_WRITE_FAILED))
 
@@ -3390,7 +3428,7 @@ class TidalPlayerExp(commands.Cog):
         ok = await self.tidal.add_track_to_playlist(pl, track_id)
         if ok:
             name = getattr(track, "name", str(track_id))
-            await ctx.send(embed=_success_embed(f"Added **{truncate(name, 60)}** to playlist."))
+            await ctx.send(embed=_success_embed(f"Added **{escape_display(name, 60)}** to playlist."), allowed_mentions=discord.AllowedMentions.none())
         else:
             await ctx.send(embed=_error_embed(Messages.ERROR_PLAYLIST_WRITE_FAILED))
 
@@ -3412,6 +3450,8 @@ class TidalPlayerExp(commands.Cog):
 
     @tpl.command(name="play")
     @commands.is_owner()
+    @commands.guild_only()
+    @playback_request(batch=True)
     async def tpl_play(self, ctx: commands.Context, playlist_id: str):
         """Queue one of your Tidal playlists."""
         if not await self.check_ready(ctx):
@@ -3423,10 +3463,11 @@ class TidalPlayerExp(commands.Cog):
         tracks = await self.tidal.get_items(pl)
         await self._process_track_list(ctx, tracks, getattr(pl, "name", playlist_id), lambda t: t, COLOR_TEAL)
 
-    @commands.group(name="tidalsetup")
+    @commands.hybrid_group(name="setup", fallback="help", invoke_without_command=True)
     @commands.is_owner()
     async def tidalsetup(self, ctx: commands.Context):
         """Configure Tidal, Spotify, and YouTube access (bot owner only)."""
+        await self._reply(ctx, "Setup: doctor, repair, login, logout, status, spotify, spotifylogin, spotifystatus, spotifylogout, youtube.")
 
     @tidalsetup.command(name="doctor")
     @commands.is_owner()
@@ -3479,7 +3520,7 @@ class TidalPlayerExp(commands.Cog):
             return
         message = (
             "FFmpeg and Deno passed validation. Run "
-            f"`{ctx.clean_prefix}reload TidalPlayerExp`, then `{ctx.clean_prefix}tidalsetup doctor` "
+            f"`{ctx.clean_prefix}reload TidalPlayerExp`, then `{ctx.clean_prefix}setup doctor` "
             "and retry playback. No bot or server restart is needed."
         )
         if os.environ.get("IMAGEIO_FFMPEG_EXE"):
@@ -3557,13 +3598,13 @@ class TidalPlayerExp(commands.Cog):
             await ctx.send(
                 embed=_error_embed(
                     "Spotify app credentials are configured, but user OAuth is not connected. "
-                    "Use `[p]tidalsetup spotifylogin`."
+                    "Use `[p]setup spotifylogin`."
                 )
             )
         else:
             await ctx.send(
                 embed=_error_embed(
-                    "Spotify is not configured. Use `[p]tidalsetup spotify` first."
+                    "Spotify is not configured. Use `[p]setup spotify` first."
                 )
             )
 
@@ -3654,7 +3695,7 @@ class TidalPlayerExp(commands.Cog):
         if logged_in:
             await ctx.send(embed=_success_embed("Tidal session is active."))
         else:
-            await ctx.send(embed=_error_embed("Not authenticated. Use `[p]tidalsetup login`."))
+            await ctx.send(embed=_error_embed("Not authenticated. Use `[p]setup login`."))
 
 
 async def setup(bot):

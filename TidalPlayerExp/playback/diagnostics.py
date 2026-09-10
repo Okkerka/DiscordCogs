@@ -104,7 +104,7 @@ async def collect_diagnostics(
     ):
         lines.append(f"FFmpeg last failure: {last_failure}")
         if last_failure.startswith("process_signal_"):
-            lines.append("FFmpeg remedy: binary crashed; use [p]tidalsetup repair, then reload TidalPlayerExp")
+            lines.append("FFmpeg remedy: binary crashed; use [p]setup repair, then reload TidalPlayerExp")
     lines.extend([
         (
             f"yt-dlp: {_safe_version(youtube_version) if youtube_version else 'missing or outdated'} "
@@ -120,13 +120,13 @@ async def collect_diagnostics(
     if not youtube_version or not deno_ready:
         lines.append("YouTube remedy: install/update cog requirements, then reload TidalPlayerExp")
     if not deno_ready:
-        lines.append("Deno remedy: [p]tidalsetup repair installs a persistent cog-local executable")
+        lines.append("Deno remedy: [p]setup repair installs a persistent cog-local executable")
     if tidal_authenticated is None:
         auth = "not checked (offline diagnostic)"
     elif tidal_authenticated:
         auth = "cached authenticated (not revalidated)"
     else:
-        auth = "not authenticated; use [p]tidalsetup login for TIDAL"
+        auth = "not authenticated; use [p]setup login for TIDAL"
     lines.append(f"TIDAL: {auth}; not required for direct YouTube")
     lines.append("Audio: conflict; unload Audio" if bot.get_cog("Audio") is not None else "Audio: no conflict")
     if guild is None:

@@ -47,6 +47,7 @@ def test_source_kind_contains_only_stable_provider_kinds() -> None:
         ("YOUTUBE", "youtube"),
         ("SOUNDCLOUD", "soundcloud"),
         ("BANDCAMP", "bandcamp"),
+        ("ATTACHMENT", "attachment"),
     ]
 
 
@@ -334,9 +335,33 @@ class _SessionFake:
         return PlaybackSnapshot(None, (), False, None)
 
     async def enqueue(
-        self, entry: PlaybackEntry, *, start_if_idle: bool = True
+        self, entry: PlaybackEntry, *, start_if_idle: bool = True, next_up: bool = False,
     ) -> bool:
-        return start_if_idle
+        return start_if_idle or next_up
+
+    async def remove(self, index: int) -> PlaybackEntry | None:
+        return None
+
+    async def clear_queue(self) -> int:
+        return 0
+
+    async def move(self, index: int, destination: int) -> bool:
+        return False
+
+    async def shuffle_queue(self) -> bool:
+        return False
+
+    async def set_repeat(self, mode: str) -> None:
+        return None
+
+    async def set_volume(self, percent: int) -> None:
+        return None
+
+    async def seek(self, seconds: float) -> bool:
+        return False
+
+    async def resume_queue(self) -> bool:
+        return False
 
     async def skip(self) -> bool:
         return True

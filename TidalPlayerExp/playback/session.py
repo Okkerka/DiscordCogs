@@ -595,7 +595,12 @@ class NativePlaybackSession:
                     repeated = replace(entry, entry_id=secrets.token_hex(12), start_time=0)
                     if self._repeat == "track":
                         self._next_entry = repeated
-                    elif len(self._queue) < self._capacity:
+                    else:
+                        # Transfer the next waiting track into the active slot
+                        # before recycling this one; total ownership stays at
+                        # capacity + one and no repeat item is silently lost.
+                        if len(self._queue) >= self._capacity:
+                            self._next_entry = self._queue.popleft()
                         self._queue.append(repeated)
             if failed:
                 await self._notify("failed", entry, generation)

@@ -15,7 +15,7 @@ from TidalPlayerExp.playback.models import PlaybackSnapshot
 
 @pytest.fixture
 def real_queue_ui(monkeypatch):
-    """Load the queue view against py-cord's real Components V2 serializer."""
+    """Load the queue view against discord.py's real Components V2 serializer."""
     monkeypatch.setitem(sys.modules, "discord", real_discord)
     monkeypatch.setitem(sys.modules, "discord.ui", real_discord.ui)
     path = Path(__file__).parents[1] / "ui" / "queue.py"
@@ -118,16 +118,17 @@ async def test_refresh_reads_authoritative_snapshot_and_clamps_a_shrunken_page(r
     new_snapshot = PlaybackSnapshot(None, (_entry(1, title="Only remaining"),), True, 123)
     session = SimpleNamespace(snapshot=lambda: new_snapshot)
     view, cog = _view(real_queue_ui, old_snapshot, page=1, session=session)
-    interaction = SimpleNamespace(response=SimpleNamespace(edit_message=AsyncMock()))
+    interaction = SimpleNamespace(response=SimpleNamespace(defer=AsyncMock()), edit_original_response=AsyncMock())
 
     await view._refresh(interaction)
 
     cog.backend.get.assert_awaited_once_with(99)
     assert view.page == 0
     assert "Only remaining" in _text(view)
-    interaction.response.edit_message.assert_awaited_once()
-    assert interaction.response.edit_message.await_args.kwargs["view"] is view
-    mentions = interaction.response.edit_message.await_args.kwargs["allowed_mentions"]
+    interaction.response.defer.assert_awaited_once()
+    interaction.edit_original_response.assert_awaited_once()
+    assert interaction.edit_original_response.await_args.kwargs["view"] is view
+    mentions = interaction.edit_original_response.await_args.kwargs["allowed_mentions"]
     assert not mentions.everyone and not mentions.users and not mentions.roles
 
 
@@ -136,12 +137,21 @@ async def test_timeout_disables_buttons_and_stops_the_nonpersistent_view(real_qu
     snapshot = PlaybackSnapshot(None, (_entry(1),), False, 123)
     view, _ = _view(real_queue_ui, snapshot)
     view.message = SimpleNamespace(edit=AsyncMock())
+    message = view.message
 
     await view.on_timeout()
 
     assert all(button.disabled for button in _buttons(view))
     assert view.is_finished()
-    view.message.edit.assert_awaited_once()
-    assert view.message.edit.await_args.kwargs["view"] is view
-    mentions = view.message.edit.await_args.kwargs["allowed_mentions"]
+    message.edit.assert_awaited_once()
+    assert message.edit.await_args.kwargs["view"] is view
+    mentions = message.edit.await_args.kwargs["allowed_mentions"]
     assert not mentions.everyone and not mentions.users and not mentions.roles
+    assert view.message is None
+    assert not view.snapshot.queued
+
+
+def test_queue_remaining_duration_accounts_for_current_position(real_queue_ui):
+    snapshot = PlaybackSnapshot(_entry(1), (_entry(2), _entry(3)), False, 123, position=30)
+    view, _ = _view(real_queue_ui, snapshot)
+    assert "Remaining: 05:30" in _text(view)

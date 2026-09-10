@@ -31,33 +31,33 @@ Downloader repository:
 [p]unload TidalPlayer
 [p]unload audio
 [p]load TidalPlayerExp
-[p]tidalsetup doctor
+[p]setup doctor
 ```
 
 No server restart is needed. If doctor reports a dependency as installed but
 unavailable, update/reinstall that dependency and reload the cog. A broken or
 incompatible native library still needs a working wheel for the host; the cog
 never enables voice by skipping crypto imports or encryption checks.
-Both old and experimental cogs use the same commands, so they cannot be loaded
-together. This cog also refuses to share voice ownership with Audio or another
+The old and experimental cogs cannot be loaded together. The experiment's new
+generic commands also overlap Red Audio. This cog refuses to share voice ownership with another
 cog; it never unloads other cogs for you.
 
 Join a voice channel and try:
 
 ```text
-[p]tplay <YouTube video URL>
-[p]tplay <SoundCloud track/set or Bandcamp track/album URL>
-[p]tidalsetup login
-[p]tplay <TIDAL URL or song search>
-[p]tqueue
+[p]play <YouTube video URL>
+[p]play <SoundCloud track/set or Bandcamp track/album URL>
+[p]setup login
+[p]play <TIDAL URL or song search>
+[p]queue
 ```
 
 The bot needs Connect and Speak permissions. Playback controls require you to be
-in its voice channel. `tidalsetup doctor` is owner-only and checks local versions,
+in its voice channel. `setup doctor` is owner-only and checks local versions,
 voice readiness, FFmpeg features, YouTube dependencies, cached TIDAL login state,
 and voice ownership. It does not connect, fetch media, or revalidate credentials.
 
-If voice connects but a track is skipped, run `tidalsetup doctor` immediately
+If voice connects but a track is skipped, run `setup doctor` immediately
 after the failure, without reloading. `FFmpeg last failure` gives the most recent
 startup failure across the cog's sessions (for example `http_403`, `tls_error`,
 or `process_signal_11`) and its exit code. The same safe category is logged;
@@ -70,15 +70,15 @@ host can reach a media server or decode that particular source.
 Bot owners can install a persistent FFmpeg/Deno pair entirely through Discord:
 
 ```text
-[p]tidalsetup repair
+[p]setup repair
 ```
 
 Wait for the success message, then run:
 
 ```text
 [p]reload TidalPlayerExp
-[p]tidalsetup doctor
-[p]tplay <YouTube or TIDAL URL>
+[p]setup doctor
+[p]play <YouTube or TIDAL URL>
 ```
 
 This is intended for a crashing bundled FFmpeg (such as
@@ -100,7 +100,9 @@ Windows x86-64. Other platforms retain normal dependency discovery. Allow
 outbound HTTPS to GitHub release downloads, permission to execute files in cog
 data, and enough disk space for staging (roughly 150 MB of downloads on Linux,
 190 MB on Windows; leave about 1 GB free). A matching healthy runtime is reused.
-Previous installed generations are retained so an in-use binary is not deleted.
+At cog startup, cleanup retains the active runtime and one backup, and removes
+obsolete owned generations and staging files older than 24 hours. Repair itself
+does not remove previous generations while the cog may be using their binaries.
 An explicit `IMAGEIO_FFMPEG_EXE` setting still takes precedence and is not changed
 by repair. Local validation does not guarantee the host can reach every media
 provider; retry playback after reloading to verify the original problem.
@@ -168,16 +170,61 @@ is not a guarantee that every site or individual track currently works.
   Flat collections can have sparse metadata: SoundCloud set titles may use
   track URL slugs, and entries without public track URLs are skipped.
 - TIDAL links/search and Spotify-to-TIDAL imports require TIDAL authentication.
-  Spotify setup is optional: `[p]tidalsetup spotify` and
-  `[p]tidalsetup spotifylogin`. An optional YouTube Data API key can be configured
-  with `[p]tidalsetup youtube`.
+  Spotify setup is optional: `[p]setup spotify` and
+  `[p]setup spotifylogin`. An optional YouTube Data API key can be configured
+  with `[p]setup youtube`.
 - Use the now-playing panel to pause/resume, skip, stop, choose a suggestion, or
   toggle autoplay. Autoplay generates TIDAL tracks only and needs TIDAL login.
-- Slash `/tplay` acknowledges queue admission even for the first song, clearing
+- Slash `/play` acknowledges queue admission even for the first song, clearing
   Discord's thinking indicator; the player panel is published separately when
   audio starts. The short acknowledgement is deleted after one minute.
-- `[p]tstop` cancels a running playlist **import**, leaving admitted tracks alone.
-  The controller's **Stop** button stops playback and clears the queue.
+- `[p]stop`, `/stop`, and the controller's **Stop** button share one implementation:
+  stop audio, clear the waiting queue, and cancel pending lookups/imports.
+  The old `tstop` command has been removed, with no alias.
+
+### Commands
+
+All commands below have prefix and slash versions. The renamed commands do not
+keep the old `tplay`, `tqueue`, `tsearch`, `tnowplaying`, `tpl`, or `tidalsetup` aliases.
+
+| Command | Behavior |
+| --- | --- |
+| `play <link/search>` | Play supported media; `/play file:<attachment>` or a prefix-message attachment plays an uploaded audio file. |
+| `playnext <link/search>` | Put one track next, without interrupting the current song. Collections use `play`. |
+| `queue` | Components V2 panel with current song, numbered waiting songs, durations, requester IDs, paging and refresh. |
+| `now` | Resend the now-playing controls. |
+| `pause`, `resume`, `skip`, `stop` | Control playback; stop also clears the queue and cancels imports. |
+| `remove <index>` | Remove a waiting song. **1 is the next song**, never the current song. Slash: `/remove track index:1`. |
+| `remove all` | Clear waiting songs and cancel imports without interrupting current audio. Slash: `/remove all`. |
+| `move <index> <destination>`, `shuffle` | Reorder waiting songs using the queue's one-based numbers. |
+| `volume [0–150]` | Show/set the saved server volume. 0 mutes; 100 is normal. Amplification is peak-limited. |
+| `repeat off/track/queue` | Repeat successful playback; skips and failures do not repeat. |
+| `seek <seconds or MM:SS or HH:MM:SS>`, `replay` | Seek/restart a finite track, keeping its queue and paused state. |
+| `retry` | Resume waiting tracks after the consecutive-failure safeguard halts playback. |
+| `autoplay [on/off]` | Show/set automatic TIDAL recommendations; requires Manage Server. |
+| `tidalsearch <query>` | Choose from TIDAL search results. |
+| `tplaylist list/create/add/remove/play` | Manage the owner's TIDAL playlists (bot owner only). |
+| `setup` | Provider login/configuration, doctor, repair and status (bot owner only). |
+| `tfilter`, `tinteractive` | Toggle search filtering/interactive selection; requires Manage Server. |
+| `musichelp` | Show compact usage guidance. |
+
+Volume changes briefly rebuffer at the current position, using FFmpeg rather than
+adding Python-side audio encoding. Live/unknown-length streams return to their
+live edge; seek/replay are unavailable for unknown-length sources. At volume 100,
+compatible unseeked Opus streams retain the low-CPU copy path. Stop leaves the
+idle voice connection for the existing two-minute automatic disconnect.
+
+Uploaded audio is limited to **50 MiB** per file (Discord may impose a lower
+upload limit). Accepted types are MP3, M4A, FLAC, WAV, OGG, Opus, AAC, and audio
+WebM/MP4. Only Discord-hosted attachments are accepted, not arbitrary file URLs.
+Signed attachment URLs are private in memory, capped at 1,000 records, expire
+after at most 12 hours or their earlier CDN expiry, and are cleared on unload.
+Re-upload an expired file. Files are streamed through FFmpeg, never downloaded
+to a song-cache directory; files without duration metadata display `Unknown`.
+
+After updating, reload `TidalPlayerExp` and synchronize this cog's slash commands
+using your bot's normal Red slash-command setup. Command names such as `play`,
+`stop`, and `setup` must not be registered by another loaded cog.
 
 ## Reliability and resource use
 

@@ -196,12 +196,14 @@ class CompositeSourceResolver:
     def __init__(
         self, tidal: TidalSourceResolver, youtube: SourceResolver,
         *, public_audio: SourceResolver | None = None,
+        attachments: SourceResolver | None = None,
     ) -> None:
         self._tidal = tidal
         self._youtube = youtube
         # PublicAudioResolver borrows the same YouTube worker and owns no child
         # lifecycle separately; closing both would duplicate cleanup ownership.
         self._public_audio = public_audio
+        self._attachments = attachments
         self._closing_task: asyncio.Task[None] | None = None
         self._closed = False
 
@@ -214,6 +216,8 @@ class CompositeSourceResolver:
             return await self._tidal.resolve(reference)
         if reference.kind is SourceKind.YOUTUBE:
             return await self._youtube.resolve(reference)
+        if reference.kind is SourceKind.ATTACHMENT and self._attachments is not None:
+            return await self._attachments.resolve(reference)
         if reference.kind in (SourceKind.SOUNDCLOUD, SourceKind.BANDCAMP) and self._public_audio is not None:
             return await self._public_audio.resolve(reference)
         raise SourceResolutionError()
@@ -223,10 +227,17 @@ class CompositeSourceResolver:
             return
         task = self._closing_task
         if task is None:
-            task = asyncio.create_task(self._youtube.close())
+            task = asyncio.create_task(self._close_owned())
             self._closing_task = task
             task.add_done_callback(self._close_finished)
         await asyncio.shield(task)
+
+    async def _close_owned(self) -> None:
+        try:
+            await self._youtube.close()
+        finally:
+            if self._attachments is not None:
+                await self._attachments.close()
 
     def _close_finished(self, task: asyncio.Task[None]) -> None:
         if self._closing_task is not task:

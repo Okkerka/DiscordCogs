@@ -189,6 +189,11 @@ class AttachmentResolver:
             raise AttachmentResolutionError()
         return ResolvedSource(stored.url, {})
 
+    def discard(self, reference: SourceReference) -> None:
+        """Release a rejected upload; never call for a queued or playing reference."""
+        if reference.kind is SourceKind.ATTACHMENT:
+            self._entries.pop(reference.identifier, None)
+
     async def close(self) -> None:
         """Forget every private signed URL during cog shutdown."""
         self._entries.clear()

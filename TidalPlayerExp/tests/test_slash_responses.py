@@ -74,7 +74,10 @@ async def test_slash_nowplaying_sends_panel_through_command_response(cog, native
     )
     await cog.tnowplaying(ctx)
     ctx.defer.assert_awaited_once()
-    ctx.send.assert_awaited_once_with(view=panel)
+    from discord import AllowedMentions
+    ctx.send.assert_awaited_once()
+    assert ctx.send.await_args.kwargs["view"] is panel
+    assert ctx.send.await_args.kwargs["allowed_mentions"].to_dict() == AllowedMentions.none().to_dict()
     ctx.channel.send.assert_not_awaited()
     assert cog._controller_messages[1] is ctx.send.return_value
 

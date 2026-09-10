@@ -41,13 +41,13 @@ class Messages:
     ERROR_TIMEOUT = "Selection timed out."
     ERROR_FETCH_FAILED = "Could not fetch playlist."
     ERROR_NO_SPOTIFY = (
-        "Spotify not configured. Use `[p]tidalsetup spotify` to set app credentials."
+        "Spotify not configured. Use `[p]setup spotify` to set app credentials."
     )
-    ERROR_NOT_USER_PLAYLIST = "That playlist is not a user-owned playlist. Use `[p]tpl list` to see your playlists."
+    ERROR_NOT_USER_PLAYLIST = "That playlist is not a user-owned playlist. Use `[p]tplaylist list` to see your playlists."
     ERROR_PLAYLIST_WRITE_FAILED = "Playlist operation failed."
     ERROR_NO_QUEUE = "The queue is empty."
     ERROR_BATCH_IN_PROGRESS = (
-        "A playlist import is already running. Use `[p]tstop` before starting another."
+        "A playlist import is already running. Use `[p]remove all` before starting another."
     )
 
 

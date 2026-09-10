@@ -26,7 +26,7 @@ REQUIRED_COMMAND_NAMES = {
     "tsearch",
     "tnowplaying",
     "tqueue",
-    "tstop",
+    "stop_command",
     "tfilter",
     "tinteractive",
     "tpl",
@@ -69,8 +69,9 @@ class TestCommandRegistration:
     def test_tqueue_is_coroutine(self, mod):
         assert inspect.iscoroutinefunction(mod.TidalPlayerExp.tqueue)
 
-    def test_tstop_is_coroutine(self, mod):
-        assert inspect.iscoroutinefunction(mod.TidalPlayerExp.tstop)
+    def test_stop_command_is_coroutine_and_tstop_is_removed(self, mod):
+        assert inspect.iscoroutinefunction(mod.TidalPlayerExp.stop_command)
+        assert not hasattr(mod.TidalPlayerExp, "tstop")
 
     def test_tfilter_is_coroutine(self, mod):
         assert inspect.iscoroutinefunction(mod.TidalPlayerExp.tfilter)
@@ -209,7 +210,7 @@ async def test_tidalsetup_youtube_opens_red_secure_token_view(cog) -> None:
 
 
 @pytest.mark.asyncio
-async def test_queue_title_reports_displayed_and_total_tracks(cog, native_session) -> None:
+async def test_queue_uses_full_snapshot_in_message_bound_queue_view(cog, native_session) -> None:
     from TidalPlayerExp.tests.conftest import make_entry
     current_mod = importlib.import_module(cog.__class__.__module__)
     queue = [
@@ -217,16 +218,32 @@ async def test_queue_title_reports_displayed_and_total_tracks(cog, native_sessio
         for index in range(1, current_mod.MAX_ITEMS + 8)
     ]
     native_session.entries = queue
-    ctx = SimpleNamespace(guild=SimpleNamespace(id=1), send=AsyncMock())
-    menu = SimpleNamespace(start=AsyncMock())
+    message = SimpleNamespace()
+    ctx = SimpleNamespace(guild=SimpleNamespace(id=1), defer=AsyncMock(), send=AsyncMock(return_value=message))
+    created_views = []
+
+    class RecordingQueueView:
+        def __init__(self, view_cog, guild_id, snapshot):
+            self.cog = view_cog
+            self.guild_id = guild_id
+            self.snapshot = snapshot
+            self.message = None
+            created_views.append(self)
+
+        def stop(self):
+            pass
 
     with (
-        patch.object(type(cog), "check_ready", new=AsyncMock(return_value=True)),
-        patch.object(current_mod, "SimpleMenu", return_value=menu) as menu_factory,
+        patch.object(current_mod, "QueueView", RecordingQueueView),
+        patch.object(current_mod, "SimpleMenu") as simple_menu,
     ):
         await cog.tqueue(ctx)
 
-    first_page = menu_factory.call_args.args[0][0]
-    assert first_page.title == (
-        f"Queue (first {current_mod.MAX_ITEMS} of {len(queue)} tracks)"
-    )
+    assert len(created_views) == 1
+    view = created_views[0]
+    assert view.cog is cog
+    assert view.guild_id == 1
+    assert view.snapshot.queued == tuple(queue)
+    assert len(view.snapshot.queued) > current_mod.MAX_ITEMS
+    assert view.message is message
+    simple_menu.assert_not_called()

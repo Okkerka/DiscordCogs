@@ -20,6 +20,7 @@ async def test_gain_transcodes_only_when_needed(ffmpeg_module, tmp_path, volume,
         assert argv[argv.index("-c:a") + 1] == ("copy" if copied else "libopus")
         if volume != 100:
             assert argv[argv.index("-af") + 1].startswith(f"volume={volume / 100:.2f}")
+            assert ("alimiter=limit=1:level=false:latency=true" in argv[argv.index("-af") + 1]) == (volume > 100)
         else:
             assert "-af" not in argv
     finally:

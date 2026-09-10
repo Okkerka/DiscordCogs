@@ -45,6 +45,7 @@ class FakeGuildConfig:
         self._filter_remixes = _ConfigValue(True)
         self._interactive_search = _ConfigValue(False)
         self._autoplay_enabled = _ConfigValue(False)
+        self.volume = _ConfigValue(100)
 
     @property
     def filter_remixes(self) -> _ConfigValue:
@@ -129,6 +130,8 @@ class FakeConfig:
 def _make_discord_stub() -> types.ModuleType:
     discord = types.ModuleType("discord")
     discord.AudioSource = real_discord.AudioSource
+    discord.Attachment = real_discord.Attachment
+    discord.AllowedMentions = real_discord.AllowedMentions
     discord.oggparse = real_discord.oggparse
     discord.Color = MagicMock()
     discord.Color.blue = MagicMock(return_value="blue")
@@ -245,6 +248,8 @@ def _make_redbot_stub(fake_config: FakeConfig) -> types.ModuleType:
                 f.command = command
                 return f
             return decorator
+
+        hybrid_group = group
 
         @staticmethod
         def is_owner():
@@ -485,12 +490,24 @@ class FakePlaybackSession:
         self.paused = False
         self.enqueue = AsyncMock(side_effect=self._enqueue)
         self.skip = AsyncMock(return_value=True)
-        self.stop = AsyncMock()
+        self.stop = AsyncMock(side_effect=self._stop)
+        self.clear_queue = AsyncMock(side_effect=self._clear_queue)
         self.set_paused = AsyncMock(return_value=True)
 
     def _enqueue(self, entry, **kwargs):
         self.entries.append(entry)
         return True
+
+    async def _stop(self, *, clear_queue=True):
+        self.current = None
+        self.paused = False
+        if clear_queue:
+            await self._clear_queue()
+
+    async def _clear_queue(self):
+        count = len(self.entries)
+        self.entries.clear()
+        return count
 
     def snapshot(self):
         from TidalPlayerExp.playback.models import PlaybackSnapshot

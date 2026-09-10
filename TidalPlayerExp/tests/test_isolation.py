@@ -15,7 +15,7 @@ REQUIRED_COMMAND_NAMES = {
     "tsearch",
     "tnowplaying",
     "tqueue",
-    "tstop",
+    "stop_command",
     "tfilter",
     "tinteractive",
     "tpl",

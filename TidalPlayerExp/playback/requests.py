@@ -16,6 +16,7 @@ class PlaybackRequest:
     context: Any
     generation: int
     batch: asyncio.Event | None = None
+    next_up: bool = False
 
 
 _request: ContextVar[PlaybackRequest | None] = ContextVar("tidalplayer_request", default=None)
@@ -38,7 +39,7 @@ def request_is_cancelled(cog: Any, ctx: Any) -> bool:
 def playback_request(*, batch: bool = False) -> Callable:
     """Keep the original stop generation across nested handlers and provider awaits.
 
-    Collection ownership starts before the initial lookup, so tstop covers the
+    Collection ownership starts before the initial lookup, so stop covers the
     whole import, not just its queue-admission loop.
     """
     def decorate(operation: Callable) -> Callable:

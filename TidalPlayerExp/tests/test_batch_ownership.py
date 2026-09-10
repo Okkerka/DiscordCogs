@@ -56,21 +56,19 @@ def test_batch_event_release_requires_the_owner(cog) -> None:
 
 
 @pytest.mark.asyncio
-async def test_tstop_sets_only_the_active_batch_event(cog) -> None:
+async def test_cancel_imports_sets_only_the_active_batch_event(cog) -> None:
     guild = SimpleNamespace(id=83)
     event = cog._claim_batch(guild.id)
-    ctx = SimpleNamespace(guild=guild, send=AsyncMock())
 
-    await cog.tstop(ctx)
+    cog._cancel_imports(guild.id)
 
     assert event is not None and event.is_set()
 
 
 @pytest.mark.asyncio
-async def test_tstop_without_active_batch_does_not_create_an_event(cog) -> None:
+async def test_cancel_imports_without_active_batch_does_not_create_an_event(cog) -> None:
     guild = SimpleNamespace(id=84)
-    ctx = SimpleNamespace(guild=guild, send=AsyncMock())
 
-    await cog.tstop(ctx)
+    cog._cancel_imports(guild.id)
 
     assert guild.id not in cog._cancel_events

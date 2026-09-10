@@ -112,13 +112,13 @@ async def test_stop_while_public_metadata_pending_cannot_restart_playback(cog, p
 
 
 @pytest.mark.asyncio
-async def test_tstop_public_collection_preserves_admitted_entries(cog, public_ctx, native_session):
+async def test_cancel_imports_public_collection_preserves_admitted_entries(cog, public_ctx, native_session):
     items = tuple(_metadata(f"https://soundcloud.com/artist/song-{index}") for index in range(4))
     cog.public_audio_resolver.fetch_collection.return_value = items
 
     async def enqueue(entry):
         native_session._enqueue(entry)
-        await cog.tstop(public_ctx)
+        cog._cancel_imports(public_ctx.guild.id)
         return True
 
     native_session.enqueue.side_effect = enqueue

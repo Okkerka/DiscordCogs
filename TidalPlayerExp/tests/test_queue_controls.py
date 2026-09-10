@@ -144,3 +144,21 @@ async def test_retry_only_resumes_halted_queue():
         assert not await session.resume_queue()
     finally:
         await session.close()
+
+
+@pytest.mark.asyncio
+async def test_queue_repeat_preserves_tracks_when_waiting_queue_is_full():
+    session, voice, resolver, factory, sink = setup(queue_capacity=1)
+    try:
+        await session.set_repeat("queue")
+        await session.enqueue(entry(1))
+        await sink.expect("started")
+        assert await session.enqueue(entry(2))
+        for expected in (2, 1, 2):
+            voice.callbacks[-1](None)
+            await sink.expect("started")
+            assert session.snapshot().current.meta["track_id"] == expected
+            assert len(session.snapshot().queued) == 1
+            assert session.snapshot().queued[0].meta["track_id"] == 3 - expected
+    finally:
+        await session.close()

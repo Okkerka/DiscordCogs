@@ -73,7 +73,7 @@ async def test_unavailable_voice_packages_do_not_send_owner_into_restart_loop(do
     assert "DAVE: 1.2.3 (installed but unavailable" in report
     assert "reload TidalPlayerExp" in report
     assert "restart Red" not in report
-    assert "tidalsetup login" in report
+    assert "setup login" in report
     assert "Voice: none" in report
 
 
@@ -122,7 +122,7 @@ async def test_crashed_ffmpeg_reports_owner_repair_instead_of_dependency_reinsta
     report = await doctor.collect_diagnostics(
         bot, backend, factory, tidal_authenticated=None, guild=guild,
     )
-    assert "tidalsetup repair" in report
+    assert "setup repair" in report
 
 
 def test_managed_deno_is_ready_even_after_downloader_binary_disappears(monkeypatch, tmp_path):

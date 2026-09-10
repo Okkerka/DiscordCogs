@@ -164,7 +164,7 @@ async def test_unusable_pages_have_a_finite_work_budget(cog, playlist_ctx, empty
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["enumeration", "matching", "admission"])
-async def test_tstop_prevents_future_admission_and_preserves_already_queued(cog, playlist_ctx, native_session, stage):
+async def test_cancel_imports_prevents_future_admission_and_preserves_already_queued(cog, playlist_ctx, native_session, stage):
     entered, release = asyncio.Event(), asyncio.Event()
     original_enqueue = native_session._enqueue
 
@@ -194,7 +194,7 @@ async def test_tstop_prevents_future_admission_and_preserves_already_queued(cog,
     task = asyncio.create_task(cog._handle_youtube_playlist(playlist_ctx, PLAYLIST_ID))
     try:
         await asyncio.wait_for(entered.wait(), 2)
-        await cog.tstop(playlist_ctx)
+        cog._cancel_imports(playlist_ctx.guild.id)
         release.set()
         await asyncio.wait_for(task, 2)
     finally:

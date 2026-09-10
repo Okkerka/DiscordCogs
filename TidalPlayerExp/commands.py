@@ -1,7 +1,6 @@
 """Shared prefix/slash playback controls; sessions own all queue mutations."""
 from __future__ import annotations
 
-import asyncio
 from typing import Literal
 
 import discord
@@ -69,14 +68,22 @@ class PlaybackCommands:
             except discord.HTTPException:
                 pass
 
+    def _can_cancel_request(self, ctx: commands.Context, session: PlaybackSession | None) -> bool:
+        """Check voice authority even while Discord's handshake is unpublished."""
+        if ctx.guild is None or self._closing:
+            return False
+        channel = getattr(getattr(ctx.author, "voice", None), "channel", None)
+        connecting = getattr(getattr(ctx.guild, "voice_client", None), "channel", None)
+        target_id = session.snapshot().channel_id if session is not None else getattr(connecting, "id", None)
+        return channel is not None and (target_id is None or target_id == channel.id)
+
     @commands.hybrid_command(name="stop")
     @commands.guild_only()
     async def stop_command(self, ctx: commands.Context) -> None:
         """Stop playback, clear waiting songs, and cancel pending imports/lookups."""
         await self._defer(ctx)
-        channel = getattr(getattr(ctx.author, "voice", None), "channel", None)
         session = await self.backend.get(ctx.guild.id)
-        if channel is None or (session is not None and session.snapshot().channel_id != channel.id):
+        if not self._can_cancel_request(ctx, session):
             await self._reply(ctx, "Join the bot's voice channel to stop playback.")
             return
         await self._stop_playback(ctx.guild.id)
@@ -94,18 +101,23 @@ class PlaybackCommands:
             await self._reply(ctx, "Invalid queue position. Use queue; 1 is the next song.")
             return
         await self._reply(ctx, f"Removed #{index}: {escape_display(removed.meta['title'])}.")
-        await self._refresh_controller(ctx.guild.id)
+        await self._refresh_controller(ctx.guild.id, force=True)
 
     @remove_command.command(name="all")
     async def remove_all(self, ctx: commands.Context) -> None:
         """Clear waiting tracks and imports without stopping the current song."""
-        session = await self._control_session(ctx)
-        if session is None:
+        await self._defer(ctx)
+        if ctx.guild is None:
+            await self._reply(ctx, "Playback is unavailable here.")
+            return
+        session = await self.backend.get(ctx.guild.id)
+        if not self._can_cancel_request(ctx, session):
+            await self._reply(ctx, "Join the bot's voice channel to clear the queue.")
             return
         self._cancel_imports(ctx.guild.id)
-        count = await session.clear_queue()
+        count = await session.clear_queue() if session is not None else 0
         await self._reply(ctx, f"Cleared {count} waiting track(s). Current playback continues.")
-        await self._refresh_controller(ctx.guild.id)
+        await self._refresh_controller(ctx.guild.id, force=True)
 
     @commands.hybrid_command(name="volume")
     @commands.guild_only()
@@ -120,8 +132,12 @@ class PlaybackCommands:
         if not 0 <= percent <= 150:
             await self._reply(ctx, "Volume must be between 0 and 150.")
             return
-        await session.set_volume(percent)
-        await self.config.guild(ctx.guild).volume.set(percent)
+        async with self._guild_locks[ctx.guild.id]:
+            if self._closing or await self.backend.get(ctx.guild.id) is not session:
+                await self._reply(ctx, "The voice session changed. Try volume again.")
+                return
+            await session.set_volume(percent)
+            await self.config.guild(ctx.guild).volume.set(percent)
         await self._reply(ctx, f"Volume: {percent}%." + (" Amplification is peak-limited." if percent > 100 else ""))
 
     @commands.hybrid_command(name="pause")
@@ -142,7 +158,7 @@ class PlaybackCommands:
             changed = await session.set_paused(paused)
             await self._reply(ctx, ("Paused." if paused else "Resumed.") if changed else "Nothing is playing.")
             if changed:
-                await self._refresh_controller(ctx.guild.id)
+                await self._refresh_controller(ctx.guild.id, force=True)
 
     @commands.hybrid_command(name="skip")
     @commands.guild_only()
@@ -162,7 +178,7 @@ class PlaybackCommands:
             moved = await session.move(index, destination)
             await self._reply(ctx, f"Moved #{index} to #{destination}." if moved else "Invalid queue positions. Use queue to see current numbers.")
             if moved:
-                await self._refresh_controller(ctx.guild.id)
+                await self._refresh_controller(ctx.guild.id, force=True)
 
     @commands.hybrid_command(name="shuffle")
     @commands.guild_only()
@@ -173,7 +189,7 @@ class PlaybackCommands:
             shuffled = await session.shuffle_queue()
             await self._reply(ctx, "Waiting tracks shuffled." if shuffled else "Queue at least two waiting tracks first.")
             if shuffled:
-                await self._refresh_controller(ctx.guild.id)
+                await self._refresh_controller(ctx.guild.id, force=True)
 
     @commands.hybrid_command(name="repeat")
     @commands.guild_only()
@@ -232,7 +248,7 @@ class PlaybackCommands:
                     task.cancel()
         enabled = await setting()
         await self._reply(ctx, f"Autoplay: {'on' if enabled else 'off'}.")
-        await self._refresh_controller(ctx.guild.id)
+        await self._refresh_controller(ctx.guild.id, force=True)
 
     @commands.hybrid_command(name="playnext")
     @commands.guild_only()

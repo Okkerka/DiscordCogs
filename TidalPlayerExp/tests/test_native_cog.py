@@ -61,8 +61,8 @@ async def test_skip_is_single_native_transition(cog, native_ctx, native_session)
 
 
 @pytest.mark.asyncio
-async def test_tstop_only_cancels_import(cog, native_ctx, native_session):
+async def test_stop_playback_cancels_import_and_stops_native_session(cog, native_ctx, native_session):
     event = cog._claim_batch(1)
-    await cog.tstop(native_ctx)
+    await cog._stop_playback(native_ctx.guild.id)
     assert event.is_set()
-    native_session.stop.assert_not_called()
+    native_session.stop.assert_awaited_once_with(clear_queue=True)

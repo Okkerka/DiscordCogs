@@ -9,7 +9,7 @@ from TidalPlayerExp.tests.conftest import make_entry
 
 
 def context():
-    return SimpleNamespace(guild=SimpleNamespace(id=1), author=SimpleNamespace(id=2),
+    return SimpleNamespace(guild=SimpleNamespace(id=1), author=SimpleNamespace(id=2, voice=SimpleNamespace(channel=SimpleNamespace(id=22))),
                            channel=SimpleNamespace(), interaction=object(),
                            send=AsyncMock(), defer=AsyncMock())
 
@@ -27,7 +27,7 @@ async def test_stop_during_track_lookup_prevents_late_enqueue(cog, native_sessio
     cog._prepare_playback_session = AsyncMock(return_value=native_session)
     pending = asyncio.create_task(cog._handle_track(ctx, "1"))
     await entered.wait()
-    cog._stop_generations[1] += 1
+    cog._cancel_imports(1)
     release.set()
     await pending
     assert not native_session.entries
@@ -35,7 +35,7 @@ async def test_stop_during_track_lookup_prevents_late_enqueue(cog, native_sessio
 
 
 @pytest.mark.asyncio
-async def test_tstop_covers_initial_playlist_lookup(cog, native_session, monkeypatch):
+async def test_stop_command_cancels_initial_playlist_lookup_and_clears_playback(cog, native_session, monkeypatch):
     ctx = context()
     entered, release = asyncio.Event(), asyncio.Event()
     async def lookup(*_):
@@ -47,12 +47,16 @@ async def test_tstop_covers_initial_playlist_lookup(cog, native_session, monkeyp
     cog._resolve_and_extract = AsyncMock(return_value=(SimpleNamespace(id=1), make_entry().meta))
     cog.check_ready = AsyncMock(return_value=True)
     cog._prepare_playback_session = AsyncMock(return_value=native_session)
+    native_session.current = make_entry(2)
+    native_session.entries = [make_entry(3)]
     pending = asyncio.create_task(cog._handle_playlist(ctx, "1"))
     await entered.wait()
-    await cog.tstop(ctx)
+    await cog.stop_command(ctx)
     release.set()
     await pending
     assert not native_session.entries
+    assert native_session.current is None
+    native_session.stop.assert_awaited_once_with(clear_queue=True)
     assert 1 not in cog._cancel_events
 
 

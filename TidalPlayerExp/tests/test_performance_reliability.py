@@ -127,7 +127,10 @@ async def test_deferred_controller_refresh_edits_original_response(cog) -> None:
     ):
         await cog._refresh_controller(guild_id, interaction)
 
-    interaction.edit_original_response.assert_awaited_once_with(view=view)
+    from discord import AllowedMentions
+    interaction.edit_original_response.assert_awaited_once()
+    assert interaction.edit_original_response.await_args.kwargs["view"] is view
+    assert interaction.edit_original_response.await_args.kwargs["allowed_mentions"].to_dict() == AllowedMentions.none().to_dict()
 
 
 @pytest.mark.asyncio
