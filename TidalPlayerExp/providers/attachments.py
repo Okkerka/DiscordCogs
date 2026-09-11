@@ -122,11 +122,16 @@ class AttachmentResolver:
             raise ValueError(_ERR_CDN)
 
         path_parts = parts.path.split("/")
-        if len(path_parts) != 5 or path_parts[0] or path_parts[1] != "attachments":
+        # Interaction uploads use a separate CDN path from message attachments.
+        # Keep its signed URL unchanged: these paths are not interchangeable.
+        if (
+            len(path_parts) != 5 or path_parts[0]
+            or path_parts[1] not in {"attachments", "ephemeral-attachments"}
+        ):
             raise ValueError(_ERR_LINK)
-        channel_id, attachment_id, encoded_filename = path_parts[2:]
+        parent_id, attachment_id, encoded_filename = path_parts[2:]
         if not (
-            channel_id.isascii() and channel_id.isdecimal()
+            parent_id.isascii() and parent_id.isdecimal()
             and attachment_id.isascii() and attachment_id.isdecimal()
         ):
             raise ValueError(_ERR_LINK)

@@ -44,6 +44,45 @@ def test_register_keeps_signed_cdn_url_out_of_reference_metadata_and_repr():
     assert attachment.url not in repr(next(iter(resolver._entries.values())))
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("host", ["cdn.discordapp.com", "media.discordapp.net"])
+@pytest.mark.parametrize("path", ["attachments", "ephemeral-attachments"])
+async def test_message_and_interaction_uploads_keep_signed_url_and_expiry(host, path):
+    now = [_NOW]
+    resolver = AttachmentResolver(clock=lambda: now[0])
+    upload = _attachment(
+        filename="clip.mp3", size=251237,
+        url=f"https://{host}/{path}/123456789/987654321/clip.mp3"
+        f"?ex={int(_NOW + 60):x}&is=abc&hm=signed-secret",
+    )
+    reference, meta = resolver.register(upload)
+    assert (await resolver.resolve(reference)).url == upload.url
+    assert (await resolver.resolve(reference)).media_only
+    assert "signed-secret" not in repr((reference, meta))
+    now[0] += 61
+    with pytest.raises(SourceResolutionError, match="Re-upload"):
+        await resolver.resolve(reference)
+
+
+@pytest.mark.parametrize("path", [
+    "ephemeral-attachments/123/456/%2Fmix.mp3",
+    "ephemeral-attachments/123/456/%5Cmix.mp3",
+    "ephemeral-attachments/123/456/other.mp3",
+    "ephemeral-attachments/123/456/../mix.mp3",
+    "ephemeral-attachments/not-an-id/456/mix.mp3",
+    "ephemeral-attachments/123/not-an-id/mix.mp3",
+    "ephemeral-attachments/123/456/mix.mp3?ex=invalid",
+    "ephemeral-attachments/123/456/mix.mp3?ex=ffffffff&ex=ffffffff",
+    "ephemeral-attachments-extra/123/456/mix.mp3",
+    "avatars/123/456/mix.mp3",
+])
+def test_interaction_uploads_still_reject_malformed_paths_and_expiry(path):
+    resolver = AttachmentResolver(clock=lambda: _NOW)
+    with pytest.raises(ValueError, match="invalid attachment link"):
+        resolver.register(_attachment(url=f"https://cdn.discordapp.com/{path}"))
+    assert not resolver._entries
+
+
 @pytest.mark.parametrize("filename,mime", [
     ("song.mp3", None), ("song.flac", "application/octet-stream"),
     ("song.wav", "Audio/Wav; charset=binary"), ("song.m4a", ""),

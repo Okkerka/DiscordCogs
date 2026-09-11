@@ -103,6 +103,8 @@ async def test_file_playback_bypasses_tidal_and_never_exposes_signed_url(control
     ctx = context()
     ctx.interaction = object() if slash else None
     file = _attachment()
+    if slash:
+        file.url = file.url.replace("/attachments/", "/ephemeral-attachments/")
     cog.attachment_resolver = AttachmentResolver(clock=lambda: _NOW)
     cog._prepare_playback_session = AsyncMock(return_value=session)
     cog.check_ready = AsyncMock(side_effect=AssertionError("Files must not require TIDAL"))
