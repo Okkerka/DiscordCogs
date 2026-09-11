@@ -48,12 +48,13 @@ async def test_tidal_metadata_failures_do_not_log_sdk_exception(cog, caplog, met
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("slash,deferred", [(False, False), (True, False), (True, True)])
-async def test_command_error_handlers_keep_provider_failures_private(cog, caplog, monkeypatch, slash, deferred) -> None:
+@pytest.mark.parametrize("error_type", [RuntimeError, ValueError])
+async def test_command_error_handlers_keep_provider_failures_private(cog, caplog, monkeypatch, slash, deferred, error_type) -> None:
     module = importlib.import_module(cog.__class__.__module__)
 
     class InvokeError(Exception):
         def __init__(self):
-            self.original = RuntimeError(SECRET)
+            self.original = error_type(SECRET)
 
     monkeypatch.setattr(module.app_commands if slash else module.commands, "CommandInvokeError", InvokeError)
     target = SimpleNamespace(
@@ -69,7 +70,8 @@ async def test_command_error_handlers_keep_provider_failures_private(cog, caplog
         response = target.send
     response.assert_awaited_once()
     assert SECRET not in caplog.text
-    assert "RuntimeError" in caplog.text
+    assert error_type.__name__ in caplog.text
+    assert SECRET not in response.await_args.kwargs["embed"].description
     assert all(record.exc_info is None for record in caplog.records)
 
 

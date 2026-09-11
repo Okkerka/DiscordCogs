@@ -1052,6 +1052,70 @@ assert process.poll() is not None
     assert completed.returncode == 0, completed.stderr
 
 
+@pytest.mark.skipif(os.environ.get("CI_NO_FFMPEG_SMOKE") == "1", reason="FFmpeg smoke disabled")
+def test_packaged_ffmpeg_extracts_audio_from_mp4_in_isolated_process() -> None:
+    """Exercise the production audio mapping/encoder with a real video container."""
+    script = r'''
+import asyncio
+from pathlib import Path
+import subprocess
+import tempfile
+from TidalPlayerExp.playback.ffmpeg import FFmpegSourceFactory, _FFmpegAudioSource
+from TidalPlayerExp.playback.models import ResolvedSource
+
+capability = asyncio.run(FFmpegSourceFactory().check())
+with tempfile.TemporaryDirectory(prefix="tidal-video-smoke-") as directory:
+    video = Path(directory) / "upload.mp4"
+    subprocess.run([
+        capability.executable, "-hide_banner", "-loglevel", "error", "-nostdin",
+        "-f", "lavfi", "-i", "color=size=16x16:duration=0.16",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.16",
+        "-c:v", "mpeg4", "-c:a", "aac", "-shortest", str(video),
+    ], check=True, stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+    args = FFmpegSourceFactory._argv(
+        capability, ResolvedSource("https://cdn.discordapp.com/upload.mp4", {}, media_only=True), copied=False,
+    )
+    assert args[args.index("-map") + 1] == "0:a:0" and "-vn" in args
+    # Only this offline test substitutes a local input. Runtime keeps HTTPS-only.
+    args[args.index("-i") + 1] = str(video)
+    args[args.index("-protocol_whitelist") + 1] = "file"
+    for option in ("-reconnect", "-reconnect_streamed", "-reconnect_delay_max"):
+        index = args.index(option)
+        del args[index:index + 2]
+    process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, shell=False)
+    source = _FFmpegAudioSource(process, copied=False)
+    try:
+        source.prime()
+        packets = []
+        while packet := source.read():
+            packets.append(packet)
+        assert packets and all(isinstance(packet, bytes) for packet in packets)
+    finally:
+        source.cleanup()
+    assert process.poll() is not None
+    # A DASH document under the same upload policy must fail before fetching
+    # any of its nested URLs. The earlier unsafe path attempted this connection.
+    disguised = b"""<?xml version="1.0"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+        type="static" mediaPresentationDuration="PT1S" minBufferTime="PT1S"
+        profiles="urn:mpeg:dash:profile:isoff-on-demand:2011"><Period>
+        <AdaptationSet mimeType="audio/mp4"><Representation id="1" bandwidth="128000">
+        <BaseURL>https://127.0.0.1:9/audio.mp4</BaseURL>
+        </Representation></AdaptationSet></Period></MPD>"""
+    args[args.index("-i") + 1] = "pipe:0"
+    args[args.index("-protocol_whitelist") + 1] = "pipe,https,tls,tcp,crypto"
+    blocked = subprocess.run(args, input=disguised, capture_output=True, timeout=10)
+    assert blocked.returncode != 0
+    assert b"not on whitelist" in blocked.stderr.lower(), blocked.stderr
+    assert b"Connection to" not in blocked.stderr, blocked.stderr
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", script], cwd=Path(__file__).resolve().parents[2],
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("stderr", "returncode", "reason"), [
     (b"[https] HTTP error 403 Forbidden https://private.example/?token=secret", 1, "http_403"),

@@ -290,9 +290,37 @@ def _make_redbot_stub(fake_config: FakeConfig) -> types.ModuleType:
                 self.send = AsyncMock()
                 self.command = MagicMock()
 
+        class CommandInvokeError(Exception):
+            def __init__(self, original: Exception | None = None) -> None:
+                self.original = original or RuntimeError("error")
+
+        class BucketType:
+            default = 0
+            user = 1
+            guild = 2
+            channel = 3
+            member = 4
+            category = 5
+            role = 6
+
         @staticmethod
-        def CommandInvokeError(e: Exception) -> Exception:
-            return e
+        def dynamic_cooldown(*args: Any, **kwargs: Any):
+            return lambda f: f
+
+        @staticmethod
+        def cooldown(*args: Any, **kwargs: Any):
+            return lambda f: f
+
+        class Cooldown:
+            def __init__(self, rate: float, per: float) -> None:
+                self.rate = rate
+                self.per = per
+
+        CommandOnCooldown = type("CommandOnCooldown", (Exception,), {"retry_after": 5.0})
+        MissingPermissions = type("MissingPermissions", (Exception,), {})
+        BotMissingPermissions = type("BotMissingPermissions", (Exception,), {})
+        BadArgument = type("BadArgument", (Exception,), {})
+        CheckFailure = type("CheckFailure", (Exception,), {})
 
     redbot.core.commands = _FakeCommands
 
@@ -300,6 +328,10 @@ def _make_redbot_stub(fake_config: FakeConfig) -> types.ModuleType:
     redbot.core.app_commands.AppCommandError = Exception
     redbot.core.app_commands.CommandInvokeError = Exception
     redbot.core.app_commands.UserFeedbackCheckFailure = Exception
+    redbot.core.app_commands.CommandOnCooldown = type("AppCommandOnCooldown", (Exception,), {"retry_after": 5.0})
+    redbot.core.app_commands.MissingPermissions = type("AppMissingPermissions", (Exception,), {})
+    redbot.core.app_commands.BotMissingPermissions = type("AppBotMissingPermissions", (Exception,), {})
+    redbot.core.app_commands.CheckFailure = type("AppCheckFailure", (Exception,), {})
 
     class _FakeRed:
         async def get_shared_api_tokens(self, service: str) -> dict:

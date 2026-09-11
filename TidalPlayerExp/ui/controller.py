@@ -28,7 +28,7 @@ def _duration(seconds: int) -> str:
     return format_duration(max(0, int(seconds or 0)))
 
 
-def _track_info(meta: TrackMeta, *, autoplay_enabled: bool) -> str:
+def _track_info(meta: TrackMeta, *, autoplay_enabled: bool, position: float | None = None) -> str:
     # These budgets also reserve space for next-up text and controller labels
     # within Discord's 4000-character Components V2 message budget.
     title = escape_display(meta.get("title") or "Unknown track", 512)
@@ -48,6 +48,14 @@ def _track_info(meta: TrackMeta, *, autoplay_enabled: bool) -> str:
         f"**Autoplay:** {autoplay_state}\n"
         f"**Duration:** {duration}"
     )
+    if position is not None and position >= 0:
+        elapsed = format_duration(int(position))
+        dur_seconds = meta.get("duration") or 0
+        if dur_seconds > 0:
+            remaining = format_duration(max(0, int(dur_seconds - position)))
+            info += f"\n**Position (snapshot):** {elapsed} / {duration} · **Remaining:** {remaining}"
+        else:
+            info += f"\n**Position (snapshot):** {elapsed}"
     if source_url:
         info += f"\n[Open in {escape_display(source_link_label(meta), 64)}]({source_url})"
     return info
@@ -64,6 +72,7 @@ class PlayerControllerView(discord.ui.LayoutView):
         autoplay_enabled: bool = False,
         paused: bool = False,
         next_up: TrackMeta | None = None,
+        position: float | None = None,
     ) -> None:
         super().__init__(timeout=None)
         self.cog = cog
@@ -72,6 +81,7 @@ class PlayerControllerView(discord.ui.LayoutView):
         self.autoplay_enabled = autoplay_enabled
         self.paused = paused
         self.next_up = next_up or {}
+        self.position = position
         self._build_layout()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -86,7 +96,7 @@ class PlayerControllerView(discord.ui.LayoutView):
         title = str(self.meta.get("title") or "Unknown track")
         image_url = safe_display_url(self.meta.get("image"), 2048)
         autoplay_state = "On" if self.autoplay_enabled else "Off"
-        info = _track_info(self.meta, autoplay_enabled=self.autoplay_enabled)
+        info = _track_info(self.meta, autoplay_enabled=self.autoplay_enabled, position=self.position)
         next_title = escape_display(self.next_up.get("title") or "", 512)
         next_artist = escape_display(self.next_up.get("artist") or "")
         if next_title:

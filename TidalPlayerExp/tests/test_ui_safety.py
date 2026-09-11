@@ -2,12 +2,62 @@
 from __future__ import annotations
 
 import importlib.util
+import asyncio
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import discord as real_discord
 import pytest
+
+
+@pytest.mark.asyncio
+async def test_interactive_search_bounds_and_escapes_provider_metadata(cog, monkeypatch):
+    import TidalPlayerExp.tidalplayer as module
+
+    monkeypatch.setattr(module.TrackSelectView, "wait_for_selection", AsyncMock(return_value=None))
+    message = SimpleNamespace(delete=AsyncMock())
+    ctx = SimpleNamespace(author=SimpleNamespace(id=1), send=AsyncMock(return_value=message))
+    hostile = "[click](https://evil.example) @everyone " + "😀" * 3000
+    tracks = [SimpleNamespace(name=hostile, artist=SimpleNamespace(name=hostile),
+                              album=SimpleNamespace(name=hostile), duration=120)] * 5
+    await cog._interactive_select(ctx, tracks)
+    payload = ctx.send.call_args.kwargs
+    description = payload["embed"].description
+    assert len(description.encode("utf-16-le")) // 2 <= 4096
+    assert "@everyone" not in description and "[click](https://evil.example)" not in description
+    assert payload["allowed_mentions"].everyone is False
+    assert all(len(button.label.encode("utf-16-le")) // 2 <= 80 for button in payload["view"].children)
+
+
+@pytest.mark.asyncio
+async def test_interactive_search_cancellation_stops_view_and_deletes_prompt(cog, monkeypatch):
+    import TidalPlayerExp.tidalplayer as module
+
+    started = asyncio.Event()
+
+    async def wait_for_selection(_view):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(module.TrackSelectView, "wait_for_selection", wait_for_selection)
+    message = SimpleNamespace(delete=AsyncMock())
+    ctx = SimpleNamespace(author=SimpleNamespace(id=1), send=AsyncMock(return_value=message))
+    pending = asyncio.create_task(cog._interactive_select(ctx, [SimpleNamespace(name="Song", duration=120)]))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        view = ctx.send.call_args.kwargs["view"]
+        stopped = Mock(wraps=view.stop)
+        monkeypatch.setattr(view, "stop", stopped)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        stopped.assert_called_once()
+        message.delete.assert_awaited_once()
+    finally:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
 
 
 @pytest.fixture

@@ -1,8 +1,32 @@
 """Native command admission and effective playback event integration."""
 from types import SimpleNamespace
+from dataclasses import replace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rebuffer", [True, False])
+async def test_seek_leaves_controller_untouched_but_new_tracks_resend(cog, native_session, rebuffer):
+    from TidalPlayerExp.tests.test_native_session import entry
+    from TidalPlayerExp.playback.models import PlaybackSnapshot
+
+    previous = entry(1)
+    current = replace(previous, entry_id="new", start_time=10,
+                      replaces_entry_id=previous.entry_id if rebuffer else None)
+    cog._current_entries[1] = previous
+    native_session.snapshot.return_value = PlaybackSnapshot(current, (), False, 22, position=10)
+    cog._refresh_controller = AsyncMock()
+    cog._resend_controller_for_track_start = AsyncMock()
+    cog._schedule_controller_recommendations = Mock()
+    await cog.track_started(1, current)
+    assert cog._current_entries[1] is current
+    if rebuffer:
+        cog._resend_controller_for_track_start.assert_not_awaited()
+        cog._refresh_controller.assert_not_awaited()
+    else:
+        cog._resend_controller_for_track_start.assert_awaited_once_with(guild_id=1)
 
 
 @pytest.fixture

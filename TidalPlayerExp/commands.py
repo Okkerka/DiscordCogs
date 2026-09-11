@@ -12,16 +12,56 @@ from .playback.requests import current_request, playback_request
 from .ui.display import escape_display
 
 
+def parse_position(value: str) -> int | None:
+    """Parse a bounded absolute timestamp without accepting signs or fractions."""
+    if len(value) > 12:
+        return None
+    parts = value.strip().split(":")
+    if not 1 <= len(parts) <= 3 or any(not item.isascii() or not item.isdecimal() for item in parts):
+        return None
+    values = [int(item) for item in parts]
+    if any(item >= 60 for item in values[1:]):
+        return None
+    total = 0
+    for item in values:
+        total = total * 60 + item
+    return total
+
+
+def playback_cooldown(ctx: commands.Context) -> commands.Cooldown:
+    """Per-user cooldown: 3.5s for normal searches/tracks, 10s for playlist/album imports."""
+    query = ""
+    if ctx.kwargs and "query" in ctx.kwargs:
+        query = str(ctx.kwargs["query"] or "").lower()
+    elif ctx.args and len(ctx.args) > 2:
+        query = " ".join(str(a) for a in ctx.args[2:]).lower()
+    elif getattr(ctx, "message", None) and ctx.message.content:
+        query = ctx.message.content.lower()
+    elif getattr(ctx, "interaction", None) and getattr(ctx.interaction, "data", None):
+        options = ctx.interaction.data.get("options", [])
+        query = " ".join(str(opt.get("value", "")) for opt in options).lower()
+
+    if any(k in query for k in ("playlist", "album", "mix", "/sets/")):
+        return commands.Cooldown(1, 10.0)
+    return commands.Cooldown(1, 3.5)
+
+
 class PlaybackCommands:
     """Command mixin using the cog's native backend and existing controller lifecycle."""
 
     async def _defer(self, ctx: commands.Context) -> None:
         """Defer only interactions so prefix commands don't trigger unnecessary typing."""
-        interaction = getattr(ctx, "interaction", None)
-        if interaction is not None:
-            response = getattr(interaction, "response", None)
-            if response is not None and not response.is_done():
-                await interaction.response.defer()
+        if getattr(ctx, "interaction", None) is not None:
+            response = getattr(ctx.interaction, "response", None)
+            if response is not None and response.is_done():
+                return
+            if hasattr(ctx, "defer") and callable(ctx.defer):
+                await ctx.defer()
+            else:
+                interaction = ctx.interaction
+                response = getattr(interaction, "response", None)
+                if response is not None and not response.is_done():
+                    await interaction.response.defer()
 
     async def cog_before_invoke(self, ctx: commands.Context) -> None:
         if getattr(ctx, "interaction", None) is not None:
@@ -116,6 +156,10 @@ class PlaybackCommands:
     @remove_command.command(name="all")
     async def remove_all(self, ctx: commands.Context) -> None:
         """Clear waiting tracks and imports without stopping the current song."""
+        await self._clear_waiting(ctx)
+
+    async def _clear_waiting(self, ctx: commands.Context) -> None:
+        """Shared validated implementation; never invoke another command callback."""
         await self._defer(ctx)
         if ctx.guild is None:
             await self._reply(ctx, "Playback is unavailable here.")
@@ -131,6 +175,12 @@ class PlaybackCommands:
         count = await session.clear_queue() if session is not None else 0
         await self._reply(ctx, f"Cleared {count} waiting track(s). Current playback continues.")
         await self._refresh_controller(ctx.guild.id, force=True)
+
+    @commands.hybrid_command(name="clear")
+    @commands.guild_only()
+    async def clear_command(self, ctx: commands.Context) -> None:
+        """Clear waiting tracks and imports without stopping the current song."""
+        await self._clear_waiting(ctx)
 
     @commands.hybrid_command(name="volume")
     @commands.guild_only()
@@ -266,6 +316,7 @@ class PlaybackCommands:
     @commands.hybrid_command(name="playnext")
     @commands.guild_only()
     @playback_request()
+    @commands.dynamic_cooldown(playback_cooldown, commands.BucketType.user)
     async def playnext_command(self, ctx: commands.Context, *, query: str) -> None:
         """Queue one song/search result next without interrupting playback."""
         request = current_request(self, ctx)
@@ -280,30 +331,15 @@ class PlaybackCommands:
         await self._reply(ctx,
             "**Native music commands**\n"
             "`play <link/search>` — TIDAL, YouTube, SoundCloud, Bandcamp, or Spotify imports.\n"
-            "`playfile` or `/playfile file:<upload>` — Play uploaded audio files directly.\n"
+            "`/play` optionally selects `platform`: tidal, youtube, or soundcloud; unset keeps TIDAL search.\n"
+            "`playfile` or `/playfile file:<upload>` — Play audio/video uploads (including MP4), up to 50 MiB.\n"
             "`queue` · `now` · `tidalsearch <query>`\n"
             "`pause` · `resume` · `skip` · `stop` (stops audio, clears queue, cancels imports)\n"
             "`remove 1` removes the next waiting song; any valid queue number works. "
-            "`remove all` clears waiting songs/imports but keeps current audio. Slash: `/remove track index:1` or `/remove all`.\n"
+            "`remove all` or `clear` clears waiting songs/imports but keeps current audio. Slash: `/remove track index:1`, `/remove all`, or `/clear`.\n"
             "`playnext <link/search>` · `move 5 1` · `shuffle` · `repeat off/track/queue`\n"
             "`volume 0–150` · `seek 1:30` · `replay` · `retry` · `autoplay on/off`\n"
             "`tplaylist` manages TIDAL playlists; `setup` handles provider logins and diagnostics (bot owner). "
             "`tfilter` and `tinteractive` require Manage Server.\n"
             "Playback controls require the bot's voice channel. Voice disconnects automatically after two idle minutes. "
             "Volume changes may briefly rebuffer. Files are streamed, not permanently downloaded; expired uploads need re-uploading.")
-
-
-def parse_position(value: str) -> int | None:
-    """Parse a bounded absolute timestamp without accepting signs or fractions."""
-    if len(value) > 12:
-        return None
-    parts = value.strip().split(":")
-    if not 1 <= len(parts) <= 3 or any(not item.isascii() or not item.isdecimal() for item in parts):
-        return None
-    values = [int(item) for item in parts]
-    if any(item >= 60 for item in values[1:]):
-        return None
-    total = 0
-    for item in values:
-        total = total * 60 + item
-    return total

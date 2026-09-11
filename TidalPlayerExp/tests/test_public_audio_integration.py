@@ -61,6 +61,7 @@ async def test_public_track_command_is_keyless_and_queues_stable_reference(cog, 
     ("https://artist.bandcamp.com/album/record", "https://artist.bandcamp.com/track/song"),
 ])
 async def test_public_collection_is_capped_ordered_and_lazy(cog, public_ctx, native_session, url, track_url):
+    cog._refresh_controller = AsyncMock()
     items = tuple(_metadata(f"{track_url}-{index}") for index in range(12))
     cog.public_audio_resolver.fetch_collection.return_value = items
     await cog.tplay(public_ctx, query=url)
@@ -70,6 +71,7 @@ async def test_public_collection_is_capped_ordered_and_lazy(cog, public_ctx, nat
     cog.public_audio_resolver.resolve.assert_not_awaited()
     assert not cog._cancel_events
     assert "Queued 12/12" in public_ctx.send.return_value.edit.await_args.kwargs["embed"].description
+    cog._refresh_controller.assert_awaited_once_with(public_ctx.guild.id, force=True)
 
 
 @pytest.mark.asyncio

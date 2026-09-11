@@ -144,6 +144,7 @@ class ResolvedSource:
     duration: int | None = None
     start_time: float = 0.0
     volume: int = 100
+    media_only: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.url, str):
@@ -172,6 +173,8 @@ class ResolvedSource:
             raise ValueError("Playback offset is invalid")
         if isinstance(self.volume, bool) or not isinstance(self.volume, int) or not 0 <= self.volume <= 150:
             raise ValueError("Volume must be between 0 and 150")
+        if not isinstance(self.media_only, bool):
+            raise ValueError("Media-only policy must be a boolean")
 
     def __repr__(self) -> str:
         """Return a constant representation that cannot expose media details."""
@@ -190,12 +193,18 @@ class PlaybackEntry:
     requester_id: int | None
     fallback_meta: TrackMeta | None = None
     start_time: float = 0.0
+    replaces_entry_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.start_time, (int, float)) or isinstance(self.start_time, bool) or not math.isfinite(self.start_time) or self.start_time < 0:
             raise ValueError("Playback offset is invalid")
         if not isinstance(self.entry_id, str) or not self.entry_id or len(self.entry_id) > 64:
             raise ValueError("Playback entry identifier is invalid")
+        if self.replaces_entry_id is not None and (
+            not isinstance(self.replaces_entry_id, str) or not self.replaces_entry_id
+            or len(self.replaces_entry_id) > 64
+        ):
+            raise ValueError("Playback predecessor identifier is invalid")
         if self.fallback == self.primary:
             raise ValueError("Playback fallback must differ from primary")
         copied_meta = _copy_track_meta(self.meta)

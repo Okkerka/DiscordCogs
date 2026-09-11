@@ -107,10 +107,10 @@ async def test_file_playback_bypasses_tidal_and_never_exposes_signed_url(control
     cog._prepare_playback_session = AsyncMock(return_value=session)
     cog.check_ready = AsyncMock(side_effect=AssertionError("Files must not require TIDAL"))
     if slash:
-        await cog.tplay(ctx, file=file)
+        await cog.playfile(ctx, file=file)
     else:
         ctx.message.attachments = [file]
-        await cog.tplay(ctx)
+        await cog.playfile(ctx)
     await sink.expect("started")
     assert session.snapshot().current.primary.kind.value == "attachment"
     assert file.url not in repr(session.snapshot().current)
@@ -122,7 +122,7 @@ async def test_failed_file_admission_releases_private_registry_slot(controls):
     cog, session, sink = controls
     cog.attachment_resolver = AttachmentResolver(clock=lambda: _NOW)
     cog._prepare_playback_session = AsyncMock(return_value=None)
-    await cog.tplay(context(), file=_attachment())
+    await cog.playfile(context(), file=_attachment())
     assert not cog.attachment_resolver._entries
 
 
@@ -207,3 +207,59 @@ async def test_cancel_controls_respect_handshaking_voice_channel(cog, method):
 def test_seek_timestamp_validation(value, want):
     from TidalPlayerExp.commands import parse_position
     assert parse_position(value) == want
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform", ["youtube", "soundcloud"])
+async def test_selected_platform_search_does_not_require_tidal(controls, monkeypatch, platform):
+    import importlib
+    from TidalPlayerExp.playback.models import SourceKind, SourceReference
+    cog, session, sink = controls
+    module = importlib.import_module(cog.__class__.__module__)
+    ref = SourceReference(SourceKind.YOUTUBE, "abcdefghijk") if platform == "youtube" else SourceReference(SourceKind.SOUNDCLOUD, "https://soundcloud.com/artist/song")
+    search = AsyncMock(return_value=(ref, entry().meta))
+    monkeypatch.setattr(module, "search_provider", search, raising=False)
+    cog.check_ready = AsyncMock(side_effect=AssertionError("Should not check TIDAL login"))
+    cog._prepare_playback_session = AsyncMock(return_value=session)
+    await cog.tplay(context(), query="artist song", platform=platform)
+    await sink.expect("started")
+    assert session.snapshot().current.primary == ref
+    search.assert_awaited_once_with(cog.youtube_resolver, "artist song", platform)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform", [None, "tidal"])
+async def test_unspecified_or_tidal_search_keeps_catalog_behavior(controls, monkeypatch, platform):
+    cog, session, sink = controls
+    cog.check_ready = AsyncMock(return_value=True)
+    cog._prepare_playback_session = AsyncMock(return_value=session)
+    search = AsyncMock(return_value=[object()])
+    monkeypatch.setattr(type(cog.tidal), "search", search)
+    cog._load_and_queue_track = AsyncMock()
+    await cog.tplay(context(), query="artist song", platform=platform)
+    search.assert_awaited_once_with("artist song", filter_remixes=True)
+    cog._load_and_queue_track.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_platform_selection_does_not_reroute_explicit_links(controls):
+    cog, session, sink = controls
+    cog._prepare_playback_session = AsyncMock(return_value=session)
+    cog._handle_youtube_video = AsyncMock()
+    await cog.tplay(context(), query="https://youtu.be/abcdefghijk", platform="soundcloud")
+    cog._handle_youtube_video.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_defer_is_idempotent_after_global_hook(cog):
+    ctx = context()
+    responded = False
+    async def defer():
+        nonlocal responded
+        assert not responded
+        responded = True
+    ctx.interaction = SimpleNamespace(response=SimpleNamespace(is_done=lambda: responded))
+    ctx.defer = AsyncMock(side_effect=defer)
+    await cog.cog_before_invoke(ctx)
+    await cog._defer(ctx)
+    ctx.defer.assert_awaited_once()

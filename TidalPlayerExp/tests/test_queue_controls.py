@@ -91,6 +91,7 @@ async def test_seek_restarts_same_track_and_preserves_queue_and_pause():
         assert await session.seek(10)
         await sink.expect("started")
         assert seen[-1].start_time == 10
+        assert session.snapshot().current.replaces_entry_id == "1"
         assert session.snapshot().paused
         assert session.snapshot().position >= 10
         assert [item.entry_id for item in session.snapshot().queued] == ["2"]

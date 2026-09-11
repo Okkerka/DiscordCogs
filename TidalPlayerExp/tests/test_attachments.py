@@ -44,6 +44,45 @@ def test_register_keeps_signed_cdn_url_out_of_reference_metadata_and_repr():
     assert attachment.url not in repr(next(iter(resolver._entries.values())))
 
 
+@pytest.mark.parametrize("filename,mime", [
+    ("song.mp3", None), ("song.flac", "application/octet-stream"),
+    ("song.wav", "Audio/Wav; charset=binary"), ("song.m4a", ""),
+    ("clip.mp4", "video/mp4"), ("clip.MP4", "application/octet-stream"),
+    ("clip.webm", "video/webm"), ("clip.mov", "video/quicktime"),
+    ("clip.mkv", "video/x-matroska"), ("clip.avi", "video/x-msvideo"),
+    ("clip.m4v", "video/x-m4v"), ("clip.mpeg", "video/mpeg"),
+])
+def test_audio_and_video_uploads_accept_optional_or_advisory_mime(filename, mime):
+    resolver = AttachmentResolver(clock=lambda: _NOW)
+    upload = _attachment(filename=filename, content_type=mime,
+        url=f"https://cdn.discordapp.com/attachments/123/456/{filename}")
+    reference, meta = resolver.register(upload)
+    assert reference.kind is SourceKind.ATTACHMENT
+    assert meta["title"] == filename.rsplit(".", 1)[0]
+
+
+@pytest.mark.parametrize("filename,mime", [("page.html", "video/mp4"), ("program.exe", None), ("list.m3u8", "audio/mpegurl"), ("photo.jpg", "application/octet-stream")])
+def test_media_mime_cannot_bypass_extension_allowlist(filename, mime):
+    resolver = AttachmentResolver(clock=lambda: _NOW)
+    with pytest.raises(ValueError, match="supported"):
+        resolver.register(_attachment(filename=filename, content_type=mime))
+
+
+@pytest.mark.asyncio
+async def test_closed_registry_rejects_new_uploads():
+    resolver = AttachmentResolver(clock=lambda: _NOW)
+    await resolver.close()
+    with pytest.raises(ValueError):
+        resolver.register(_attachment())
+
+
+@pytest.mark.asyncio
+async def test_upload_resolution_requires_media_only_demuxing():
+    resolver = AttachmentResolver(clock=lambda: _NOW)
+    reference, _ = resolver.register(_attachment())
+    assert (await resolver.resolve(reference)).media_only is True
+
+
 @pytest.mark.asyncio
 async def test_resolve_returns_the_private_signed_url_only_for_a_live_opaque_reference():
     resolver = AttachmentResolver(clock=lambda: _NOW)

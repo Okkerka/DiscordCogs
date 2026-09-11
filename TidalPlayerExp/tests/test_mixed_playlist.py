@@ -99,6 +99,7 @@ async def test_flat_playlist_filters_private_deleted_and_duplicates(cog, playlis
 
 @pytest.mark.asyncio
 async def test_mixed_matching_preserves_order_and_original_fallback(cog, playlist_ctx, native_session):
+    cog._refresh_controller = AsyncMock()
     cog.tidal.is_logged_in.return_value = True
     cog.youtube_resolver.fetch_playlist.return_value = tuple(_video(f"{i:011d}", f"AZALI - Rivals {i}") for i in range(12))
     active = peak = 0
@@ -118,6 +119,7 @@ async def test_mixed_matching_preserves_order_and_original_fallback(cog, playlis
     await cog._handle_youtube_playlist(playlist_ctx, PLAYLIST_ID)
 
     assert len(native_session.entries) == 12
+    cog._refresh_controller.assert_awaited_once_with(playlist_ctx.guild.id, force=True)
     assert 1 < peak <= 8
     for index, entry in enumerate(native_session.entries):
         if index % 2 == 0:

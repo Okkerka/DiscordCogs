@@ -86,7 +86,8 @@ def success_embed(message: str) -> discord.Embed:
     return discord.Embed(description=clamp_text(message, 4096), color=COLOR_GREEN)
 
 
-def make_now_playing_embed(meta: TrackMeta, autoplay_enabled: bool = False) -> discord.Embed:
+def make_now_playing_embed(meta: TrackMeta, autoplay_enabled: bool = False, *, position: float | None = None) -> discord.Embed:
+    """Rich now-playing card with album art, source badge, and resolution."""
     description = [f"**{escape_display(meta.get('title') or 'Unknown track', 512)}**",
                    escape_display(meta.get("artist") or "Unknown artist")]
     if meta.get("album"):
@@ -104,7 +105,17 @@ def make_now_playing_embed(meta: TrackMeta, autoplay_enabled: bool = False) -> d
             value=f"[Listen]({share_url})",
             inline=True,
         )
-    embed.set_footer(text=f"Duration: {display_duration(meta)} · Delivery: Discord Opus")
+    if position is not None and position >= 0:
+        elapsed = format_duration(int(position))
+        dur_seconds = meta.get("duration") or 0
+        if dur_seconds > 0:
+            remaining = format_duration(max(0, int(dur_seconds - position)))
+            footer_text = f"Position (snapshot): {elapsed} / {display_duration(meta)} · Remaining: {remaining} · Delivery: Discord Opus"
+        else:
+            footer_text = f"Position (snapshot): {elapsed} · Delivery: Discord Opus"
+    else:
+        footer_text = f"Duration: {display_duration(meta)} · Delivery: Discord Opus"
+    embed.set_footer(text=footer_text)
     if image := safe_display_url(meta.get("image"), 2048):
         embed.set_thumbnail(url=image)
     return embed

@@ -12,6 +12,51 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from unittest.mock import AsyncMock
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalidate", ["logout", "unload"])
+async def test_device_login_cannot_commit_after_logout_or_unload(cog, monkeypatch, invalidate):
+    """A completed SDK worker must not revive an authorization the owner cancelled."""
+    state_ready = asyncio.Event()
+    release = asyncio.Event()
+    expiry = datetime.now(timezone.utc) + timedelta(hours=6)
+    session = SimpleNamespace(
+        expiry_time=expiry, token_type="Bearer", access_token="old-access",
+        refresh_token="old-refresh", login_oauth=lambda: (
+            SimpleNamespace(verification_uri_complete="https://login.tidal.com/test", expires_in=120),
+            SimpleNamespace(result=lambda: True),
+        ),
+    )
+    cog.tidal.session = session
+    calls = 0
+
+    async def run_blocking(_handler, operation, timeout):
+        nonlocal calls
+        calls += 1
+        result = operation()
+        if calls == 3:
+            state_ready.set()
+            await release.wait()
+        return result
+
+    monkeypatch.setattr(type(cog.tidal), "_run_blocking", run_blocking)
+    ctx = SimpleNamespace(author=SimpleNamespace(send=AsyncMock()), send=AsyncMock())
+    pending = asyncio.create_task(cog.tidalsetup_login(ctx))
+    try:
+        await asyncio.wait_for(state_ready.wait(), timeout=1)
+        if invalidate == "logout":
+            await cog.tidal.logout()
+        else:
+            cog._closing = True
+        release.set()
+        await asyncio.wait_for(pending, timeout=1)
+        assert await cog.tokens.restore() is None
+        assert not any("successful" in call.kwargs["embed"].description for call in ctx.send.call_args_list)
+    finally:
+        release.set()
+        await asyncio.gather(pending, return_exceptions=True)
 
 
 @pytest.mark.asyncio

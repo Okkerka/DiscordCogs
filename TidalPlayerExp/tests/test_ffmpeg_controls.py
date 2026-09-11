@@ -6,6 +6,27 @@ from TidalPlayerExp.tests.test_ffmpeg_source import _factory, _Process, ffmpeg_m
 
 
 @pytest.mark.asyncio
+async def test_uploads_cannot_select_network_playlist_demuxers(ffmpeg_module, tmp_path):
+    calls = []
+
+    def spawn(argv, **kwargs):
+        calls.append(argv)
+        return _Process()
+
+    factory, *_ = _factory(ffmpeg_module, tmp_path, spawn)
+    audio = await factory.create(ResolvedSource("https://cdn.discordapp.com/upload.mp4", {}, media_only=True))
+    try:
+        argv = calls[0]
+        formats = argv[argv.index("-format_whitelist") + 1].split(",")
+        assert {"mov", "matroska", "mp3", "wav", "flac"} <= set(formats)
+        assert not {"hls", "dash", "concat", "sdp", "image2"} & set(formats)
+        assert argv.index("-format_whitelist") < argv.index("-i")
+    finally:
+        audio.cleanup()
+        await factory.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("volume,copied", [(0, False), (100, True), (150, False)])
 async def test_gain_transcodes_only_when_needed(ffmpeg_module, tmp_path, volume, copied):
     calls = []

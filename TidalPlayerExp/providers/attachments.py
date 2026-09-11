@@ -19,21 +19,18 @@ _MAX_TTL_SECONDS = 12 * 60 * 60
 _MAX_URL_LENGTH = 8_192
 _TOKEN = re.compile(r"[0-9a-f]{32}\Z")
 _SIGNED_EXPIRY = re.compile(r"[0-9a-fA-F]{1,16}\Z")
-_AUDIO_TYPES = {
-    "mp3": frozenset(("audio/mpeg", "audio/mp3")),
-    "m4a": frozenset(("audio/mp4", "audio/x-m4a")),
-    "flac": frozenset(("audio/flac", "audio/x-flac")),
-    "wav": frozenset(("audio/wav", "audio/wave", "audio/x-wav")),
-    "ogg": frozenset(("audio/ogg", "application/ogg")),
-    "opus": frozenset(("audio/opus", "audio/ogg")),
-    "aac": frozenset(("audio/aac", "audio/x-aac")),
-    "webm": frozenset(("audio/webm",)),
-    "mp4": frozenset(("audio/mp4",)),
-}
+_MEDIA_EXTENSIONS = frozenset({
+    "mp3", "m4a", "flac", "wav", "ogg", "opus", "aac", "aif", "aiff", "wma",
+    "mp4", "webm", "mkv", "mov", "avi", "m4v", "mpeg", "mpg", "mka", "3gp",
+})
+_GENERIC_MIME_TYPES = frozenset({
+    "", "application/octet-stream", "binary/octet-stream", "application/binary",
+    "application/x-octet-stream", "application/ogg", "application/mp4",
+})
 
 _ERR_CDN = "Upload a file attached to this Discord message from the Discord CDN."
 _ERR_LINK = "The uploaded file has an invalid attachment link."
-_ERR_FORMAT = "Upload a supported audio file."
+_ERR_FORMAT = "Upload a supported audio or video file, such as MP3, FLAC, WAV, MP4, WebM, MOV, or MKV."
 _ERR_SIZE = "Uploaded files must be between 1 byte and 50 MiB."
 _ERR_EXPIRED = "This attachment is no longer available. Re-upload the file and try again."
 _ERR_CAPACITY = "Too many uploaded files are waiting to play. Try again shortly."
@@ -74,6 +71,7 @@ class AttachmentResolver:
         self._clock = clock
         self._max_entries = max_entries
         self._entries: dict[str, _StoredAttachment] = {}
+        self._closed = False
 
     def _purge_expired(self, now: float) -> None:
         for identifier, stored in tuple(self._entries.items()):
@@ -86,13 +84,17 @@ class AttachmentResolver:
         content_type = getattr(attachment, "content_type", None)
         if not isinstance(filename, str) or not filename or any(ord(char) < 32 for char in filename):
             raise ValueError(_ERR_FORMAT)
-        if not isinstance(content_type, str):
+        if content_type is not None and not isinstance(content_type, str):
             raise ValueError(_ERR_FORMAT)  # noqa: TRY004 - admission errors have one public type
         stem, separator, extension = filename.rpartition(".")
         if not separator or not stem:
             raise ValueError(_ERR_FORMAT)
-        allowed_types = _AUDIO_TYPES.get(extension.casefold())
-        if allowed_types is None or content_type.casefold() not in allowed_types:
+        # Discord's MIME label is optional and advisory, not a media probe.
+        # Keep the extension allowlist, then let FFmpeg validate and select audio.
+        mime = (content_type or "").split(";", 1)[0].strip().casefold()
+        if extension.casefold() not in _MEDIA_EXTENSIONS or (
+            mime not in _GENERIC_MIME_TYPES and not mime.startswith(("audio/", "video/"))
+        ):
             raise ValueError(_ERR_FORMAT)
         return filename, stem
 
@@ -152,6 +154,8 @@ class AttachmentResolver:
 
     def register(self, attachment: object) -> tuple[SourceReference, TrackMeta]:
         """Admit one real Discord attachment and return an opaque playback reference."""
+        if self._closed:
+            raise ValueError("File playback is shutting down. Try again after the cog reloads.")
         now = self._clock()
         self._purge_expired(now)
         if len(self._entries) >= self._max_entries:
@@ -187,7 +191,7 @@ class AttachmentResolver:
         stored = self._entries.get(reference.identifier)
         if stored is None:
             raise AttachmentResolutionError()
-        return ResolvedSource(stored.url, {})
+        return ResolvedSource(stored.url, {}, media_only=True)
 
     def discard(self, reference: SourceReference) -> None:
         """Release a rejected upload; never call for a queued or playing reference."""
@@ -196,4 +200,5 @@ class AttachmentResolver:
 
     async def close(self) -> None:
         """Forget every private signed URL during cog shutdown."""
+        self._closed = True
         self._entries.clear()

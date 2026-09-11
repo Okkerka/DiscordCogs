@@ -165,7 +165,7 @@ class TestCheckReady:
 @pytest.mark.asyncio
 async def test_tplay_defers_before_readiness_checks(cog) -> None:
     cog._initialized = True
-    ctx = SimpleNamespace(defer=AsyncMock())
+    ctx = SimpleNamespace(defer=AsyncMock(), interaction=SimpleNamespace())
 
     async def check_ready(_self, _ctx):
         ctx.defer.assert_awaited_once_with()

@@ -239,7 +239,10 @@ class NativePlaybackSession:
         assert self._current is not None
         current, paused = self._current, self._paused
         self._interrupt()
-        self._next_entry = replace(current, entry_id=secrets.token_hex(12), start_time=position)
+        self._next_entry = replace(
+            current, entry_id=secrets.token_hex(12), start_time=position,
+            replaces_entry_id=current.entry_id,
+        )
         self._pause_on_start = paused
         self._running = True
         self._runner = asyncio.create_task(self._restart(self._cleanup_barrier, None))
@@ -592,7 +595,7 @@ class NativePlaybackSession:
                 if self._failures >= 3:
                     self._running = False
                 elif not failed and self._repeat != "off":
-                    repeated = replace(entry, entry_id=secrets.token_hex(12), start_time=0)
+                    repeated = replace(entry, entry_id=secrets.token_hex(12), start_time=0, replaces_entry_id=None)
                     if self._repeat == "track":
                         self._next_entry = repeated
                     else:

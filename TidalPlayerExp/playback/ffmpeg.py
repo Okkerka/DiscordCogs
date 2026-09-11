@@ -38,6 +38,9 @@ _ALLOWED_HEADERS = (
     ("referer", "Referer"),
     ("origin", "Origin"),
 )
+# Uploaded bytes are untrusted even on Discord's CDN. Do not let an XML/text
+# playlist disguised as MP4 trigger arbitrary nested network requests.
+_UPLOAD_DEMUXERS = "aac,aiff,asf,avi,flac,matroska,webm,mov,mp4,m4a,3gp,3g2,mj2,mp3,mpeg,mpegts,ogg,wav"
 
 
 class _ChildProcess(Protocol):
@@ -565,6 +568,8 @@ class FFmpegSourceFactory:
         ]
         if headers is not None:
             argv.extend(("-headers", headers))
+        if source.media_only:
+            argv.extend(("-format_whitelist", _UPLOAD_DEMUXERS))
         if source.start_time:
             argv.extend(("-ss", f"{source.start_time:.3f}"))
         argv.extend(

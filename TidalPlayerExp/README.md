@@ -173,6 +173,12 @@ is not a guarantee that every site or individual track currently works.
   Spotify setup is optional: `[p]setup spotify` and
   `[p]setup spotifylogin`. An optional YouTube Data API key can be configured
   with `[p]setup youtube`.
+- Slash `/play` has an optional `platform` choice: `tidal`, `youtube`, or
+  `soundcloud`. Leaving it unset keeps the existing TIDAL search. Explicit
+  YouTube/SoundCloud searches queue the top result from that platform, without
+  TIDAL login or extra API keys. The choice affects search text only; supplied
+  links keep their provider routing, including TIDAL-first YouTube link matching.
+  Searches are bounded to 300 characters, one result, and a 30-second deadline.
 - Use the now-playing panel to pause/resume, skip, stop, choose a suggestion, or
   toggle autoplay. Autoplay generates TIDAL tracks only and needs TIDAL login.
 - Slash `/play` acknowledges queue admission even for the first song, clearing
@@ -189,13 +195,14 @@ keep the old `tplay`, `tqueue`, `tsearch`, `tnowplaying`, `tpl`, or `tidalsetup`
 
 | Command | Behavior |
 | --- | --- |
-| `play <link/search>` | Play supported media; `/play file:<attachment>` or a prefix-message attachment plays an uploaded audio file. |
+| `play <link/search>` | Play supported media or search TIDAL. Slash `/play` optionally selects TIDAL, YouTube, or SoundCloud with `platform`. |
+| `playfile` | Attach one audio/video file to the prefix message, or use `/playfile file:<attachment>`. |
 | `playnext <link/search>` | Put one track next, without interrupting the current song. Collections use `play`. |
 | `queue` | Components V2 panel with current song, numbered waiting songs, durations, requester IDs, paging and refresh. |
 | `now` | Resend the now-playing controls. |
 | `pause`, `resume`, `skip`, `stop` | Control playback; stop also clears the queue and cancels imports. |
 | `remove <index>` | Remove a waiting song. **1 is the next song**, never the current song. Slash: `/remove track index:1`. |
-| `remove all` | Clear waiting songs and cancel imports without interrupting current audio. Slash: `/remove all`. |
+| `remove all`, `clear` | Clear waiting songs and cancel imports without interrupting current audio. Slash: `/remove all` or `/clear`. |
 | `move <index> <destination>`, `shuffle` | Reorder waiting songs using the queue's one-based numbers. |
 | `volume [0–150]` | Show/set the saved server volume. 0 mutes; 100 is normal. Amplification is peak-limited. |
 | `repeat off/track/queue` | Repeat successful playback; skips and failures do not repeat. |
@@ -214,13 +221,21 @@ live edge; seek/replay are unavailable for unknown-length sources. At volume 100
 compatible unseeked Opus streams retain the low-CPU copy path. Stop leaves the
 idle voice connection for the existing two-minute automatic disconnect.
 
-Uploaded audio is limited to **50 MiB** per file (Discord may impose a lower
-upload limit). Accepted types are MP3, M4A, FLAC, WAV, OGG, Opus, AAC, and audio
-WebM/MP4. Only Discord-hosted attachments are accepted, not arbitrary file URLs.
+Uploaded media is limited to **50 MiB** per file (Discord may impose a lower
+upload limit). Accepted extensions include MP3, M4A, FLAC, WAV, OGG, Opus, AAC,
+AIFF, WMA, MP4, WebM, MKV, MOV, AVI, M4V, MPEG/MPG, MKA, and 3GP. Missing or
+generic MIME labels are accepted for these extensions; explicit non-media
+labels and unknown extensions are rejected. Video files must contain a decodable
+audio track: FFmpeg extracts audio and converts it to Discord Opus, discarding
+video, subtitles, and data streams. Only Discord-hosted attachments are accepted,
+not arbitrary file URLs.
 Signed attachment URLs are private in memory, capped at 1,000 records, expire
 after at most 12 hours or their earlier CDN expiry, and are cleared on unload.
 Re-upload an expired file. Files are streamed through FFmpeg, never downloaded
 to a song-cache directory; files without duration metadata display `Unknown`.
+The player panel's position is a snapshot, refreshed by `now` or controls that
+change the panel, not a live counter. Seek/replay and volume rebuffering leave
+the existing controller untouched: no repost and no edit.
 
 After updating, reload `TidalPlayerExp` and synchronize this cog's slash commands
 using your bot's normal Red slash-command setup. Command names such as `play`,
@@ -252,10 +267,14 @@ minutes. Source startup, extraction, and cleanup have bounded deadlines.
 Cancelled voice handshakes retain ownership for cleanup, and stop/close waits
 for pending source creation to finish cleaning up before disconnecting.
 Late controller updates cannot restore a panel after its queue ends.
+Collection imports refresh the controller once after admission rather than
+editing it for every queued song. Interactive search prompts bound and escape
+catalog text and release their views when cancelled.
 
 OAuth credential fields are saved together in one Config group update, without
 changing the stored schema. Login checks discard results from replaced TIDAL
 sessions; Spotify callbacks recheck pending state and expiry after token exchange.
+TIDAL device-login results cannot restore credentials after logout or unload.
 Error logs identify the failing operation and exception type without formatting
 provider exceptions.
 
