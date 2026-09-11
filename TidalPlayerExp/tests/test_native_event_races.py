@@ -14,6 +14,31 @@ from TidalPlayerExp.tests.test_native_session import entry
 
 
 @pytest.mark.asyncio
+async def test_cancelled_track_start_send_releases_unpublished_controller(cog):
+    current = entry(1)
+    session = SimpleNamespace(snapshot=lambda: PlaybackSnapshot(current, (), False, 22))
+    cog.backend = SimpleNamespace(get=AsyncMock(return_value=session))
+    cog._current_entries[1] = current
+    view = SimpleNamespace(stop=Mock())
+    cog._controller_view = AsyncMock(return_value=view)
+    entered = asyncio.Event()
+
+    async def send(**kwargs):
+        entered.set()
+        await asyncio.Future()
+
+    cog._playback_channels[1] = SimpleNamespace(send=send)
+    pending = asyncio.create_task(cog._resend_controller_for_track_start(guild_id=1))
+    await asyncio.wait_for(entered.wait(), 2)
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    view.stop.assert_called_once()
+    assert 1 not in cog._controller_views
+    assert 1 not in cog._controller_messages
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("blocked_stage", ["view", "edit"])
 async def test_recommendation_refresh_cannot_restore_ended_queue_panel(cog, blocked_stage):
     ready, release = asyncio.Event(), asyncio.Event()

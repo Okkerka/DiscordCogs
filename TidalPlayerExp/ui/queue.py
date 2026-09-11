@@ -147,23 +147,22 @@ class QueueView(discord.ui.LayoutView):
             return PlaybackSnapshot(None, (), False, None)
         return session.snapshot()
 
-    async def _update(self, interaction: discord.Interaction, *, page: int | None = None) -> None:
+    async def _update(self, interaction: discord.Interaction, *, page_delta: int = 0) -> None:
         """Serialize button clicks so each edit reflects one authoritative snapshot."""
         await interaction.response.defer()
         async with self._update_lock:
             if self.is_finished():
                 return
             self.snapshot = await self._load_snapshot()
-            if page is not None:
-                self.page = max(0, page)
+            self.page = max(0, self.page + page_delta)
             self._build_layout()
             await interaction.edit_original_response(view=self, allowed_mentions=_MENTIONS_NONE)
 
     async def _back(self, interaction: discord.Interaction) -> None:
-        await self._update(interaction, page=self.page - 1)
+        await self._update(interaction, page_delta=-1)
 
     async def _next(self, interaction: discord.Interaction) -> None:
-        await self._update(interaction, page=self.page + 1)
+        await self._update(interaction, page_delta=1)
 
     async def _refresh(self, interaction: discord.Interaction) -> None:
         await self._update(interaction)

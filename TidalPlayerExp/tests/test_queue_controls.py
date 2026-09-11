@@ -163,3 +163,32 @@ async def test_queue_repeat_preserves_tracks_when_waiting_queue_is_full():
             assert session.snapshot().queued[0].meta["track_id"] == 3 - expected
     finally:
         await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["seek", "volume"])
+async def test_failed_paused_restart_does_not_pause_the_next_track(operation):
+    session, voice, resolver, factory, sink = setup()
+    original = resolver.resolve
+
+    async def fail_restarted_track(reference):
+        if reference.identifier == "1":
+            raise RuntimeError("Source expired")
+        return await original(reference)
+
+    try:
+        await session.enqueue(entry(1))
+        await sink.expect("started")
+        await session.enqueue(entry(2))
+        await session.set_paused(True)
+        resolver.resolve = fail_restarted_track
+        if operation == "seek":
+            assert await session.seek(5)
+        else:
+            await session.set_volume(50)
+        await sink.expect("failed")
+        await sink.expect("started")
+        assert session.snapshot().current.meta["track_id"] == 2
+        assert not session.snapshot().paused
+    finally:
+        await session.close()

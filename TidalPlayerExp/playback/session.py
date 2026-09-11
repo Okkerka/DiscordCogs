@@ -594,6 +594,9 @@ class NativePlaybackSession:
                     return
                 self._current = None
                 self._paused = False
+                # A failed paused seek/rebuffer must not transfer its pause
+                # intent to an unrelated waiting song.
+                self._pause_on_start = False
                 self._started_at = self._paused_at = None
                 self._failures = self._failures + 1 if failed else 0
                 if self._failures >= 3:

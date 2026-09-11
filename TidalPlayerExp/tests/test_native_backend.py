@@ -460,6 +460,43 @@ async def test_one_session_cleanup_failure_does_not_skip_other_guild(environment
 
 
 @pytest.mark.asyncio
+async def test_housekeeping_retries_failed_idle_cleanup(environment):
+    e = environment
+    ticks = asyncio.Queue()
+    sleeping = asyncio.Event()
+
+    async def sleep(interval):
+        sleeping.set()
+        await ticks.get()
+
+    async def tick():
+        await asyncio.wait_for(sleeping.wait(), 2)
+        sleeping.clear()
+        ticks.put_nowait(None)
+        await asyncio.wait_for(sleeping.wait(), 2)
+
+    e.backend._clock = lambda: 0.0
+    e.backend._sleep = sleep
+    session = await e.backend.connect(e.guild, e.channel)
+    try:
+        session.failure = True
+        e.backend._clock = lambda: 150.0
+        await tick()
+        assert session in e.backend._retired
+        assert not session.closed
+        session.failure = False
+        await tick()
+        assert session.closed
+        assert not e.backend._retired
+        assert e.guild.voice_client is None
+        replacement = await e.backend.connect(e.guild, e.channel)
+        assert replacement is not session
+    finally:
+        session.failure = False
+        await e.backend.close()
+
+
+@pytest.mark.asyncio
 async def test_replacement_during_connect_is_untouched(environment):
     e = environment
     replacement = Voice(e.channel)
@@ -477,6 +514,52 @@ async def test_replacement_during_connect_is_untouched(environment):
     assert e.guild.voice_client is replacement
     assert await e.backend.get(1) is None
     await e.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_retired_retry_does_not_close_a_reconnected_sibling(environment):
+    e = environment
+    tick, sleeping = asyncio.Event(), asyncio.Event()
+
+    async def sleep(interval):
+        sleeping.set()
+        await tick.wait()
+        tick.clear()
+
+    e.backend._sleep = sleep
+    guild2 = SimpleNamespace(id=2, me=object(), voice_client=None)
+    channels = {1: e.channel, 2: Channel(guild2)}
+    old = {gid: await e.backend.connect(channel.guild, channel) for gid, channel in channels.items()}
+    for session in old.values():
+        session.failure = True
+        assert not await e.backend._try_dispose(session)
+    original_close = e.backend.close_guild
+    replacement = None
+
+    async def close_with_sibling_reconnect(guild_id):
+        nonlocal replacement
+        if replacement is None:
+            sibling_id = 3 - guild_id
+            old[sibling_id].failure = False
+            await original_close(sibling_id)
+            channel = channels[sibling_id]
+            replacement = await e.backend.connect(channel.guild, channel)
+        await original_close(guild_id)
+
+    e.backend.close_guild = close_with_sibling_reconnect
+    try:
+        await asyncio.wait_for(sleeping.wait(), 2)
+        sleeping.clear()
+        tick.set()
+        await asyncio.wait_for(sleeping.wait(), 2)
+        assert replacement is not None
+        assert not replacement.closed
+        assert await e.backend.get(replacement.guild_id) is replacement
+    finally:
+        e.backend.close_guild = original_close
+        for session in old.values():
+            session.failure = False
+        await e.backend.close()
 
 
 @pytest.mark.asyncio

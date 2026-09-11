@@ -229,6 +229,27 @@ async def test_lastfm_request_uses_the_reusable_async_session(cog) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", [False, True])
+async def test_lastfm_bounds_results_and_skips_individual_malformed_tracks(cog, malformed):
+    tracks = [{"name": f"Song {index}", "artist": {"name": "Artist"}} for index in range(100)]
+    if malformed:
+        tracks[1:3] = [None, {"name": "Broken", "artist": None}]
+    response = MagicMock()
+    response.raise_for_status = MagicMock()
+    response.json = AsyncMock(return_value={"similartracks": {"track": tracks}})
+    request = MagicMock()
+    request.__aenter__ = AsyncMock(return_value=response)
+    request.__aexit__ = AsyncMock(return_value=None)
+    cog._lastfm_session = SimpleNamespace(closed=False, get=MagicMock(return_value=request))
+    cog.bot.get_shared_api_tokens = AsyncMock(return_value={"api_key": "key"})
+
+    result = await cog._lastfm_similar_tracks("Artist", "Song", limit=4)
+
+    expected = [0, 3] if malformed else [0, 1, 2, 3]
+    assert result == [("Artist", f"Song {index}") for index in expected]
+
+
+@pytest.mark.asyncio
 async def test_lastfm_error_log_does_not_contain_api_key(cog, caplog) -> None:
     secret = "lastfm-secret-value"
 

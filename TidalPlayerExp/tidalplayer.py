@@ -2221,6 +2221,9 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         self, artist: str, title: str, limit: int = 25,
     ) -> List[Tuple[str, str]]:
         """Get similar track names from Last.fm's public read-only API."""
+        limit = max(0, min(limit, 25))
+        if not limit:
+            return []
         tokens = await self.bot.get_shared_api_tokens("lastfm")
         api_key = tokens.get("api_key")
         if not api_key or not artist or not title:
@@ -2240,14 +2243,24 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             async with session.get("https://ws.audioscrobbler.com/2.0/", params=params) as response:
                 response.raise_for_status()
                 payload = await response.json(content_type=None)
-            entries = payload.get("similartracks", {}).get("track", [])
+            similar = payload.get("similartracks") if isinstance(payload, dict) else None
+            entries = similar.get("track", []) if isinstance(similar, dict) else []
             if isinstance(entries, dict):
                 entries = [entries]
-            return [
-                (str(item.get("artist", {}).get("name", "")).strip(), str(item.get("name", "")).strip())
-                for item in entries
-                if item.get("artist", {}).get("name") and item.get("name")
-            ]
+            if not isinstance(entries, list):
+                return []
+            pairs: List[Tuple[str, str]] = []
+            # Enforce the requested workload even if the provider ignores its
+            # limit. A malformed item must not discard its healthy neighbours.
+            for item in islice(entries, limit):
+                if not isinstance(item, dict) or not isinstance(item.get("artist"), dict):
+                    continue
+                artist_name, track_name = item["artist"].get("name"), item.get("name")
+                if isinstance(artist_name, str) and isinstance(track_name, str):
+                    artist_name, track_name = artist_name.strip(), track_name.strip()
+                    if artist_name and track_name:
+                        pairs.append((artist_name, track_name))
+            return pairs
         except Exception as error:
             _log_provider_failure("Last.fm", "similar-track lookup", error)
             return []
@@ -2517,23 +2530,27 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         if session is None:
             return False
         view = await self._controller_view(guild_id, session.snapshot().paused)
-        if not await self._entry_is_current(guild_id, entry.entry_id):
-            view.stop()
-            return False
+        published = False
         try:
+            if not await self._entry_is_current(guild_id, entry.entry_id):
+                return False
             sender = ctx if ctx is not None else channel
             message = await sender.send(view=view, allowed_mentions=discord.AllowedMentions.none())
+            if not await self._entry_is_current(guild_id, entry.entry_id):
+                await _delete_message_safe(message)
+                return False
+            self._stop_controller_view(guild_id)
+            self._controller_views[guild_id] = view
+            self._controller_messages[guild_id] = message
+            published = True
+            return True
         except discord.HTTPException:
-            view.stop()
             return False
-        if not await self._entry_is_current(guild_id, entry.entry_id):
-            view.stop()
-            await _delete_message_safe(message)
-            return False
-        self._stop_controller_view(guild_id)
-        self._controller_views[guild_id] = view
-        self._controller_messages[guild_id] = message
-        return True
+        finally:
+            # This view has no timeout. Cancelled sends/ownership checks must
+            # release it just like rejected or stale Discord responses do.
+            if not published:
+                view.stop()
 
     def _remember_track(self, guild_id: int, meta: TrackMeta) -> None:
         track_id = str(meta.get("track_id") or "")

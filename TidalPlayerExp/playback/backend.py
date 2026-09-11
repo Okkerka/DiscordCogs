@@ -251,6 +251,22 @@ class NativePlaybackBackend:
     async def _housekeep(self) -> None:
         while True:
             await self._sleep(self._housekeeping_interval)
+            # Failed disposal removes a session from _sessions but retains
+            # ownership here. Retry it without touching an active handshake.
+            for retired in tuple(self._retired):
+                guild_id = retired.guild_id
+                # Another guild's cleanup can yield long enough for this one
+                # to recover and reconnect. Never act on its old identity.
+                if (
+                    retired not in self._retired
+                    or guild_id in self._pending
+                    or guild_id in self._removals
+                ):
+                    continue
+                try:
+                    await self.close_guild(guild_id)
+                except PlaybackUnavailable:
+                    continue
             now = self._clock()
             for guild_id, session in tuple(self._sessions.items()):
                 state = session.snapshot()

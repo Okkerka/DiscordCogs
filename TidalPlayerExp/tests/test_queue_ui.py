@@ -1,6 +1,7 @@
 """Components V2 queue panel behavior and Discord safety limits."""
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import sys
 from pathlib import Path
@@ -155,3 +156,41 @@ def test_queue_remaining_duration_accounts_for_current_position(real_queue_ui):
     snapshot = PlaybackSnapshot(_entry(1), (_entry(2), _entry(3)), False, 123, position=30)
     view, _ = _view(real_queue_ui, snapshot)
     assert "Remaining: 05:30" in _text(view)
+
+
+@pytest.mark.asyncio
+async def test_overlapping_next_clicks_each_advance_one_page(real_queue_ui):
+    snapshot = PlaybackSnapshot(None, tuple(_entry(index) for index in range(1, 32)), False, 123)
+    view, _ = _view(real_queue_ui, snapshot)
+    editing, release, second_deferred = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def slow_edit(**kwargs):
+        editing.set()
+        await release.wait()
+
+    first = SimpleNamespace(response=SimpleNamespace(defer=AsyncMock()), edit_original_response=slow_edit)
+    second = SimpleNamespace(
+        response=SimpleNamespace(defer=AsyncMock(side_effect=second_deferred.set)),
+        edit_original_response=AsyncMock(),
+    )
+    pending = asyncio.create_task(view._next(first))
+    tasks = [pending]
+    try:
+        await asyncio.wait_for(editing.wait(), 2)
+        # Hold the first edit while another click waits for the view lock.
+        # A further click must use the page reached by the preceding click.
+        next_click = asyncio.create_task(view._next(second))
+        tasks.append(next_click)
+        await asyncio.wait_for(second_deferred.wait(), 2)
+        third = SimpleNamespace(response=SimpleNamespace(defer=AsyncMock()), edit_original_response=AsyncMock())
+        third_click = asyncio.create_task(view._next(third))
+        tasks.append(third_click)
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(*tasks)
+        assert view.page == 3
+        assert "Page 4/4" in _text(view)
+    finally:
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        view.stop()
