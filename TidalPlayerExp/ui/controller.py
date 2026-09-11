@@ -45,9 +45,10 @@ def _track_info(meta: TrackMeta, *, autoplay_enabled: bool, position: float | No
         f"*{album}*\n\n"
         f"**{quality_label}:** {escape_display(quality)}\n"
         "**Delivery:** Discord Opus\n"
-        f"**Autoplay:** {autoplay_state}\n"
-        f"**Duration:** {duration}"
     )
+    if meta.get("source") != "Uploaded file":
+        info += f"**Autoplay:** {autoplay_state}\n"
+    info += f"**Duration:** {duration}"
     if position is not None and position >= 0:
         elapsed = format_duration(int(position))
         dur_seconds = meta.get("duration") or 0
@@ -78,7 +79,7 @@ class PlayerControllerView(discord.ui.LayoutView):
         self.cog = cog
         self.meta = meta or {}
         self.recommendations = list(recommendations)[:25]
-        self.autoplay_enabled = autoplay_enabled
+        self.autoplay_enabled = autoplay_enabled and self.meta.get("source") != "Uploaded file"
         self.paused = paused
         self.next_up = next_up or {}
         self.position = position
@@ -116,9 +117,11 @@ class PlayerControllerView(discord.ui.LayoutView):
             container.add_item(discord.ui.TextDisplay(info))
 
         container.add_item(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
-        container.add_item(discord.ui.TextDisplay("### Suggested songs"))
-        container.add_item(discord.ui.ActionRow(self._make_suggestions_select()))
-        container.add_item(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+        uploaded = self.meta.get("source") == "Uploaded file"
+        if not uploaded:
+            container.add_item(discord.ui.TextDisplay("### Suggested songs"))
+            container.add_item(discord.ui.ActionRow(self._make_suggestions_select()))
+            container.add_item(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
 
         autoplay_button = discord.ui.Button(
             label=f"Autoplay: {autoplay_state}",
@@ -148,9 +151,10 @@ class PlayerControllerView(discord.ui.LayoutView):
         )
         stop_button.callback = self._stop
 
-        container.add_item(
-            discord.ui.ActionRow(autoplay_button, pause_button, skip_button, stop_button)
-        )
+        buttons = [pause_button, skip_button, stop_button]
+        if not uploaded:
+            buttons.insert(0, autoplay_button)
+        container.add_item(discord.ui.ActionRow(*buttons))
         self.add_item(container)  # attach the populated container to the LayoutView
 
     def _make_suggestions_select(self) -> discord.ui.Select:

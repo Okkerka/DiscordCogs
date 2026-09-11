@@ -102,6 +102,58 @@ class _Process:
         return self.returncode
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("header, expected", [
+    (b"  Duration: 00:00:15.67, start: 0.025057, bitrate: 128 kb/s\n", 15),
+    (b"  Duration: 01:02:03.40, start: 0.000000, bitrate: 128 kb/s\n", 3723),
+    (b"  Duration: 00:00:00.16, start: 0.000000, bitrate: 128 kb/s\n", 1),
+    (b"  Duration: N/A, start: 0.000000, bitrate: N/A\n", None),
+    (b"    comment: Duration: 00:00:55.00, start: 0.000000\n", None),
+    (b"  Duration: 00:99:15.00, start: 0.000000\n", None),
+])
+async def test_uploaded_audio_reports_bounded_input_duration_at_start(ffmpeg_module, tmp_path, header, expected):
+    process = _Process()
+    process.stderr = io.BytesIO(b"Input #0, mp3, from 'private-url':\n" + header)
+    factory, _, _ = _factory(ffmpeg_module, tmp_path, lambda *a, **kw: process)
+    audio = await factory.create(ResolvedSource("https://example.com/file.mp3", {}, media_only=True))
+    try:
+        assert audio.duration == expected
+        assert audio.read() == b"\x08audio"
+        assert "private-url" not in repr(audio)
+    finally:
+        audio.cleanup()
+        await factory.close()
+
+
+def test_duration_reader_handles_split_headers_without_waiting_for_pipe_eof(ffmpeg_module):
+    release = threading.Event()
+
+    class ShortHeader:
+        chunks = iter([b"Input #0, mp3:\n  Dur", b"ation: 00:00:15.", b"67, start: 0.0\n"])
+
+        def read(self, size):
+            raise AssertionError("Buffered read must not wait to fill the pipe")
+
+        def read1(self, size):
+            try:
+                return next(self.chunks)
+            except StopIteration:
+                release.wait(timeout=2)
+                return b""
+
+        def close(self):
+            pass
+
+    reader = ffmpeg_module._StderrReader(ShortHeader(), inspect_duration=True)
+    try:
+        reader.wait_metadata()
+        assert reader.duration == 15
+        assert not release.is_set()
+    finally:
+        release.set()
+        reader.finish()
+
+
 def _probe_success(calls: list[tuple[tuple[str, ...], float]]):
     def probe(argv: Sequence[str], timeout: float) -> bytes:
         calls.append((tuple(argv), timeout))
@@ -615,6 +667,7 @@ async def test_create_uses_safe_exact_argv_and_copy_transcode_matrix(
         "-hide_banner",
         "-loglevel",
         "error",
+        "-nostats",
         "-nostdin",
         "-rw_timeout",
         "15000000",
@@ -1068,8 +1121,8 @@ with tempfile.TemporaryDirectory(prefix="tidal-video-smoke-") as directory:
     video = Path(directory) / "upload.mp4"
     subprocess.run([
         capability.executable, "-hide_banner", "-loglevel", "error", "-nostdin",
-        "-f", "lavfi", "-i", "color=size=16x16:duration=0.16",
-        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.16",
+        "-f", "lavfi", "-i", "color=size=16x16:duration=2.16",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2.16",
         "-c:v", "mpeg4", "-c:a", "aac", "-shortest", str(video),
     ], check=True, stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
     args = FFmpegSourceFactory._argv(
@@ -1084,9 +1137,10 @@ with tempfile.TemporaryDirectory(prefix="tidal-video-smoke-") as directory:
         del args[index:index + 2]
     process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, shell=False)
-    source = _FFmpegAudioSource(process, copied=False)
+    source = _FFmpegAudioSource(process, copied=False, inspect_duration=True)
     try:
         source.prime()
+        assert source.duration == 2, source.duration
         packets = []
         while packet := source.read():
             packets.append(packet)

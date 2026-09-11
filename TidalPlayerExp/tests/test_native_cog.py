@@ -37,6 +37,22 @@ def native_ctx(cog):
     return ctx
 
 
+@pytest.mark.asyncio
+async def test_uploaded_file_does_not_schedule_autoplay_or_lookup_recommendations(cog):
+    from TidalPlayerExp.tests.test_native_session import entry
+    from TidalPlayerExp.playback.models import SourceKind, SourceReference
+
+    upload = replace(entry(), primary=SourceReference(SourceKind.ATTACHMENT, "a" * 32),
+                     meta={**entry().meta, "source": "Uploaded file", "track_id": None})
+    await cog.config.guild_from_id(1).autoplay_enabled.set(True)
+    cog._radio_candidates = AsyncMock(side_effect=AssertionError("No file recommendations"))
+    assert await cog._get_recommendations(1, upload.meta) == []
+    cog._radio_candidates.assert_not_awaited()
+    cog._schedule_autoplay(1, upload, 0)
+    assert not cog._autoplay_tasks
+    assert await cog.config.guild_from_id(1).autoplay_enabled() is True
+
+
 @pytest.fixture
 def native_session(cog):
     from TidalPlayerExp.playback.models import PlaybackSnapshot

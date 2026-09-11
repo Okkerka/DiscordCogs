@@ -201,6 +201,30 @@ async def test_playback_publishes_missing_youtube_duration_without_overwriting_k
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("known, detected, expected", [(0, 15, 15), (120, 15, 120), (0, None, 0), (0, True, 0), (0, -1, 0)])
+async def test_audio_duration_reaches_start_event_without_mutating_queued_metadata(known, detected, expected):
+    class DurationFactory(Factory):
+        async def create(self, resolved):
+            audio = await super().create(resolved)
+            audio.duration = detected
+            return audio
+
+    voice, resolver, factory, sink = Voice(), Resolver(), DurationFactory(), Sink()
+    original = replace(entry(), primary=SourceReference(SourceKind.ATTACHMENT, "a" * 32),
+                       meta={**entry().meta, "duration": known, "source": "Uploaded file"})
+    session = NativePlaybackSession(1, voice, resolver, factory, sink)
+    try:
+        assert await session.enqueue(original)
+        await sink.expect("started")
+        assert sink.started[0].meta["duration"] == expected
+        assert session.snapshot().current.meta["duration"] == expected
+        assert original.meta["duration"] == known
+    finally:
+        await session.close()
+    assert factory.sources[0].cleanups == 1
+
+
+@pytest.mark.asyncio
 async def test_fifo_pause_resume_and_threaded_duplicate_end():
     session, voice, resolver, factory, sink = setup()
     assert await session.enqueue(entry(1))

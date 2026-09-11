@@ -468,7 +468,7 @@ class NativePlaybackSession:
             asyncio.wait_for(self._factory.create(resolved), self._create_timeout)
         )
         try:
-            return entry, _OwnedAudio(await asyncio.shield(creation))
+            audio = await asyncio.shield(creation)
         except asyncio.CancelledError:
             try:
                 audio = await creation
@@ -479,6 +479,10 @@ class NativePlaybackSession:
             else:
                 await asyncio.to_thread(_OwnedAudio(audio).cleanup)
             raise
+        duration = getattr(audio, "duration", None)
+        if entry.meta["duration"] <= 0 and type(duration) is int and duration > 0:
+            entry = replace(entry, meta={**entry.meta, "duration": duration})
+        return entry, _OwnedAudio(audio)
 
     async def _prepare(
         self, entry: PlaybackEntry

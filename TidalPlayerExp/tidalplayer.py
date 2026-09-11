@@ -2353,6 +2353,8 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
     def _recommendation_source(meta: TrackMeta | None) -> str:
         """Return the stable ID used to keep suggestions tied to one track."""
         values = meta or {}
+        if values.get("source") == "Uploaded file":
+            return ""
         track_id = str(values.get("track_id") or "")
         if track_id:
             return f"id:{track_id}"
@@ -2742,6 +2744,8 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                 self._autoplay_tasks.pop(guild_id, None)
 
     def _schedule_autoplay(self, guild_id: int, previous: PlaybackEntry, generation: int) -> None:
+        if previous.primary.kind is SourceKind.ATTACHMENT:
+            return
         task = self._autoplay_tasks.get(guild_id)
         if task is None or task.done():
             self._autoplay_tasks[guild_id] = asyncio.create_task(

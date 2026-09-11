@@ -31,7 +31,11 @@ _PRIME_TIMEOUT_SECONDS = 20.0
 _PROBE_OUTPUT_LIMIT = 256 * 1024
 _PROCESS_WAIT_SECONDS = 0.5
 _EOF_WAIT_SECONDS = 0.1
+_METADATA_WAIT_SECONDS = 0.25
 _VERSION_PATTERN = re.compile(r"\Affmpeg version ([^\s]+)")
+_INPUT_DURATION_PATTERN = re.compile(
+    rb"(?:^|\n)  Duration: (N/A|[0-9]{2,6}:[0-5][0-9]:[0-5][0-9](?:\.[0-9]{1,6})?), start:"
+)
 log = logging.getLogger("red.tidalplayerexp.ffmpeg")
 _ALLOWED_HEADERS = (
     ("user-agent", "User-Agent"),
@@ -111,8 +115,12 @@ def _stderr_reason(output: bytes) -> str | None:
 class _StderrReader:
     """Continuously drain a pipe; retain only a safe category and bounded chunks."""
 
-    def __init__(self, stream: BinaryIO | None) -> None:
+    def __init__(self, stream: BinaryIO | None, *, inspect_duration: bool = False) -> None:
         self.reason: str | None = None
+        self.duration: int | None = None
+        self._metadata_ready = threading.Event()
+        if not inspect_duration or stream is None:
+            self._metadata_ready.set()
         self._thread: threading.Thread | None = None
         if stream is not None:
             self._thread = threading.Thread(
@@ -123,16 +131,36 @@ class _StderrReader:
     def _drain(self, stream: BinaryIO) -> None:
         tail = b""
         try:
-            while chunk := stream.read(4096):
-                if self.reason is None:
+            # Buffered read(n) can wait to fill n bytes even though FFmpeg has
+            # already printed its short input header. read1 drains it promptly.
+            read_chunk = getattr(stream, "read1", stream.read)
+            while chunk := read_chunk(4096):
+                if self.reason is None or not self._metadata_ready.is_set():
                     combined = tail + chunk
-                    self.reason = _stderr_reason(combined)
+                    if self.reason is None:
+                        self.reason = _stderr_reason(combined)
+                    if not self._metadata_ready.is_set():
+                        match = _INPUT_DURATION_PATTERN.search(combined)
+                        if match is not None:
+                            if match[1] != b"N/A":
+                                hours, minutes, seconds = match[1].split(b":")
+                                total = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+                                if total > 0:
+                                    self.duration = max(1, int(total))
+                            self._metadata_ready.set()
+                        elif b"\nStream mapping:" in combined or b"\nOutput #0" in combined:
+                            self._metadata_ready.set()
                     tail = combined[-256:]
         except Exception:  # noqa: BLE001 - never let pipe errors print raw provider output
             # Cleanup can close the pipe while its final bytes are being read.
             return
         finally:
+            self._metadata_ready.set()
             _quiet_process_call(stream.close)
+
+    def wait_metadata(self) -> None:
+        """Briefly synchronize header parsing; absent duration never blocks audio."""
+        self._metadata_ready.wait(timeout=_METADATA_WAIT_SECONDS)
 
     def finish(self) -> None:
         """Allow the reaped process's final diagnostics to drain without hanging."""
@@ -302,7 +330,7 @@ def _cleanup_process(process: _ChildProcess) -> None:
 class _FFmpegAudioSource(discord.AudioSource):
     """An Opus packet source that owns and redacts its FFmpeg child."""
 
-    def __init__(self, process: _ChildProcess, *, copied: bool) -> None:
+    def __init__(self, process: _ChildProcess, *, copied: bool, inspect_duration: bool = False) -> None:
         self._process = process
         self._copied = copied
         self._buffered: bytes | None = None
@@ -313,7 +341,7 @@ class _FFmpegAudioSource(discord.AudioSource):
         stdout = process.stdout
         if stdout is None:
             raise PlaybackStartError()
-        self._stderr = _StderrReader(getattr(process, "stderr", None))
+        self._stderr = _StderrReader(getattr(process, "stderr", None), inspect_duration=inspect_duration)
         self._failure_exit: int | None = None
         self._packets = iter(oggparse.OggStream(stdout).iter_packets())
 
@@ -322,6 +350,11 @@ class _FFmpegAudioSource(discord.AudioSource):
 
     def is_opus(self) -> bool:
         return True
+
+    @property
+    def duration(self) -> int | None:
+        """Input duration discovered during priming, never elapsed output time."""
+        return self._stderr.duration
 
     def _mark_failed(self) -> PlaybackStartError:
         error = PlaybackStartError()
@@ -383,6 +416,7 @@ class _FFmpegAudioSource(discord.AudioSource):
             if not packet:
                 raise self._mark_failed()
             self._buffered = packet
+        self._stderr.wait_metadata()
 
     def read(self) -> bytes:
         duration_failed = False
@@ -549,7 +583,8 @@ class FFmpegSourceFactory:
             capability.executable,
             "-hide_banner",
             "-loglevel",
-            "error",
+            "info" if source.media_only else "error",
+            "-nostats",
             "-nostdin",
             "-rw_timeout",
             "15000000",
@@ -625,7 +660,7 @@ class FFmpegSourceFactory:
                 shell=False,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
-            return _FFmpegAudioSource(process, copied=copied)
+            return _FFmpegAudioSource(process, copied=copied, inspect_duration=source.media_only)
         except Exception:  # noqa: BLE001 - argv, URL, and headers must not survive this boundary
             if process is not None:
                 _cleanup_process(process)

@@ -151,6 +151,28 @@ def test_source_and_quality_are_escaped_in_controller(real_ui):
     assert "@everyone" not in info
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uploaded", [True, False])
+async def test_uploaded_file_controller_omits_autoplay_and_suggestions(real_ui, cog, uploaded):
+    _, controller = real_ui
+    view = controller.PlayerControllerView(cog, metadata(
+        source="Uploaded file" if uploaded else "YouTube", duration=15,
+    ), autoplay_enabled=True)
+    try:
+        text = "\n".join(item.content for item in view.walk_children()
+                         if isinstance(item, real_discord.ui.TextDisplay))
+        controls = {getattr(item, "custom_id", None) for item in view.walk_children()}
+        assert "**Duration:** 00:15" in text
+        assert ("Autoplay" in text) is not uploaded
+        assert ("Suggested songs" in text) is not uploaded
+        assert ("tidalplayer:v2:autoplay" in controls) is not uploaded
+        assert ("tidalplayer:v2:suggestions" in controls) is not uploaded
+        assert {"tidalplayer:v2:pause", "tidalplayer:v2:skip", "tidalplayer:v2:stop"} <= controls
+        view.to_components()
+    finally:
+        view.stop()
+
+
 @pytest.mark.parametrize("factory", ["error_embed", "success_embed"])
 def test_status_embeds_keep_authored_markdown_and_bound_descriptions(real_ui, factory):
     embeds, _ = real_ui

@@ -8,6 +8,7 @@ def test_prefix_and_slash_surface_has_new_names_and_attachment_option():
     code = '''
 from TidalPlayerExp.tidalplayer import TidalPlayerExp
 from redbot.core.commands import HybridCommand, HybridGroup
+import discord
 commands = {c.name: c for c in TidalPlayerExp.__cog_commands__ if c.parent is None}
 required = {'play','playfile','playnext','queue','stop','remove','clear','volume','pause','resume','skip',
             'now','move','shuffle','repeat','seek','replay','autoplay','retry','musichelp',
@@ -26,6 +27,10 @@ play_params = {p.name:p for p in commands['play'].app_command.parameters}
 assert not play_params['platform'].required
 assert play_params['platform'].default is None
 assert {c.value for c in play_params['platform'].choices} == {'tidal', 'youtube', 'soundcloud'}
+tree = discord.app_commands.CommandTree(discord.Client(intents=discord.Intents.none()))
+wire_options = {p['name']: p for p in commands['play'].app_command.to_dict(tree)['options']}
+assert wire_options['query']['required'] is True
+assert wire_options['platform']['required'] is False
 assert commands['remove'].get_command('all') is not None
 assert {'list','create','add','remove','play'} <= {c.name for c in commands['tplaylist'].commands}
 assert 'disconnect' not in commands

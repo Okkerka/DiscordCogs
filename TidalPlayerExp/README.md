@@ -244,7 +244,12 @@ not arbitrary file URLs.
 Signed attachment URLs are private in memory, capped at 1,000 records, expire
 after at most 12 hours or their earlier CDN expiry, and are cleared on unload.
 Re-upload an expired file. Files are streamed through FFmpeg, never downloaded
-to a song-cache directory; files without duration metadata display `Unknown`.
+to a song-cache directory. Duration is extracted from the playback process's
+input header before showing the controller, without a separate metadata probe;
+files whose duration FFmpeg cannot determine still display `Unknown`.
+Uploaded files do not trigger autoplay or recommendation searches, and their
+controllers omit those controls. The server's autoplay setting for regular music
+is unchanged; manually queued tracks still play normally after an upload.
 The player panel's position is a snapshot, refreshed by `now` or controls that
 change the panel, not a live counter. Seek/replay and volume rebuffering leave
 the existing controller untouched: no repost and no edit.
