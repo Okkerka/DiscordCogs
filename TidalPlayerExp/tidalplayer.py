@@ -3186,8 +3186,22 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
     @commands.guild_only()
     @playback_request()
     @commands.dynamic_cooldown(playback_cooldown, commands.BucketType.user)
-    async def tplay(self, ctx: commands.Context, *, query: str, platform: Literal["tidal", "youtube", "soundcloud"] | None = None) -> None:
+    async def tplay(self, ctx: commands.Context, *, query: str) -> None:
         """Play a provider link or search query (TIDAL, YouTube, SoundCloud, Bandcamp, Spotify)."""
+        await self._play_request(ctx, query=query)
+
+    @commands.hybrid_command(name="playfrom")
+    @commands.guild_only()
+    @playback_request()
+    @commands.dynamic_cooldown(playback_cooldown, commands.BucketType.user)
+    async def playfrom(
+        self,
+        ctx: commands.Context,
+        platform: Literal["tidal", "youtube", "soundcloud"],
+        *,
+        query: str,
+    ) -> None:
+        """Search a chosen music platform. Supplied links keep their original provider routing."""
         await self._play_request(ctx, query=query, platform=platform)
 
     @commands.hybrid_command(name="playfile")

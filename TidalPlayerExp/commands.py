@@ -331,7 +331,7 @@ class PlaybackCommands:
         await self._reply(ctx,
             "**Native music commands**\n"
             "`play <link/search>` — TIDAL, YouTube, SoundCloud, Bandcamp, or Spotify imports.\n"
-            "`/play` optionally selects `platform`: tidal, youtube, or soundcloud; unset keeps TIDAL search.\n"
+            "`playfrom <platform> <search>` — choose tidal, youtube, or soundcloud; `/play` stays query-only.\n"
             "`playfile` or `/playfile file:<upload>` — Play audio/video uploads (including MP4), up to 50 MiB.\n"
             "`queue` · `now` · `tidalsearch <query>`\n"
             "`pause` · `resume` · `skip` · `stop` (stops audio, clears queue, cancels imports)\n"

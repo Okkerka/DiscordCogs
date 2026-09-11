@@ -223,7 +223,7 @@ async def test_selected_platform_search_does_not_require_tidal(controls, monkeyp
     monkeypatch.setattr(module, "search_provider", search, raising=False)
     cog.check_ready = AsyncMock(side_effect=AssertionError("Should not check TIDAL login"))
     cog._prepare_playback_session = AsyncMock(return_value=session)
-    await cog.tplay(context(), query="artist song", platform=platform)
+    await cog.playfrom(context(), platform, query="artist song")
     await sink.expect("started")
     assert session.snapshot().current.primary == ref
     search.assert_awaited_once_with(cog.youtube_resolver, "artist song", platform)
@@ -238,7 +238,10 @@ async def test_unspecified_or_tidal_search_keeps_catalog_behavior(controls, monk
     search = AsyncMock(return_value=[object()])
     monkeypatch.setattr(type(cog.tidal), "search", search)
     cog._load_and_queue_track = AsyncMock()
-    await cog.tplay(context(), query="artist song", platform=platform)
+    if platform is None:
+        await cog.tplay(context(), query="artist song")
+    else:
+        await cog.playfrom(context(), platform, query="artist song")
     search.assert_awaited_once_with("artist song", filter_remixes=True)
     cog._load_and_queue_track.assert_awaited_once()
 
@@ -248,7 +251,7 @@ async def test_platform_selection_does_not_reroute_explicit_links(controls):
     cog, session, sink = controls
     cog._prepare_playback_session = AsyncMock(return_value=session)
     cog._handle_youtube_video = AsyncMock()
-    await cog.tplay(context(), query="https://youtu.be/abcdefghijk", platform="soundcloud")
+    await cog.playfrom(context(), "soundcloud", query="https://youtu.be/abcdefghijk")
     cog._handle_youtube_video.assert_awaited_once()
 
 

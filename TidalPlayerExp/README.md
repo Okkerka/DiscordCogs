@@ -183,8 +183,9 @@ is not a guarantee that every site or individual track currently works.
   Spotify setup is optional: `[p]setup spotify` and
   `[p]setup spotifylogin`. An optional YouTube Data API key can be configured
   with `[p]setup youtube`.
-- Slash `/play` has an optional `platform` choice: `tidal`, `youtube`, or
-  `soundcloud`. Leaving it unset keeps the existing TIDAL search. Explicit
+- Slash `/play` takes only `query`, keeping the existing TIDAL text search.
+  Use `/playfrom platform:<tidal|youtube|soundcloud> query:<search>` or
+  `[p]playfrom <platform> <search>` to choose a search platform. Explicit
   YouTube/SoundCloud searches queue the top result from that platform, without
   TIDAL login or extra API keys. The choice affects search text only; supplied
   links keep their provider routing, including TIDAL-first YouTube link matching.
@@ -205,7 +206,8 @@ keep the old `tplay`, `tqueue`, `tsearch`, `tnowplaying`, `tpl`, or `tidalsetup`
 
 | Command | Behavior |
 | --- | --- |
-| `play <link/search>` | Play supported media or search TIDAL. Slash `/play` optionally selects TIDAL, YouTube, or SoundCloud with `platform`. |
+| `play <link/search>` | Play supported media or search TIDAL. Slash `/play` takes only `query`. |
+| `playfrom <platform> <search>` | Search TIDAL, YouTube, or SoundCloud explicitly. Slash `/playfrom` takes `platform` and `query`. |
 | `playfile` | Attach one audio/video file to the prefix message, or use `/playfile file:<attachment>`. |
 | `playnext <link/search>` | Put one track next, without interrupting the current song. Collections use `play`. |
 | `queue` | Components V2 panel with current song, numbered waiting songs, durations, requester IDs, paging and refresh. |
