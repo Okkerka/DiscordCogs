@@ -726,7 +726,7 @@ class Moderation(commands.Cog):
             await ctx.send(f"❌ Could not change nickname: {e}")
 
     # ================= Message Management =================
-    @commands.command(aliases=["purge"]
+    @commands.command(aliases=["purge"])
     @commands.guild_only()
     @mod_or_permissions(manage_messages=True)
     @commands.bot_has_permissions(manage_messages=True, read_message_history=True)
