@@ -4,6 +4,15 @@ import random
 import asyncio
 from typing import Optional
 import re
+import logging
+import shlex
+import uuid
+from datetime import timedelta
+
+from .helpers import parse_timestamp, parse_message_link
+from .ui import ReminderView
+
+log = logging.getLogger("red.utilities")
 
 GAY_PERCENTAGE_MIN_NORMAL = 0
 GAY_PERCENTAGE_MAX_NORMAL = 100
@@ -57,12 +66,20 @@ class Utilities(commands.Cog):
         self.awaiting_hawk_response = {}
         self.last_hawk_user = {}
         self.timed_pings = {}
+        self.config.register_user(reminders={})
+        self._reminder_lock = asyncio.Lock()
+        self._reminder_task = asyncio.create_task(self._reminder_loop())
+
+    async def cog_before_invoke(self, ctx: commands.Context) -> None:
+        if ctx.interaction and not ctx.interaction.response.is_done():
+            await ctx.defer(ephemeral=ctx.command.qualified_name.split()[0] in {"remindme", "reminders", "quote"})
 
     def cog_unload(self):
+        self._reminder_task.cancel()
         for task in self.timed_pings.values():
             task.cancel()
 
-    @commands.command(aliases=["av", "pfp"])
+    @commands.hybrid_command(aliases=["av", "pfp"])
     async def avatar(self, ctx, member: Optional[discord.Member] = None):
         member = member or ctx.author
         
@@ -83,14 +100,15 @@ class Utilities(commands.Cog):
         
         embed.description = " | ".join(formats) if formats else None
         
-        if member.guild_avatar:
+        if getattr(member, "guild_avatar", None):
             guild_avatar_url = member.guild_avatar.url
             embed.set_thumbnail(url=guild_avatar_url)
             embed.set_footer(text="Thumbnail shows Server-Specific Avatar")
             
         await ctx.send(embed=embed)
 
-    @commands.command(aliases=["ui", "whois"])
+    @commands.hybrid_command(aliases=["ui", "whois"])
+    @commands.guild_only()
     async def userinfo(self, ctx, member: Optional[discord.Member] = None):
         member = member or ctx.author
         
@@ -141,7 +159,7 @@ class Utilities(commands.Cog):
             
         await ctx.send(embed=embed)
 
-    @commands.command(aliases=["si", "guildinfo"])
+    @commands.hybrid_command(aliases=["si", "guildinfo"])
     @commands.guild_only()
     async def serverinfo(self, ctx):
         g = ctx.guild
@@ -197,11 +215,11 @@ class Utilities(commands.Cog):
         
         await ctx.send(embed=embed)
 
-    @commands.command(aliases=["latency", "botping"])
+    @commands.hybrid_command(aliases=["latency", "botping"])
     async def status(self, ctx):
         await ctx.send(f"Bot latency: `{round(ctx.bot.latency * 1000)} ms`")
 
-    @commands.command(aliases=["8ball"])
+    @commands.hybrid_command(aliases=["8ball"])
     async def eightball(self, ctx, *, question: str):
         """Magic 8-Ball response."""
         answers = [
@@ -225,7 +243,7 @@ class Utilities(commands.Cog):
         embed.set_footer(text=f"Asked by {ctx.author.display_name}", icon_url=ctx.author.display_avatar.url)
         await ctx.send(embed=embed)
 
-    @commands.command()
+    @commands.hybrid_command()
     @commands.guild_only()
     async def poll(self, ctx, *, question: str):
         if "|" in question:
@@ -267,9 +285,13 @@ class Utilities(commands.Cog):
             await msg.add_reaction("👍")
             await msg.add_reaction("👎")
 
-    @commands.command()
-    async def choose(self, ctx, *choices):
-        """Choose between multiple options."""
+    @commands.hybrid_command()
+    async def choose(self, ctx: commands.Context, *, choices: str):
+        """Choose from space-separated options; quote multiword options or separate with |."""
+        try:
+            choices = [c.strip() for c in choices.split("|") if c.strip()] if "|" in choices else shlex.split(choices)
+        except ValueError:
+            return await ctx.send("Close any quoted options before trying again.")
         if len(choices) < 2:
             return await ctx.send("❌ You must provide at least 2 options.")
         
@@ -282,7 +304,7 @@ class Utilities(commands.Cog):
         embed.set_footer(text=f"Requested by {ctx.author.display_name}", icon_url=ctx.author.display_avatar.url)
         await ctx.send(embed=embed)
 
-    @commands.command()
+    @commands.hybrid_command()
     async def coinflip(self, ctx):
         """Flip a coin."""
         result = random.choice(['Heads', 'Tails'])
@@ -294,7 +316,7 @@ class Utilities(commands.Cog):
         embed.set_footer(text=f"Flipped by {ctx.author.display_name}", icon_url=ctx.author.display_avatar.url)
         await ctx.send(embed=embed)
 
-    @commands.command()
+    @commands.hybrid_command()
     async def dice(self, ctx, *, expression: str = "6"):
         """
         Roll dice! Supports RPG notation (e.g. 2d6 + 4, 3d20) or single number of sides (e.g. 20).
@@ -360,7 +382,7 @@ class Utilities(commands.Cog):
         
         await ctx.send(embed=embed)
 
-    @commands.command()
+    @commands.hybrid_command()
     @commands.guild_only()
     async def hawk(self, ctx, user: Optional[discord.Member] = None):
         if not await self.config.guild(ctx.guild).hawk_enabled():
@@ -385,7 +407,7 @@ class Utilities(commands.Cog):
             allowed_mentions=discord.AllowedMentions(users=True),
         )
 
-    @commands.command()
+    @commands.hybrid_command()
     @commands.guild_only()
     async def gay(self, ctx, user: Optional[discord.Member] = None):
         if not await self.config.guild(ctx.guild).gay_enabled():
@@ -395,7 +417,7 @@ class Utilities(commands.Cog):
         user = user or ctx.author
         hawk_users = set(await self.config.guild(ctx.guild).hawk_users())
         is_owner = await ctx.bot.is_owner(ctx.author)
-        if user.id in hawk_users and skibiditoilet in ctx.message.content and is_owner:
+        if user.id in hawk_users and skibiditoilet in (ctx.message.content or "") and is_owner:
             pct = 9999
         elif user.id in hawk_users:
             pct = 9999 if random.randrange(100) == 0 else random.randint(GAY_PERCENTAGE_MIN_HAWK, GAY_PERCENTAGE_MAX_HAWK)
@@ -411,10 +433,15 @@ class Utilities(commands.Cog):
     async def thanos(self, ctx):
         await ctx.send(embed=discord.Embed(title="Thanos Meme", color=BASE).set_image(url=THANOS_IMG))
 
-    @commands.command()
+    @commands.hybrid_command()
     @commands.is_owner()
     @commands.guild_only()
-    async def addhawk(self, ctx, *users: discord.Member):
+    async def addhawk(self, ctx: commands.Context, *, users: str):
+        """Add members by mentions or IDs separated by spaces; quote multiword names."""
+        try:
+            users = [await commands.MemberConverter().convert(ctx, value) for value in shlex.split(users)]
+        except ValueError:
+            return await ctx.send("Close quoted member names before trying again.")
         if not users:
             return await ctx.send("Please specify one or more users.")
         config = self.config.guild(ctx.guild)
@@ -430,7 +457,7 @@ class Utilities(commands.Cog):
         )
         await ctx.send(msg or "No users added.")
 
-    @commands.command()
+    @commands.hybrid_command()
     @commands.is_owner()
     @commands.guild_only()
     async def removehawk(self, ctx, user: discord.Member):
@@ -443,7 +470,7 @@ class Utilities(commands.Cog):
         else:
             await ctx.send("Not found in the hawk list.")
 
-    @commands.command()
+    @commands.hybrid_command()
     @commands.is_owner()
     @commands.guild_only()
     async def listhawk(self, ctx):
@@ -464,7 +491,7 @@ class Utilities(commands.Cog):
             )
         )
 
-    @commands.command()
+    @commands.hybrid_command()
     @commands.is_owner()
     @commands.guild_only()
     async def clearhawks(self, ctx):
@@ -480,7 +507,7 @@ class Utilities(commands.Cog):
         embed.add_field(name="Removed User IDs", value=", ".join(str(u) for u in removed) if removed else "None")
         await ctx.send(embed=embed)
 
-    @commands.command()
+    @commands.hybrid_command()
     @commands.is_owner()
     @commands.guild_only()
     async def disablehawk(self, ctx):
@@ -493,7 +520,7 @@ class Utilities(commands.Cog):
             embed.set_image(url=HAWK_ENABLED_GIF)
         await ctx.send(embed=embed)
 
-    @commands.command()
+    @commands.hybrid_command()
     @commands.is_owner()
     @commands.guild_only()
     async def disablegay(self, ctx):
@@ -507,7 +534,7 @@ class Utilities(commands.Cog):
             )
         )
 
-    @commands.command()
+    @commands.hybrid_command()
     @commands.is_owner()
     @commands.guild_only()
     async def timedping(self, ctx, user: discord.Member, *, duration: str):
@@ -543,9 +570,15 @@ class Utilities(commands.Cog):
                     allowed_mentions=discord.AllowedMentions(users=True),
                 )
         except asyncio.CancelledError:
-            pass
+            raise
+        except discord.HTTPException:
+            log.warning("Repeating ping stopped because delivery failed")
+        finally:
+            key = (channel.guild.id, user.id)
+            if self.timed_pings.get(key) is asyncio.current_task():
+                self.timed_pings.pop(key, None)
 
-    @commands.command()
+    @commands.hybrid_command()
     @commands.is_owner()
     @commands.guild_only()
     async def stoptimedping(self, ctx, user: discord.Member):
@@ -556,7 +589,7 @@ class Utilities(commands.Cog):
         del self.timed_pings[key]
         await ctx.send(f"Stopped repeating ping for {user.mention}.")
 
-    @commands.command()
+    @commands.hybrid_command()
     @commands.is_owner()
     @commands.guild_only()
     async def listtimedpings(self, ctx):
@@ -568,6 +601,174 @@ class Utilities(commands.Cog):
             for uid, _ in active
         ]
         await ctx.send("**Active Timed Pings:**\n" + "\n".join(lines))
+
+    @commands.hybrid_command()
+    @commands.guild_only()
+    async def membercount(self, ctx: commands.Context):
+        """Show human, bot, and total member counts."""
+        if not ctx.guild.chunked:
+            await ctx.guild.chunk()
+        members = ctx.guild.members
+        bots = sum(member.bot for member in members)
+        embed = discord.Embed(title="Member count", color=BASE)
+        embed.add_field(name="Humans", value=str(len(members) - bots))
+        embed.add_field(name="Bots", value=str(bots))
+        embed.add_field(name="Total", value=str(ctx.guild.member_count or len(members)))
+        if ctx.guild.member_count != len(members):
+            embed.set_footer(text="Human/bot breakdown reflects available cached members.")
+        await ctx.send(embed=embed)
+
+    @commands.hybrid_command()
+    async def timestamp(self, ctx: commands.Context, date_time: str, timezone: str = "UTC"):
+        """Create Discord timestamps. Quote YYYY-MM-DD HH:MM for prefix use; default zone UTC."""
+        try:
+            stamp = parse_timestamp(date_time, timezone)
+        except (ValueError, OverflowError, OSError) as exc:
+            return await ctx.send(str(exc), allowed_mentions=discord.AllowedMentions.none())
+        embed = discord.Embed(title="Discord timestamp", description=f"<t:{stamp}:F>\n<t:{stamp}:R>", color=BASE)
+        for label, style in (("Full date", "F"), ("Short date/time", "f"), ("Relative", "R"), ("Time", "t")):
+            embed.add_field(name=label, value=f"`<t:{stamp}:{style}>`", inline=False)
+        embed.set_footer(text=f"Input timezone: {timezone}. Discord displays times in each viewer's timezone.")
+        await ctx.send(embed=embed)
+
+    @commands.hybrid_command()
+    @commands.guild_only()
+    async def quote(self, ctx: commands.Context, message_link: str):
+        """Quote a message. Cross-channel quotes are private slash responses only."""
+        try:
+            guild_id, channel_id, message_id = parse_message_link(message_link)
+        except ValueError as exc:
+            return await ctx.send(str(exc), ephemeral=True)
+        if guild_id != ctx.guild.id:
+            return await ctx.send("Quote a message from this server.", ephemeral=True)
+        channel = ctx.guild.get_channel_or_thread(channel_id)
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return await ctx.send("That message channel is unavailable.", ephemeral=True)
+        # Prefix output remains in its source channel. Slash output is always private.
+        if channel.id != ctx.channel.id and not ctx.interaction:
+            return await ctx.send("Use quote in the source channel, or /quote for a private cross-channel quote.")
+        for member in (ctx.author, ctx.guild.me):
+            perms = channel.permissions_for(member)
+            if not (perms.view_channel and perms.read_message_history):
+                return await ctx.send("You and I both need access to that channel's message history.", ephemeral=True)
+        if isinstance(channel, discord.Thread) and channel.is_private():
+            if not channel.permissions_for(ctx.author).manage_threads:
+                try:
+                    await channel.fetch_member(ctx.author.id)
+                except discord.HTTPException:
+                    return await ctx.send("You must belong to that private thread.", ephemeral=True)
+        try:
+            message = await channel.fetch_message(message_id)
+        except discord.HTTPException:
+            return await ctx.send("I could not retrieve that message. It may have been deleted or become inaccessible.", ephemeral=True)
+        embed = discord.Embed(title="Quoted message", description=message.content[:3500] or "No text content.", color=BASE, timestamp=message.created_at)
+        embed.set_author(name=str(message.author), icon_url=message.author.display_avatar.url)
+        embed.add_field(name="Original", value=f"[Jump to message]({message.jump_url})")
+        if message.attachments:
+            embed.add_field(name="Attachments", value=f"{len(message.attachments)} attachment(s) — open the original to view.")
+        embed.set_footer(text=f"#{channel.name}")
+        await ctx.send(embed=embed, ephemeral=bool(ctx.interaction), allowed_mentions=discord.AllowedMentions.none())
+
+    async def _cancel_reminder(self, user_id: int, reminder_id: str) -> bool:
+        async with self._reminder_lock:
+            async with self.config.user_from_id(user_id).reminders() as reminders:
+                return reminders.pop(reminder_id, None) is not None
+
+    @commands.hybrid_command()
+    @commands.cooldown(1, 5, commands.BucketType.user)
+    async def remindme(self, ctx: commands.Context, duration: str, *, text: str):
+        """Set a personal DM reminder, from 10 seconds to 365 days; survives restarts."""
+        try:
+            seconds = parse_duration_to_seconds(duration)
+        except ValueError:
+            return await ctx.send("Use a duration such as 30m, 2h, or 1d12h.", ephemeral=True)
+        if not 10 <= seconds <= 365 * 86400 or not 1 <= len(text.strip()) <= 1500:
+            return await ctx.send("Use 10 seconds–365 days and 1–1500 characters of reminder text.", ephemeral=True)
+        due = (discord.utils.utcnow() + timedelta(seconds=seconds)).timestamp()
+        reminder_id = uuid.uuid4().hex[:12]
+        async with self._reminder_lock:
+            async with self.config.user(ctx.author).reminders() as reminders:
+                if len(reminders) >= 20:
+                    return await ctx.send("You have 20 reminders. Cancel an old reminder first.", ephemeral=True)
+                reminders[reminder_id] = {"text": text.strip(), "due": due, "attempts": 0, "state": "pending"}
+        embed = discord.Embed(title="Reminder scheduled", description=f"I’ll DM you <t:{int(due)}:R>.\n\n{discord.utils.escape_mentions(text)}", color=BASE)
+        embed.set_footer(text=f"ID: {reminder_id} · DMs must be open. Use reminders list/cancel after restart.")
+        await ctx.send(embed=embed, view=ReminderView(self, ctx.author.id, reminder_id), ephemeral=bool(ctx.interaction), allowed_mentions=discord.AllowedMentions.none())
+
+    @commands.hybrid_group(invoke_without_command=True, fallback="show")
+    async def reminders(self, ctx: commands.Context):
+        """View or cancel your personal reminders."""
+        await self._show_reminders(ctx)
+
+    @reminders.command(name="list")
+    async def reminders_list(self, ctx: commands.Context):
+        """Show pending reminders and delivery failures privately."""
+        await self._show_reminders(ctx)
+
+    async def _show_reminders(self, ctx: commands.Context) -> None:
+        reminders = await self.config.user(ctx.author).reminders()
+        embed = discord.Embed(title="Your reminders", color=BASE)
+        for rid, item in sorted(reminders.items(), key=lambda pair: pair[1]["due"]):
+            embed.add_field(name=f"{rid} · {item['state']}", value=f"<t:{int(item['due'])}:R> — {item['text'][:170]}", inline=False)
+        if not reminders:
+            embed.description = "You have no saved reminders."
+        if ctx.interaction or not ctx.guild:
+            await ctx.send(embed=embed, ephemeral=bool(ctx.interaction), allowed_mentions=discord.AllowedMentions.none())
+        else:
+            try:
+                await ctx.author.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+            except discord.HTTPException:
+                return await ctx.send("I couldn't DM your reminders. Use /reminders list for a private response.")
+            await ctx.send("Sent your reminders by DM.")
+
+    @reminders.command(name="cancel")
+    async def reminders_cancel(self, ctx: commands.Context, reminder_id: str):
+        """Cancel one of your reminders using its ID."""
+        removed = await self._cancel_reminder(ctx.author.id, reminder_id)
+        await ctx.send("Reminder cancelled." if removed else "No reminder with that ID belongs to you.", ephemeral=bool(ctx.interaction))
+
+    async def _deliver_due_reminders(self) -> None:
+        users = await self.config.all_users()
+        now = discord.utils.utcnow().timestamp()
+        for uid, data in users.items():
+            for rid, snapshot in data.get("reminders", {}).items():
+                if snapshot.get("state") != "pending" or snapshot.get("retry_at", snapshot["due"]) > now:
+                    continue
+                # Serialize delivery with cancellation and privacy deletion. Re-read stale snapshots.
+                async with self._reminder_lock:
+                    async with self.config.user_from_id(uid).reminders() as reminders:
+                        item = reminders.get(rid)
+                        if not item or item["state"] != "pending":
+                            continue
+                        try:
+                            user = self.bot.get_user(uid) or await self.bot.fetch_user(uid)
+                            await user.send(embed=discord.Embed(title="Reminder", description=item["text"], color=BASE), allowed_mentions=discord.AllowedMentions.none())
+                        except (discord.Forbidden, discord.NotFound):
+                            item["state"] = "failed (DM unavailable)"
+                        except discord.HTTPException:
+                            item["attempts"] += 1
+                            if item["attempts"] >= 5:
+                                item["state"] = "failed (delivery error)"
+                            else:
+                                item["retry_at"] = now + 60 * item["attempts"]
+                        else:
+                            del reminders[rid]
+
+    async def _reminder_loop(self) -> None:
+        await self.bot.wait_until_ready()
+        while True:
+            try:
+                await self._deliver_due_reminders()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Reminder scheduler iteration failed")
+            await asyncio.sleep(15)
+
+    async def red_delete_data_for_user(self, *, requester: str, user_id: int) -> None:
+        """Remove personal reminders when Red requests deletion of user data."""
+        async with self._reminder_lock:
+            await self.config.user_from_id(user_id).clear()
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
