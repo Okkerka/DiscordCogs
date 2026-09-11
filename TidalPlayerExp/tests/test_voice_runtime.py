@@ -54,6 +54,7 @@ async def main():
     cog = SimpleNamespace(
         bot=SimpleNamespace(get_cog=lambda name: None, add_view=lambda view: None),
         runtime=SimpleNamespace(cleanup=noop),
+        tidal=SimpleNamespace(start_refresh_loop=lambda: None),
         _migrate_config=noop, _initialize_apis=noop,
     )
     await TidalPlayerExp.cog_load(cog)

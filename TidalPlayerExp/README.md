@@ -42,6 +42,16 @@ The old and experimental cogs cannot be loaded together. The experiment's new
 generic commands also overlap Red Audio. This cog refuses to share voice ownership with another
 cog; it never unloads other cogs for you.
 
+If `load`/`reload` keeps the bot typing, do not repeatedly issue the command.
+Startup logs identify import, construction, voice, runtime cleanup, configuration,
+provider initialization, and registration stages. Cog initialization has a
+90-second cancellation deadline and failed loads release their resources;
+shutdown also logs each cleanup stage. A blocked OS/native filesystem operation
+can still delay cancellation while its worker safely stops. If the final log is
+`startup: cog registered`, the cog's setup returned and Red is still finishing its
+own loader bookkeeping. Existing stuck tasks from older code may need one **bot
+process restart**, not a server restart, after the update is installed.
+
 Join a voice channel and try:
 
 ```text
@@ -227,7 +237,9 @@ AIFF, WMA, MP4, WebM, MKV, MOV, AVI, M4V, MPEG/MPG, MKA, and 3GP. Missing or
 generic MIME labels are accepted for these extensions; explicit non-media
 labels and unknown extensions are rejected. Video files must contain a decodable
 audio track: FFmpeg extracts audio and converts it to Discord Opus, discarding
-video, subtitles, and data streams. Only Discord-hosted attachments are accepted,
+video, subtitles, and data streams. Uploaded content is restricted to media
+container demuxers; embedded network playlists such as DASH/HLS are rejected
+even when renamed to a media extension. Only Discord-hosted attachments are accepted,
 not arbitrary file URLs.
 Signed attachment URLs are private in memory, capped at 1,000 records, expire
 after at most 12 hours or their earlier CDN expiry, and are cleared on unload.

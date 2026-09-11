@@ -124,6 +124,7 @@ LOGIN_CACHE_TTL = 300.0
 PROGRESS_EDIT_RATELIMIT = 1.5
 LOGIN_CHECK_TIMEOUT = 10.0
 LOGIN_CHECK_RETRIES = 2
+COG_LOAD_TIMEOUT = 90.0
 PAGINATION_LIMIT = 100
 MAX_ITEMS = 1000
 RATELIMIT_BACKOFF_BASE = 2.0
@@ -1227,21 +1228,48 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         return self.runtime.locate("deno") or _deno_path()
 
     async def cog_load(self) -> None:
-        if self.bot.get_cog("Audio") is not None or self.bot.get_cog("TidalPlayer") is not None:
-            await self.backend.close()
-            await self.tidal.unload()
-            raise commands.UserFeedbackCheckFailure(
-                "Unload Audio and the original TidalPlayer before loading TidalPlayerExp."
-            )
-        await asyncio.to_thread(initialize_voice_runtime)
+        """Initialize with a deadline and unwind even before Red owns the cog."""
+        stage = "conflict check"
         try:
-            await self.runtime.cleanup(protected_paths=())
-        except RuntimeRepairError as error:
-            log.warning("Native runtime cleanup deferred (%s)", error.code)
-        await self._migrate_config()
-        await self._initialize_apis()
-        self._persistent_view = PlayerControllerView(self)
-        self.bot.add_view(self._persistent_view)
+            async with asyncio.timeout(COG_LOAD_TIMEOUT):
+                if self.bot.get_cog("Audio") is not None or self.bot.get_cog("TidalPlayer") is not None:
+                    raise commands.UserFeedbackCheckFailure(
+                        "Unload Audio and the original TidalPlayer before loading TidalPlayerExp."
+                    )
+                stage = "voice runtime initialization"
+                log.info("TidalPlayerExp startup: %s", stage)
+                await asyncio.to_thread(initialize_voice_runtime)
+                stage = "native runtime cleanup"
+                log.info("TidalPlayerExp startup: %s", stage)
+                try:
+                    await self.runtime.cleanup(protected_paths=())
+                except RuntimeRepairError as error:
+                    log.warning("Native runtime cleanup deferred (%s)", error.code)
+                stage = "config migration"
+                log.info("TidalPlayerExp startup: %s", stage)
+                await self._migrate_config()
+                stage = "provider initialization"
+                log.info("TidalPlayerExp startup: %s", stage)
+                await self._initialize_apis()
+                stage = "controller registration"
+                log.info("TidalPlayerExp startup: %s", stage)
+                self._persistent_view = PlayerControllerView(self)
+                self.bot.add_view(self._persistent_view)
+                self.tidal.start_refresh_loop()
+                self._initialized = True
+        except BaseException as error:
+            # discord.py calls cog_load before its command-registration rollback.
+            # A failed/cancelled load therefore has to release its own resources.
+            log.warning("TidalPlayerExp startup failed during %s (%s)", stage, type(error).__name__)
+            try:
+                await self.cog_unload()
+            except Exception as cleanup_error:
+                _log_provider_failure("TidalPlayerExp", "failed-load cleanup", cleanup_error)
+            if isinstance(error, TimeoutError):
+                raise commands.UserFeedbackCheckFailure(
+                    f"TidalPlayerExp startup timed out during {stage}. Check the bot logs."
+                ) from None
+            raise
 
     async def _migrate_config(self) -> None:
         try:
@@ -1257,6 +1285,8 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
 
     async def cog_unload(self) -> None:
         self._closing = True
+        self._initialized = False
+        log.info("TidalPlayerExp shutdown: stopping background tasks")
         for ev in self._cancel_events.values():
             ev.set()
         tasks = {
@@ -1271,10 +1301,11 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             await asyncio.gather(*tasks, return_exceptions=True)
         await self._close_lastfm_session()
         for resource, cleanup in (
+            ("Tidal", self.tidal.unload),
             ("Native runtime repair", self.runtime.close),
             ("Native voice", self.backend.close),
-            ("Tidal", self.tidal.unload),
         ):
+            log.info("TidalPlayerExp shutdown: %s", resource)
             try:
                 await cleanup()
             except Exception as error:
@@ -1555,9 +1586,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             if isinstance(r, Exception):
                 _log_provider_failure(name, "initialization", r)
         elapsed = asyncio.get_running_loop().time() - t0
-        self._initialized = True
-        self.tidal.start_refresh_loop()
-        log.info(f"TidalPlayerExp fully initialized in {elapsed:.2f}s")
+        log.info("TidalPlayerExp providers initialized in %.2fs", elapsed)
 
     async def _initialize_spotify(self) -> None:
         async with self._spotify_commit_lock:
@@ -3781,5 +3810,17 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             await ctx.send(embed=_error_embed("Not authenticated. Use `[p]setup login`."))
 
 
-async def setup(bot):
-    await bot.add_cog(TidalPlayerExp(bot))
+async def setup(bot: Red) -> None:
+    """Register the cog and release resources if Red rejects registration."""
+    log.info("TidalPlayerExp startup: constructing cog")
+    cog = TidalPlayerExp(bot)
+    try:
+        await bot.add_cog(cog)
+    except BaseException:
+        if not cog._closing:
+            try:
+                await cog.cog_unload()
+            except Exception as error:
+                _log_provider_failure("TidalPlayerExp", "registration cleanup", error)
+        raise
+    log.info("TidalPlayerExp startup: cog registered")

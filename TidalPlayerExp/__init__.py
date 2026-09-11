@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -10,6 +11,7 @@ if TYPE_CHECKING:
 
 async def setup(bot: Red) -> None:
     """Load the active cog without importing provider dependencies prematurely."""
+    logging.getLogger("red.tidalplayerexp").info("TidalPlayerExp startup: importing cog")
     from .tidalplayer import setup as setup_cog
 
     await setup_cog(bot)

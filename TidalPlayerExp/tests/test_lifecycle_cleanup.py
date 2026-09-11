@@ -140,3 +140,161 @@ async def test_load_conflict_is_reported_without_mutating_other_cogs(cog, native
     cog.backend.close.assert_awaited_once()
     cog.tidal.unload.assert_awaited_once()
     cog.bot.add_view.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_failed_load_closes_resources_and_refresh_worker(cog, monkeypatch):
+    """Red does not call cog_unload when cog_load itself raises."""
+    import sys
+
+    module = sys.modules[type(cog).__module__]
+    monkeypatch.setattr(module, "initialize_voice_runtime", lambda: None)
+    monkeypatch.setattr(module, "PlayerControllerView", MagicMock())
+    cog.bot.wait_until_ready = asyncio.Event().wait
+    cog._migrate_config = AsyncMock()
+    cog.tokens.restore = AsyncMock(return_value=None)
+    cog.bot.add_view.side_effect = RuntimeError("registration failed")
+
+    with pytest.raises(RuntimeError, match="registration failed"):
+        await cog.cog_load()
+
+    try:
+        assert cog._closing
+        assert not cog._initialized
+        assert cog.tidal._refresh_task is None
+        assert cog._persistent_view is None
+        assert cog.runtime._closed
+    finally:
+        # Also drain the deliberately reproduced leak on the failing version.
+        await cog.cog_unload()
+
+
+@pytest.mark.asyncio
+async def test_stalled_load_times_out_with_stage_and_cleans_up(cog, monkeypatch, caplog):
+    import sys
+
+    module = sys.modules[type(cog).__module__]
+    monkeypatch.setattr(module, "initialize_voice_runtime", lambda: None)
+    monkeypatch.setattr(module, "COG_LOAD_TIMEOUT", 0.05, raising=False)
+    cog._migrate_config = AsyncMock()
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def stalled_restore():
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    cog.tokens.restore = stalled_restore
+    # The outer deadline is only a test safeguard, not the cog's implementation.
+    with pytest.raises(Exception, match="startup timed out during provider initialization"):
+        await asyncio.wait_for(cog.cog_load(), timeout=1)
+
+    assert entered.is_set() and cancelled.is_set()
+    assert cog._closing and not cog._initialized
+    assert cog.tidal._refresh_task is None
+    assert "provider initialization" in caplog.text
+    cog.bot.add_view.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_load_cleans_up_and_preserves_cancellation(cog, monkeypatch):
+    import sys
+
+    module = sys.modules[type(cog).__module__]
+    monkeypatch.setattr(module, "initialize_voice_runtime", lambda: None)
+    entered = asyncio.Event()
+
+    async def stalled_migration():
+        entered.set()
+        await asyncio.Event().wait()
+
+    cog._migrate_config = stalled_migration
+    loading = asyncio.create_task(cog.cog_load())
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    loading.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await loading
+    assert cog._closing
+    assert cog.runtime._closed
+    assert cog.tidal._refresh_task is None
+
+
+@pytest.mark.asyncio
+async def test_successful_load_starts_refresh_only_after_controller_registration(cog, monkeypatch):
+    import sys
+
+    module = sys.modules[type(cog).__module__]
+    monkeypatch.setattr(module, "initialize_voice_runtime", lambda: None)
+    monkeypatch.setattr(module, "PlayerControllerView", MagicMock())
+    cog._migrate_config = AsyncMock()
+    cog.tokens.restore = AsyncMock(return_value=None)
+    cog.bot.wait_until_ready = asyncio.Event().wait
+
+    def register(view):
+        assert cog.tidal._refresh_task is None
+        assert not cog._initialized
+
+    cog.bot.add_view.side_effect = register
+    try:
+        await cog.cog_load()
+        assert cog._initialized
+        assert cog.tidal._refresh_task is not None
+        assert not cog.tidal._refresh_task.done()
+    finally:
+        await cog.cog_unload()
+    assert not cog._initialized
+    assert cog.tidal._refresh_task is None
+
+
+@pytest.mark.asyncio
+async def test_registration_rejection_releases_constructed_cog(cog, monkeypatch):
+    import sys
+
+    module = sys.modules[type(cog).__module__]
+    monkeypatch.setattr(module, "TidalPlayerExp", lambda bot: cog)
+    cog.bot.add_cog.side_effect = RuntimeError("registration rejected")
+    with pytest.raises(RuntimeError, match="registration rejected"):
+        await module.setup(cog.bot)
+    assert cog._closing
+    assert cog.runtime._closed
+
+
+@pytest.mark.asyncio
+async def test_registration_does_not_repeat_framework_cleanup(cog, monkeypatch):
+    import sys
+
+    module = sys.modules[type(cog).__module__]
+    monkeypatch.setattr(module, "TidalPlayerExp", lambda bot: cog)
+    original_unload = cog.cog_unload
+    cog.cog_unload = AsyncMock(wraps=original_unload)
+
+    async def reject(instance):
+        # discord.py already invokes unload for prefix-command conflicts.
+        await instance.cog_unload()
+        raise RuntimeError("duplicate command")
+
+    cog.bot.add_cog.side_effect = reject
+    with pytest.raises(RuntimeError, match="duplicate command"):
+        await module.setup(cog.bot)
+    cog.cog_unload.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_registration_preserves_original_failure_when_cleanup_fails(cog, monkeypatch, caplog):
+    import sys
+
+    module = sys.modules[type(cog).__module__]
+    monkeypatch.setattr(module, "TidalPlayerExp", lambda bot: cog)
+    cog.bot.add_cog.side_effect = RuntimeError("registration rejected")
+    original_unload = cog.cog_unload
+    cog.cog_unload = AsyncMock(side_effect=OSError("private cleanup details"))
+    try:
+        with pytest.raises(RuntimeError, match="registration rejected"):
+            await module.setup(cog.bot)
+        assert "private cleanup details" not in caplog.text
+        assert "OSError" in caplog.text
+    finally:
+        await original_unload()
