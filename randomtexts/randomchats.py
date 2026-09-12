@@ -1,56 +1,174 @@
 import asyncio
+import copy
 import html
+import json
+import logging
 import random
 import re
+import time
 import xml.etree.ElementTree as ET
+from collections import defaultdict, deque
+from collections.abc import Callable
+from typing import Literal
 
 import aiohttp
 import discord
 from redbot.core import Config, commands
 from redbot.core.bot import Red
 
+log = logging.getLogger("red.randomtexts")
+FETCH_DEADLINE = 10
+CATEGORIES = ("brainrot", "showerthought", "dadjoke", "fact")
+Category = Literal["brainrot", "showerthought", "dadjoke", "fact"]
+DEFAULTS = {
+    "enabled": False,
+    "counter": 0,
+    "target": 50,
+    "channels": [],
+    "categories": list(CATEGORIES),
+    "frequency_min": 10,
+    "frequency_max": 100,
+}
+
 
 class RandomText(commands.Cog):
     """Randomly sends Brainrot, Showerthoughts, Jokes, and Facts in chat."""
 
-    def __init__(self, bot: Red):
+    def __init__(self, bot: Red) -> None:
         self.bot = bot
-        self.session = aiohttp.ClientSession()
-        self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        self.session: aiohttp.ClientSession | None = None
+        self.headers = {"User-Agent": "Red-RandomTexts/2.0"}
 
         # Server-wide config
         self.config = Config.get_conf(
             self, identifier=98429482394, force_registration=True
         )
-        default_guild = {"enabled": False, "counter": 0, "target": 50}
-        self.config.register_guild(**default_guild)
+        self.config.register_guild(**DEFAULTS)
+        self.cache = {category: deque(maxlen=20) for category in CATEGORIES}
+        self._settings: dict[int, dict] = {}
+        self._locks = defaultdict(asyncio.Lock)
+        self._load_locks = defaultdict(asyncio.Lock)
+        self._busy: set[int] = set()
+        self._network_slots = asyncio.Semaphore(4)
+        self._rss_cache: dict[str, tuple[float, ET.Element]] = {}
+        self._views: set = set()
+        self._closed = False
 
-        self.cache = {"brainrot": [], "showerthought": [], "dadjoke": [], "fact": []}
+    async def cog_load(self) -> None:
+        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8))
 
-    async def cog_unload(self):
-        await self.session.close()
+    async def cog_unload(self) -> None:
+        self._closed = True
+        for view in list(self._views):
+            view.stop()
+        self._views.clear()
+        if self.session is not None:
+            await self.session.close()
+
+    async def get_settings(self, guild_id: int) -> dict:
+        """Read a detached settings snapshot; mutations use update_settings."""
+        if guild_id not in self._settings:
+            async with self._load_locks[guild_id]:
+                if guild_id not in self._settings:
+                    self._settings[guild_id] = await self.config.guild_from_id(
+                        guild_id
+                    ).all()
+        return copy.deepcopy(self._settings[guild_id])
+
+    async def update_settings(self, guild_id: int, **changes) -> None:
+        """Validate and persist a settings change under the counter lock."""
+        await self._edit_settings(guild_id, lambda settings: settings.update(changes))
+
+    async def _edit_settings(self, guild_id: int, edit: Callable[[dict], None]) -> dict:
+        """Apply a read-modify-write operation to the latest locked snapshot."""
+        async with self._locks[guild_id]:
+            settings = await self.get_settings(guild_id)
+            edit(settings)
+            if not 1 <= settings["frequency_min"] <= settings["frequency_max"] <= 10000:
+                raise ValueError(
+                    "Frequency must be between 1 and 10,000 messages, minimum first."
+                )
+            if not settings["categories"] or set(settings["categories"]) - set(
+                CATEGORIES
+            ):
+                raise ValueError("Select at least one valid category.")
+            if len(settings["channels"]) > 25 or any(
+                type(cid) is not int or cid <= 0 for cid in settings["channels"]
+            ):
+                raise ValueError("Choose up to 25 valid channels.")
+            if not 1 <= settings["target"] <= 10000:
+                raise ValueError("The next target must be between 1 and 10,000.")
+            await self.config.guild_from_id(guild_id).set(settings)
+            self._settings[guild_id] = settings
+            return copy.deepcopy(settings)
+
+    async def can_manage(self, user: discord.Member) -> bool:
+        return (
+            user.guild_permissions.manage_guild
+            or await self.bot.is_owner(user)
+            or await self.bot.is_admin(user)
+        )
+
+    async def cog_check(self, ctx: commands.Context) -> bool:
+        """Enforce settings access on hybrid children as well as the group."""
+        if ctx.command.qualified_name == "copypasta":
+            return True
+        if ctx.guild is None:
+            raise commands.NoPrivateMessage()
+        if not await self.can_manage(ctx.author):
+            raise commands.CheckFailure(
+                "You need Manage Server or Red administrator permission."
+            )
+        return True
 
     # --- HELPERS ---
 
-    async def check_cache(self, category, content):
+    async def check_cache(self, category: str, content: str) -> bool:
         if content in self.cache[category]:
             return False
         self.cache[category].append(content)
-        if len(self.cache[category]) > 20:
-            self.cache[category].pop(0)
         return True
 
-    async def fetch_rss(self, url):
+    async def _fetch(self, url: str, *, headers: dict | None = None) -> bytes | None:
+        """Bound provider concurrency, time and response size; never log bodies."""
+        if self._closed or self.session is None or self.session.closed:
+            return None
         try:
-            async with self.session.get(
-                url, headers=self.headers, timeout=4
-            ) as response:
-                if response.status == 200:
-                    text = await response.text()
-                    return ET.fromstring(text)
-        except:
-            pass
+            async with (
+                asyncio.timeout(FETCH_DEADLINE),
+                self._network_slots,
+                self.session.get(url, headers=headers or self.headers) as response,
+            ):
+                if response.status != 200:
+                    log.debug("Random text provider returned HTTP %s", response.status)
+                    return None
+                body = bytearray()
+                async for chunk in response.content.iter_chunked(16384):
+                    body.extend(chunk)
+                    if len(body) > 524288:
+                        log.warning("Random text provider response exceeded 512 KiB")
+                        return None
+                return bytes(body)
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            log.debug("Random text provider request failed")
         return None
+
+    async def fetch_rss(self, url: str) -> ET.Element | None:
+        cached = self._rss_cache.get(url)
+        if cached and cached[0] > time.monotonic():
+            return cached[1]
+        body = await self._fetch(url)
+        if body is None:
+            return None
+        try:
+            if b"<!DOCTYPE" in body.upper() or b"<!ENTITY" in body.upper():
+                return None
+            root = ET.fromstring(body)
+        except ET.ParseError:
+            log.debug("Random text provider returned malformed RSS")
+            return None
+        self._rss_cache[url] = (time.monotonic() + 300, root)
+        return root
 
     def clean_content(self, content):
         if not content:
@@ -62,14 +180,28 @@ class RandomText(commands.Cog):
         content = re.sub(r"<[^>]+>", "", content)
         return re.sub(r"\s+", " ", content).strip()
 
-    async def send_split_message(self, channel, text):
-        if len(text) <= 2000:
-            await channel.send(text)
-            return
-        chunks = [text[i : i + 1990] for i in range(0, len(text), 1990)]
-        for chunk in chunks:
-            await channel.send(chunk)
-            await asyncio.sleep(1)
+    async def send_split_message(self, channel, text: str) -> None:
+        """Send at most three embed pages, with a plaintext permission fallback."""
+        destination = getattr(channel, "channel", channel)
+        use_embed = (
+            not getattr(destination, "guild", None)
+            or destination.permissions_for(destination.guild.me).embed_links
+        )
+        size = 4000 if use_embed else 1900
+        text = text[: size * 3 - 1] + "…" if len(text) > size * 3 else text
+        for start in range(0, len(text), size):
+            chunk = text[start : start + size]
+            if use_embed:
+                await channel.send(
+                    embed=discord.Embed(
+                        description=chunk, color=discord.Color.blurple()
+                    ),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            else:
+                await channel.send(
+                    chunk, allowed_mentions=discord.AllowedMentions.none()
+                )
 
     # --- GENERATORS ---
 
@@ -275,7 +407,7 @@ class RandomText(commands.Cog):
 
         if await self.check_cache("brainrot", final):
             return final
-        return await self.get_brainrot()
+        return None
 
     async def get_showerthought(self):
         root = await self.fetch_rss(
@@ -285,37 +417,45 @@ class RandomText(commands.Cog):
             entries = root.findall("{http://www.w3.org/2005/Atom}entry")
             random.shuffle(entries)
             for entry in entries:
-                title = entry.find("{http://www.w3.org/2005/Atom}title").text or ""
-                if await self.check_cache("showerthought", title):
+                title = entry.findtext("{http://www.w3.org/2005/Atom}title", "").strip()
+                if title and await self.check_cache("showerthought", title):
                     return f"🚿 **Shower Thought:**\n{title}"
         return None
 
     async def get_dadjoke(self):
-        try:
-            async with self.session.get(
-                "https://icanhazdadjoke.com/", headers={"Accept": "application/json"}
-            ) as r:
-                if r.status == 200:
-                    js = await r.json()
-                    joke = js["joke"]
-                    if await self.check_cache("dadjoke", joke):
-                        return f"😂 **Dad Joke:**\n{joke}"
-        except:
-            pass
-        return None
+        return await self._json_text(
+            "https://icanhazdadjoke.com/", "joke", "dadjoke", "😂 **Dad Joke:**"
+        )
 
     async def get_fact(self):
+        return await self._json_text(
+            "https://uselessfacts.jsph.pl/random.json?language=en",
+            "text",
+            "fact",
+            "🧠 **Fact:**",
+        )
+
+    async def _json_text(
+        self, url: str, key: str, category: str, label: str
+    ) -> str | None:
+        body = await self._fetch(
+            url, headers={**self.headers, "Accept": "application/json"}
+        )
+        if body is None:
+            return None
         try:
-            async with self.session.get(
-                "https://uselessfacts.jsph.pl/random.json?language=en"
-            ) as r:
-                if r.status == 200:
-                    js = await r.json()
-                    fact = js["text"]
-                    if await self.check_cache("fact", fact):
-                        return f"🧠 **Fact:**\n{fact}"
-        except:
-            pass
+            data = json.loads(body)
+        except (ValueError, UnicodeError):
+            log.debug("Random text provider returned invalid JSON")
+            return None
+        value = data.get(key) if isinstance(data, dict) else None
+        if (
+            isinstance(value, str)
+            and value.strip()
+            and len(value) <= 12000
+            and await self.check_cache(category, value)
+        ):
+            return f"{label}\n{value}"
         return None
 
     async def get_copypasta_text(self):
@@ -326,8 +466,8 @@ class RandomText(commands.Cog):
             entries = root.findall("{http://www.w3.org/2005/Atom}entry")
             random.shuffle(entries)
             for entry in entries:
-                title = entry.find("{http://www.w3.org/2005/Atom}title").text or ""
-                content = entry.find("{http://www.w3.org/2005/Atom}content").text or ""
+                title = entry.findtext("{http://www.w3.org/2005/Atom}title", "")
+                content = entry.findtext("{http://www.w3.org/2005/Atom}content", "")
                 body = self.clean_content(content)
 
                 if len(body) < 10 or body.strip() == title.strip():
@@ -342,80 +482,205 @@ class RandomText(commands.Cog):
     # --- LISTENERS & LOGIC ---
 
     @commands.Cog.listener()
-    async def on_message(self, message):
-        if message.author.bot:
+    async def on_message(self, message: discord.Message) -> None:
+        if self._closed or message.author.bot or not message.guild:
             return
-        if not message.guild:
+        if await self.bot.cog_disabled_in_guild(self, message.guild):
             return
-
-        # IGNORE COMMAND MESSAGES (Prevents triggering on "randomtext settarget" calls)
+        if not await self.bot.allowed_by_whitelist_blacklist(message.author):
+            return
+        permissions = message.channel.permissions_for(message.guild.me)
+        can_send = (
+            permissions.send_messages_in_threads
+            if isinstance(message.channel, discord.Thread)
+            else permissions.send_messages
+        )
+        if not can_send:
+            return
+        settings = await self.get_settings(message.guild.id)
+        channel_ids = (message.channel.id, getattr(message.channel, "parent_id", None))
+        if not settings["enabled"] or (
+            settings["channels"]
+            and not set(channel_ids).intersection(settings["channels"])
+        ):
+            return
         ctx = await self.bot.get_context(message)
         if ctx.valid:
             return
+        guild_id = message.guild.id
+        async with self._locks[guild_id]:
+            settings = await self.get_settings(guild_id)
+            if (
+                self._closed
+                or guild_id in self._busy
+                or not settings["enabled"]
+                or (
+                    settings["channels"]
+                    and not set(channel_ids).intersection(settings["channels"])
+                )
+            ):
+                return
+            settings["counter"] += 1
+            if settings["counter"] < settings["target"]:
+                await self.config.guild_from_id(guild_id).counter.set(
+                    settings["counter"]
+                )
+                self._settings[guild_id] = settings
+                return
+            settings["counter"] = 0
+            settings["target"] = random.randint(
+                settings["frequency_min"], settings["frequency_max"]
+            )
+            await self.config.guild_from_id(guild_id).set(settings)
+            self._settings[guild_id] = settings
+            self._busy.add(guild_id)
+        try:
+            text = await self.generate_text(settings["categories"])
+            # Configuration can change while a provider request is in flight.
+            current = await self.get_settings(guild_id)
+            if (
+                text
+                and not self._closed
+                and current["enabled"]
+                and current["categories"] == settings["categories"]
+                and (
+                    not current["channels"]
+                    or set(channel_ids).intersection(current["channels"])
+                )
+            ):
+                await self.send_split_message(message.channel, text)
+        except discord.HTTPException:
+            log.warning("Could not deliver random text in guild %s", guild_id)
+        finally:
+            self._busy.discard(guild_id)
 
-        if not await self.config.guild(message.guild).enabled():
-            return
-
-        current = await self.config.guild(message.guild).counter()
-        target = await self.config.guild(message.guild).target()
-
-        current += 1
-
-        if current >= target:
-            await self.trigger_random_text(message.channel)
-            await self.config.guild(message.guild).counter.set(0)
-            # Randomize next target
-            await self.config.guild(message.guild).target.set(random.randint(10, 100))
-        else:
-            await self.config.guild(message.guild).counter.set(current)
-
-    async def trigger_random_text(self, channel):
-        options = [
-            self.get_brainrot,
-            self.get_showerthought,
-            self.get_dadjoke,
-            self.get_fact,
-        ]
-        func = random.choice(options)
-
-        text = await func()
-        if text is None:
-            text = await self.get_brainrot()
-
-        await self.send_split_message(channel, text)
+    async def generate_text(self, categories: list[str]) -> str | None:
+        """Try only enabled categories, at most once each."""
+        choices = list(dict.fromkeys(c for c in categories if c in CATEGORIES))
+        random.shuffle(choices)
+        for category in choices:
+            text = await getattr(self, f"get_{category}")()
+            if text:
+                return text
+        return None
 
     # --- COMMANDS ---
 
-    @commands.group()
+    @commands.hybrid_group(invoke_without_command=True, fallback="settings")
     @commands.guild_only()
     @commands.admin_or_permissions(manage_guild=True)
-    async def randomtext(self, ctx):
-        """Manage Server-Wide Random Text settings."""
-        pass
+    async def randomtext(self, ctx: commands.Context) -> None:
+        """Open the random text settings panel."""
+        from .ui import RandomTextView
+
+        view = RandomTextView(self, ctx.author.id, ctx.guild.id)
+        await view.build()
+        view.message = await ctx.send(
+            view=view, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
+        )
 
     @randomtext.command()
-    async def toggle(self, ctx):
+    async def toggle(self, ctx: commands.Context) -> None:
         """Enable/Disable random text for the ENTIRE server."""
-        current = await self.config.guild(ctx.guild).enabled()
-        await self.config.guild(ctx.guild).enabled.set(not current)
-        state = "Enabled" if not current else "Disabled"
+
+        def edit(settings: dict) -> None:
+            settings["enabled"] = not settings["enabled"]
+
+        settings = await self._edit_settings(ctx.guild.id, edit)
+        state = "Enabled" if settings["enabled"] else "Disabled"
         await ctx.send(f"✅ Random Text is now **{state}** for this server.")
 
     @randomtext.command()
-    async def settarget(self, ctx, messages: int):
+    async def settarget(self, ctx: commands.Context, messages: int) -> None:
         """Set the number of messages required to trigger the NEXT text."""
-        if messages < 1:
-            await ctx.send("❌ Number must be at least 1.")
+        if not 1 <= messages <= 10000:
+            await ctx.send("Choose between 1 and 10,000 messages.")
             return
-
-        await self.config.guild(ctx.guild).target.set(messages)
-        await self.config.guild(ctx.guild).counter.set(0)
+        await self.update_settings(ctx.guild.id, target=messages, counter=0)
         await ctx.send(
             f"✅ Counter reset! The next random text will trigger after **{messages}** chat messages."
         )
 
-    @commands.command()
-    async def copypasta(self, ctx):
+    @randomtext.command(name="frequency")
+    async def frequency(
+        self, ctx: commands.Context, minimum: int, maximum: int
+    ) -> None:
+        """Set the persistent random message interval and reset the counter."""
+        if not 1 <= minimum <= maximum <= 10000:
+            return await ctx.send("Use 1–10,000 messages, minimum first.")
+        await self.update_settings(
+            ctx.guild.id,
+            frequency_min=minimum,
+            frequency_max=maximum,
+            target=random.randint(minimum, maximum),
+            counter=0,
+        )
+        await ctx.send(
+            f"Future posts will be spaced {minimum}–{maximum} eligible messages apart."
+        )
+
+    @randomtext.command(name="category")
+    async def category(
+        self, ctx: commands.Context, category: Category, enabled: bool
+    ) -> None:
+        """Enable or disable one content category."""
+
+        def edit(settings: dict) -> None:
+            settings["categories"] = [
+                c
+                for c in CATEGORIES
+                if (c == category and enabled)
+                or (c != category and c in settings["categories"])
+            ]
+
+        try:
+            await self._edit_settings(ctx.guild.id, edit)
+        except ValueError as error:
+            return await ctx.send(str(error))
+        await ctx.send(f"{category}: {'enabled' if enabled else 'disabled'}.")
+
+    @randomtext.command(name="channel")
+    async def channel(
+        self,
+        ctx: commands.Context,
+        action: Literal["add", "remove", "all"],
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        """Restrict automatic posts to channels; all restores server-wide behavior."""
+
+        def edit(settings: dict) -> None:
+            channels = settings["channels"]
+            if action == "all":
+                settings["channels"] = []
+            elif channel is None:
+                raise ValueError("Choose a text channel.")
+            elif action == "add" and channel.id not in channels:
+                channels.append(channel.id)
+            elif action == "remove" and channel.id in channels:
+                if len(channels) == 1:
+                    raise ValueError(
+                        "Use channel all to allow every channel, or toggle to disable automatic posts."
+                    )
+                channels.remove(channel.id)
+
+        try:
+            await self._edit_settings(ctx.guild.id, edit)
+        except ValueError as error:
+            return await ctx.send(str(error))
+        await ctx.send("Automatic posting channels updated.")
+
+    @commands.hybrid_command()
+    @commands.cooldown(1, 15, commands.BucketType.user)
+    async def copypasta(self, ctx: commands.Context) -> None:
         """Post a random copypasta (Manual Command)."""
+        await ctx.defer()
         text = await self.get_copypasta_text()
-        await self.send_split_message(ctx.channel, text)
+        # Send through Context so slash invocations receive a completed response.
+        await self.send_split_message(ctx, text)
+
+    @commands.Cog.listener()
+    async def on_guild_remove(self, guild: discord.Guild) -> None:
+        self._settings.pop(guild.id, None)
+
+    async def red_delete_data_for_user(self, *, requester: str, user_id: int) -> None:
+        """No user records are persisted by this cog."""

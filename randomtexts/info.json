@@ -1,0 +1,13 @@
+{
+    "author": ["Okkerka"],
+    "name": "RandomText",
+    "short": "Configurable random chat posts with Components V2 settings.",
+    "description": "Random facts, jokes, shower thoughts and brainrot with channel restrictions, category controls, saved frequency ranges, safe previews and hybrid commands.",
+    "install_msg": "Open [p]randomtext to configure automatic posts. Slash equivalents are available after enabling RandomText in Red's slash settings. Existing settings are preserved. Requires a Components V2-capable Red installation; see README.",
+    "requirements": [],
+    "tags": ["fun", "chat", "utility"],
+    "min_bot_version": "3.5.24",
+    "min_python_version": [3, 11, 0],
+    "end_user_data_statement": "Stores server settings, selected channel IDs and a server-wide message counter. Does not persist message contents or user IDs. A bounded, temporary cache contains fetched or generated public content.",
+    "type": "COG"
+}

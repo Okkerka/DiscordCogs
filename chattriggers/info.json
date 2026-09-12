@@ -1,0 +1,13 @@
+{
+    "author": ["Okkerka"],
+    "name": "ChatTriggers",
+    "short": "Custom chat alerts with Components V2 management.",
+    "description": "Text, image and optional Lavalink sound triggers with paginated editing, per-trigger music behavior, cooldowns, channel restrictions, permission checks and hybrid commands.",
+    "install_msg": "Open [p]chattrigger to manage triggers. New lets you choose whether its sound interrupts music or is skipped while music is busy. Optional sounds require Red Audio/Lavalink. Existing triggers and permissions are preserved; see README.",
+    "requirements": [],
+    "tags": ["alerts", "chat", "audio"],
+    "min_bot_version": "3.5.24",
+    "min_python_version": [3, 11, 0],
+    "end_user_data_statement": "Stores server trigger phrases, configured messages and media URLs, channel restrictions, and explicitly authorized user and manager IDs. User deletion requests remove those permission entries. Cooldown timestamps are temporary and do not store user IDs.",
+    "type": "COG"
+}
