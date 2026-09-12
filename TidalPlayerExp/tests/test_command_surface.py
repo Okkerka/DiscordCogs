@@ -45,3 +45,27 @@ assert 'disconnect' not in commands
     result = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[2],
         capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_real_red_missing_arguments_get_usage_feedback():
+    code = '''
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from redbot.core import commands
+from TidalPlayerExp.tidalplayer import TidalPlayerExp
+
+async def check():
+    command = next(c for c in TidalPlayerExp.__cog_commands__ if c.name == 'play')
+    error = commands.MissingRequiredArgument(command.clean_params['query'])
+    ctx = SimpleNamespace(command=command, send=AsyncMock())
+    await TidalPlayerExp.cog_command_error(None, ctx, error)
+    message = ctx.send.await_args.kwargs['embed'].description.lower()
+    assert 'argument' in message and 'help' in message, message
+    assert 'unexpected' not in message, message
+
+asyncio.run(check())
+'''
+    result = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[2],
+        capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stdout + result.stderr

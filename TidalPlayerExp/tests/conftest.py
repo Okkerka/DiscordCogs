@@ -319,7 +319,8 @@ def _make_redbot_stub(fake_config: FakeConfig) -> types.ModuleType:
         CommandOnCooldown = type("CommandOnCooldown", (Exception,), {"retry_after": 5.0})
         MissingPermissions = type("MissingPermissions", (Exception,), {})
         BotMissingPermissions = type("BotMissingPermissions", (Exception,), {})
-        BadArgument = type("BadArgument", (Exception,), {})
+        UserInputError = type("UserInputError", (Exception,), {})
+        BadArgument = type("BadArgument", (UserInputError,), {})
         CheckFailure = type("CheckFailure", (Exception,), {})
 
     redbot.core.commands = _FakeCommands

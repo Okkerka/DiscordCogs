@@ -177,8 +177,7 @@ class NativePlaybackBackend:
             self._sessions[guild.id] = created
             self._retired.discard(created)
             self._empty_since[guild.id] = self._clock()
-            if self._housekeeping is None:
-                self._housekeeping = asyncio.create_task(self._housekeep())
+            self._ensure_housekeeping()
             return created
         except asyncio.CancelledError:
             if created is not None:
@@ -208,8 +207,14 @@ class NativePlaybackBackend:
         try:
             await self._dispose(session)
         except Exception:  # noqa: BLE001 - retain failed cleanup for explicit retry
+            self._ensure_housekeeping()
             return False
         return True
+
+    def _ensure_housekeeping(self) -> None:
+        """Retry retained cleanup even when no connection has succeeded yet."""
+        if not self._closing and self._housekeeping is None:
+            self._housekeeping = asyncio.create_task(self._housekeep())
 
     async def close_guild(self, guild_id: int) -> None:
         """Invalidate connects and close only this guild's owned resources."""

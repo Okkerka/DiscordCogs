@@ -1400,8 +1400,8 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         if isinstance(error, (commands.MissingPermissions, commands.BotMissingPermissions)):
             await ctx.send(embed=_error_embed("You do not have permission to run this command."))
             return
-        if isinstance(error, commands.BadArgument):
-            await ctx.send(embed=_error_embed("Invalid argument. Check this command's help for the expected values."))
+        if isinstance(error, commands.UserInputError):
+            await ctx.send(embed=_error_embed("Invalid argument or missing required value. Check this command's help for the expected values."))
             return
         if isinstance(error, commands.CheckFailure):
             await ctx.send(embed=_error_embed("You cannot run this command right now."))

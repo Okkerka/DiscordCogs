@@ -156,6 +156,42 @@ async def test_duplicate_connect_reuses_one_session(environment):
 
 
 @pytest.mark.asyncio
+async def test_first_connection_failure_starts_cleanup_retries(environment, monkeypatch):
+    e = environment
+    tick, sleeping = asyncio.Event(), asyncio.Event()
+
+    class InitialFailure(Session):
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.failure = True
+
+    async def sleep(interval):
+        sleeping.set()
+        await tick.wait()
+        tick.clear()
+
+    monkeypatch.setattr(e.module, "NativePlaybackSession", InitialFailure)
+    e.backend._sleep = sleep
+    e.channel.error = RuntimeError("Handshake failed")
+    try:
+        with pytest.raises(PlaybackUnavailable):
+            await e.backend.connect(e.guild, e.channel)
+        retired, = e.backend._retired
+        assert e.backend._housekeeping is not None
+        retired.failure = False
+        await asyncio.wait_for(sleeping.wait(), 2)
+        sleeping.clear()
+        tick.set()
+        await asyncio.wait_for(sleeping.wait(), 2)
+        assert retired.closed
+        assert not e.backend._retired
+    finally:
+        for session in e.backend._retired:
+            session.failure = False
+        await e.backend.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "obstacle", ["audio", "foreign", "wrong_guild", "connect", "speak"]
 )
