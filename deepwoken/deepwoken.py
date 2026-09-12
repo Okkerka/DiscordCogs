@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import math
 import re
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -23,6 +24,7 @@ from .weapon_updater import (
     WeaponRow,
     WORKBOOK_HEADERS,
     install_runtime_workbook,
+    normalize_name,
     reconcile_weapons,
     validate_candidate,
     validate_workbook_semantics,
@@ -115,7 +117,7 @@ class Deepwoken(commands.Cog):
 
     @staticmethod
     def _number(value: Any) -> float | None:
-        match = re.search(r"-?\d+(?:\.\d+)?", str(value or ""))
+        match = re.search(r"-?\d+(?:\.\d+)?", str(value) if value is not None else "")
         return float(match.group()) if match else None
 
     @staticmethod
@@ -135,7 +137,13 @@ class Deepwoken(commands.Cog):
 
     @staticmethod
     def _integer(value: str) -> int | None:
-        return int(value) if re.fullmatch(r"-?[0-9]+", value) else None
+        if not re.fullmatch(r"-?[0-9]+", value):
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            # Python limits integer conversion length; a slash string can exceed it.
+            return None
 
     @staticmethod
     def _looks_like_stat_query(args: tuple[str, ...]) -> bool:
@@ -159,6 +167,12 @@ class Deepwoken(commands.Cog):
 
     def _load_preferred_weapons(self) -> list[dict[str, Any]]:
         """Load the valid runtime workbook when available, else bundled data."""
+        rows, path = self._read_preferred_weapons()
+        self.workbook_path = path
+        return rows
+
+    def _read_preferred_weapons(self) -> tuple[list[WeaponRow], Path]:
+        """Read a complete snapshot without publishing state from a worker thread."""
         if self.runtime_workbook_path.exists():
             try:
                 weapons = self._load_weapons(self.runtime_workbook_path)
@@ -168,12 +182,10 @@ class Deepwoken(commands.Cog):
                     type(error).__name__,
                 )
             else:
-                self.workbook_path = self.runtime_workbook_path
-                return weapons
+                return weapons, self.runtime_workbook_path
 
         weapons = self._load_weapons(self.bundled_workbook_path)
-        self.workbook_path = self.bundled_workbook_path
-        return weapons
+        return weapons, self.bundled_workbook_path
 
     def _load_weapons(self, path: Path) -> list[dict[str, Any]]:
         """Load and deduplicate weapon rows from one fixed workbook path."""
@@ -199,7 +211,7 @@ class Deepwoken(commands.Cog):
                     if any(str(value or "").strip() for value in values):
                         blank_name_rows.append(row)
                     continue
-                key = name.casefold()
+                key = normalize_name(name)
                 if key not in best_rows or self._row_score(row) > self._row_score(best_rows[key]):
                     best_rows[key] = row
             rows = [*blank_name_rows, *best_rows.values()]
@@ -212,6 +224,10 @@ class Deepwoken(commands.Cog):
             except CandidateValidationError as error:
                 raise WorkbookSchemaError("Workbook contains invalid weapon data.") from error
             return rows
+        except WorkbookSchemaError:
+            raise
+        except WORKBOOK_OPEN_ERRORS as error:
+            raise RuntimeWorkbookReadError("Unable to read workbook worksheet.") from error
         finally:
             workbook.close()
 
@@ -246,17 +262,42 @@ class Deepwoken(commands.Cog):
         return damage
 
     def _dps(self, row: dict[str, Any], stats: dict[str, int], prof: int) -> float | None:
-        damage, speed = self._damage(row, stats, prof), self._number(row.get("Swing Speed"))
-        if damage is None or speed is None or speed <= 0: return None
-        return damage / ((1 / (speed * 2)) + (self._number(row.get("Endlag")) or 0))
+        return self._dps_for_damage(row, self._damage(row, stats, prof))
+
+    def _dps_for_damage(self, row: WeaponRow, damage: float | None) -> float | None:
+        speed = self._number(row.get("Swing Speed"))
+        endlag = self._number(row.get("Endlag")) or 0
+        if (damage is None or speed is None or speed <= 0 or endlag < 0
+                or not all(math.isfinite(value) for value in (damage, speed, endlag))):
+            return None
+        duration = 0.5 / speed + endlag
+        if duration <= 0:
+            return None
+        dps = damage / duration
+        return dps if math.isfinite(dps) else None
 
     def _rankable(self, row: dict[str, Any]) -> bool:
         if str(row.get("Name") or "").strip() in RANKING_EXCLUSIONS: return False
         if str(row.get("Weapon Class") or "") in {"Special / Other", "Elemental", "Fighting Style"}: return False
         return not any(value > 100 for value in self._requirements(row.get("Requirements")).values())
 
-    @commands.command(name="dwweapon", aliases=["dw", "weapon"])
-    async def dwweapon(self, ctx: commands.Context, *args: str):
+    @commands.hybrid_command(name="dwweapon", aliases=["dw", "weapon"])
+    async def dwweapon(self, ctx: commands.Context, *, query: str = "") -> None:
+        """Look up a weapon or rank a build, e.g. heavy 100 medium 100 prof 6.
+
+        Parameters
+        ----------
+        query: str
+            Weapon name, build stats, or updatelist (bot owner only).
+        """
+        if ctx.interaction is not None:
+            await ctx.defer()
+        query = query.strip()
+        if len(query) >= 2 and query[0] == query[-1] and query[0] in ("\"", "'"):
+            query = query[1:-1]
+        await self._weapon_query(ctx, *query.split())
+
+    async def _weapon_query(self, ctx: commands.Context, *args: str) -> None:
         """Look up a weapon or rank every weapon usable with a multi-stat build."""
         if not args:
             await ctx.send("Use `[p]dwweapon <name>` or `[p]dwweapon heavy 100 medium 100 prof 6`.")
@@ -287,7 +328,8 @@ class Deepwoken(commands.Cog):
             if not self._rankable(row): continue
             if not self._scaling(row.get("Scaling")).keys() & stats.keys(): continue
             if not self._meets_requirements(row, stats): continue
-            damage, dps = self._damage(row, stats, prof), self._dps(row, stats, prof)
+            damage = self._damage(row, stats, prof)
+            dps = self._dps_for_damage(row, damage)
             if damage is not None and dps is not None: ranked.append((dps, damage, row))
         if not ranked:
             return []
@@ -297,8 +339,8 @@ class Deepwoken(commands.Cog):
         for start in range(0, len(ranked), RANKING_PAGE_SIZE):
             lines = []
             for position, (dps, damage, row) in enumerate(ranked[start:start + RANKING_PAGE_SIZE], start + 1):
-                name = self._bounded_embed_text(row.get("Name") or "Unknown", 128)
-                label = self._bounded_embed_text(row.get("Weapon Type") or "Unknown", 32)
+                name = self._safe_discord_text(row.get("Name") or "Unknown", 128)
+                label = self._safe_discord_text(row.get("Weapon Type") or "Unknown", 32)
                 if str(row.get("Weapon Class") or "") == "Crazy Slots": label += " | Crazy Slots"
                 dps_text = self._bounded_embed_text(f"{dps:.2f}", 24)
                 damage_text = self._bounded_embed_text(f"{damage:.2f}", 24)
@@ -514,9 +556,9 @@ class Deepwoken(commands.Cog):
         return Deepwoken._bounded_embed_text(text, UPDATE_CONFLICT_NAME_LIMIT)
 
     async def _lookup(self, ctx: commands.Context, query: str):
-        query = query.casefold().strip()
-        exact = [row for row in self.weapons if str(row.get("Name") or "").casefold() == query]
-        matches = exact or [row for row in self.weapons if query in str(row.get("Name") or "").casefold()]
+        query = normalize_name(query)
+        exact = [row for row in self.weapons if normalize_name(row.get("Name")) == query]
+        matches = exact or [row for row in self.weapons if query in normalize_name(row.get("Name"))]
         if not matches:
             await ctx.send("Weapon not found.")
             return
@@ -552,7 +594,7 @@ class Deepwoken(commands.Cog):
             embed.add_field(
                 name=self._safe_discord_text(label, DISCORD_EMBED_FIELD_NAME_LIMIT),
                 value=self._safe_discord_text(
-                    row.get(key) or "N/A",
+                    "N/A" if row.get(key) in (None, "") else row[key],
                     min(LOOKUP_FIELD_VALUE_LIMIT, DISCORD_EMBED_FIELD_VALUE_LIMIT),
                 ),
                 inline=label != "Requirements",
@@ -560,8 +602,24 @@ class Deepwoken(commands.Cog):
         embed.set_footer(text="Example: [p]dwweapon heavy 100 medium 100 prof 6")
         await ctx.send(embed=embed)
 
-    @commands.command(name="dwreload")
+    @commands.hybrid_command(name="dwreload")
     @commands.is_owner()
-    async def dwreload(self, ctx: commands.Context):
-        self.weapons = self._load_preferred_weapons()
+    async def dwreload(self, ctx: commands.Context) -> None:
+        """Reload the saved weapon workbook (bot owner only)."""
+        if ctx.interaction is not None:
+            await ctx.defer()
+        async with self._update_lock:
+            try:
+                snapshot = await self._run_blocking(
+                    self._read_preferred_weapons,
+                    on_cancelled_success=self._activate_loaded_snapshot,
+                )
+            except (RuntimeWorkbookReadError, WorkbookSchemaError, OSError) as error:
+                LOGGER.warning("Weapon reload failed: %s", self._safe_log_detail(error))
+                await ctx.send("Weapon reload failed; the previous list is still active.")
+                return
+            self._activate_loaded_snapshot(snapshot)
         await ctx.send(f"Reloaded {len(self.weapons)} unique weapon rows.")
+
+    def _activate_loaded_snapshot(self, snapshot: tuple[list[WeaponRow], Path]) -> None:
+        self.weapons, self.workbook_path = snapshot

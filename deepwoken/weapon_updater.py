@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
 import re
@@ -178,16 +179,21 @@ def validate_workbook_semantics(
 
     malformed_damage: list[str] = []
     invalid_speed: list[str] = []
+    invalid_endlag: list[str] = []
     missing_scaling: list[str] = []
     unrecognized_scaling: list[str] = []
     for row in normalized_rows:
         name = _display_text(row["Name"])
         if not _is_lookup_only_offhand(row):
-            if _number(row["Base Damage"]) is None:
+            damage = _number(row["Base Damage"])
+            if damage is None or damage < 0 or not math.isfinite(damage):
                 malformed_damage.append(name)
             speed = _number(row["Swing Speed"])
-            if speed is None or speed <= 0:
+            if speed is None or speed <= 0 or not math.isfinite(speed):
                 invalid_speed.append(name)
+            endlag = _number(row["Endlag"])
+            if endlag is not None and (endlag < 0 or not math.isfinite(endlag)):
+                invalid_endlag.append(name)
         if not _is_rankable_candidate(row, exclusions, recognized):
             continue
         scaling_stats = _scaling_stats(row["Scaling"])
@@ -199,6 +205,8 @@ def validate_workbook_semantics(
         raise CandidateValidationError("Candidate has malformed base damage: " + _name_sample(malformed_damage) + ".")
     if invalid_speed:
         raise CandidateValidationError("Candidate has non-positive swing speed: " + _name_sample(invalid_speed) + ".")
+    if invalid_endlag:
+        raise CandidateValidationError("Candidate has invalid endlag: " + _name_sample(invalid_endlag) + ".")
     if missing_scaling:
         raise CandidateValidationError("Rankable weapons are missing scaling stats: " + _name_sample(missing_scaling) + ".")
     if unrecognized_scaling:

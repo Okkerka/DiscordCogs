@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any as _Any
 
 
@@ -15,4 +16,5 @@ def __getattr__(name: str) -> _Any:
 async def setup(bot):
     from .deepwoken import Deepwoken
 
-    await bot.add_cog(Deepwoken(bot))
+    cog = await asyncio.to_thread(Deepwoken, bot)
+    await bot.add_cog(cog)

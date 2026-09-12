@@ -70,6 +70,8 @@ class FakeContext:
         self.messages = []
         self.bot = bot or FakeBot()
         self.author = author or object()
+        self.interaction = None
+        self.defer = mock.AsyncMock()
 
     async def send(self, content=None, *, embed=None):
         if embed is not None:
@@ -101,6 +103,7 @@ commands = types.ModuleType("redbot.core.commands")
 commands.Cog = object
 commands.Context = object
 commands.command = passthrough_decorator
+commands.hybrid_command = passthrough_decorator
 commands.is_owner = passthrough_decorator
 
 redbot = types.ModuleType("redbot")
@@ -141,6 +144,151 @@ for name, module in original_modules.items():
 
 
 class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
+    async def test_setup_loads_workbook_off_loop_and_registers_on_loop(self):
+        from deepwoken import setup
+
+        loop_thread = threading.get_ident()
+        reader_threads = []
+        registration_threads = []
+        original_loader = Deepwoken._load_weapons
+
+        def load(cog, path):
+            reader_threads.append(threading.get_ident())
+            return original_loader(cog, path)
+
+        async def register(cog):
+            registration_threads.append(threading.get_ident())
+            self.assertTrue(cog.weapons)
+
+        bot = mock.Mock(add_cog=mock.AsyncMock(side_effect=register))
+        with mock.patch.object(Deepwoken, "_load_weapons", load):
+            await setup(bot)
+        self.assertTrue(reader_threads)
+        self.assertTrue(all(worker != loop_thread for worker in reader_threads))
+        self.assertEqual(registration_threads, [loop_thread])
+
+    async def test_hybrid_query_defers_then_uses_shared_parser(self):
+        ctx = FakeContext()
+        ctx.interaction = object()
+        self.cog._weapon_query = mock.AsyncMock()
+        await self.cog.dwweapon(ctx, query="heavy 100   medium 100 prof 6")
+        ctx.defer.assert_awaited_once()
+        self.cog._weapon_query.assert_awaited_once_with(
+            ctx, "heavy", "100", "medium", "100", "prof", "6"
+        )
+
+    async def test_hybrid_updater_denies_nonowner_without_fetching(self):
+        ctx = FakeContext()
+        ctx.interaction = object()
+        self.cog._weapon_source = mock.Mock()
+        await self.cog.dwweapon(ctx, query="updatelist")
+        ctx.defer.assert_awaited_once()
+        self.cog._weapon_source.fetch.assert_not_called()
+        self.assertIn("Only the bot owner", ctx.messages[0])
+
+    async def test_prefix_hybrid_query_does_not_defer(self):
+        ctx = FakeContext()
+        self.cog._weapon_query = mock.AsyncMock()
+        await self.cog.dwweapon(ctx, query="Frost Gauntlets")
+        ctx.defer.assert_not_awaited()
+        self.cog._weapon_query.assert_awaited_once_with(ctx, "Frost", "Gauntlets")
+
+    async def test_quoted_weapon_name_keeps_prefix_compatibility(self):
+        self.cog.weapons = [self.complete_row("Enforcer's Axe")]
+        ctx = FakeContext()
+        await self.cog.dwweapon(ctx, query='"Enforcer\'s Axe"')
+        self.assertEqual(len(ctx.embeds), 1)
+
+    def test_ranking_escapes_weapon_markup_and_mentions(self):
+        self.cog.weapons = [self.complete_row("**@everyone**")]
+        page = self.cog._ranking_pages({"HVY": 100}, 6)[0]
+        self.assertNotIn("@everyone", page.description)
+        self.assertIn("\\*\\*", page.description)
+
+    async def test_reload_waits_for_update_lock_and_reads_off_event_loop(self):
+        cog = Deepwoken(object())
+        ctx = FakeContext()
+        ctx.interaction = object()
+        loop_thread = threading.get_ident()
+        worker_threads = []
+        rows = [self.complete_row("Reloaded")]
+
+        def read_snapshot():
+            worker_threads.append(threading.get_ident())
+            return rows, cog.runtime_workbook_path
+
+        await cog._update_lock.acquire()
+        with mock.patch.object(cog, "_read_preferred_weapons", side_effect=read_snapshot):
+            task = asyncio.create_task(cog.dwreload(ctx))
+            try:
+                await asyncio.sleep(0)
+                self.assertFalse(worker_threads)
+                self.assertFalse(task.done())
+            finally:
+                cog._update_lock.release()
+            await task
+        self.assertEqual(len(worker_threads), 1)
+        self.assertNotEqual(worker_threads[0], loop_thread)
+        self.assertIs(cog.weapons, rows)
+        self.assertEqual(cog.workbook_path, cog.runtime_workbook_path)
+        ctx.defer.assert_awaited_once()
+
+    async def test_failed_reload_preserves_rows_and_path(self):
+        cog = Deepwoken(object())
+        rows, path = cog.weapons, cog.workbook_path
+        ctx = FakeContext()
+        with (
+            mock.patch.object(cog, "_read_preferred_weapons", side_effect=OSError("unreadable")),
+            self.assertLogs("deepwoken.deepwoken", level="WARNING"),
+        ):
+            await cog.dwreload(ctx)
+        self.assertIs(cog.weapons, rows)
+        self.assertEqual(cog.workbook_path, path)
+        self.assertIn("previous list is still active", ctx.messages[0])
+
+    def test_lazy_corrupt_worksheet_falls_back_to_bundled(self):
+        path = runtime_data_path / "weapons.xlsx"
+        self.write_workbook(path, [self.runtime_row("Corrupt")])
+        with ZipFile(path) as archive:
+            members = {name: archive.read(name) for name in archive.namelist()}
+        # Valid workbook container; corruption appears only during row iteration.
+        members["xl/worksheets/sheet1.xml"] = members["xl/worksheets/sheet1.xml"].replace(
+            b"</sheetData>", b"<invalid></sheetData>"
+        )
+        with ZipFile(path, "w") as archive:
+            for name, content in members.items():
+                archive.writestr(name, content)
+        with self.assertLogs("deepwoken.deepwoken", level="WARNING"):
+            cog = Deepwoken(object())
+        self.assertEqual(cog.workbook_path, cog.bundled_workbook_path)
+        self.assertTrue(cog.weapons)
+
+    def test_negative_endlag_does_not_crash_ranking(self):
+        row = self.weapon("Bad timing", "Heavy", "0 HVY", "HVY: 5", 20)
+        row["Endlag"] = "-0.5"
+        self.assertIsNone(self.cog._dps(row, {"HVY": 100}, 6))
+
+    async def test_oversized_slash_stat_is_reported_as_invalid(self):
+        ctx = FakeContext()
+        await self.cog.dwweapon(ctx, query="heavy " + "9" * 5000)
+        self.assertIn("Invalid stat query", ctx.messages[0])
+
+    async def test_zero_damage_survives_calculation_and_lookup(self):
+        row = self.complete_row("Zero Blade")
+        row["Base Damage"] = 0
+        self.cog.weapons = [row]
+        self.assertEqual(self.cog._dps(row, {"HVY": 100}, 6), 0)
+        ctx = FakeContext()
+        await self.cog._lookup(ctx, "Zero Blade")
+        damage = next(field for field in ctx.embeds[0].fields if field["name"] == "Base Damage")
+        self.assertEqual(damage["value"], "0")
+
+    async def test_unicode_normalized_lookup(self):
+        self.cog.weapons = [self.complete_row("Ｆｒｏｓｔ Blade")]
+        ctx = FakeContext()
+        await self.cog._lookup(ctx, "frost blade")
+        self.assertEqual(len(ctx.embeds), 1)
+
     def setUp(self):
         self.runtime_directory = TemporaryDirectory()
         global runtime_data_path
@@ -240,7 +388,7 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
         cog = Deepwoken(object())
         ctx = FakeContext()
 
-        await cog.dwweapon(ctx, "Unknown Weapon")
+        await cog._weapon_query(ctx, "Unknown Weapon")
 
         self.assertEqual(cog.workbook_path, cog.bundled_workbook_path)
         self.assertTrue(cog.bundled_workbook_path.is_file())
@@ -463,7 +611,7 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
         for query in invalid_queries:
             with self.subTest(query=query):
                 ctx = FakeContext()
-                await self.cog.dwweapon(ctx, *query)
+                await self.cog._weapon_query(ctx, *query)
                 self.assertEqual(len(ctx.messages), 1)
                 self.assertIn("0 to 100", ctx.messages[0])
                 self.assertIn("0 to 6", ctx.messages[0])
@@ -488,7 +636,7 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
         ]
         ctx = FakeContext()
 
-        await self.cog.dwweapon(ctx, "Frost", "Gauntlets")
+        await self.cog._weapon_query(ctx, "Frost", "Gauntlets")
 
         self.assertEqual(ctx.messages, [])
         self.assertEqual(ctx.embeds[0].title, "Frost Gauntlets")
@@ -498,7 +646,7 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
         cog = self.configured_cog(source)
         ctx = FakeContext(bot=FakeBot(owner=True))
 
-        await cog.dwweapon(ctx, "UPDATELIST", "unexpected")
+        await cog._weapon_query(ctx, "UPDATELIST", "unexpected")
 
         self.assertEqual(ctx.messages, ["Use `[p]dwweapon updatelist` with no extra arguments."])
         self.assertEqual(source.calls, 0)
@@ -519,7 +667,7 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
             path.write_bytes(value)
         ctx = FakeContext(bot=FakeBot(owner=False))
 
-        await cog.dwweapon(ctx, "updatelist")
+        await cog._weapon_query(ctx, "updatelist")
 
         self.assertEqual(len(ctx.messages), 1)
         self.assertIn("owner", ctx.messages[0].casefold())
@@ -541,7 +689,7 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
             return real_install(*args)
 
         with mock.patch("deepwoken.deepwoken.install_runtime_workbook", side_effect=install_after_check):
-            await cog.dwweapon(ctx, "updatelist")
+            await cog._weapon_query(ctx, "updatelist")
 
         self.assertEqual(len(ctx.messages), 1)
         summary = ctx.messages[0]
@@ -563,13 +711,13 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
         first_ctx = FakeContext(bot=FakeBot(owner=True))
         second_ctx = FakeContext(bot=FakeBot(owner=True))
 
-        first = asyncio.create_task(cog.dwweapon(first_ctx, "updatelist"))
+        first = asyncio.create_task(cog._weapon_query(first_ctx, "updatelist"))
         for _ in range(10):
             if source.first_entered.is_set():
                 break
             await asyncio.sleep(0)
         self.assertTrue(source.first_entered.is_set())
-        second = asyncio.create_task(cog.dwweapon(second_ctx, "updatelist"))
+        second = asyncio.create_task(cog._weapon_query(second_ctx, "updatelist"))
         await asyncio.sleep(0)
 
         self.assertEqual(source.calls, 1)
@@ -608,7 +756,7 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
 
                 with self.assertLogs("deepwoken.deepwoken", level="ERROR") as logs:
                     with patcher:
-                        await cog.dwweapon(ctx, "updatelist")
+                        await cog._weapon_query(ctx, "updatelist")
 
                 self.assertEqual(len(ctx.messages), 1)
                 self.assertEqual(len(logs.output), 1)
@@ -639,7 +787,7 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
             release_worker.wait(timeout=5)
 
         with mock.patch("deepwoken.deepwoken.write_workbook", side_effect=blocked_write):
-            update = asyncio.create_task(cog.dwweapon(ctx, "updatelist"))
+            update = asyncio.create_task(cog._weapon_query(ctx, "updatelist"))
             for _ in range(100):
                 if worker_started.is_set():
                     break
@@ -679,7 +827,7 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
             return real_install(*args)
 
         with mock.patch("deepwoken.deepwoken.install_runtime_workbook", side_effect=blocked_install):
-            update = asyncio.create_task(cog.dwweapon(ctx, "updatelist"))
+            update = asyncio.create_task(cog._weapon_query(ctx, "updatelist"))
             for _ in range(100):
                 if installer_started.is_set():
                     break
@@ -752,7 +900,7 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
                         mock.patch("deepwoken.deepwoken.asyncio.to_thread", blocked_to_thread),
                         mock.patch("deepwoken.deepwoken.asyncio.create_task", capture_worker),
                     ):
-                        command = real_create_task(cog.dwweapon(ctx, "updatelist"))
+                        command = real_create_task(cog._weapon_query(ctx, "updatelist"))
                         while not captured_workers:
                             await asyncio.sleep(0)
                         command.cancel()
@@ -800,7 +948,7 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
         ctx = FakeContext(bot=FakeBot(owner=True))
 
         with self.assertLogs("deepwoken.deepwoken", level="ERROR") as logs:
-            await cog.dwweapon(ctx, "updatelist")
+            await cog._weapon_query(ctx, "updatelist")
 
         self.assertEqual(ctx.messages, ["Weapon list update failed; the previous list is still active."])
         self.assertEqual(cog.weapons, old_rows)
@@ -841,14 +989,14 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
         ]
         source = FakeWeaponSource((self.source_payload_rows(rows),))
         cog = self.configured_cog(source)
-        await cog.dwweapon(FakeContext(bot=FakeBot(owner=True)), "updatelist")
+        await cog._weapon_query(FakeContext(bot=FakeBot(owner=True)), "updatelist")
 
         exact = FakeContext()
         substring = FakeContext()
         multiple = FakeContext()
-        await cog.dwweapon(exact, names[0])
-        await cog.dwweapon(substring, "Unique", "Alpha")
-        await cog.dwweapon(multiple, "Shared")
+        await cog._weapon_query(exact, names[0])
+        await cog._weapon_query(substring, "Unique", "Alpha")
+        await cog._weapon_query(multiple, "Shared")
 
         for embed in (exact.embeds[0], substring.embeds[0]):
             total = len(embed.title or "") + len(embed.description or "") + len(embed.footer or "")
@@ -874,7 +1022,7 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
         cog = self.configured_cog(source, weapons=old_rows)
         ctx = FakeContext(bot=FakeBot(owner=True))
 
-        await cog.dwweapon(ctx, "updatelist")
+        await cog._weapon_query(ctx, "updatelist")
 
         self.assertEqual(len(ctx.messages), 1)
         self.assertLessEqual(len(ctx.messages[0]), 2000)
@@ -884,12 +1032,12 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
     async def test_successful_update_immediately_serves_lookup_and_public_ranking(self):
         source = FakeWeaponSource((self.source_payload("New Blade"),))
         cog = self.configured_cog(source)
-        await cog.dwweapon(FakeContext(bot=FakeBot(owner=True)), "updatelist")
+        await cog._weapon_query(FakeContext(bot=FakeBot(owner=True)), "updatelist")
 
         lookup = FakeContext(bot=FakeBot(owner=False))
         ranking = FakeContext(bot=FakeBot(owner=False))
-        await cog.dwweapon(lookup, "New", "Blade")
-        await cog.dwweapon(ranking, "heavy", "100", "medium", "100", "prof", "6")
+        await cog._weapon_query(lookup, "New", "Blade")
+        await cog._weapon_query(ranking, "heavy", "100", "medium", "100", "prof", "6")
 
         self.assertEqual(lookup.embeds[0].title, "New Blade")
         self.assertIn("New Blade", ranking.embeds[0].description)
@@ -904,7 +1052,7 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
         cog = self.configured_cog(source)
         owner = FakeContext(bot=FakeBot(owner=True))
 
-        await cog.dwweapon(owner, "updatelist")
+        await cog._weapon_query(owner, "updatelist")
 
         self.assertIn("Weapon list updated.", owner.messages[0])
         self.assertEqual([row["Name"] for row in cog.weapons], ["Sovereign Bangle"])
@@ -920,8 +1068,8 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
         lookup = FakeContext(bot=FakeBot(owner=False))
         ranking = FakeContext(bot=FakeBot(owner=False))
 
-        await cog.dwweapon(lookup, "Public", "Weapon", "00")
-        await cog.dwweapon(ranking, "heavy", "100", "medium", "100", "prof", "6")
+        await cog._weapon_query(lookup, "Public", "Weapon", "00")
+        await cog._weapon_query(ranking, "heavy", "100", "medium", "100", "prof", "6")
 
         self.assertEqual(lookup.embeds[0].title, "Public Weapon 00")
         self.assertEqual(len(ranking.embeds), 2)
