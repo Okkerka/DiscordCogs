@@ -1,616 +1,718 @@
-"""
-GrokCog - AI Assistant for Red Discord Bot
-Optimized for Verified Information & Context Awareness
-"""
+"""Context-aware Groq assistant for Red Discord Bot."""
 
 import asyncio
 import hashlib
 import json
 import logging
+import math
 import re
 import time
+from collections import deque
+from collections.abc import Callable, Coroutine
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from weakref import WeakSet
 
 import aiohttp
 import discord
 from redbot.core import Config, commands
 from redbot.core.bot import Red
 
+from .helpers import (
+    DEFAULT_MODEL,
+    MAX_INPUT_LENGTH,
+    SEARCH_MODEL,
+    SEARCH_PATTERN,
+    SYSTEM_PROMPT,
+    Answer,
+    AnswerPages,
+    ProviderError,
+    answer_pages,
+    extract_json,
+    response_answer,
+)
+
 log = logging.getLogger("red.grokcog")
-
 GROQ_API_BASE = "https://api.groq.com/openai/v1"
-DEFAULT_MODEL = "moonshotai/kimi-k2-instruct-0905"
-
-# --- OPTIMIZATION: PRE-COMPILED REGEX ---
-# 1. Strict Code Block: Matches `````` or ``````
-JSON_BLOCK_REGEX = re.compile(r"``````", re.DOTALL)
-# 2. Fallback: Matches from the first { to the last } in the string
-# Using dotall to capture newlines inside the JSON
-JSON_FALLBACK_REGEX = re.compile(r"\{.*\}", re.DOTALL)
-
-# --- OPTIMIZED PROMPT ---
-K2_PROMPT = """You are a fact-based AI assistant that ONLY provides information you can verify or cite from credible sources.
-
-CRITICAL RULES:
-1. NEVER make up information, facts, statistics, or sources.
-2. If you don't have verified information, say "I don't have verified information about this".
-3. ONLY cite sources you actually have access to or know to exist with high certainty (like Standard Wikipedia articles).
-4. Distinguish clearly between verified facts and general knowledge.
-5. When uncertain, explicitly state your uncertainty level.
-
-VERIFICATION & WIKIPEDIA:
-- You may use "Wikipedia" as a source for established general knowledge.
-- If referencing a Wikipedia article, ensure the URL follows the standard format: "https://en.wikipedia.org/wiki/Topic_Name"
-- Do not cite specific news articles or obscure websites unless you have the content in your context.
-- Stick to high-confidence general consensus for "verified" info.
-
-Response Format (valid JSON only, no markdown):
-
-{
-    "answer": "Your factual answer here.\\n\\nUse verified information only. If making claims, cite sources [1].",
-    "confidence": 0.85,
-    "sources": [
-        {"title": "Wikipedia: Quantum Mechanics", "url": "https://en.wikipedia.org/wiki/Quantum_mechanics"}
-    ]
-}
-
-Confidence Guidelines:
-- 0.9-1.0: Directly cited from verified sources or strict general consensus (e.g., Wikipedia).
-- 0.7-0.89: Well-established facts from general knowledge.
-- 0.5-0.69: General knowledge with some uncertainty.
-- Below 0.5: Speculation or uncertain information.
-
-Source Citation Rules:
-- If you don't have sources, use empty array: "sources": []
-- Never fabricate URLs.
-"""
-
-COOLDOWN_SECONDS = 5
-MIN_API_CALL_GAP = 0.5
-MAX_REQUESTS_PER_MINUTE = 60
-RATE_LIMIT_WINDOW = 60
-CACHE_TTL = 3600
-MAX_CACHE_SIZE = 256
-MAX_INPUT_LENGTH = 8000
-MAX_RETRIES = 3
-
-
-class APIRequestQueue:
-    def __init__(self, cog):
-        self.cog = cog
-        self.queue = asyncio.Queue(maxsize=128)
-        self.worker_task = None
-
-    async def start(self):
-        if self.worker_task is None or self.worker_task.done():
-            self.worker_task = asyncio.create_task(self._worker())
-            log.info("API Request Queue worker started")
-
-    async def stop(self):
-        if self.worker_task:
-            self.worker_task.cancel()
-            try:
-                await self.worker_task
-            except asyncio.CancelledError:
-                pass
-            self.worker_task = None
-            log.info("API Request Queue worker stopped")
-
-    async def enqueue(self, coro) -> Any:
-        future = asyncio.Future()
-        await self.queue.put((coro, future))
-        return await future
-
-    async def _worker(self):
-        while True:
-            try:
-                coro, future = await self.queue.get()
-                await self.cog._respect_api_rate_limits()
-                try:
-                    # Added Timeout to prevent hanging threads if Groq stalls
-                    result = await asyncio.wait_for(coro, timeout=60)
-                    if not future.done():
-                        future.set_result(result)
-                except Exception as e:
-                    if not future.done():
-                        future.set_exception(e)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                log.exception("Worker error")
-                if "future" in locals() and not future.done():
-                    future.set_exception(e)
-                await asyncio.sleep(0.1)
+MAX_PENDING = 128
 
 
 class GrokCog(commands.Cog):
-    def __init__(self, bot):
+    """Answer questions, mentions and replies with optional web evidence."""
+
+    def __init__(self, bot: Red):
         self.bot = bot
         self.config = Config.get_conf(
             self, identifier=0x4B324B32, force_registration=True
         )
-
         self.config.register_global(
             api_key=None,
             timeout=120,
-            max_retries=MAX_RETRIES,
-            cooldown_seconds=COOLDOWN_SECONDS,
-            min_api_call_gap=MIN_API_CALL_GAP,
-            max_requests_per_minute=MAX_REQUESTS_PER_MINUTE,
+            max_retries=3,
+            cooldown_seconds=5,
+            min_api_call_gap=0.5,
+            max_requests_per_minute=60,
             model_name=DEFAULT_MODEL,
             request_queue_enabled=True,
         )
-
         self.config.register_guild(
-            enabled=True,
-            max_input_length=MAX_INPUT_LENGTH,
-            default_temperature=0.3,
+            enabled=True, max_input_length=MAX_INPUT_LENGTH, default_temperature=0.3
         )
-
         self.config.register_user(
-            request_count=0,
-            last_request_time=None,
-            rate_limit_hits=0,
+            request_count=0, last_request_time=None, rate_limit_hits=0
         )
-
-        self._cache: Dict[str, Tuple[float, discord.Embed]] = {}
-        self._active: Dict[int, asyncio.Task] = {}
-        self._session: Optional[aiohttp.ClientSession] = None
-        self._last_api_call: Optional[datetime] = None
-        self._request_times: List[float] = []
+        self._session: aiohttp.ClientSession | None = None
         self._ready = asyncio.Event()
-        self._inflight_requests: Dict[str, asyncio.Future] = {}
-        self._api_queue = APIRequestQueue(self)
+        self._slots = asyncio.Semaphore(3)
+        self._rate_lock = asyncio.Lock()
+        self._request_times: deque[float] = deque()
+        self._last_api_call = 0.0
+        self._active: dict[int, asyncio.Task] = {}
+        self._operations: set[asyncio.Task] = set()
+        self._cooldowns: dict[int, float] = {}
+        self._inflight_requests: dict[str, asyncio.Task[Answer]] = {}
+        self._waiters: dict[str, int] = {}
+        self._cache: dict[str, tuple[float, Answer]] = {}
+        self._cache_epoch = 0
+        self._models_cache: tuple[float, list[str]] = (0, [])
+        self._model_lock = asyncio.Lock()
+        self._views: WeakSet[AnswerPages] = WeakSet()
 
-    async def cog_load(self):
+    async def cog_load(self) -> None:
         self._session = aiohttp.ClientSession()
-        if await self.config.request_queue_enabled():
-            await self._api_queue.start()
         self._ready.set()
-        log.info(f"GrokCog loaded with model '{await self.config.model_name()}'")
 
-    async def cog_unload(self):
+    async def cog_unload(self) -> None:
         self._ready.clear()
-        await self._api_queue.stop()
-        for task in list(self._active.values()):
+        tasks = (
+            set(self._active.values())
+            | set(self._inflight_requests.values())
+            | self._operations
+        )
+        for task in tasks:
             task.cancel()
-        if self._active:
-            await asyncio.wait(self._active.values(), timeout=5)
-        for future in list(self._inflight_requests.values()):
-            if not future.done():
-                future.cancel()
-        self._inflight_requests.clear()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for view in self._views:
+            view.stop()
+        self._views.clear()
+        self._cache.clear()
         if self._session and not self._session.closed:
             await self._session.close()
-        log.info("GrokCog unloaded successfully")
+
+    async def red_delete_data_for_user(self, *, requester: str, user_id: int) -> None:
+        """Delete statistics and discard transient question/answer data."""
+        task = self._active.get(user_id)
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await self.config.user_from_id(user_id).clear()
+        self._cooldowns.pop(user_id, None)
+        self._clear_cache()
+        for view in list(self._views):
+            if view.owner == user_id:
+                view.stop()
+                self._views.discard(view)
+
+    def _clear_cache(self) -> None:
+        self._cache_epoch += 1
+        self._cache.clear()
 
     @staticmethod
     def _key(text: str) -> str:
-        return hashlib.sha256(text.strip().lower().encode()).hexdigest()
+        return hashlib.sha256(text.strip().encode()).hexdigest()
 
-    def _cache_get(self, key: str) -> Optional[discord.Embed]:
-        if item := self._cache.get(key):
-            ts, val = item
-            if time.time() - ts < CACHE_TTL:
-                return val
-            self._cache.pop(key, None)
-        return None
+    @staticmethod
+    def _needs_search(question: str) -> bool:
+        return bool(SEARCH_PATTERN.search(question))
 
-    def _cache_set(self, key: str, val: discord.Embed) -> None:
-        self._cache[key] = (time.time(), val)
-        if len(self._cache) > MAX_CACHE_SIZE:
-            for k, _ in sorted(self._cache.items(), key=lambda x: x[1][0])[:32]:
-                self._cache.pop(k, None)
+    _extract_json = staticmethod(extract_json)
 
-    async def _respect_api_rate_limits(self):
-        await self._ready.wait()
-        while True:
-            now = time.time()
-            window_start = now - RATE_LIMIT_WINDOW
-            self._request_times = [t for t in self._request_times if t > window_start]
+    def _format(self, data: Answer) -> discord.Embed:
+        return answer_pages(data)[0]
 
-            max_per_minute = await self.config.max_requests_per_minute()
+    async def _respect_api_rate_limits(self) -> None:
+        # Reserve a slot for every attempt, including retries and model discovery.
+        async with self._rate_lock:
+            per_minute = max(1, int(await self.config.max_requests_per_minute()))
+            gap = float(await self.config.min_api_call_gap())
+            gap = max(0.0, gap) if math.isfinite(gap) else 0.5
+            while True:
+                now = time.monotonic()
+                while self._request_times and self._request_times[0] <= now - 60:
+                    self._request_times.popleft()
+                delay = max(0, self._last_api_call + gap - now)
+                if len(self._request_times) >= per_minute:
+                    delay = max(delay, self._request_times[0] + 60 - now)
+                if delay <= 0:
+                    self._last_api_call = now
+                    self._request_times.append(now)
+                    return
+                await asyncio.sleep(delay)
 
-            if len(self._request_times) >= max_per_minute:
-                oldest_request = self._request_times[0]
-                wait_time = RATE_LIMIT_WINDOW - (now - oldest_request)
-                if wait_time > 0:
-                    await asyncio.sleep(wait_time)
-                    continue
-
-            if self._last_api_call:
-                now = time.time()
-                time_since_last = now - self._last_api_call.timestamp()
-                min_gap = await self.config.min_api_call_gap()
-                if time_since_last < min_gap:
-                    wait_time = min_gap - time_since_last
-                    await asyncio.sleep(wait_time)
-                    continue
-
-            self._last_api_call = datetime.now(timezone.utc)
-            self._request_times.append(time.time())
-            break
-
-    async def _validate(
-        self,
-        user_id: int,
-        guild_id: Optional[int],
-        question: str,
-        channel: discord.abc.Messageable,
-    ) -> bool:
-        if not self._ready.is_set():
-            return False
-
-        if not question or not question.strip():
-            return False
-
-        # FIX: Check API Key presence early and warn
-        if not await self.config.api_key():
-            await channel.send(
-                "⚠️ **Configuration Error:** API Key is not set. Use `[p]grok admin apikey`."
-            )
-            return False
-
-        if guild_id:
-            guild_config = self.config.guild_from_id(guild_id)
-            if not await guild_config.enabled():
-                return False
-            max_length = await guild_config.max_input_length()
-        else:
-            max_length = MAX_INPUT_LENGTH
-
-        if len(question) > max_length:
-            await channel.send(f"⛔ Question too long ({len(question)}/{max_length}).")
-            return False
-
-        if user_id in self._active:
-            await channel.send("⏳ Please wait for your previous request.")
-            return False
-
-        return True
-
-    async def _ask_groq(self, question: str, temperature: float) -> dict:
+    async def _request_json(
+        self, method: str, path: str, payload: dict | None = None
+    ) -> dict:
         api_key = await self.config.api_key()
-        if not api_key:
-            raise ValueError("⛔ API key missing.")
+        if not isinstance(api_key, str) or not api_key.strip():
+            raise ProviderError(
+                "Groq API key is not configured. Ask the owner to run grok admin apikey privately."
+            )
+        if not self._session or self._session.closed:
+            raise ProviderError(
+                "The assistant is restarting. Please try again shortly."
+            )
+        attempts = min(5, max(1, int(await self.config.max_retries())))
+        timeout = min(120, max(5, float(await self.config.timeout())))
+        for attempt in range(attempts):
+            retry_delay = min(2**attempt, 10)
+            await self._respect_api_rate_limits()
+            try:
+                async with self._session.request(
+                    method,
+                    f"{GROQ_API_BASE}{path}",
+                    json=payload,
+                    headers={
+                        "Authorization": f"Bearer {api_key.strip()}",
+                        "Groq-Model-Version": "latest",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=timeout, connect=10),
+                ) as response:
+                    if response.status == 429 or response.status >= 500:
+                        try:
+                            delay = float(
+                                response.headers.get("Retry-After", retry_delay)
+                            )
+                            if math.isfinite(delay):
+                                retry_delay = min(30, max(0, delay))
+                        except (TypeError, ValueError):
+                            pass
+                        failure = (
+                            "Groq is busy or rate-limited. Please try again shortly."
+                        )
+                    elif response.status != 200:
+                        messages = {
+                            401: "Groq rejected the API key. The bot owner needs to update it.",
+                            403: "This Groq key does not have permission for the requested model.",
+                            400: "Groq rejected this request. Check the configured model and its supported options.",
+                            404: "The configured Groq model is unavailable. Use grok models and ask the owner to update it.",
+                        }
+                        raise ProviderError(
+                            messages.get(
+                                response.status,
+                                f"Groq request failed (HTTP {response.status}).",
+                            )
+                        )
+                    else:
+                        # A read(n) can return a partial chunk; consume until EOF with a hard cap.
+                        raw = bytearray()
+                        async for chunk in response.content.iter_chunked(65536):
+                            raw.extend(chunk)
+                            if len(raw) > 2_000_000:
+                                raise ProviderError(
+                                    "Groq returned an oversized response."
+                                )
+                        try:
+                            data = json.loads(raw)
+                        except (ValueError, UnicodeDecodeError) as exc:
+                            raise ProviderError(
+                                "Groq returned an unreadable response."
+                            ) from exc
+                        if not isinstance(data, dict):
+                            raise ProviderError("Groq returned an unexpected response.")
+                        return data
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                failure = "Could not reach Groq in time. Please try again shortly."
+            if attempt + 1 == attempts:
+                raise ProviderError(failure)
+            await asyncio.sleep(retry_delay)
+        raise ProviderError("Groq request failed.")
 
-        model_name = await self.config.model_name()
+    async def _ask_groq(
+        self,
+        question: str,
+        temperature: float,
+        *,
+        search: bool = False,
+        model: str | None = None,
+    ) -> Answer:
+        selected = SEARCH_MODEL if search else (model or await self.config.model_name())
+        prompt = (
+            SYSTEM_PROMPT
+            + "\nCurrent UTC date: "
+            + datetime.now(timezone.utc).date().isoformat()
+        )
+        if search:
+            prompt += "\nSearch the web before answering this request. Cite retrieved evidence."
         payload = {
-            "model": model_name,
+            "model": selected,
             "messages": [
-                {"role": "system", "content": K2_PROMPT},
+                {"role": "system", "content": prompt},
                 {"role": "user", "content": question},
             ],
             "temperature": temperature,
-            "max_completion_tokens": 8192,
-            "top_p": 1,
+            "max_completion_tokens": 4096,
             "stream": False,
         }
+        if selected in {"groq/compound", "groq/compound-mini"}:
+            payload["compound_custom"] = {
+                "tools": {"enabled_tools": ["web_search", "visit_website"]}
+            }
+        data = await self._request_json("POST", "/chat/completions", payload)
+        return response_answer(data, selected, search)
 
-        max_retries = await self.config.max_retries()
-        api_key_clean = api_key.strip()
-
-        for attempt in range(max_retries):
-            try:
-                timeout = aiohttp.ClientTimeout(
-                    connect=10, total=await self.config.timeout()
-                )
-                async with self._session.post(
-                    f"{GROQ_API_BASE}/chat/completions",
-                    json=payload,
-                    headers={
-                        "Authorization": f"Bearer {api_key_clean}",
-                        "Content-Type": "application/json",
-                    },
-                    timeout=timeout,
-                ) as resp:
-                    if resp.status == 429:
-                        wait_time = int(resp.headers.get("Retry-After", 5))
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(wait_time)
-                            continue
-                        raise ValueError("⏱️ Rate limit reached.")
-
-                    if resp.status != 200:
-                        err_text = await resp.text()
-                        raise ValueError(f"⛔ Groq error {resp.status}: {err_text}")
-
-                    data = await resp.json()
-                    content = (
-                        data.get("choices", [{}])[0]
-                        .get("message", {})
-                        .get("content", "")
-                    )
-
-                    if not content:
-                        raise ValueError("Empty response.")
-
-                    return self._extract_json(content)
-
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    raise e
-                await asyncio.sleep(1)
-
-        raise ValueError("Failed after retries.")
-
-    def _extract_json(self, content: str) -> dict:
-        # 1. Direct parse
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            pass
-
-        # 2. Markdown Block
-        if match := JSON_BLOCK_REGEX.search(content):
-            try:
-                return json.loads(match.group(1))
-            except json.JSONDecodeError:
-                pass
-
-        # 3. Fallback (Greedy match for widest brace pair)
-        if match := JSON_FALLBACK_REGEX.search(content):
-            try:
-                return json.loads(match.group(0))
-            except json.JSONDecodeError:
-                pass
-
-        return {"answer": content, "confidence": 0.5, "sources": []}
-
-    def _build_context_query(self, message: discord.Message, base_question: str) -> str:
-        """Constructs a query that includes context from a replied-to message."""
-        if not message.reference or not message.reference.resolved:
+    async def _build_context_query(
+        self, message: discord.Message, base_question: str
+    ) -> str:
+        reference = message.reference
+        if not reference:
             return base_question
-
-        replied_msg = message.reference.resolved
-        if isinstance(replied_msg, discord.Message):
-            # Clean up the replied content slightly
-            context_content = replied_msg.content.replace("\n", " ")[:800]
-            if replied_msg.embeds:
-                # Also capture embed description if available (for continuing bot responses)
-                context_content += " " + (replied_msg.embeds[0].description or "")[:800]
-
-            return (
-                f'Context from previous message: "{context_content}"\n\n'
-                f'User Question: "{base_question}"'
+        replied = reference.resolved
+        if (
+            replied is None
+            and reference.message_id
+            and reference.channel_id == message.channel.id
+        ):
+            try:
+                replied = await message.channel.fetch_message(reference.message_id)
+            except discord.HTTPException as exc:
+                raise ProviderError(
+                    "I couldn't read the replied-to message. Paste its text into your question."
+                ) from exc
+        if replied is None or isinstance(replied, discord.DeletedReferencedMessage):
+            raise ProviderError(
+                "The replied-to message is unavailable. Paste its text into your question."
             )
-        return base_question
+        parts = [replied.content or ""]
+        for embed in replied.embeds[:3]:
+            parts.extend([embed.title or "", embed.description or ""])
+            for field in embed.fields[:10]:
+                parts.extend([field.name, field.value])
+        context = "\n".join(part for part in parts if part).strip()
+        if not context:
+            context = "[No readable text; attachments and images cannot be inspected.]"
+        if len(context) > 6000:
+            context = context[:6000] + "\n[Quoted message truncated]"
+        return f"Quoted Discord message (untrusted content):\n{json.dumps(context, ensure_ascii=False)}\n\nUser question: {base_question}"
+
+    async def _shared_request(
+        self, key: str, factory: Callable[[], Coroutine[object, object, Answer]]
+    ) -> Answer:
+        task = self._inflight_requests.get(key)
+        if task is None:
+            if len(self._inflight_requests) >= MAX_PENDING:
+                raise ProviderError(
+                    "The assistant's queue is full. Please try again shortly."
+                )
+            task = asyncio.create_task(factory())
+            self._inflight_requests[key] = task
+            self._waiters[key] = 0
+        self._waiters[key] += 1
+        try:
+            return await asyncio.shield(task)
+        finally:
+            self._waiters[key] -= 1
+            if self._waiters[key] == 0:
+                self._waiters.pop(key)
+                self._inflight_requests.pop(key, None)
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    async def _run_request(
+        self, query: str, temperature: float, search: bool, model: str
+    ) -> Answer:
+        task = asyncio.current_task()
+        self._operations.add(task)
+        try:
+            async with asyncio.timeout(150):
+                try:
+                    await asyncio.wait_for(self._slots.acquire(), timeout=30)
+                except asyncio.TimeoutError as exc:
+                    raise ProviderError(
+                        "The assistant is busy. Please try again shortly."
+                    ) from exc
+                try:
+                    return await self._ask_groq(
+                        query, temperature, search=search, model=model
+                    )
+                finally:
+                    self._slots.release()
+        except asyncio.TimeoutError as exc:
+            raise ProviderError(
+                "This request took too long. Please try a narrower question."
+            ) from exc
+        finally:
+            self._operations.discard(task)
 
     async def _process(
-        self,
-        user_id: int,
-        guild_id: Optional[int],
-        question: str,
-        channel,
-        message: Optional[discord.Message] = None,
-    ):
-        # Inject Context if reply exists
-        final_question = question
-        if message:
-            final_question = self._build_context_query(message, question)
-
-        if not await self._validate(user_id, guild_id, final_question, channel):
+        self, ctx: commands.Context, question: str, *, search: bool = False
+    ) -> None:
+        user_id = ctx.author.id
+        if not self._ready.is_set():
+            await ctx.send("The assistant is starting. Please try again shortly.")
             return
-
+        if user_id in self._active:
+            await ctx.send("Please wait for your previous request, or use grok cancel.")
+            return
         task = asyncio.current_task()
         self._active[user_id] = task
-        key = self._key(final_question)
-
         try:
-            if cached := self._cache_get(key):
-                await channel.send(embed=cached)
-                return
-
-            # Dedup check
-            if key in self._inflight_requests:
-                try:
-                    result = await asyncio.wait_for(
-                        self._inflight_requests[key], timeout=30
-                    )
-                    formatted = self._format(result)
-                    await channel.send(embed=formatted)
+            # Context.typing defers slash responses; all sends stay on the interaction.
+            async with ctx.typing():
+                if ctx.guild and not await self.config.guild(ctx.guild).enabled():
+                    await ctx.send("The assistant is disabled in this server.")
                     return
-                except asyncio.TimeoutError:
-                    pass
-
-            async with channel.typing():
-                temperature = 0.3
-                if guild_id:
-                    temperature = await self.config.guild_from_id(
-                        guild_id
-                    ).default_temperature()
-
-                api_coro = self._ask_groq(final_question, temperature)
-
-                if await self.config.request_queue_enabled():
-                    future = asyncio.Future()
-                    self._inflight_requests[key] = future
-                    try:
-                        result = await self._api_queue.enqueue(api_coro)
-                        if not future.done():
-                            future.set_result(result)
-                    finally:
-                        self._inflight_requests.pop(key, None)
-                else:
-                    result = await api_coro
-
-                embed = self._format(result)
-                self._cache_set(key, embed)
-                await channel.send(embed=embed)
-
-                async with self.config.user_from_id(user_id).all() as user_data:
-                    user_data["request_count"] = user_data.get("request_count", 0) + 1
-                    user_data["last_request_time"] = time.time()
-
-        except Exception as e:
-            log.error(f"Error: {e}")
-            await channel.send(f"⛔ Error: {str(e)}")
-        finally:
-            self._active.pop(user_id, None)
-            self._inflight_requests.pop(key, None)
-
-    def _format(self, data: dict) -> discord.Embed:
-        answer = data.get("answer", "No response.")
-        confidence = data.get("confidence", 0.0)
-        sources = data.get("sources", [])
-
-        if confidence >= 0.9:
-            color = discord.Color.green()
-        elif confidence >= 0.7:
-            color = discord.Color.blue()
-        elif confidence >= 0.5:
-            color = discord.Color.gold()
-        else:
-            color = discord.Color.orange()
-
-        embed = discord.Embed(
-            title="DripBot's Response",
-            description=answer[:4096],
-            color=color,
-            timestamp=datetime.now(timezone.utc),
-        )
-
-        if sources or confidence >= 0.7:
-            embed.add_field(name="Confidence", value=f"{confidence:.0%}", inline=True)
-
-        if sources and isinstance(sources, list):
-            source_text = ""
-            for i, src in enumerate(sources[:5], 1):
-                if isinstance(src, dict):
-                    title = src.get("title", "Source")[:100]
-                    url = src.get("url", "")
-                    source_text += (
-                        f"{i}. [{title}]({url})\n" if url else f"{i}. {title}\n"
+                limit = (
+                    await self.config.guild(ctx.guild).max_input_length()
+                    if ctx.guild
+                    else MAX_INPUT_LENGTH
+                )
+                if not question.strip() or len(question) > min(
+                    MAX_INPUT_LENGTH, max(1, limit)
+                ):
+                    await ctx.send(
+                        f"Please provide a question of at most {min(MAX_INPUT_LENGTH, max(1, limit))} characters."
                     )
-
-            if source_text:
-                embed.add_field(name="Sources", value=source_text[:1024], inline=False)
-
-        embed.set_footer(text=f"Model: {DEFAULT_MODEL} • Fact-Checked")
-        return embed
+                    return
+                cooldown = min(3600, max(0, int(await self.config.cooldown_seconds())))
+                now = time.monotonic()
+                self._cooldowns = {
+                    uid: ts for uid, ts in self._cooldowns.items() if now - ts < 3600
+                }
+                remaining = self._cooldowns.get(user_id, -3600) + cooldown - now
+                if remaining > 0:
+                    await ctx.send(
+                        f"Please wait {remaining:.1f}s before another question."
+                    )
+                    return
+                self._cooldowns[user_id] = now
+                query = await self._build_context_query(ctx.message, question)
+                search = search or self._needs_search(question)
+                model = SEARCH_MODEL if search else await self.config.model_name()
+                temperature = (
+                    await self.config.guild(ctx.guild).default_temperature()
+                    if ctx.guild
+                    else 0.3
+                )
+                epoch = self._cache_epoch
+                key = self._key(
+                    json.dumps(
+                        [
+                            ctx.guild.id if ctx.guild else None,
+                            ctx.channel.id,
+                            model,
+                            temperature,
+                            search,
+                            query,
+                            epoch,
+                            datetime.now(timezone.utc).date().isoformat(),
+                        ]
+                    )
+                )
+                cached = self._cache.get(key)
+                ttl = 300 if search else 3600
+                if cached and now - cached[0] < ttl:
+                    result = cached[1]
+                else:
+                    result = await self._shared_request(
+                        key,
+                        lambda: self._run_request(query, temperature, search, model),
+                    )
+                    if epoch == self._cache_epoch:
+                        self._cache[key] = (time.monotonic(), result)
+                        while len(self._cache) > 256:
+                            self._cache.pop(next(iter(self._cache)))
+                pages = answer_pages(result)
+                view = AnswerPages(user_id, pages) if len(pages) > 1 else None
+                if view:
+                    self._views.add(view)
+                kwargs = {
+                    "embed": pages[0],
+                    "view": view,
+                    "allowed_mentions": discord.AllowedMentions.none(),
+                }
+                if ctx.interaction is None:
+                    sent = await ctx.reply(**kwargs, mention_author=False)
+                else:
+                    sent = await ctx.send(**kwargs)
+                if view:
+                    view.message = sent
+                async with self.config.user(ctx.author).all() as stats:
+                    stats["request_count"] = stats.get("request_count", 0) + 1
+                    stats["last_request_time"] = time.time()
+        except asyncio.CancelledError:
+            if self._ready.is_set() and ctx.interaction is not None:
+                try:
+                    await ctx.send("Request cancelled.")
+                except discord.HTTPException:
+                    log.warning("Could not complete a cancelled interaction")
+            raise
+        except ProviderError as exc:
+            await ctx.send(str(exc), allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            log.warning("Could not deliver an assistant response to Discord")
+        except Exception as exc:  # noqa: BLE001 -- final UI boundary must not leak raw errors/secrets
+            # Never log prompts, credentials, raw provider bodies or private messages.
+            log.error("Assistant request failed (%s)", type(exc).__name__)
+            await ctx.send(
+                "The assistant encountered an unexpected error. Please try again."
+            )
+        finally:
+            if self._active.get(user_id) is task:
+                self._active.pop(user_id, None)
 
     @commands.Cog.listener()
-    async def on_message(self, msg: discord.Message):
-        if msg.author.bot or not self._ready.is_set():
+    async def on_message(self, msg: discord.Message) -> None:
+        if msg.author.bot or not self._ready.is_set() or not self.bot.user:
             return
-
-        # Check for Reply Context FIRST
-        is_reply_to_me = False
-        if msg.reference and msg.reference.resolved:
-            resolved = msg.reference.resolved
-            if (
-                isinstance(resolved, discord.Message)
-                and resolved.author == self.bot.user
-            ):
-                is_reply_to_me = True
-
+        if await self.bot.cog_disabled_in_guild(self, msg.guild):
+            return
+        if not await self.bot.allowed_by_whitelist_blacklist(msg.author):
+            return
+        if not await self.bot.ignored_channel_or_guild(msg):
+            return
+        ctx = await self.bot.get_context(msg)
+        if ctx.valid:
+            return
         is_mention = self.bot.user in msg.mentions
-
-        if msg.guild:
-            if not await self.config.guild(msg.guild).enabled():
+        reference = msg.reference
+        replied = reference.resolved if reference else None
+        is_reply_to_me = (
+            isinstance(replied, discord.Message)
+            and replied.author.id == self.bot.user.id
+        )
+        if not msg.guild:
+            if not isinstance(msg.channel, discord.DMChannel):
                 return
+            prefixes = await self.bot.get_valid_prefixes()
+            if any(msg.content.startswith(prefix) for prefix in prefixes):
+                return
+        elif not (is_mention or is_reply_to_me):
+            return
+        content = re.sub(rf"<@!?{self.bot.user.id}>", "", msg.content).strip()
+        if content:
+            await self._process(ctx, content)
 
-            if is_mention or is_reply_to_me:
-                content = msg.content
-                for mention in msg.mentions:
-                    content = content.replace(f"<@{mention.id}>", "").replace(
-                        f"<@!{mention.id}>", ""
-                    )
+    @commands.hybrid_group(name="grok", fallback="ask", invoke_without_command=True)
+    async def grok(self, ctx: commands.Context, *, question: str) -> None:
+        """Ask a question; fact checks automatically search for evidence."""
+        await self._process(ctx, question)
 
-                await self._process(
-                    msg.author.id,
-                    msg.guild.id,
-                    content.strip(),
-                    msg.channel,
-                    message=msg,
-                )
+    @grok.command(name="search")
+    async def grok_search(self, ctx: commands.Context, *, question: str) -> None:
+        """Search the web for an answer with retrieved sources."""
+        await self._process(ctx, question, search=True)
 
-        elif isinstance(msg.channel, discord.DMChannel):
-            if not any(
-                msg.content.startswith(p) for p in await self.bot.get_valid_prefixes()
-            ):
-                await self._process(
-                    msg.author.id, None, msg.content, msg.channel, message=msg
-                )
-
-    @commands.hybrid_group(name="grok", invoke_without_command=True)
-    @commands.cooldown(1, COOLDOWN_SECONDS, commands.BucketType.user)
-    async def grok(self, ctx: commands.Context, *, question: str):
-        await ctx.typing()
-        await self._process(
-            ctx.author.id,
-            ctx.guild.id if ctx.guild else None,
-            question,
-            ctx.channel,
-            message=ctx.message,
+    @grok.command(name="cancel")
+    async def grok_cancel(self, ctx: commands.Context) -> None:
+        """Cancel your current question or queued request."""
+        task = self._active.get(ctx.author.id)
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await ctx.send(
+            "Request cancelled." if task else "You have no active request.",
+            ephemeral=True,
         )
 
     @grok.command(name="stats")
-    async def grok_stats(self, ctx: commands.Context):
+    async def grok_stats(self, ctx: commands.Context) -> None:
+        """Show successful answers delivered to you, including cache hits."""
         stats = await self.config.user(ctx.author).all()
         embed = discord.Embed(
-            title=f"📊 {ctx.author.display_name}'s Stats", color=discord.Color.gold()
+            title=f"{ctx.author.display_name}'s Stats", color=discord.Color.gold()
         )
         embed.add_field(name="Total Queries", value=stats.get("request_count", 0))
         await ctx.send(embed=embed)
 
+    async def _models(self) -> list[str]:
+        now = time.monotonic()
+        if self._models_cache[1] and now - self._models_cache[0] < 300:
+            return self._models_cache[1]
+        epoch = self._cache_epoch
+        task = asyncio.current_task()
+        self._operations.add(task)
+        try:
+            async with asyncio.timeout(30):
+                async with self._model_lock:
+                    if self._models_cache[1] and now - self._models_cache[0] < 300:
+                        return self._models_cache[1]
+                    async with self._slots:
+                        data = await self._request_json("GET", "/models")
+                    items = data.get("data")
+                    if not isinstance(items, list):
+                        raise ProviderError("Groq returned an invalid model list.")
+                    models = sorted(
+                        {
+                            item["id"]
+                            for item in items
+                            if isinstance(item, dict)
+                            and isinstance(item.get("id"), str)
+                        }
+                    )
+                    if epoch == self._cache_epoch:
+                        self._models_cache = (now, models)
+                    return models
+        except asyncio.TimeoutError as exc:
+            raise ProviderError(
+                "Model discovery timed out. Please try again shortly."
+            ) from exc
+        finally:
+            self._operations.discard(task)
+
+    @grok.command(name="models")
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def grok_models(self, ctx: commands.Context) -> None:
+        """List models available through the configured Groq key."""
+        async with ctx.typing():
+            try:
+                models = await self._models()
+            except ProviderError as exc:
+                await ctx.send(str(exc))
+                return
+            text = "\n".join(models) or "No models available."
+            for offset in range(0, len(text), 1800):
+                await ctx.send(
+                    text[offset : offset + 1800],
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+
     @grok.group(name="admin")
-    async def grok_admin(self, ctx: commands.Context):
-        pass
+    async def grok_admin(self, ctx: commands.Context) -> None:
+        """Configure the Groq assistant."""
 
     @grok_admin.command(name="apikey")
     @commands.is_owner()
-    async def admin_apikey(self, ctx: commands.Context, *, api_key: str):
+    async def admin_apikey(
+        self, ctx: commands.Context, *, api_key: str | None = None
+    ) -> None:
+        """Set the key via slash (private response) or a prefix command in DM."""
+        if ctx.guild and ctx.interaction is None:
+            if api_key:
+                try:
+                    await ctx.message.delete()
+                except discord.HTTPException:
+                    pass
+            await ctx.send(
+                "Use this command in DM or via slash. If you posted a key here, rotate it in Groq's console."
+            )
+            return
+        if (
+            not api_key
+            or not api_key.strip()
+            or len(api_key) > 512
+            or any(ch.isspace() for ch in api_key.strip())
+        ):
+            await ctx.send(
+                "Provide a valid Groq API key via this slash command or in DM.",
+                ephemeral=True,
+            )
+            return
         await self.config.api_key.set(api_key.strip())
-        await ctx.send("✅ API key saved.")
+        self._models_cache = (0, [])
+        self._clear_cache()
+        await ctx.send("Groq API key saved.", ephemeral=True)
 
     @grok_admin.command(name="verify")
     @commands.is_owner()
-    async def admin_verify(self, ctx: commands.Context):
-        msg = await ctx.send("🔍 Testing API...")
-        try:
-            # Simple test call
-            await self._ask_groq("Test", 0.1)
-            await msg.edit(content="✅ API key is working!")
-        except Exception as e:
-            await msg.edit(content=f"⛔ Error: {e}")
+    async def admin_verify(self, ctx: commands.Context) -> None:
+        """Test the configured key and text model with a small question."""
+        async with ctx.typing(ephemeral=True):
+            try:
+                result = await self._run_request(
+                    "Reply with OK.", 0.1, False, await self.config.model_name()
+                )
+                await ctx.send(
+                    f"Groq is working. Model: {result['model']}", ephemeral=True
+                )
+            except ProviderError as exc:
+                await ctx.send(str(exc), ephemeral=True)
 
     @grok_admin.command(name="toggle")
+    @commands.guild_only()
     @commands.admin_or_permissions(manage_guild=True)
-    async def admin_toggle(self, ctx: commands.Context):
-        current = await self.config.guild(ctx.guild).enabled()
-        await self.config.guild(ctx.guild).enabled.set(not current)
-        status = "ENABLED 🟢" if not current else "DISABLED 🔴"
-        await ctx.send(f"✅ Grok is now **{status}**")
+    async def admin_toggle(self, ctx: commands.Context) -> None:
+        """Enable or disable assistant answers in this server."""
+        async with self.config.guild(ctx.guild).all() as settings:
+            settings["enabled"] = not settings["enabled"]
+            enabled = settings["enabled"]
+        await ctx.send(f"Grok is now {'enabled' if enabled else 'disabled'}.")
 
     @grok_admin.command(name="cooldown")
     @commands.is_owner()
-    async def admin_cooldown(self, ctx: commands.Context, seconds: int):
+    async def admin_cooldown(self, ctx: commands.Context, seconds: int) -> None:
+        """Set seconds between questions per user across all entry points (0-3600)."""
+        if not 0 <= seconds <= 3600:
+            await ctx.send(
+                "Cooldown must be between 0 and 3600 seconds.", ephemeral=True
+            )
+            return
         await self.config.cooldown_seconds.set(seconds)
-        await ctx.send(f"✅ Cooldown set to {seconds}s")
+        await ctx.send(f"Cooldown set to {seconds}s.", ephemeral=True)
 
     @grok_admin.command(name="setmodel")
     @commands.is_owner()
-    async def admin_setmodel(self, ctx: commands.Context, model: str):
-        await self.config.model_name.set(model)
-        await ctx.send(f"✅ Model set to `{model}`")
+    async def admin_setmodel(self, ctx: commands.Context, model: str) -> None:
+        """Choose an available chat model; search uses Groq Compound."""
+        async with ctx.typing(ephemeral=True):
+            try:
+                if model not in await self._models():
+                    await ctx.send(
+                        "Unknown model. Use grok models to list available IDs.",
+                        ephemeral=True,
+                    )
+                    return
+                # Also check chat compatibility: the catalog includes audio and guard models.
+                await self._run_request("Reply with OK.", 0.1, False, model)
+            except ProviderError as exc:
+                await ctx.send(str(exc), ephemeral=True)
+                return
+            await self.config.model_name.set(model)
+            self._clear_cache()
+            await ctx.send(
+                f"Model set to {model}.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+    @admin_setmodel.autocomplete("model")
+    async def model_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[discord.app_commands.Choice[str]]:
+        if not await self.bot.is_owner(interaction.user):
+            return []
+        return [
+            discord.app_commands.Choice(name=model, value=model)
+            for model in self._models_cache[1]
+            if current.lower() in model.lower() and len(model) <= 100
+        ][:25]
 
     @grok_admin.command(name="ratelimits")
     @commands.is_owner()
     async def admin_ratelimits(
         self, ctx: commands.Context, per_minute: int, min_gap: float
-    ):
-        await self.config.max_requests_per_minute.set(per_minute)
-        await self.config.min_api_call_gap.set(min_gap)
-        await ctx.send(f"✅ Rate limits updated: {per_minute}/min, {min_gap}s gap")
+    ) -> None:
+        """Set the global request budget and spacing between API attempts."""
+        if (
+            not 1 <= per_minute <= 600
+            or not math.isfinite(min_gap)
+            or not 0 <= min_gap <= 60
+        ):
+            await ctx.send(
+                "Use 1-600 requests/minute and a finite gap between 0 and 60 seconds.",
+                ephemeral=True,
+            )
+            return
+        async with self.config.all() as settings:
+            settings["max_requests_per_minute"] = per_minute
+            settings["min_api_call_gap"] = min_gap
+        await ctx.send(
+            f"Rate limits updated: {per_minute}/min, {min_gap}s gap.", ephemeral=True
+        )
 
     @grok_admin.command(name="clearcache")
     @commands.is_owner()
-    async def admin_clearcache(self, ctx: commands.Context):
-        self._cache.clear()
-        await ctx.send("✅ Cache cleared")
-
-
-async def setup(bot):
-    await bot.add_cog(GrokCog(bot))
+    async def admin_clearcache(self, ctx: commands.Context) -> None:
+        """Clear cached answers, including answers still being generated."""
+        self._clear_cache()
+        await ctx.send("Cache cleared.", ephemeral=True)
