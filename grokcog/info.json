@@ -2,12 +2,12 @@
     "author": ["Okkerka"],
     "name": "GrokCog",
     "short": "Groq questions and contextual web fact checks",
-    "description": "Answer prefix/slash questions, bot mentions and replies using Groq. Fact-check requests use Groq Compound web search with retrieved citations.",
+    "description": "Answer prefix/slash questions, bot mentions, replies and images using Groq. Qwen reads supplied images; fact-check requests use Groq Compound web search with retrieved citations.",
     "install_msg": "Configure a Groq key using [p]grok admin apikey in DM or its slash equivalent. Enable slash commands with [p]slash enablecog GrokCog, then [p]slash sync. See the cog README for model selection and examples.",
     "tags": ["ai", "groq", "search", "fact-check"],
     "requirements": [],
     "min_bot_version": "3.5.0",
     "min_python_version": [3, 11, 0],
     "type": "COG",
-    "end_user_data_statement": "Stores user IDs with successful answer counts and last request timestamps, server preferences and a bot-owner API key in Red Config. Questions, quoted message text and answers are held in bounded in-memory request/cache/UI state and sent to Groq; web-search requests may also be processed by Groq's search tools. No conversation history is persisted by this cog. Red user-data deletion removes user statistics and transient cog data; it cannot delete Discord messages or provider-held data."
+    "end_user_data_statement": "Stores user IDs with successful answer counts and last request timestamps, server preferences and a bot-owner API key in Red Config. Questions, quoted message text, selected signed Discord image URLs and answers are held in bounded in-memory request/cache/UI state. Text and image URLs are sent to Groq, which fetches the images; web-search requests may also be processed by Groq's search tools. Images are not downloaded to disk and no conversation history is persisted by this cog. Red user-data deletion removes user statistics and transient cog data; it cannot delete Discord messages or provider-held data."
 }

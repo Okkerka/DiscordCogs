@@ -9,6 +9,8 @@ Groq-powered questions and web fact checks for Red. Requires Python 3.11+.
 - `@bot is this true?` while replying to a message — reads the quoted message's text
   and embeds, requests a web search, and replies to your question with evidence.
 - `@bot is it true that ...?` — checks a claim written in the question itself.
+- Attach an image with `@bot what does this say?`, or reply to a picture with
+  `@bot is this true?`. Select a supported Qwen model first (see below).
 - Reply to the bot's answer to ask a follow-up. Mentioning the bot also works when
   the original message isn't cached; it fetches the replied-to message from that channel.
 - `>grok question` or `/grok ask question` — ordinary questions, with automatic
@@ -25,8 +27,8 @@ Searching can incur Groq tool charges in addition to model usage.
 
 Replies include up to 6,000 characters of quoted text, including embed descriptions
 and fields. Longer context is marked as truncated. Missing/deleted/inaccessible
-messages produce a clear error. Images, screenshots, attachments and longer
-conversation chains are not read. The prompt asks for image text when needed.
+messages produce a clear error. Longer conversation chains, videos, GIFs and
+document attachments are not read.
 Enable Message Content Intent for mention/reply/prefix behavior, and give the bot
 View Channel, Read Message History, Send Messages and Embed Links permissions.
 
@@ -35,6 +37,34 @@ Previous/Next buttons that expire after three minutes. Search results are eviden
 not guaranteed truth. A search without usable source metadata does not display an
 unsupported verification verdict. Self-reported confidence percentages and the old
 unconditional "Fact-Checked" badge have been removed.
+
+## Images and screenshots
+
+Select `qwen/qwen3.8-27b` or `qwen/qwen3.6-27b` with `>grok admin setmodel` to use
+image input. The bot reads PNG, JPEG and WebP attachments on your question and on
+the message you replied to. Embedded images/thumbnails use Discord's image proxy;
+author avatars/icons are not included. On `/grok ask` and `/grok search`, use the
+optional `image` attachment field. Prefix commands automatically use attachments.
+After upgrading, run `>slash sync` to expose the new image option.
+
+Ordinary image questions go directly to Qwen. Image fact checks first ask Qwen to
+read the relevant text, numbers and visual details, then pass those observations
+and the original question to Compound for web evidence. Image observations are
+explicitly treated as uncertain, untrusted transcription. Blurry text and cropped
+tables can limit the answer; no model can guarantee an exact transcription.
+If a text-only model is selected, the cog asks the owner to select Qwen; it does
+not silently switch your configured model or ignore the image.
+
+Up to three images are accepted per question, including replied-to images.
+Known attachments are capped at 8 MB each and 16 MB total. Embedded image sizes
+are checked by Groq's image service. The bot sends HTTPS Discord CDN/proxy URLs
+to Groq, including the signed query string needed to access attachments; it does
+not download images to disk or fetch arbitrary user URLs on the bot server.
+Groq fetches the images. Inaccessible/expired URLs or provider image limits can
+still fail. Images use the same API rate limits, timeouts and cancellation controls;
+fact checks use two model calls, so image checks consume more free-tier capacity.
+Each image currently counts as 2,048 input tokens on these Qwen models.
+[Groq image input documentation](https://console.groq.com/docs/vision).
 
 ## Setup and existing installations
 
@@ -78,7 +108,7 @@ in-flight requests from repopulating the cleared cache.
 
 ## Privacy and verification
 
-Questions and quoted text are sent to Groq. The cog persists user counts/timestamps,
+Questions, quoted text and selected Discord image URLs are sent to Groq. The cog persists user counts/timestamps,
 server preferences and the owner's key in Red Config, not conversation history.
 Red user-data deletion cancels the user's request, removes statistics/cooldown/UI
 state, and invalidates the response cache. It does not remove Discord messages or
@@ -108,3 +138,4 @@ API references:
 - [Groq models](https://console.groq.com/docs/models)
 - [Groq web search and response metadata](https://console.groq.com/docs/tool-use/built-in-tools/web-search)
 - [Compound tool configuration](https://console.groq.com/docs/compound/built-in-tools)
+- [Qwen image input](https://console.groq.com/docs/vision)

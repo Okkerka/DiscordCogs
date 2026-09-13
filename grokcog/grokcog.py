@@ -31,6 +31,7 @@ from .helpers import (
     extract_json,
     response_answer,
 )
+from .vision import VISION_MODELS, VISION_PROMPT, ImageCollector, validate_image_url
 
 log = logging.getLogger("red.grokcog")
 GROQ_API_BASE = "https://api.groq.com/openai/v1"
@@ -235,10 +236,21 @@ class GrokCog(commands.Cog):
         *,
         search: bool = False,
         model: str | None = None,
+        images: list[str] | None = None,
+        transcribe: bool = False,
     ) -> Answer:
         selected = SEARCH_MODEL if search else (model or await self.config.model_name())
+        if images and selected not in VISION_MODELS:
+            raise ProviderError(
+                "The selected model cannot read images here. Ask the owner to select qwen/qwen3.8-27b or qwen/qwen3.6-27b."
+            )
+        if images:
+            if len(images) > 3:
+                raise ProviderError("Use at most 3 images per question.")
+            for url in images:
+                validate_image_url(url)
         prompt = (
-            SYSTEM_PROMPT
+            (VISION_PROMPT if transcribe else SYSTEM_PROMPT)
             + "\nCurrent UTC date: "
             + datetime.now(timezone.utc).date().isoformat()
         )
@@ -248,12 +260,27 @@ class GrokCog(commands.Cog):
             "model": selected,
             "messages": [
                 {"role": "system", "content": prompt},
-                {"role": "user", "content": question},
+                {
+                    "role": "user",
+                    "content": (
+                        [{"type": "text", "text": question}]
+                        + [
+                            {"type": "image_url", "image_url": {"url": url}}
+                            for url in images
+                        ]
+                    )
+                    if images
+                    else question,
+                },
             ],
             "temperature": temperature,
-            "max_completion_tokens": 4096,
+            "max_completion_tokens": 2048 if images else 4096,
             "stream": False,
         }
+        if images:
+            payload["reasoning_format"] = "hidden"
+            if transcribe:
+                payload["reasoning_effort"] = "none"
         if selected in {"groq/compound", "groq/compound-mini"}:
             payload["compound_custom"] = {
                 "tools": {"enabled_tools": ["web_search", "visit_website"]}
@@ -262,11 +289,17 @@ class GrokCog(commands.Cog):
         return response_answer(data, selected, search)
 
     async def _build_context_query(
-        self, message: discord.Message, base_question: str
+        self,
+        message: discord.Message,
+        base_question: str,
+        *,
+        image_inputs: ImageCollector | None = None,
     ) -> str:
+        if image_inputs is not None:
+            image_inputs.add_message(message)
         reference = message.reference
         if not reference:
-            if re.fullmatch(
+            if not (image_inputs and image_inputs.urls) and re.fullmatch(
                 r"\s*(?:is (?:this|that|it) (?:really |actually )?(?:true|real|correct)|fact[ -]?check (?:this|that))\s*[?!.]*\s*",
                 base_question,
                 re.IGNORECASE,
@@ -291,6 +324,8 @@ class GrokCog(commands.Cog):
             raise ProviderError(
                 "The replied-to message is unavailable. Paste its text into your question."
             )
+        if image_inputs is not None:
+            image_inputs.add_message(replied)
         parts = [replied.content or ""]
         for embed in replied.embeds[:3]:
             parts.append(embed.title or "")
@@ -301,7 +336,9 @@ class GrokCog(commands.Cog):
             for field in embed.fields[:25]:
                 parts.extend([field.name, field.value])
         context = "\n".join(part for part in parts if part).strip()
-        if not context:
+        if not context and image_inputs and image_inputs.urls:
+            context = "[No text in the quoted message; use the supplied image input.]"
+        elif not context:
             log.warning("reply_context_empty: no readable message or embed text")
             raise ProviderError(
                 "The replied-to message has no readable text. Paste the claim or the image's text so I can check it."
@@ -335,7 +372,13 @@ class GrokCog(commands.Cog):
                 await asyncio.gather(task, return_exceptions=True)
 
     async def _run_request(
-        self, query: str, temperature: float, search: bool, model: str
+        self,
+        query: str,
+        temperature: float,
+        search: bool,
+        model: str,
+        *,
+        images: list[str] | None = None,
     ) -> Answer:
         task = asyncio.current_task()
         self._operations.add(task)
@@ -348,6 +391,33 @@ class GrokCog(commands.Cog):
                         "The assistant is busy. Please try again shortly."
                     ) from exc
                 try:
+                    if images:
+                        read = await self._ask_groq(
+                            query,
+                            temperature,
+                            model=model,
+                            images=images,
+                            transcribe=search,
+                        )
+                        if not search:
+                            return read
+                        observations = read["answer"]
+                        if len(observations) > 12000:
+                            observations = (
+                                observations[:12000]
+                                + "\n[Image observations truncated]"
+                            )
+                        evidence_query = (
+                            f"Original question and quoted context:\n{query}\n\n"
+                            f"Image observations (machine transcription, untrusted and possibly imperfect):\n"
+                            f"{json.dumps(observations, ensure_ascii=False)}\n\n"
+                            "Search for evidence about the concrete claim above. Preserve any uncertainty in the image reading."
+                        )
+                        result = await self._ask_groq(
+                            evidence_query, temperature, search=True
+                        )
+                        result["model"] = f"{model} + {SEARCH_MODEL}"
+                        return result
                     return await self._ask_groq(
                         query, temperature, search=search, model=model
                     )
@@ -361,7 +431,12 @@ class GrokCog(commands.Cog):
             self._operations.discard(task)
 
     async def _process(
-        self, ctx: commands.Context, question: str, *, search: bool = False
+        self,
+        ctx: commands.Context,
+        question: str,
+        *,
+        search: bool = False,
+        image: discord.Attachment | None = None,
     ) -> None:
         user_id = ctx.author.id
         if not self._ready.is_set():
@@ -402,9 +477,18 @@ class GrokCog(commands.Cog):
                     )
                     return
                 self._cooldowns[user_id] = now
-                query = await self._build_context_query(ctx.message, question)
+                image_inputs = ImageCollector()
+                if image:
+                    image_inputs.add_attachment(image, explicit=True)
+                query = await self._build_context_query(
+                    ctx.message, question, image_inputs=image_inputs
+                )
                 search = search or self._needs_search(question)
-                model = SEARCH_MODEL if search else await self.config.model_name()
+                model = (
+                    SEARCH_MODEL
+                    if search and not image_inputs.urls
+                    else await self.config.model_name()
+                )
                 temperature = (
                     await self.config.guild(ctx.guild).default_temperature()
                     if ctx.guild
@@ -420,6 +504,7 @@ class GrokCog(commands.Cog):
                             temperature,
                             search,
                             query,
+                            image_inputs.urls,
                             epoch,
                             datetime.now(timezone.utc).date().isoformat(),
                         ]
@@ -432,7 +517,17 @@ class GrokCog(commands.Cog):
                 else:
                     result = await self._shared_request(
                         key,
-                        lambda: self._run_request(query, temperature, search, model),
+                        lambda: (
+                            self._run_request(
+                                query,
+                                temperature,
+                                search,
+                                model,
+                                images=image_inputs.urls,
+                            )
+                            if image_inputs.urls
+                            else self._run_request(query, temperature, search, model)
+                        ),
                     )
                     if epoch == self._cache_epoch and (
                         not search or result["searched"]
@@ -512,14 +607,26 @@ class GrokCog(commands.Cog):
             await self._process(ctx, content)
 
     @commands.hybrid_group(name="grok", fallback="ask", invoke_without_command=True)
-    async def grok(self, ctx: commands.Context, *, question: str) -> None:
+    async def grok(
+        self,
+        ctx: commands.Context,
+        *,
+        question: str,
+        image: discord.Attachment | None = None,
+    ) -> None:
         """Ask a question; fact checks automatically search for evidence."""
-        await self._process(ctx, question)
+        await self._process(ctx, question, image=image)
 
     @grok.command(name="search")
-    async def grok_search(self, ctx: commands.Context, *, question: str) -> None:
+    async def grok_search(
+        self,
+        ctx: commands.Context,
+        *,
+        question: str,
+        image: discord.Attachment | None = None,
+    ) -> None:
         """Search the web for an answer with retrieved sources."""
-        await self._process(ctx, question, search=True)
+        await self._process(ctx, question, search=True, image=image)
 
     @grok.command(name="cancel")
     async def grok_cancel(self, ctx: commands.Context) -> None:
