@@ -543,3 +543,165 @@ async def test_non_owner_cannot_pass_admin_requirements(cog):
         ctx.bot_permissions = discord.Permissions.all()
         ctx.permission_state = PermState.NORMAL
         assert not await cmd.requires.verify(ctx)
+
+
+def test_browser_results_are_usable_search_evidence():
+    data = {
+        "choices": [
+            {
+                "message": {
+                    "content": "Supported by this page.",
+                    "executed_tools": [
+                        {
+                            "type": "visit_website",
+                            "browser_results": [
+                                {
+                                    "title": "Primary source",
+                                    "url": "https://example.org/claim",
+                                    "content": "Evidence",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            }
+        ]
+    }
+    result = response_answer(data, "groq/compound", True)
+    assert result["searched"]
+    assert result["sources"][0]["url"] == "https://example.org/claim"
+    assert result["answer"] == "Supported by this page."
+
+
+def test_missing_sources_logged_without_private_content(caplog):
+    data = {
+        "choices": [
+            {
+                "message": {
+                    "content": "PRIVATE_MESSAGE",
+                    "executed_tools": [
+                        {"type": "UNKNOWN_SECRET", "output": "PRIVATE_TOOL_OUTPUT"}
+                    ],
+                }
+            }
+        ]
+    }
+    with caplog.at_level("WARNING", logger="red.grokcog"):
+        result = response_answer(data, "groq/compound", True)
+    assert "search_no_sources" in caplog.text
+    assert "executed_tools=1" in caplog.text
+    assert "PRIVATE" not in caplog.text and "UNKNOWN_SECRET" not in caplog.text
+    assert "General answer" not in answer_pages(result)[0].footer.text
+
+
+@pytest.mark.asyncio
+async def test_search_without_sources_is_not_cached(cog):
+    cog._run_request = AsyncMock(return_value=answer("No sources"))
+    ctx = context()
+    await cog._process(ctx, "search for this claim")
+    await cog._process(ctx, "search for this claim")
+    assert cog._run_request.await_count == 2
+    assert not cog._cache
+
+
+@pytest.mark.asyncio
+async def test_empty_reply_requests_text_before_calling_provider(cog):
+    ctx = context()
+    ctx.message.reference = SimpleNamespace(
+        resolved=SimpleNamespace(content="", embeds=[])
+    )
+    cog._run_request = AsyncMock(return_value=answer())
+    await cog._process(ctx, "is this true?")
+    cog._run_request.assert_not_awaited()
+    assert "text" in ctx.send.call_args.args[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_vague_question_without_reply_requests_claim(cog):
+    cog._run_request = AsyncMock(return_value=answer())
+    ctx = context()
+    await cog._process(ctx, "is this true?")
+    cog._run_request.assert_not_awaited()
+    assert "claim" in ctx.send.call_args.args[0].lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_sources", [False, True])
+async def test_verify_search_checks_retrieved_evidence(cog, has_sources):
+    result = answer()
+    result["searched"] = has_sources
+    result["sources"] = (
+        [{"title": "Official", "url": "https://example.org"}] if has_sources else []
+    )
+    cog._run_request = AsyncMock(return_value=result)
+    ctx = context(slash=True)
+    await GrokCog.admin_verify.callback(cog, ctx, mode="search")
+    assert cog._run_request.call_args.args[2] is True
+    assert ("Search is working" in ctx.send.call_args.args[0]) is has_sources
+
+
+@pytest.mark.asyncio
+async def test_weapon_ranking_includes_footer_assumptions_and_all_fields(cog):
+    embed = discord.Embed(title="Weapon ranking | MED 100 | Prof 6")
+    for index in range(15):
+        embed.add_field(
+            name=f"{index + 1}. Soulwrought Longsword (Sword | Crazy Slots)",
+            value="DPS: 91.68 | M1: 43.24",
+        )
+    embed.set_footer(
+        text="DPS includes listed Endlag; bleed, crits, procs, enchants, talents, PEN, and resistance are excluded."
+    )
+    ctx = context()
+    ctx.message.reference = SimpleNamespace(
+        resolved=SimpleNamespace(content="", embeds=[embed])
+    )
+    cog._run_request = AsyncMock(return_value=answer())
+    await cog._process(ctx, "is this true?")
+    query = cog._run_request.call_args.args[0]
+    assert "Weapon ranking | MED 100 | Prof 6" in query
+    assert "15. Soulwrought" in query
+    assert "DPS includes listed Endlag" in query
+    assert "resistance are excluded" in query
+
+
+@pytest.mark.asyncio
+async def test_actual_weapon_ranking_description_reaches_search(cog):
+    rows = [
+        ("Soulwrought Longsword (Sword | Crazy Slots)", "91.68", "43.24"),
+        ("Soulwrought Spear (Spear | Crazy Slots)", "81.12", "43.61"),
+        ("Ritual Sacrifice (Spear)", "77.84", "43.24"),
+        ("Kyrsblade (Sword)", "71.52", "35.76"),
+        ("Alloyed Vigil Longsword (Sword)", "71.28", "35.64"),
+        ("Nocturne (Sword)", "71.09", "34.85"),
+        ("Alloyed Cavalry Saber (Sword)", "70.80", "35.40"),
+        ("Palace Tachi (Sword)", "70.21", "37.75"),
+        ("Eye of Malice (Sword)", "69.69", "36.68"),
+        ("Alloyed Shotel (Sword)", "69.38", "35.76"),
+        ("Serpent's Edge (Sword)", "69.38", "35.76"),
+        ("Alloyed Katana (Sword)", "69.19", "34.59"),
+        ("Phantomcleave (Sword)", "69.19", "34.59"),
+        ("Shattered Katana (Sword)", "69.19", "34.59"),
+        ("Alloyed Officer Saber (Sword)", "69.02", "34.51"),
+    ]
+    description = "\n".join(
+        f"{i}. {name}\nDPS: {dps} | M1: {m1}"
+        for i, (name, dps, m1) in enumerate(rows, 1)
+    )
+    footer = (
+        "Showing 1-15 of 73. Numeric stat requirements are enforced; non-stat unlock alternatives are not modeled. "
+        "Crazy Slots and qualifying hybrids are included. DPS includes listed Endlag; bleed, crits, procs, enchants, talents, PEN, and resistance are excluded."
+    )
+    embed = discord.Embed(
+        title="Weapon ranking | MED 100 | Prof 6", description=description
+    )
+    embed.set_footer(text=footer)
+    ctx = context()
+    ctx.message.reference = SimpleNamespace(
+        resolved=SimpleNamespace(content="", embeds=[embed])
+    )
+    cog._run_request = AsyncMock(return_value=answer())
+    await cog._process(ctx, "is this true?")
+    query = cog._run_request.call_args.args[0]
+    quoted = json.loads(query.split("\n\nUser question:", 1)[0].split("\n", 1)[1])
+    assert description in quoted and footer in quoted
+    assert cog._run_request.call_args.args[2] is True

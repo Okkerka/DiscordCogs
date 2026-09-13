@@ -46,7 +46,9 @@ unconditional "Fact-Checked" badge have been removed.
    selection verifies chat compatibility before saving. The catalog may include
    audio models that cannot answer chat questions. Run `models` first to populate
    the owner-only model autocomplete cache.
-4. Run `>grok admin verify` to test the configured key/model.
+4. Run `>grok admin verify` to test the configured key/model. Separately run
+   `>grok admin verify search` to test Compound source retrieval. On slash, select
+   `mode: search`. A working chat model does not establish that search works.
 5. Enable slash commands: `>slash enablecog GrokCog`, then `>slash sync`.
 
 Replace `>` with your configured prefix. Admin commands also have slash equivalents.
@@ -93,6 +95,14 @@ python -m ruff format --check grokcog
 Tests mock Discord/network boundaries and exercise real command registration, reply
 context, search metadata, malformed output, concurrent requests, retries and cleanup.
 Live deployment still needs the setup checks and an actual mention/reply/slash test.
+
+If a search returns no usable sources, the cog logs a `search_no_sources` warning
+under `red.grokcog`, containing only counts of tool/result fields. It does not log
+your question, quoted messages, URLs, tool output or key. Such answers are not
+cached, so a retry can recover immediately. The footer distinguishes an unverified
+search from a normal chat answer. Website-visit evidence in `browser_results` is
+accepted alongside search results. Embed footers and all 25 possible fields are
+included in reply context, subject to the total context bound above.
 
 API references:
 - [Groq models](https://console.groq.com/docs/models)

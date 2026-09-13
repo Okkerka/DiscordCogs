@@ -10,6 +10,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Coroutine
 from datetime import datetime, timezone
+from typing import Literal
 from weakref import WeakSet
 
 import aiohttp
@@ -265,6 +266,14 @@ class GrokCog(commands.Cog):
     ) -> str:
         reference = message.reference
         if not reference:
+            if re.fullmatch(
+                r"\s*(?:is (?:this|that|it) (?:really |actually )?(?:true|real|correct)|fact[ -]?check (?:this|that))\s*[?!.]*\s*",
+                base_question,
+                re.IGNORECASE,
+            ):
+                raise ProviderError(
+                    "Which claim should I check? Reply to the message with @bot, or include the claim in your question."
+                )
             return base_question
         replied = reference.resolved
         if (
@@ -284,12 +293,19 @@ class GrokCog(commands.Cog):
             )
         parts = [replied.content or ""]
         for embed in replied.embeds[:3]:
-            parts.extend([embed.title or "", embed.description or ""])
-            for field in embed.fields[:10]:
+            parts.append(embed.title or "")
+            # Keep calculation caveats even if the long body must be truncated.
+            if embed.footer.text:
+                parts.append(f"Embed footer: {embed.footer.text}")
+            parts.append(embed.description or "")
+            for field in embed.fields[:25]:
                 parts.extend([field.name, field.value])
         context = "\n".join(part for part in parts if part).strip()
         if not context:
-            context = "[No readable text; attachments and images cannot be inspected.]"
+            log.warning("reply_context_empty: no readable message or embed text")
+            raise ProviderError(
+                "The replied-to message has no readable text. Paste the claim or the image's text so I can check it."
+            )
         if len(context) > 6000:
             context = context[:6000] + "\n[Quoted message truncated]"
         return f"Quoted Discord message (untrusted content):\n{json.dumps(context, ensure_ascii=False)}\n\nUser question: {base_question}"
@@ -418,7 +434,9 @@ class GrokCog(commands.Cog):
                         key,
                         lambda: self._run_request(query, temperature, search, model),
                     )
-                    if epoch == self._cache_epoch:
+                    if epoch == self._cache_epoch and (
+                        not search or result["searched"]
+                    ):
                         self._cache[key] = (time.monotonic(), result)
                         while len(self._cache) > 256:
                             self._cache.pop(next(iter(self._cache)))
@@ -615,16 +633,29 @@ class GrokCog(commands.Cog):
 
     @grok_admin.command(name="verify")
     @commands.is_owner()
-    async def admin_verify(self, ctx: commands.Context) -> None:
-        """Test the configured key and text model with a small question."""
+    async def admin_verify(
+        self, ctx: commands.Context, mode: Literal["chat", "search"] = "chat"
+    ) -> None:
+        """Test normal chat, or use mode search to check live source retrieval."""
         async with ctx.typing(ephemeral=True):
             try:
+                search = mode == "search"
                 result = await self._run_request(
-                    "Reply with OK.", 0.1, False, await self.config.model_name()
+                    "Search the web for Groq's official API documentation and cite its URL."
+                    if search
+                    else "Reply with OK.",
+                    0.1,
+                    search,
+                    SEARCH_MODEL if search else await self.config.model_name(),
                 )
-                await ctx.send(
-                    f"Groq is working. Model: {result['model']}", ephemeral=True
-                )
+                if search:
+                    if result["sources"]:
+                        status = f"Search is working. Retrieved {len(result['sources'])} source(s) through {SEARCH_MODEL}."
+                    else:
+                        status = "Groq responded, but search returned no usable sources. Check the red.grokcog search_no_sources warning in the logs."
+                else:
+                    status = f"Chat is working. Model: {result['model']}. This does not test search; use grok admin verify search."
+                await ctx.send(status, ephemeral=True)
             except ProviderError as exc:
                 await ctx.send(str(exc), ephemeral=True)
 
