@@ -15,6 +15,19 @@ class SourceResolver(Protocol):
 
 
 @runtime_checkable
+class SourceLeases(Protocol):
+    """Optional, non-raising event-loop ownership for private source references.
+
+    Each admitted entry retains once. Seek/repeat transfer that ownership;
+    removal or final consumption releases it. Unknown references are no-ops.
+    """
+
+    def retain(self, reference: SourceReference) -> None: ...
+
+    def release(self, reference: SourceReference) -> None: ...
+
+
+@runtime_checkable
 class PlaybackEventSink(Protocol):
     async def track_started(self, guild_id: int, entry: PlaybackEntry) -> None: ...
 

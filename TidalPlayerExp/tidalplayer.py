@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from itertools import islice
 from typing import Any, Callable, Deque, Dict, List, Literal, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlsplit
+from weakref import WeakValueDictionary
 
 import aiohttp
 import discord
@@ -1153,7 +1154,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         "_recommendation_cache", "_recommendation_tasks", "_recommendation_task_sources",
         "_controller_recommendation_tasks", "_controller_last_refresh", "_current_entries",
         "_recommendation_lookup_slots", "_lastfm_session", "youtube_resolver", "source_factory", "_closing", "_guild_generations",
-        "_persistent_view", "_controller_views", "_stop_generations", "public_audio_resolver",
+        "_persistent_view", "_controller_views", "_controller_locks", "_stop_generations", "public_audio_resolver",
         "_spotify_auth_manager", "_spotify_refresh_token", "_spotify_login_states",
         "_spotify_login_views", "_spotify_auth_lock", "_spotify_commit_lock",
         "runtime", "attachment_resolver",
@@ -1197,6 +1198,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         self._controller_messages: Dict[int, discord.Message] = {}
         self._persistent_view: PlayerControllerView | None = None
         self._controller_views: Dict[int, PlayerControllerView] = {}
+        self._controller_locks: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()
         self._playback_channels: Dict[int, discord.abc.Messageable] = {}
         self._controller_meta: Dict[int, TrackMeta] = {}
         self._recent_track_ids: Dict[int, Deque[str]] = defaultdict(
@@ -1360,6 +1362,14 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         if view is not None:
             view.stop()
 
+    def _controller_lock(self, guild_id: int) -> asyncio.Lock:
+        """Share a lock while updates own or await it; release idle guild keys."""
+        lock = self._controller_locks.get(guild_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._controller_locks[guild_id] = lock
+        return lock
+
     def _claim_batch(self, guild_id: int) -> asyncio.Event | None:
         if guild_id in self._cancel_events:
             return None
@@ -1378,20 +1388,39 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         operation: Callable[[PlayerControllerView], Awaitable[Any]],
         *, still_current: Callable[[], Awaitable[bool]] | None = None,
     ) -> Any:
-        if still_current is not None and not await still_current():
-            view.stop()
-            return None
-        self._stop_controller_view(guild_id)
+        acquired = False
         try:
+            async with self._controller_lock(guild_id):
+                acquired = True
+                return await self._activate_controller_view_locked(
+                    guild_id, view, operation, still_current=still_current,
+                )
+        finally:
+            if not acquired:
+                view.stop()
+
+    async def _activate_controller_view_locked(
+        self,
+        guild_id: int,
+        view: PlayerControllerView,
+        operation: Callable[[PlayerControllerView], Awaitable[Any]],
+        *, still_current: Callable[[], Awaitable[bool]] | None = None,
+    ) -> Any:
+        """Publish under the guild controller lock and own every rejection path."""
+        published = False
+        try:
+            if self._closing or (still_current is not None and not await still_current()):
+                return None
+            self._stop_controller_view(guild_id)
             result = await operation(view)
-        except BaseException:
-            view.stop()
-            raise
-        if still_current is not None and not await still_current():
-            view.stop()
-            return None
-        self._controller_views[guild_id] = view
-        return result
+            if self._closing or (still_current is not None and not await still_current()):
+                return None
+            self._controller_views[guild_id] = view
+            published = True
+            return result
+        finally:
+            if not published:
+                view.stop()
 
     async def cog_command_error(self, ctx: commands.Context, error: Exception) -> None:
         if isinstance(error, commands.CommandOnCooldown):
@@ -2516,6 +2545,12 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
     async def _resend_controller_for_track_start(
         self, *, guild_id: int, ctx: commands.Context | None = None,
     ) -> bool:
+        async with self._controller_lock(guild_id):
+            return await self._resend_controller_for_track_start_locked(guild_id=guild_id, ctx=ctx)
+
+    async def _resend_controller_for_track_start_locked(
+        self, *, guild_id: int, ctx: commands.Context | None = None,
+    ) -> bool:
         entry = self._current_entries.get(guild_id)
         if entry is None or not await self._entry_is_current(guild_id, entry.entry_id):
             return False
@@ -2590,6 +2625,15 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         self, guild_id: int, interaction: discord.Interaction | None = None,
         *, force: bool = False,
     ) -> None:
+        async with self._controller_lock(guild_id):
+            await self._refresh_controller_locked(guild_id, interaction, force=force)
+
+    async def _refresh_controller_locked(
+        self, guild_id: int, interaction: discord.Interaction | None = None,
+        *, force: bool = False,
+    ) -> None:
+        if self._closing:
+            return
         if interaction is None and guild_id not in self._controller_messages:
             return
         now = asyncio.get_running_loop().time()
@@ -2603,9 +2647,14 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         entry = player.snapshot().current if player else None
         entry_id = entry.entry_id if entry else None
         message = self._controller_messages.get(guild_id)
+        if (interaction is not None and interaction.message is not None and message is not None
+                and interaction.message is not message
+                and getattr(interaction.message, "id", None) != getattr(message, "id", None)):
+            return
 
         async def still_current() -> bool:
-            if self._closing or generation != self._stop_generations[guild_id]:
+            if (self._closing or generation != self._stop_generations[guild_id]
+                    or self._controller_messages.get(guild_id) is not message):
                 return False
             current_player = await self._get_session_for_guild(guild_id)
             if current_player is not player:
@@ -2615,12 +2664,9 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
 
         paused = player.snapshot().paused if player else False
         view = await self._controller_view(guild_id, paused)
-        if not await still_current():
-            view.stop()
-            return
         if interaction is not None:
             if interaction.response.is_done():
-                await self._activate_controller_view(
+                await self._activate_controller_view_locked(
                     guild_id,
                     view,
                     lambda active_view: interaction.edit_original_response(
@@ -2629,7 +2675,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                     still_current=still_current,
                 )
             else:
-                await self._activate_controller_view(
+                await self._activate_controller_view_locked(
                     guild_id,
                     view,
                     lambda active_view: interaction.response.edit_message(
@@ -2644,7 +2690,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             self._controller_last_refresh[guild_id] = now
         elif message is not None:
             try:
-                await self._activate_controller_view(
+                await self._activate_controller_view_locked(
                     guild_id, view, lambda active_view: message.edit(view=active_view, allowed_mentions=discord.AllowedMentions.none()),
                     still_current=still_current,
                 )

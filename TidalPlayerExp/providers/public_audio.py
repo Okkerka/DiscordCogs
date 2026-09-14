@@ -44,7 +44,13 @@ def _duration(value: object) -> int | None:
     value = _optional(value)
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, (float, int)) or value < 0:
+        raise ValueError("Invalid duration")
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:
+        raise ValueError("Invalid duration") from None
+    if not finite:
         raise ValueError("Invalid duration")
     return max(1, int(value)) if value else None
 

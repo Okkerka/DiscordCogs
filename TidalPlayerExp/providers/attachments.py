@@ -42,12 +42,13 @@ class AttachmentResolutionError(SourceResolutionError):
     _DEFAULT_MESSAGE = _ERR_EXPIRED
 
 
-@dataclass(frozen=True, slots=True, repr=False)
+@dataclass(slots=True, repr=False)
 class _StoredAttachment:
     """Private URL plus its strict expiry; its representation is intentionally inert."""
 
     url: str = field(repr=False)
     expires_at: float
+    leases: int = 0
 
     def __repr__(self) -> str:
         return "StoredAttachment(<redacted>)"
@@ -198,10 +199,28 @@ class AttachmentResolver:
             raise AttachmentResolutionError()
         return ResolvedSource(stored.url, {}, media_only=True)
 
-    def discard(self, reference: SourceReference) -> None:
-        """Release a rejected upload; never call for a queued or playing reference."""
+    def retain(self, reference: SourceReference) -> None:
+        """Keep a registered link for one admitted entry, on the bot event loop."""
         if reference.kind is SourceKind.ATTACHMENT:
-            self._entries.pop(reference.identifier, None)
+            stored = self._entries.get(reference.identifier)
+            if stored is not None:
+                stored.leases += 1
+
+    def release(self, reference: SourceReference) -> None:
+        """Forget a link as soon as its last playback owner has released it."""
+        if reference.kind is SourceKind.ATTACHMENT:
+            stored = self._entries.get(reference.identifier)
+            if stored is not None and stored.leases > 0:
+                stored.leases -= 1
+                if stored.leases == 0:
+                    self._entries.pop(reference.identifier, None)
+
+    def discard(self, reference: SourceReference) -> None:
+        """Forget an unowned upload without invalidating admitted copies."""
+        if reference.kind is SourceKind.ATTACHMENT:
+            stored = self._entries.get(reference.identifier)
+            if stored is not None and stored.leases == 0:
+                self._entries.pop(reference.identifier, None)
 
     async def close(self) -> None:
         """Forget every private signed URL during cog shutdown."""

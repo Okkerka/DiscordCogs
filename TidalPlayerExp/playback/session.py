@@ -19,7 +19,7 @@ import discord
 from ..domain.models import TrackMeta
 from .errors import PlaybackUnavailable
 from .ffmpeg import AudioSourceFactory
-from .interfaces import PlaybackEventSink, SourceResolver
+from .interfaces import PlaybackEventSink, SourceLeases, SourceResolver
 from .models import PlaybackEntry, PlaybackSnapshot
 
 log = logging.getLogger(__name__)
@@ -107,6 +107,7 @@ class NativePlaybackSession:
         self._guild_id = guild_id
         self._voice_client = voice_client
         self._resolver = resolver
+        self._source_leases = resolver if isinstance(resolver, SourceLeases) else None
         self._factory = source_factory
         self._sink = sink
         self._capacity = queue_capacity
@@ -169,6 +170,8 @@ class NativePlaybackSession:
         async with self._lock:
             if self._closed or len(self._queue) >= self._capacity:
                 return False
+            if self._source_leases is not None:
+                self._source_leases.retain(entry.primary)
             if next_up:
                 self._queue.appendleft(entry)
             else:
@@ -187,13 +190,23 @@ class NativePlaybackSession:
                 return None
             removed = self._queue[index - 1]
             del self._queue[index - 1]
+            self._release_entry(removed)
             return removed
+
+    def _release_entry(self, entry: PlaybackEntry | None) -> None:
+        if entry is not None and self._source_leases is not None:
+            self._source_leases.release(entry.primary)
+
+    def _clear_queue(self) -> None:
+        for entry in self._queue:
+            self._release_entry(entry)
+        self._queue.clear()
 
     async def clear_queue(self) -> int:
         """Clear waiting tracks without interrupting current audio."""
         async with self._lock:
             count = len(self._queue)
-            self._queue.clear()
+            self._clear_queue()
             return count
 
     async def move(self, index: int, destination: int) -> bool:
@@ -238,7 +251,7 @@ class NativePlaybackSession:
         """Called under the state lock; the predecessor retains source cleanup."""
         assert self._current is not None
         current, paused = self._current, self._paused
-        self._interrupt()
+        self._interrupt(preserve_reference=True)
         self._next_entry = replace(
             current, entry_id=secrets.token_hex(12), start_time=position,
             replaces_entry_id=current.entry_id,
@@ -296,7 +309,7 @@ class NativePlaybackSession:
             self._paused = paused
             return True
 
-    def _interrupt(self) -> asyncio.Task[None] | None:
+    def _interrupt(self, *, preserve_reference: bool = False) -> asyncio.Task[None] | None:
         """Invalidate callbacks under the state lock; the old worker owns cleanup."""
         self._generation += 1
         self._paused = False
@@ -312,6 +325,9 @@ class NativePlaybackSession:
                 self._voice_client.stop()
             except Exception as error:  # noqa: BLE001 - still clean the owned source on stop failure
                 log.warning("Voice stop failed (%s)", type(error).__name__)
+        if not preserve_reference:
+            self._release_entry(self._current)
+            self._release_entry(self._next_entry)
         self._current = None
         self._next_entry = None
         self._pause_on_start = False
@@ -364,7 +380,7 @@ class NativePlaybackSession:
         """Stop without queue-end events and optionally retain waiting entries."""
         async with self._lock:
             if clear_queue:
-                self._queue.clear()
+                self._clear_queue()
             self._repeat = "off"
             self._failures = 0
             self._running = False
@@ -384,7 +400,7 @@ class NativePlaybackSession:
             ):
                 self._closed = True
                 self._running = False
-                self._queue.clear()
+                self._clear_queue()
                 previous = self._interrupt()
                 self._close_task = asyncio.create_task(self._finish_close(self._cleanup_barrier))
             else:
@@ -556,10 +572,17 @@ class NativePlaybackSession:
                     async with self._lock:
                         if self._generation != generation or self._closed:
                             return
+                        # Fallback changes the primary reference. Transfer its
+                        # lease before either playing or taking the lost-voice
+                        # failure path, so both paths release the effective one.
+                        if self._current is not None and self._current.primary != entry.primary:
+                            if self._source_leases is not None:
+                                self._source_leases.retain(entry.primary)
+                            self._release_entry(self._current)
+                        self._current = entry
                         if not self._owned() or not self._voice_client.is_connected():
                             failed = True
                         else:
-                            self._current = entry
                             self._source = audio
                             self._voice_client.play(
                                 audio,
@@ -599,6 +622,8 @@ class NativePlaybackSession:
                 self._pause_on_start = False
                 self._started_at = self._paused_at = None
                 self._failures = self._failures + 1 if failed else 0
+                if failed or self._repeat == "off":
+                    self._release_entry(entry)
                 if self._failures >= 3:
                     self._running = False
                 elif not failed and self._repeat != "off":

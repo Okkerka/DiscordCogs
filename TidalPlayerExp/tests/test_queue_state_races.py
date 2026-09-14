@@ -119,11 +119,16 @@ async def test_delayed_track_panel_cannot_replace_newer_track(cog, native_sessio
     cog._playback_channels[1] = SimpleNamespace(send=send)
     cog._schedule_controller_recommendations = MagicMock()
     first_event = asyncio.create_task(cog.track_started(1, first))
-    await started.wait()
+    await asyncio.wait_for(started.wait(), 2)
     native_session.current = second
-    await cog.track_started(1, second)
-    release.set()
-    await first_event
+    second_event = asyncio.create_task(cog.track_started(1, second))
+    try:
+        # The newer event changes authoritative state while publication waits
+        # for the older send; do not hold its simulated network reply hostage.
+        await asyncio.sleep(0)
+    finally:
+        release.set()
+    await asyncio.wait_for(asyncio.gather(first_event, second_event), 2)
 
     assert cog._controller_messages[1] is new_message
     assert cog._controller_views[1] is new_view

@@ -7,7 +7,7 @@ from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
 from ..playback.errors import PlaybackUnavailable, SourceResolutionError
-from ..playback.interfaces import SourceResolver
+from ..playback.interfaces import SourceLeases, SourceResolver
 from ..playback.models import ResolvedSource, SourceKind, SourceReference
 
 _FAILED = object()
@@ -204,6 +204,7 @@ class CompositeSourceResolver:
         # lifecycle separately; closing both would duplicate cleanup ownership.
         self._public_audio = public_audio
         self._attachments = attachments
+        self._attachment_leases = attachments if isinstance(attachments, SourceLeases) else None
         self._closing_task: asyncio.Task[None] | None = None
         self._closed = False
 
@@ -221,6 +222,16 @@ class CompositeSourceResolver:
         if reference.kind in (SourceKind.SOUNDCLOUD, SourceKind.BANDCAMP) and self._public_audio is not None:
             return await self._public_audio.resolve(reference)
         raise SourceResolutionError()
+
+    def retain(self, reference: SourceReference) -> None:
+        """Retain private uploads without affecting stateless provider references."""
+        if reference.kind is SourceKind.ATTACHMENT and self._attachment_leases is not None:
+            self._attachment_leases.retain(reference)
+
+    def release(self, reference: SourceReference) -> None:
+        """Release one admitted upload's ownership."""
+        if reference.kind is SourceKind.ATTACHMENT and self._attachment_leases is not None:
+            self._attachment_leases.release(reference)
 
     async def close(self) -> None:
         if self._closed:

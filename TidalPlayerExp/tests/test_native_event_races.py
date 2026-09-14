@@ -172,3 +172,165 @@ async def test_stop_prevents_late_youtube_metadata_admission(cog):
     release.set()
     await pending
     session.enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_overlapping_controller_edits_release_every_superseded_view(cog):
+    entered, release = asyncio.Event(), asyncio.Event()
+    older, newer = SimpleNamespace(stop=Mock()), SimpleNamespace(stop=Mock())
+
+    async def slow_edit(view):
+        entered.set()
+        await release.wait()
+
+    first = asyncio.create_task(cog._activate_controller_view(1, older, slow_edit))
+    await asyncio.wait_for(entered.wait(), 1)
+    second = asyncio.create_task(cog._activate_controller_view(1, newer, AsyncMock()))
+    try:
+        await asyncio.sleep(0)
+    finally:
+        release.set()
+        await asyncio.gather(first, second)
+
+    assert cog._controller_views[1] is newer
+    older.stop.assert_called_once()
+    newer.stop.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_overlapping_resends_leave_only_the_latest_panel(cog):
+    current = entry(1)
+    session = SimpleNamespace(snapshot=lambda: PlaybackSnapshot(current, (), False, 22))
+    cog.backend = SimpleNamespace(get=AsyncMock(return_value=session))
+    cog._current_entries[1] = current
+    views = [SimpleNamespace(stop=Mock()), SimpleNamespace(stop=Mock())]
+    messages = [SimpleNamespace(id=11, delete=AsyncMock()), SimpleNamespace(id=12, delete=AsyncMock())]
+    cog._controller_view = AsyncMock(side_effect=views)
+    entered, release = asyncio.Event(), asyncio.Event()
+    send_count = 0
+
+    async def send(**kwargs):
+        nonlocal send_count
+        index = send_count
+        send_count += 1
+        if index == 0:
+            entered.set()
+            await release.wait()
+        return messages[index]
+
+    cog._playback_channels[1] = SimpleNamespace(send=send)
+    first = asyncio.create_task(cog._resend_controller_for_track_start(guild_id=1))
+    await asyncio.wait_for(entered.wait(), 1)
+    second = asyncio.create_task(cog._resend_controller_for_track_start(guild_id=1))
+    try:
+        await asyncio.sleep(0)
+    finally:
+        release.set()
+        await asyncio.gather(first, second)
+
+    assert cog._controller_messages[1] is messages[1]
+    assert cog._controller_views[1] is views[1]
+    messages[0].delete.assert_awaited_once()
+    messages[1].delete.assert_not_awaited()
+    views[0].stop.assert_called_once()
+    views[1].stop.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_old_panel_interaction_cannot_replace_resend_for_the_same_track(cog):
+    current = entry(1)
+    session = SimpleNamespace(snapshot=lambda: PlaybackSnapshot(current, (), False, 22))
+    cog.backend = SimpleNamespace(get=AsyncMock(return_value=session))
+    old_message, latest_message = SimpleNamespace(id=11), SimpleNamespace(id=12)
+    latest_view = SimpleNamespace(stop=Mock())
+    cog._controller_messages[1] = latest_message
+    cog._controller_views[1] = latest_view
+    cog._controller_view = AsyncMock(return_value=SimpleNamespace(stop=Mock()))
+    interaction = SimpleNamespace(
+        message=old_message,
+        response=SimpleNamespace(is_done=lambda: True),
+        edit_original_response=AsyncMock(),
+    )
+
+    await cog._refresh_controller(1, interaction)
+
+    assert cog._controller_messages[1] is latest_message
+    assert cog._controller_views[1] is latest_view
+    latest_view.stop.assert_not_called()
+    interaction.edit_original_response.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_check", [1, 2])
+async def test_cancelled_controller_ownership_check_releases_view(cog, blocked_check):
+    entered = asyncio.Event()
+    view = SimpleNamespace(stop=Mock())
+    checks = 0
+
+    async def still_current():
+        nonlocal checks
+        checks += 1
+        if checks == blocked_check:
+            entered.set()
+            await asyncio.Future()
+        return True
+
+    pending = asyncio.create_task(cog._activate_controller_view(
+        1, view, AsyncMock(), still_current=still_current,
+    ))
+    await asyncio.wait_for(entered.wait(), 1)
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+
+    view.stop.assert_called_once()
+    assert 1 not in cog._controller_views
+
+
+@pytest.mark.asyncio
+async def test_cancelling_waiting_controller_update_releases_its_view_and_lock(cog):
+    entered, release = asyncio.Event(), asyncio.Event()
+    active, waiting = SimpleNamespace(stop=Mock()), SimpleNamespace(stop=Mock())
+
+    async def slow_edit(view):
+        entered.set()
+        await release.wait()
+
+    first = asyncio.create_task(cog._activate_controller_view(1, active, slow_edit))
+    await asyncio.wait_for(entered.wait(), 1)
+    edit_waiting = AsyncMock()
+    second = asyncio.create_task(cog._activate_controller_view(1, waiting, edit_waiting))
+    try:
+        await asyncio.sleep(0)
+        second.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second
+    finally:
+        release.set()
+        await first
+
+    assert cog._controller_views[1] is active
+    waiting.stop.assert_called_once()
+    edit_waiting.assert_not_awaited()
+    assert not cog._controller_locks
+
+
+@pytest.mark.asyncio
+async def test_controller_lock_does_not_block_other_guilds_or_survive_updates(cog):
+    entered, release = asyncio.Event(), asyncio.Event()
+    first_view, other_view = SimpleNamespace(stop=Mock()), SimpleNamespace(stop=Mock())
+
+    async def slow_edit(view):
+        entered.set()
+        await release.wait()
+
+    first = asyncio.create_task(cog._activate_controller_view(1, first_view, slow_edit))
+    await asyncio.wait_for(entered.wait(), 1)
+    try:
+        await asyncio.wait_for(cog._activate_controller_view(2, other_view, AsyncMock()), 1)
+        assert cog._controller_views[2] is other_view
+    finally:
+        release.set()
+        await first
+
+    assert not cog._controller_locks

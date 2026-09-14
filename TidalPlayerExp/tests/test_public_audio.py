@@ -232,6 +232,33 @@ async def test_soundcloud_flat_collection_retains_provider_and_original_order(tm
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "track_url,collection_url",
+    [
+        (SOUNDCLOUD, "https://soundcloud.com/artist/sets/recordings"),
+        (BANDCAMP, "https://artist.bandcamp.com/album/recordings"),
+    ],
+)
+@pytest.mark.parametrize("duration", [10**400, -(10**400)], ids=["large-positive", "large-negative"])
+async def test_collection_skips_overflowing_duration_without_losing_neighbors(
+    tmp_path, track_url, collection_url, duration,
+):
+    entries = [
+        _metadata(track_url, title="First"),
+        _metadata(track_url + "-invalid", duration=duration),
+        _metadata(track_url + "-last", title="Last"),
+    ]
+    payload = "\n".join(json.dumps(entry) for entry in entries).encode()
+    resolver, worker, _ = _resolver(tmp_path, payload)
+    try:
+        result = await resolver.fetch_collection(collection_url)
+        assert [item.reference.identifier for item in result] == [track_url, track_url + "-last"]
+        assert [item.meta["title"] for item in result] == ["First", "Last"]
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
 async def test_soundcloud_flat_entries_can_have_only_a_public_url_and_album(tmp_path):
     # yt-dlp SoundcloudPlaylistBaseIE emits URL-transparent entries without titles.
     payload = {"webpage_url": SOUNDCLOUD + "-mix", "title": "NA", "artist": "NA", "album": "A set"}

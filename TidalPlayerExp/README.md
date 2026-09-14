@@ -245,6 +245,9 @@ even when renamed to a media extension. Only Discord-hosted attachments are acce
 not arbitrary file URLs.
 Signed attachment URLs are private in memory, capped at 1,000 records, expire
 after at most 12 hours or their earlier CDN expiry, and are cleared on unload.
+Finished, failed, skipped, or removed uploads release their records as soon as
+no queued or playing copy needs them. Repeat and seek retain the reference
+without extending its signed expiry.
 Re-upload an expired file. Files are streamed through FFmpeg, never downloaded
 to a song-cache directory. Duration is extracted from the playback process's
 input header before showing the controller, without a separate metadata probe;
