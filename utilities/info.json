@@ -1,10 +1,13 @@
 {
     "author": ["Okkerka"],
-    "description": "Automatically deletes messages from specific users across all servers.",
-    "install_msg": "Thank you for installing MessageDelete! Use `[p]msgblock add <user_id>` to start blocking users.",
-    "short": "Auto-delete messages from specific users",
-    "name": "MessageDelete",
-    "tags": ["moderation", "utility", "admin"],
+    "description": "Information, polls, random choices, timestamps, private quotes and persistent personal reminders, with prefix and slash commands.",
+    "install_msg": "Utilities loaded. See `[p]help Utilities` and this cog's README for commands and slash setup. Thanos is prefix-only.",
+    "short": "Everyday utilities and persistent reminders",
+    "name": "Utilities",
+    "tags": ["utility", "reminders", "information"],
+    "requirements": ["tzdata>=2024.1"],
+    "min_bot_version": "3.5.0",
+    "min_python_version": [3, 10, 0],
     "type": "COG",
-    "end_user_data_statement": "This cog stores user IDs of blocked users."
+    "end_user_data_statement": "Stores configured Hawk user IDs per server and up to 20 personal reminders per user, including text, due times and delivery status. Delivered reminders are removed; failed reminders remain until cancelled or user data is deleted."
 }

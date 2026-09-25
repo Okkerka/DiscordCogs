@@ -24,6 +24,10 @@ def test_dst_ambiguity_or_gap_rejected(value):
 
 
 def test_quote_link_strict():
-    assert helpers().parse_message_link("https://discord.com/channels/123/456/789") == (123, 456, 789)
+    assert helpers().parse_message_link("https://discord.com/channels/123/456/789") == (
+        123,
+        456,
+        789,
+    )
     with pytest.raises(ValueError):
         helpers().parse_message_link("https://evil.test/channels/123/456/789")

@@ -1,10 +1,11 @@
-from redbot.core import commands, Config
-import discord
 import asyncio
-from typing import Optional, Union
-from datetime import datetime, timedelta
 import logging
 import re
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Union
+
+import discord
+from redbot.core import Config, commands
 
 from .helpers import dehoisted_name, matches_purge
 from .ui import ConfirmView, HistoryView
@@ -44,8 +45,12 @@ def mod_or_permissions(**perms):
         # Use cached moderators instead of database call
         moderators = cog._get_cached_moderators(ctx.guild.id) if (ctx.guild and cog) else []
         if ctx.guild and ctx.author.id in moderators:
-            # mods: Must also have permissions
-            return await commands.has_permissions(**perms).predicate(ctx)
+            # Recompute permissions so delayed confirmation cannot use stale Context permissions.
+            actual = ctx.channel.permissions_for(ctx.author)
+            missing = [name for name, needed in perms.items() if getattr(actual, name) != needed]
+            if missing:
+                raise commands.MissingPermissions(missing)
+            return True
         # Anyone not in mods: denied
         return False
 
@@ -71,12 +76,12 @@ class Moderation(commands.Cog):
             "history": {},
         }
         self.config.register_guild(**default_guild)
-        
+
         # In-memory caches for performance
         self._blocked_cache = {}  # {guild_id: set(user_ids)}
         self._moderator_cache = {}  # {guild_id: set(user_ids)}
         self._cache_ready = False
-        
+
         # Background tasks
         self.tempban_task = None
         self._initialize_task = asyncio.create_task(self._initialize_caches())
@@ -96,7 +101,7 @@ class Moderation(commands.Cog):
             log.info("Moderation caches initialized")
         except Exception as e:
             log.error(f"Failed to initialize caches: {e}")
-        
+
         # Start tempban task after cache is ready
         self.tempban_task = self.bot.loop.create_task(self.check_tempbans())
 
@@ -112,12 +117,12 @@ class Moderation(commands.Cog):
         """Update blocked users cache and database."""
         if guild_id not in self._blocked_cache:
             self._blocked_cache[guild_id] = set()
-        
+
         if add:
             self._blocked_cache[guild_id].add(user_id)
         else:
             self._blocked_cache[guild_id].discard(user_id)
-        
+
         # Update database
         async with self.config.guild_from_id(guild_id).blocked_users() as blocked:
             if add and user_id not in blocked:
@@ -129,12 +134,12 @@ class Moderation(commands.Cog):
         """Update moderators cache and database."""
         if guild_id not in self._moderator_cache:
             self._moderator_cache[guild_id] = set()
-        
+
         if add:
             self._moderator_cache[guild_id].add(user_id)
         else:
             self._moderator_cache[guild_id].discard(user_id)
-        
+
         # Update database
         async with self.config.guild_from_id(guild_id).moderators() as mods:
             if add and user_id not in mods:
@@ -143,8 +148,11 @@ class Moderation(commands.Cog):
                 mods.remove(user_id)
 
     async def cog_before_invoke(self, ctx: commands.Context) -> None:
+        reason = ctx.kwargs.get("reason")
+        if reason and len(reason) > 1000:
+            raise commands.BadArgument("Keep moderation reasons within 1000 characters.")
         if ctx.interaction and not ctx.interaction.response.is_done():
-            await ctx.defer()
+            await ctx.defer(ephemeral=ctx.command.qualified_name.split()[0] in {"modhistory", "purge", "cleanup"})
 
     def cog_unload(self):
         self._initialize_task.cancel()
@@ -157,32 +165,35 @@ class Moderation(commands.Cog):
         while not self.bot.is_closed():
             try:
                 tasks = []
-                now = datetime.utcnow()
-                
+                now = discord.utils.utcnow()
+
                 all_guilds_data = await self.config.all_guilds()
                 for guild in self.bot.guilds:
                     guild_data = all_guilds_data.get(guild.id, {})
                     tempbans = guild_data.get("tempbans")
                     if not tempbans:
                         continue
-                    
+
                     for uid, ban_info in list(tempbans.items()):
                         try:
                             unban_time = datetime.fromisoformat(ban_info["unban_time"])
+                            if unban_time.tzinfo is None:
+                                unban_time = unban_time.replace(tzinfo=timezone.utc)
                             if unban_time <= now:
                                 tasks.append(self._process_tempban_expiry(guild, int(uid)))
                         except (ValueError, KeyError):
                             continue
-                
+
                 # Process all expired bans in parallel
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
-                
+
                 await asyncio.sleep(60)
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                log.error(f"Error in tempban checker: {e}")
+            except Exception:
+                # Keep the scheduler alive after an unexpected storage or API failure.
+                log.exception("Error in tempban checker")
                 await asyncio.sleep(60)
 
     async def _process_tempban_expiry(self, guild: discord.Guild, user_id: int):
@@ -190,10 +201,10 @@ class Moderation(commands.Cog):
         try:
             user = await self.bot.fetch_user(user_id)
             await guild.unban(user, reason="Temporary ban expired")
-            
+
             async with self.config.guild(guild).tempbans() as tb:
                 ban_info = tb.pop(str(user_id), None)
-            
+
             # Log to modlog
             if ban_info:
                 await self._log_action(
@@ -207,8 +218,8 @@ class Moderation(commands.Cog):
             # User not banned, clean up database
             async with self.config.guild(guild).tempbans() as tb:
                 tb.pop(str(user_id), None)
-        except Exception as e:
-            log.error(f"Failed to process tempban expiry for {user_id}: {e}")
+        except discord.HTTPException:
+            log.warning("Could not expire temporary ban for user %s; will retry", user_id)
 
     async def _log_action(
         self,
@@ -231,27 +242,27 @@ class Moderation(commands.Cog):
             channel_id = await self.config.guild(guild).modlog_channel()
             if not channel_id:
                 return
-            
+
             channel = guild.get_channel(channel_id)
             if not channel:
                 return
-            
+
             embed = discord.Embed(
                 title=f"🔨 {action}",
                 description=description,
                 color=color,
-                timestamp=datetime.utcnow()
+                timestamp=discord.utils.utcnow()
             )
-            
+
             if target:
                 embed.set_thumbnail(url=target.display_avatar.url)
-            
+
             if moderator:
                 embed.set_footer(
                     text=f"Moderator: {moderator}",
                     icon_url=moderator.display_avatar.url
                 )
-            
+
             await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
         except Exception as e:
             log.error(f"Failed to log action to modlog: {e}")
@@ -270,7 +281,23 @@ class Moderation(commands.Cog):
     ):
         """Unified handler for moderation actions to reduce code duplication."""
         reason = reason or "No reason provided"
-        
+
+        member = ctx.guild.get_member(target.id)
+        if member and not self._can_target(ctx, member):
+            await ctx.send("That member is protected by the role hierarchy.")
+            return False
+
+        # Execute the action
+        try:
+            await action_func()
+        except discord.Forbidden:
+            await ctx.send(f"❌ I don't have permission to {action_name.lower()} that user.")
+            return False
+        except discord.HTTPException as e:
+            await ctx.send(f"❌ Could not {action_name.lower()} user: {e}")
+            return False
+
+
         # Try to DM user
         dm_sent = False
         if dm_message:
@@ -284,17 +311,14 @@ class Moderation(commands.Cog):
                 dm_sent = True
             except (discord.Forbidden, discord.HTTPException):
                 pass
-        
-        # Execute the action
-        try:
-            await action_func()
-        except discord.Forbidden:
-            await ctx.send(f"❌ I don't have permission to {action_name.lower()} that user.")
-            return False
-        except Exception as e:
-            await ctx.send(f"❌ Could not {action_name.lower()} user: {e}")
-            return False
-        
+
+        # Log to modlog
+        log_desc = (success_message or "{target}: {reason}").format(target=f"{target.mention} ({target.id})", reason=reason)
+        if not dm_sent and dm_message:
+            log_desc += "\n⚠️ Could not DM user"
+
+        await self._log_action(ctx.guild, action_name, log_desc, success_color, target, ctx.author)
+
         # Send success message
         if success_message:
             embed = discord.Embed(
@@ -303,13 +327,7 @@ class Moderation(commands.Cog):
                 color=success_color,
             )
             await ctx.send(embed=embed)
-        
-        # Log to modlog
-        log_desc = success_message.format(target=f"{target.mention} ({target.id})", reason=reason)
-        if not dm_sent and dm_message:
-            log_desc += "\n⚠️ Could not DM user"
-        
-        await self._log_action(ctx.guild, action_name, log_desc, success_color, target, ctx.author)
+
         return True
 
     # ================= Mod Log Management =================
@@ -329,12 +347,16 @@ class Moderation(commands.Cog):
             await ctx.send("No mod log channel is configured. Use `modlog set` to configure one.")
 
     @modlog.command(name="set")
+    @commands.guild_only()
+    @commands.admin_or_permissions(administrator=True)
     async def modlog_set(self, ctx: commands.Context, channel: discord.TextChannel):
         """Set the moderation log channel."""
         await self.config.guild(ctx.guild).modlog_channel.set(channel.id)
         await ctx.send(f"✅ Mod log channel set to {channel.mention}")
 
     @modlog.command(name="disable")
+    @commands.guild_only()
+    @commands.admin_or_permissions(administrator=True)
     async def modlog_disable(self, ctx: commands.Context):
         """Disable moderation logging."""
         await self.config.guild(ctx.guild).modlog_channel.set(None)
@@ -349,30 +371,36 @@ class Moderation(commands.Cog):
         await ctx.send_help(ctx.command)
 
     @mods.command()
+    @commands.guild_only()
+    @commands.admin_or_permissions(administrator=True)
     async def add(self, ctx, user: MemberOrID):
         """Add a user to the custom moderator list."""
         user_id = user.id if isinstance(user, discord.Member) else user
-        
+
         if user_id in self._get_cached_moderators(ctx.guild.id):
             await ctx.send(f"User ID `{user_id}` is already a moderator.")
             return
-        
+
         await self._update_moderator_cache(ctx.guild.id, user_id, add=True)
         await ctx.send(f"User ID `{user_id}` added to moderator list.")
 
     @mods.command()
+    @commands.guild_only()
+    @commands.admin_or_permissions(administrator=True)
     async def remove(self, ctx, user: MemberOrID):
         """Remove a user from the custom moderator list."""
         user_id = user.id if isinstance(user, discord.Member) else user
-        
+
         if user_id not in self._get_cached_moderators(ctx.guild.id):
             await ctx.send(f"User ID `{user_id}` is not in the moderator list.")
             return
-        
+
         await self._update_moderator_cache(ctx.guild.id, user_id, add=False)
         await ctx.send(f"User ID `{user_id}` removed from moderator list.")
 
     @mods.command(name="list")
+    @commands.guild_only()
+    @commands.admin_or_permissions(administrator=True)
     async def list_(self, ctx):
         """Show all custom moderators."""
         moderators = list(self._get_cached_moderators(ctx.guild.id))
@@ -413,7 +441,7 @@ class Moderation(commands.Cog):
             ctx,
             member,
             "Member Kicked",
-            lambda: member.kick(reason=f"By {ctx.author}: {reason or 'No reason provided'}"),
+            lambda: member.kick(reason=(f"By {ctx.author} ({ctx.author.id}): {reason or 'No reason provided'}")[:512]),
             reason,
             dm_message="**Reason:** {reason}",
             success_message="**{target}** has been kicked.\n**Reason:** {reason}",
@@ -458,7 +486,7 @@ class Moderation(commands.Cog):
             "Member Banned",
             lambda: ctx.guild.ban(
                 user,
-                reason=f"By {ctx.author}: {reason or 'No reason provided'}",
+                reason=(f"By {ctx.author} ({ctx.author.id}): {reason or 'No reason provided'}")[:512],
                 delete_message_days=delete_days,
             ),
             reason,
@@ -479,21 +507,21 @@ class Moderation(commands.Cog):
             await ctx.send("❌ User not found.")
             return
 
-        # Remove from tempbans if present
-        async with self.config.guild(ctx.guild).tempbans() as tempbans:
-            tempbans.pop(str(user_id), None)
-
-        await self._execute_mod_action(
+        success = await self._execute_mod_action(
             ctx,
             user,
             "Member Unbanned",
             lambda: ctx.guild.unban(
-                user, reason=f"By {ctx.author}: {reason or 'No reason provided'}"
+                user, reason=(f"By {ctx.author} ({ctx.author.id}): {reason or 'No reason provided'}")[:512]
             ),
             reason,
             dm_message=None,
             success_message="**{target}** has been unbanned.\n**Reason:** {reason}",
         )
+
+        if success:
+            async with self.config.guild(ctx.guild).tempbans() as tempbans:
+                tempbans.pop(str(user_id), None)
 
     @commands.hybrid_command()
     @commands.guild_only()
@@ -514,7 +542,7 @@ class Moderation(commands.Cog):
         async def softban_action():
             await ctx.guild.ban(
                 member,
-                reason=f"Softban by {ctx.author}: {reason or 'No reason provided'}",
+                reason=(f"Softban by {ctx.author} ({ctx.author.id}): {reason or 'No reason provided'}")[:512],
                 delete_message_days=1,
             )
             await ctx.guild.unban(member, reason=f"Softban unban by {ctx.author}")
@@ -560,15 +588,15 @@ class Moderation(commands.Cog):
 
         try:
             delta = self._parse_duration(duration)
-            unban_time = datetime.utcnow() + delta
-        except ValueError:
+            unban_time = discord.utils.utcnow() + delta
+        except (ValueError, OverflowError):
             await ctx.send("❌ Invalid duration. Use format like: 30m, 2h, 1d, 7d")
             return
 
         async def tempban_action():
             await ctx.guild.ban(
                 user,
-                reason=f"Tempban by {ctx.author}: {reason or 'No reason provided'}",
+                reason=(f"Tempban by {ctx.author} ({ctx.author.id}): {reason or 'No reason provided'}")[:512],
                 delete_message_days=1,
             )
             async with self.config.guild(ctx.guild).tempbans() as tempbans:
@@ -578,7 +606,7 @@ class Moderation(commands.Cog):
                     "moderator": ctx.author.id,
                 }
 
-        success = await self._execute_mod_action(
+        await self._execute_mod_action(
             ctx,
             user,
             "Member Temporarily Banned",
@@ -595,10 +623,13 @@ class Moderation(commands.Cog):
     async def massban(self, ctx, *, user_ids_input: str):
         """
         Mass ban multiple users by their IDs (parallelized for speed).
-        
+
         Supports space-separated, comma-separated, or newline-separated ID lists.
         """
-        user_ids = [int(uid) for uid in re.findall(r"\d+", user_ids_input)]
+        tokens = user_ids_input.replace(",", " ").split()
+        if not tokens or any(len(token) > 20 or not token.isdecimal() or not 0 < int(token) < 2**64 for token in tokens):
+            return await ctx.send("Provide valid user IDs separated by spaces or commas.")
+        user_ids = list(dict.fromkeys(int(token) for token in tokens))
 
         if not user_ids:
             await ctx.send("❌ Please provide at least one user ID.")
@@ -613,20 +644,24 @@ class Moderation(commands.Cog):
         # Parallel ban execution
         async def ban_user(user_id: int):
             try:
-                user = await self.bot.fetch_user(user_id)
+                member = ctx.guild.get_member(user_id)
+                if member and not self._can_target(ctx, member):
+                    return (False, f"{user_id} (Protected role)")
+                user = member or await self.bot.fetch_user(user_id)
                 await ctx.guild.ban(
                     user, reason=f"Massban by {ctx.author}", delete_message_days=1
                 )
+                await self._log_action(ctx.guild, "Member Massbanned", f"User ID: {user_id}", 0xED4245, user, ctx.author)
                 return (True, f"{user} ({user_id})")
             except discord.NotFound:
                 return (False, f"{user_id} (Not found)")
             except discord.Forbidden:
                 return (False, f"{user_id} (Permission denied)")
-            except Exception as e:
-                return (False, f"{user_id} (Error: {e})")
+            except discord.HTTPException:
+                return (False, f"{user_id} (Discord request failed)")
 
         results = await asyncio.gather(*[ban_user(uid) for uid in user_ids])
-        
+
         banned = [r[1] for r in results if r[0]]
         failed = [r[1] for r in results if not r[0]]
 
@@ -651,7 +686,7 @@ class Moderation(commands.Cog):
             embed.add_field(name="Failed", value=failed_text, inline=False)
 
         await ctx.send(embed=embed)
-        
+
         # Log to modlog
         if banned:
             await self._log_action(
@@ -697,7 +732,7 @@ class Moderation(commands.Cog):
             member,
             "Member Timed Out",
             lambda: member.timeout(
-                delta, reason=f"By {ctx.author}: {reason or 'No reason provided'}"
+                delta, reason=(f"By {ctx.author} ({ctx.author.id}): {reason or 'No reason provided'}")[:512]
             ),
             reason,
             dm_message=f"You have been timed out for {duration}.\n**Reason:** {{reason}}",
@@ -717,7 +752,7 @@ class Moderation(commands.Cog):
             member,
             "Timeout Removed",
             lambda: member.timeout(
-                None, reason=f"By {ctx.author}: {reason or 'No reason provided'}"
+                None, reason=(f"By {ctx.author} ({ctx.author.id}): {reason or 'No reason provided'}")[:512]
             ),
             reason,
             dm_message=None,
@@ -728,11 +763,14 @@ class Moderation(commands.Cog):
     @commands.guild_only()
     @mod_or_permissions(manage_nicknames=True)
     @commands.bot_has_permissions(manage_nicknames=True)
-    async def rename(self, ctx, member: discord.Member, *, nickname: str = None):
+    async def rename(self, ctx, member: discord.Member, *, nickname: Optional[str] = None):
         """Change a member's nickname. Leave blank to reset."""
-        if member.top_role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
+        if not self._can_target(ctx, member):
             await ctx.send("❌ Cannot rename someone with equal or higher role.")
             return
+
+        if nickname is not None and not 1 <= len(nickname) <= 32:
+            return await ctx.send("Nicknames must contain 1–32 characters.")
 
         old_nick = member.nick or member.name
 
@@ -752,14 +790,14 @@ class Moderation(commands.Cog):
                 color=0x57F287,
             )
             await ctx.send(embed=success_embed)
-            
+
             await self._log_action(ctx.guild, title, desc, 0x57F287, member, ctx.author)
 
         except discord.Forbidden:
             await ctx.send(
                 "❌ I don't have permission to change that member's nickname."
             )
-        except Exception as e:
+        except discord.HTTPException as e:
             await ctx.send(f"❌ Could not change nickname: {e}")
 
     # ================= Message Management =================
@@ -807,31 +845,49 @@ class Moderation(commands.Cog):
         await self._log_action(ctx.guild, "Messages Purged", f"Channel: {ctx.channel.mention} | Filter: {mode} | Deleted: {len(deleted)}", 0x57F287, moderator=ctx.author)
 
     @purge.command(name="bots")
+    @commands.guild_only()
+    @mod_or_permissions(manage_messages=True)
+    @commands.bot_has_permissions(manage_messages=True, read_message_history=True)
     async def purge_bots(self, ctx: commands.Context, amount: int = 100, bot: Optional[discord.Member] = None):
         """Delete bot messages, optionally from a specific bot; preserve human chat."""
         await self._purge_messages(ctx, amount, "bots", member=bot)
 
     @purge.command(name="user")
+    @commands.guild_only()
+    @mod_or_permissions(manage_messages=True)
+    @commands.bot_has_permissions(manage_messages=True, read_message_history=True)
     async def purge_user(self, ctx: commands.Context, member: discord.Member, amount: int = 100):
         """Delete a member's messages within a bounded recent scan."""
         await self._purge_messages(ctx, amount, "member", member=member)
 
     @purge.command(name="contains")
+    @commands.guild_only()
+    @mod_or_permissions(manage_messages=True)
+    @commands.bot_has_permissions(manage_messages=True, read_message_history=True)
     async def purge_contains(self, ctx: commands.Context, amount: int = 100, *, text: str):
         """Delete recent messages containing text, ignoring case."""
         await self._purge_messages(ctx, amount, "contains", text=text)
 
     @purge.command(name="embeds")
+    @commands.guild_only()
+    @mod_or_permissions(manage_messages=True)
+    @commands.bot_has_permissions(manage_messages=True, read_message_history=True)
     async def purge_embeds(self, ctx: commands.Context, amount: int = 100):
         """Delete recent messages containing embeds or files."""
         await self._purge_messages(ctx, amount, "embeds")
 
     @purge.command(name="attachments")
+    @commands.guild_only()
+    @mod_or_permissions(manage_messages=True)
+    @commands.bot_has_permissions(manage_messages=True, read_message_history=True)
     async def purge_attachments(self, ctx: commands.Context, amount: int = 100):
         """Delete recent messages containing uploaded files."""
         await self._purge_messages(ctx, amount, "attachments")
 
     @purge.command(name="links")
+    @commands.guild_only()
+    @mod_or_permissions(manage_messages=True)
+    @commands.bot_has_permissions(manage_messages=True, read_message_history=True)
     async def purge_links(self, ctx: commands.Context, amount: int = 100):
         """Delete recent messages containing HTTP or HTTPS links."""
         await self._purge_messages(ctx, amount, "links")
@@ -854,14 +910,19 @@ class Moderation(commands.Cog):
             context = await self.bot.get_context(message)
             return context.valid
         try:
-            deleted = await ctx.channel.purge(limit=amount, before=discord.Object(id=ctx.message.id), check=check,
+            before = discord.Object(id=ctx.message.id)
+            selected = {message.id async for message in ctx.channel.history(limit=amount, before=before)
+                        if await check(message)}
+            deleted = await ctx.channel.purge(limit=amount, before=before,
+                check=lambda message: message.id in selected and not message.pinned,
                 reason=f"Command cleanup by {ctx.author} ({ctx.author.id})")
         except discord.HTTPException:
             return await ctx.send("Cleanup could not finish; some messages may already have been removed.")
         await ctx.send(embed=discord.Embed(title="Command cleanup", description=f"Removed **{len(deleted)}** messages. Pins preserved.", color=0x57F287), ephemeral=bool(ctx.interaction))
         await self._log_action(ctx.guild, "Command Cleanup", f"Channel: {ctx.channel.mention} | Deleted: {len(deleted)}", 0x57F287, moderator=ctx.author)
 
-    def _can_rename(self, ctx: commands.Context, member: discord.Member) -> bool:
+    def _can_target(self, ctx: commands.Context, member: discord.Member) -> bool:
+        """Require both moderator and bot hierarchy, excluding the owner and bot itself."""
         return (member != ctx.guild.owner and member != ctx.guild.me
                 and member.top_role < ctx.guild.me.top_role
                 and (ctx.author == ctx.guild.owner or member.top_role < ctx.author.top_role))
@@ -872,7 +933,7 @@ class Moderation(commands.Cog):
     @commands.bot_has_permissions(manage_nicknames=True)
     async def dehoist(self, ctx: commands.Context, member: discord.Member):
         """Remove leading hoisting punctuation from a member's display name."""
-        if not self._can_rename(ctx, member):
+        if not self._can_target(ctx, member):
             return await ctx.send("That member is protected by the role hierarchy.")
         name = dehoisted_name(member.display_name)
         if not name:
@@ -881,11 +942,16 @@ class Moderation(commands.Cog):
 
     async def _dehoist_candidates(self, ctx: commands.Context) -> list[tuple[discord.Member, str]]:
         if not ctx.guild.chunked:
+            if not self.bot.intents.members:
+                raise commands.BadArgument("A complete member list requires the Server Members intent.")
             await ctx.guild.chunk()
-        return [(m, name) for m in ctx.guild.members if self._can_rename(ctx, m)
+        return [(m, name) for m in ctx.guild.members if self._can_target(ctx, m)
                 and (name := dehoisted_name(m.display_name))]
 
     @dehoist.command(name="preview")
+    @commands.guild_only()
+    @mod_or_permissions(manage_nicknames=True)
+    @commands.bot_has_permissions(manage_nicknames=True)
     async def dehoist_preview(self, ctx: commands.Context):
         """Preview eligible nickname changes without modifying any members."""
         candidates = await self._dehoist_candidates(ctx)
@@ -898,6 +964,9 @@ class Moderation(commands.Cog):
         return embed
 
     @dehoist.command(name="all")
+    @commands.guild_only()
+    @mod_or_permissions(manage_nicknames=True)
+    @commands.bot_has_permissions(manage_nicknames=True)
     @commands.max_concurrency(1, per=commands.BucketType.guild)
     async def dehoist_all(self, ctx: commands.Context):
         """Preview and confirm a manual server-wide nickname cleanup."""
@@ -917,7 +986,7 @@ class Moderation(commands.Cog):
         changed = skipped = failed = 0
         for original, name in candidates:
             member = ctx.guild.get_member(original.id)
-            if (not member or not self._can_rename(ctx, member)
+            if (not member or not self._can_target(ctx, member)
                     or dehoisted_name(member.display_name) != name):
                 skipped += 1
                 continue
@@ -939,9 +1008,12 @@ class Moderation(commands.Cog):
         await ctx.send_help(ctx.command)
 
     @nickname.command(name="reset")
+    @commands.guild_only()
+    @mod_or_permissions(manage_nicknames=True)
+    @commands.bot_has_permissions(manage_nicknames=True)
     async def nickname_reset(self, ctx: commands.Context, member: discord.Member):
         """Clear a server nickname with hierarchy checks and moderation logging."""
-        if not self._can_rename(ctx, member):
+        if not self._can_target(ctx, member):
             return await ctx.send("That member is protected by the role hierarchy.")
         await self.rename.callback(self, ctx, member, nickname=None)
 
@@ -996,7 +1068,7 @@ class Moderation(commands.Cog):
                 color=0x57F287,
             )
             await ctx.send(embed=success_embed)
-            
+
             await self._log_action(
                 ctx.guild,
                 "Channel Locked",
@@ -1007,7 +1079,7 @@ class Moderation(commands.Cog):
 
         except discord.Forbidden:
             await ctx.send("❌ I don't have permission to lock that channel.")
-        except Exception as e:
+        except discord.HTTPException as e:
             await ctx.send(f"❌ Could not lock channel: {e}")
 
     @commands.hybrid_command()
@@ -1038,7 +1110,7 @@ class Moderation(commands.Cog):
                 color=0x57F287,
             )
             await ctx.send(embed=success_embed)
-            
+
             await self._log_action(
                 ctx.guild,
                 "Channel Unlocked",
@@ -1049,7 +1121,7 @@ class Moderation(commands.Cog):
 
         except discord.Forbidden:
             await ctx.send("❌ I don't have permission to unlock that channel.")
-        except Exception as e:
+        except discord.HTTPException as e:
             await ctx.send(f"❌ Could not unlock channel: {e}")
 
     @commands.hybrid_command()
@@ -1061,7 +1133,7 @@ class Moderation(commands.Cog):
     ):
         """
         Set slowmode for a channel.
-        
+
         Accepts seconds (e.g. 120) or duration strings (e.g. 5m, 1h). Use 0 to disable.
         """
         channel = channel or ctx.channel
@@ -1093,7 +1165,7 @@ class Moderation(commands.Cog):
                 title=embed_title, description=embed_desc, color=0x57F287
             )
             await ctx.send(embed=success_embed)
-            
+
             await self._log_action(
                 ctx.guild,
                 embed_title,
@@ -1104,7 +1176,7 @@ class Moderation(commands.Cog):
 
         except discord.Forbidden:
             await ctx.send("❌ I don't have permission to edit that channel.")
-        except Exception as e:
+        except discord.HTTPException as e:
             await ctx.send(f"❌ Could not set slowmode: {e}")
 
     # ============ Voice Management ============
@@ -1121,7 +1193,7 @@ class Moderation(commands.Cog):
             return await ctx.send("❌ Member is not in a voice channel.")
         if member.top_role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
             return await ctx.send("❌ Cannot kick someone with equal or higher role.")
-        
+
         await self._execute_mod_action(
             ctx,
             member,
@@ -1149,7 +1221,7 @@ class Moderation(commands.Cog):
             return await ctx.send("❌ Member is already voice muted.")
         if member.top_role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
             return await ctx.send("❌ Cannot mute someone with equal or higher role.")
-        
+
         await self._execute_mod_action(
             ctx,
             member,
@@ -1175,7 +1247,7 @@ class Moderation(commands.Cog):
             return await ctx.send("❌ Member is not in a voice channel.")
         if not member.voice.mute:
             return await ctx.send("❌ Member is not voice muted.")
-        
+
         await self._execute_mod_action(
             ctx,
             member,
@@ -1199,7 +1271,7 @@ class Moderation(commands.Cog):
         """Mute and deafen someone in voice channels."""
         if member.top_role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
             return await ctx.send("❌ Cannot ban someone with equal or higher role.")
-        
+
         await self._execute_mod_action(
             ctx,
             member,
@@ -1253,7 +1325,7 @@ class Moderation(commands.Cog):
             warning = {
                 "reason": reason,
                 "moderator": ctx.author.id,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": discord.utils.utcnow().isoformat(),
             }
             warnings[str(member.id)].append(warning)
             warn_count = len(warnings[str(member.id)])
@@ -1274,7 +1346,7 @@ class Moderation(commands.Cog):
             color=0x57F287,
         )
         await ctx.send(embed=success_embed)
-        
+
         # Log to modlog
         await self._log_action(
             ctx.guild,
@@ -1292,7 +1364,7 @@ class Moderation(commands.Cog):
         """View warnings for a member (10 per page)."""
         if page < 1:
             return await ctx.send("❌ Page number must be positive.")
-            
+
         all_warnings = await self.config.guild(ctx.guild).warnings()
         user_warnings = all_warnings.get(str(member.id), [])
 
@@ -1320,6 +1392,8 @@ class Moderation(commands.Cog):
             mod = ctx.guild.get_member(warning["moderator"])
             mod_name = mod.mention if mod else f"Unknown (ID: {warning['moderator']})"
             timestamp = datetime.fromisoformat(warning["timestamp"])
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
             warn_idx = start + i
 
             embed.add_field(
@@ -1347,7 +1421,7 @@ class Moderation(commands.Cog):
                     color=0x57F287,
                 )
                 await ctx.send(embed=success_embed)
-                
+
                 await self._log_action(
                     ctx.guild,
                     "Warnings Cleared",
@@ -1368,25 +1442,25 @@ class Moderation(commands.Cog):
             user_id_str = str(member.id)
             if user_id_str not in warnings or not warnings[user_id_str]:
                 return await ctx.send(f"❌ {member} has no active warnings.")
-            
+
             user_warnings = warnings[user_id_str]
             total = len(user_warnings)
-            
+
             if warn_number < 1 or warn_number > total:
                 return await ctx.send(f"❌ Invalid warning number. Please specify a number between 1 and {total}.")
-            
+
             removed = user_warnings.pop(warn_number - 1)
-            
+
             if not user_warnings:
                 del warnings[user_id_str]
-                
+
             success_embed = discord.Embed(
                 title="Warning Removed",
                 description=f"Removed warning **#{warn_number}** for **{member}**.\n**Original Reason:** {removed['reason']}",
                 color=0x57F287,
             )
             await ctx.send(embed=success_embed)
-            
+
             await self._log_action(
                 ctx.guild,
                 "Warning Removed",
@@ -1405,6 +1479,8 @@ class Moderation(commands.Cog):
         await ctx.send_help(ctx.command)
 
     @msgblock.command(name="add")
+    @commands.guild_only()
+    @commands.is_owner()
     async def msgblock_add(self, ctx: commands.Context, user_id: UserID):
         """Add a user to the message deletion list."""
         if user_id <= 0:
@@ -1414,21 +1490,25 @@ class Moderation(commands.Cog):
         if user_id in self._get_cached_blocked(ctx.guild.id):
             await ctx.send(f"❌ User ID `{user_id}` is already blocked.")
             return
-        
+
         await self._update_blocked_cache(ctx.guild.id, user_id, add=True)
         await ctx.send(f"✅ Added user ID `{user_id}` to the message deletion list.")
 
     @msgblock.command(name="remove")
+    @commands.guild_only()
+    @commands.is_owner()
     async def msgblock_remove(self, ctx: commands.Context, user_id: UserID):
         """Remove a user from the message deletion list."""
         if user_id not in self._get_cached_blocked(ctx.guild.id):
             await ctx.send(f"❌ User ID `{user_id}` is not blocked.")
             return
-        
+
         await self._update_blocked_cache(ctx.guild.id, user_id, add=False)
         await ctx.send(f"✅ Removed user ID `{user_id}` from the message deletion list.")
 
     @msgblock.command(name="list")
+    @commands.guild_only()
+    @commands.is_owner()
     async def msgblock_list(self, ctx: commands.Context):
         """Show all blocked users."""
         blocked_users = list(self._get_cached_blocked(ctx.guild.id))
@@ -1482,20 +1562,20 @@ class Moderation(commands.Cog):
         """Parse duration string (e.g. 1d12h30m) into a timedelta object."""
         if not duration or not isinstance(duration, str):
             raise ValueError("Empty duration")
-        
+
         duration = duration.strip()
         duration_re = re.compile(r"(?i)\s*(\d+)\s*([wdhms]?)")
-        
+
         total_seconds = 0
         idx = 0
-        
+
         for m in duration_re.finditer(duration):
             if m.start() != idx:
                 raise ValueError("Invalid duration format")
-            
+
             num = int(m.group(1))
             unit = (m.group(2) or "s").lower()
-            
+
             if unit == "w":
                 total_seconds += num * 604800
             elif unit == "d":
@@ -1508,16 +1588,19 @@ class Moderation(commands.Cog):
                 total_seconds += num
             else:
                 raise ValueError("Invalid unit")
-            
+
             idx = m.end()
-            
+
         if idx != len(duration):
             raise ValueError("Invalid trailing characters")
-            
+
         if total_seconds <= 0:
             raise ValueError("Zero duration")
-            
-        return timedelta(seconds=total_seconds)
+
+        try:
+            return timedelta(seconds=total_seconds)
+        except OverflowError as exc:
+            raise ValueError("Duration is too large") from exc
 
 
 async def setup(bot):

@@ -3253,6 +3253,76 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         """Play a provider link or search query (TIDAL, YouTube, SoundCloud, Bandcamp, Spotify)."""
         await self._play_request(ctx, query=query)
 
+
+        @commands.hybrid_command(name="yplay")
+    @commands.guild_only()
+    @playback_request()
+    @commands.dynamic_cooldown(playback_cooldown, commands.BucketType.user)
+    async def yplay(self, ctx: commands.Context, *, query: str) -> None:
+        """Play a YouTube search result or YouTube video, never a TIDAL match."""
+        from .playback.models import SourceKind, SourceReference
+        from .providers.urls import (
+            MalformedProviderURL,
+            ProviderKind,
+            parse_provider_url,
+        )
+
+        query = query.strip()
+        if not query:
+            await self._reply(ctx, "Give me a YouTube search or video link.")
+            return
+
+        try:
+            provider_url = parse_provider_url(query)
+        except MalformedProviderURL:
+            await self._reply(ctx, "That isn't a supported YouTube video link.")
+            return
+
+        if provider_url is None:
+            # Do not let an unrecognized URL become a YouTube search.
+            if "://" in query or query.lower().startswith(
+                ("www.", "youtu.be/", "youtube.com/", "music.youtube.com/")
+            ):
+                await self._reply(ctx, "Use a supported YouTube video link or a search.")
+                return
+
+            # The cog's explicit platform search queues the YouTube result.
+            await self._play_request(ctx, query=query, platform="youtube")
+            return
+
+        if (
+            provider_url.provider is not ProviderKind.YOUTUBE
+            or provider_url.content_type != "video"
+        ):
+            await self._reply(
+                ctx,
+                "yplay accepts YouTube videos only; playlists and other sites "
+                "are not supported by this command.",
+            )
+            return
+
+        await self._defer(ctx)
+
+        if self._closing or not self._initialized:
+            await self._reply(ctx, "The player is still loading.")
+            return
+
+        session = await self._prepare_playback_session(ctx)
+        if session is None:
+            return
+
+        try:
+            reference = SourceReference(
+                SourceKind.YOUTUBE, provider_url.identifier
+            )
+            video = await self.youtube_resolver.fetch_metadata(reference)
+            entry = await self._youtube_entry(video, ctx.author.id)
+        except Exception:
+            await self._reply(ctx, "Could not load that YouTube video.")
+            return
+
+        await self._admit_entry(ctx, session, entry)
+       
     @commands.hybrid_command(name="playfrom")
     @commands.guild_only()
     @playback_request()

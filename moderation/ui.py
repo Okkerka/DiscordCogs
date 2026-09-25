@@ -13,19 +13,25 @@ class ConfirmView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
-            await interaction.response.send_message("Only the requesting moderator can confirm this.", ephemeral=True)
+            await interaction.response.send_message(
+                "Only the requesting moderator can confirm this.", ephemeral=True
+            )
             return False
         return True
 
     @discord.ui.button(label="Apply nickname changes", style=discord.ButtonStyle.danger)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def confirm(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
         self.confirmed = True
         await interaction.response.edit_message(view=None)
         self.stop()
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(content="Cancelled. No nicknames changed.", view=None)
+        await interaction.response.edit_message(
+            content="Cancelled. No nicknames changed.", view=None
+        )
         self.stop()
 
 
@@ -38,12 +44,16 @@ class HistoryView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
-            await interaction.response.send_message("Run modhistory to open your own history view.", ephemeral=True)
+            await interaction.response.send_message(
+                "Run modhistory to open your own history view.", ephemeral=True
+            )
             return False
         return True
 
     @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary)
-    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def previous(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
         self.page = (self.page - 1) % len(self.pages)
         await interaction.response.edit_message(embed=self.pages[self.page], view=self)
 

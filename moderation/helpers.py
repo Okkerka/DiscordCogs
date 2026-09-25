@@ -12,8 +12,14 @@ def dehoisted_name(name: str) -> Optional[str]:
     return cleaned if cleaned and cleaned != name else None
 
 
-def matches_purge(message: discord.Message, mode: str, *, member_id: Optional[int] = None,
-                  text: str = "", include_pinned: bool = False) -> bool:
+def matches_purge(
+    message: discord.Message,
+    mode: str,
+    *,
+    member_id: Optional[int] = None,
+    text: str = "",
+    include_pinned: bool = False,
+) -> bool:
     """Match a validated filter, protecting pins unless explicitly requested."""
     if message.pinned and not include_pinned:
         return False

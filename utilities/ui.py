@@ -12,7 +12,9 @@ class ReminderView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
-            await interaction.response.send_message("This reminder belongs to another user.", ephemeral=True)
+            await interaction.response.send_message(
+                "This reminder belongs to another user.", ephemeral=True
+            )
             return False
         return True
 
@@ -22,5 +24,10 @@ class ReminderView(discord.ui.View):
         removed = await self.cog._cancel_reminder(self.author_id, self.reminder_id)
         button.disabled = True
         await interaction.edit_original_response(view=self)
-        await interaction.followup.send("Reminder cancelled." if removed else "Reminder already delivered or removed.", ephemeral=True)
+        await interaction.followup.send(
+            "Reminder cancelled."
+            if removed
+            else "Reminder already delivered or removed.",
+            ephemeral=True,
+        )
         self.stop()

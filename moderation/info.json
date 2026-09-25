@@ -1,0 +1,12 @@
+{
+    "author": ["Okkerka"],
+    "name": "Moderation",
+    "short": "Moderation, filtered cleanup and member history",
+    "description": "Prefix and slash moderation commands, protected message cleanup, confirmed dehoisting and persistent moderation history.",
+    "install_msg": "Use `[p]help Moderation`. Existing custom moderator restrictions remain in effect. Read the cog README for slash setup and new commands.",
+    "tags": ["moderation", "admin"],
+    "type": "COG",
+    "min_bot_version": "3.5.0",
+    "min_python_version": [3, 10, 0],
+    "end_user_data_statement": "Stores server moderator and blocked-user IDs, warnings, temporary bans and up to 500 recent moderation actions per target user per server, including moderator IDs, timestamps and descriptions. New history begins with this version."
+}

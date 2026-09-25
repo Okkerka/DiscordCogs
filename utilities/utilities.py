@@ -1,15 +1,16 @@
-from redbot.core import commands, Config
-import discord
-import random
 import asyncio
-from typing import Optional
-import re
 import logging
+import random
+import re
 import shlex
 import uuid
 from datetime import timedelta
+from typing import Optional
 
-from .helpers import parse_timestamp, parse_message_link
+import discord
+from redbot.core import Config, commands
+
+from .helpers import parse_message_link, parse_timestamp
 from .ui import ReminderView
 
 log = logging.getLogger("red.utilities")
@@ -95,8 +96,8 @@ class Utilities(commands.Cog):
             try:
                 url = member.display_avatar.replace(format=fmt, size=1024).url
                 formats.append(f"[{fmt.upper()}]({url})")
-            except Exception:
-                pass
+            except ValueError:
+                continue
         
         embed.description = " | ".join(formats) if formats else None
         
@@ -217,6 +218,7 @@ class Utilities(commands.Cog):
 
     @commands.hybrid_command(aliases=["latency", "botping"])
     async def status(self, ctx):
+        """Show the bot's current gateway latency."""
         await ctx.send(f"Bot latency: `{round(ctx.bot.latency * 1000)} ms`")
 
     @commands.hybrid_command(aliases=["8ball"])
@@ -238,7 +240,7 @@ class Utilities(commands.Cog):
             title="🎱 Magic 8-Ball",
             color=BASE
         )
-        embed.add_field(name="Question", value=question, inline=False)
+        embed.add_field(name="Question", value=question[:1024], inline=False)
         embed.add_field(name="Answer", value=f"🔮 **{random.choice(answers)}**", inline=False)
         embed.set_footer(text=f"Asked by {ctx.author.display_name}", icon_url=ctx.author.display_avatar.url)
         await ctx.send(embed=embed)
@@ -246,6 +248,9 @@ class Utilities(commands.Cog):
     @commands.hybrid_command()
     @commands.guild_only()
     async def poll(self, ctx, *, question: str):
+        """Create a reaction poll; separate the question and optional choices with |."""
+        if len(question) > 3000:
+            return await ctx.send("Keep the poll within 3000 characters.")
         if "|" in question:
             parts = [p.strip() for p in question.split("|") if p.strip()]
             if len(parts) < 3:
@@ -260,7 +265,7 @@ class Utilities(commands.Cog):
             reactions = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
             
             embed = discord.Embed(
-                title=f"📊 {poll_title}",
+                title=f"📊 {poll_title}"[:256],
                 color=BASE
             )
             embed.set_footer(text=f"Polled by {ctx.author.display_name}", icon_url=ctx.author.display_avatar.url)
@@ -295,7 +300,7 @@ class Utilities(commands.Cog):
         if len(choices) < 2:
             return await ctx.send("❌ You must provide at least 2 options.")
         
-        selected = random.choice(choices)
+        selected = random.choice(choices)[:1500]
         embed = discord.Embed(
             title="🤔 The Decider",
             description=f"Out of your options, I choose:\n\n✨ **{selected}** ✨",
@@ -385,6 +390,7 @@ class Utilities(commands.Cog):
     @commands.hybrid_command()
     @commands.guild_only()
     async def hawk(self, ctx, user: Optional[discord.Member] = None):
+        """Ask an eligible Hawk member the configured joke question."""
         if not await self.config.guild(ctx.guild).hawk_enabled():
             embed = discord.Embed(title="🐦 Hawk", description="The hawk command is currently **disabled**.", color=ERROR)
             embed.set_image(url=HAWK_DISABLED_GIF)
@@ -410,6 +416,7 @@ class Utilities(commands.Cog):
     @commands.hybrid_command()
     @commands.guild_only()
     async def gay(self, ctx, user: Optional[discord.Member] = None):
+        """Show a random joke percentage when this server has enabled it."""
         if not await self.config.guild(ctx.guild).gay_enabled():
             embed = discord.Embed(title="Gay Percentage", description="The gay command is currently **disabled**.", color=ERROR)
             embed.set_image(url=HAWK_DISABLED_GIF)
@@ -461,6 +468,7 @@ class Utilities(commands.Cog):
     @commands.is_owner()
     @commands.guild_only()
     async def removehawk(self, ctx, user: discord.Member):
+        """Remove one member from the owner-managed Hawk list."""
         config = self.config.guild(ctx.guild)
         hawk_users = set(await config.hawk_users())
         if user.id in hawk_users:
@@ -474,6 +482,7 @@ class Utilities(commands.Cog):
     @commands.is_owner()
     @commands.guild_only()
     async def listhawk(self, ctx):
+        """Display the owner-managed Hawk member list."""
         hawk_users = set(await self.config.guild(ctx.guild).hawk_users())
         if not hawk_users:
             return await ctx.send(
@@ -495,6 +504,7 @@ class Utilities(commands.Cog):
     @commands.is_owner()
     @commands.guild_only()
     async def clearhawks(self, ctx):
+        """Remove departed members from the Hawk list."""
         config = self.config.guild(ctx.guild)
         hawk_users = set(await config.hawk_users())
         removed = [uid for uid in hawk_users if not ctx.guild.get_member(uid)]
@@ -511,6 +521,7 @@ class Utilities(commands.Cog):
     @commands.is_owner()
     @commands.guild_only()
     async def disablehawk(self, ctx):
+        """Toggle the Hawk joke command for this server."""
         config = self.config.guild(ctx.guild)
         enabled = await config.hawk_enabled()
         await config.hawk_enabled.set(not enabled)
@@ -524,6 +535,7 @@ class Utilities(commands.Cog):
     @commands.is_owner()
     @commands.guild_only()
     async def disablegay(self, ctx):
+        """Toggle the percentage joke command for this server."""
         config = self.config.guild(ctx.guild)
         enabled = await config.gay_enabled()
         await config.gay_enabled.set(not enabled)
@@ -538,6 +550,7 @@ class Utilities(commands.Cog):
     @commands.is_owner()
     @commands.guild_only()
     async def timedping(self, ctx, user: discord.Member, *, duration: str):
+        """Start owner-only repeating pings at the specified interval."""
         try:
             total = parse_duration_to_seconds(duration)
         except ValueError:
@@ -582,6 +595,7 @@ class Utilities(commands.Cog):
     @commands.is_owner()
     @commands.guild_only()
     async def stoptimedping(self, ctx, user: discord.Member):
+        """Stop an owner-configured repeating ping."""
         key = (ctx.guild.id, user.id)
         if key not in self.timed_pings:
             return await ctx.send(f"No active timed ping found for {user.mention}.")
@@ -593,6 +607,7 @@ class Utilities(commands.Cog):
     @commands.is_owner()
     @commands.guild_only()
     async def listtimedpings(self, ctx):
+        """List active owner-configured repeating pings."""
         active = [(uid, task) for (gid, uid), task in self.timed_pings.items() if gid == ctx.guild.id]
         if not active:
             return await ctx.send("No active timed pings in this server.")
@@ -606,7 +621,7 @@ class Utilities(commands.Cog):
     @commands.guild_only()
     async def membercount(self, ctx: commands.Context):
         """Show human, bot, and total member counts."""
-        if not ctx.guild.chunked:
+        if not ctx.guild.chunked and self.bot.intents.members:
             await ctx.guild.chunk()
         members = ctx.guild.members
         bots = sum(member.bot for member in members)

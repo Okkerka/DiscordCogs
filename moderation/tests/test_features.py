@@ -14,14 +14,29 @@ def helpers():
     return module
 
 
-@pytest.mark.parametrize("name, expected", [("!!! Alice", "Alice"), ("  Éva", "Éva"), ("张三", None), ("!!!", None), ("Alice!", None)])
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("!!! Alice", "Alice"),
+        ("  Éva", "Éva"),
+        ("张三", None),
+        ("!!!", None),
+        ("Alice!", None),
+    ],
+)
 def test_dehoist_preserves_names(name, expected):
     assert helpers().dehoisted_name(name) == expected
 
 
 def test_purge_protects_pins_and_humans():
     match = helpers().matches_purge
-    msg = SimpleNamespace(pinned=False, author=SimpleNamespace(bot=False, id=1), content="hi", embeds=[], attachments=[])
+    msg = SimpleNamespace(
+        pinned=False,
+        author=SimpleNamespace(bot=False, id=1),
+        content="hi",
+        embeds=[],
+        attachments=[],
+    )
     assert not match(msg, "bots")
     msg.author.bot = True
     assert match(msg, "bots")
@@ -31,7 +46,19 @@ def test_purge_protects_pins_and_humans():
 
 
 def test_separate_attachments_and_embeds():
-    msg = SimpleNamespace(pinned=False, author=SimpleNamespace(bot=False, id=1), content="", embeds=[1], attachments=[])
+    msg = SimpleNamespace(
+        pinned=False,
+        author=SimpleNamespace(bot=False, id=1),
+        content="",
+        embeds=[1],
+        attachments=[],
+    )
     assert helpers().matches_purge(msg, "embeds")
     assert not helpers().matches_purge(msg, "attachments")
 
+
+def test_extreme_duration_is_validation_error():
+    from moderation.moderation import Moderation
+
+    with pytest.raises(ValueError):
+        Moderation._parse_duration(None, "9999999999999999999999999999999d")
