@@ -3254,7 +3254,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         await self._play_request(ctx, query=query)
 
 
-        @commands.hybrid_command(name="yplay")
+    @commands.hybrid_command(name="yplay")
     @commands.guild_only()
     @playback_request()
     @commands.dynamic_cooldown(playback_cooldown, commands.BucketType.user)
