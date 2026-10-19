@@ -713,13 +713,24 @@ class GrokCog(commands.Cog):
     ) -> None:
         """Set the key via slash (private response) or a prefix command in DM."""
         if ctx.guild and ctx.interaction is None:
+            removed = False
             if api_key:
                 try:
                     await ctx.message.delete()
+                    removed = True
+                except discord.Forbidden:
+                    # Deleting another user's message needs Manage Messages.
+                    removed = False
                 except discord.HTTPException:
-                    pass
+                    removed = False
+            warning = (
+                ""
+                if removed
+                else " The message with the key could not be removed; delete it yourself."
+            )
             await ctx.send(
                 "Use this command in DM or via slash. If you posted a key here, rotate it in Groq's console."
+                + warning
             )
             return
         if (
