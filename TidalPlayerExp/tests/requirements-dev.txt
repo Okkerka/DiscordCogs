@@ -1,6 +1,19 @@
 pytest>=8.2
 pytest-asyncio>=0.23
+pytest-timeout>=2.3
 hypothesis>=6.100
 ruff>=0.4
 mypy>=1.10
 rapidfuzz>=3.0
+# Runtime dependencies the suite exercises: conftest imports the real
+# discord.py at collection, while the subprocess contract tests and the
+# resolver/discovery tests need the same packages Red installs for the cog.
+discord.py>=2.7
+imageio-ffmpeg>=0.6.0
+yt-dlp[default]>=2026.8.19
+deno>=2.9.6
+tidalapi>=0.8.0
+spotipy
+google-api-python-client
+PyNaCl>=1.5,<1.6
+davey>=0.1.0

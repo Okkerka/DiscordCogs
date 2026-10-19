@@ -3,6 +3,7 @@ tidalplaylist/__init__.py
 tidalplaylist/info.json
 tidalplaylist/tidalplaylist.py
 *.pyc
+.idea/
 Apply-TidalPlayerFixes.ps1
 *.ps1
 TidalPlayer/.pytest_cache/

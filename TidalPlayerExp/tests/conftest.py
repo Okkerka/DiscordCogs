@@ -10,7 +10,9 @@ cog_load are faked here.  Test files add further patching as needed.
 from __future__ import annotations
 
 import asyncio
+import pathlib
 import sys
+import tempfile
 import types
 from copy import deepcopy
 from typing import Any
@@ -356,6 +358,13 @@ def _make_redbot_stub(fake_config: FakeConfig) -> types.ModuleType:
     redbot.core.bot = types.ModuleType("redbot.core.bot")
     redbot.core.bot.Red = _FakeRed
 
+    # tidalplayer.py imports ``cog_data_path`` at module level; the cog fixture
+    # monkeypatches the module attribute, so this only has to exist.
+    redbot.core.data_manager = types.ModuleType("redbot.core.data_manager")
+    redbot.core.data_manager.cog_data_path = (
+        lambda cog: pathlib.Path(tempfile.gettempdir()) / "tidalplayerexp-cog-data"
+    )
+
     redbot.core.utils = types.ModuleType("redbot.core.utils")
     redbot.core.utils.menus = types.ModuleType("redbot.core.utils.menus")
     redbot.core.utils.menus.SimpleMenu = MagicMock()
@@ -439,6 +448,7 @@ def _patch_dependencies():
         "redbot.core.commands": redbot_stub.core.commands,
         "redbot.core.app_commands": redbot_stub.core.app_commands,
         "redbot.core.bot": redbot_stub.core.bot,
+        "redbot.core.data_manager": redbot_stub.core.data_manager,
         "redbot.core.utils": redbot_stub.core.utils,
         "redbot.core.utils.menus": redbot_stub.core.utils.menus,
         "redbot.core.utils.views": redbot_stub.core.utils.views,

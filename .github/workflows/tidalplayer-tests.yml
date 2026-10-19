@@ -4,12 +4,14 @@ on:
   pull_request:
     paths:
       - "TidalPlayer/**"
+      - "TidalPlayerExp/**"
       - ".github/workflows/tidalplayer-tests.yml"
   push:
     branches:
       - test/perplexity-write
     paths:
       - "TidalPlayer/**"
+      - "TidalPlayerExp/**"
       - ".github/workflows/tidalplayer-tests.yml"
 
 permissions:
@@ -32,3 +34,28 @@ jobs:
         run: python -m compileall -q TidalPlayer
       - name: Run unit tests
         run: python -m pytest -q TidalPlayer/tests
+
+  tidalplayerexp:
+    name: TidalPlayerExp tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: TidalPlayerExp/tests/requirements-dev.txt
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r TidalPlayerExp/tests/requirements-dev.txt
+      # The subprocess contract tests import the real redbot package
+      # (conftest stubs it in-process only). Red 3.5.24 requires Python <3.12,
+      # which is why this job pins 3.11.
+      - name: Install Red for subprocess contract tests
+        run: python -m pip install "Red-DiscordBot==3.5.24"
+      - name: Compile cog sources
+        run: python -m compileall -q TidalPlayerExp
+      # Run from the repository root: the suite imports the package as
+      # "TidalPlayerExp.*", so the parent directory must be importable.
+      - name: Run unit tests
+        run: python -m pytest -q TidalPlayerExp/tests
