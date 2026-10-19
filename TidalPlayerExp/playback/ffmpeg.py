@@ -33,6 +33,7 @@ _PRIME_TIMEOUT_SECONDS = 20.0
 _PROBE_OUTPUT_LIMIT = 256 * 1024
 _PROCESS_WAIT_SECONDS = 0.5
 _EOF_WAIT_SECONDS = 1.0
+_EOF_DRAIN_SECONDS = 0.25
 _PRIME_PROBE_PACKETS = 3
 _METADATA_WAIT_SECONDS = 0.25
 _VERSION_PATTERN = re.compile(r"\Affmpeg version ([^\s]+)")
@@ -122,6 +123,7 @@ class _StderrReader:
         self.reason: str | None = None
         self.duration: int | None = None
         self._metadata_ready = threading.Event()
+        self._drained = threading.Event()
         if not inspect_duration or stream is None:
             self._metadata_ready.set()
         self._thread: threading.Thread | None = None
@@ -159,11 +161,16 @@ class _StderrReader:
             return
         finally:
             self._metadata_ready.set()
+            self._drained.set()
             _quiet_process_call(stream.close)
 
     def wait_metadata(self) -> None:
         """Briefly synchronize header parsing; absent duration never blocks audio."""
         self._metadata_ready.wait(timeout=_METADATA_WAIT_SECONDS)
+
+    def wait_drained(self, timeout: float) -> None:
+        """Briefly wait for the reader to finish, so a late category is seen."""
+        self._drained.wait(timeout=timeout)
 
     def finish(self) -> None:
         """Allow the reaped process's final diagnostics to drain without hanging."""
@@ -430,6 +437,16 @@ class _FFmpegAudioSource(discord.AudioSource):
                 except Exception:  # noqa: BLE001 - process errors are redacted at this boundary
                     returncode = -1
             if returncode not in (None, 0):
+                raise self._mark_failed()
+            # The process has exited, so its final diagnostics are available.
+            # A provider failure that still exits zero truncated the stream and
+            # must not be reported as a track that finished normally.
+            self._stderr.wait_drained(_EOF_DRAIN_SECONDS)
+            if self._stderr.reason:
+                log.warning(
+                    "FFmpeg stream ended with a provider failure: %s",
+                    self.failure_summary("playback_failed"),
+                )
                 raise self._mark_failed()
             return b""
         if self._copied and not _opus_packet_is_20ms(packet):
@@ -773,8 +790,10 @@ class FFmpegSourceFactory:
             await asyncio.shield(self._cleanup(source))
             raise
         except TimeoutError:
-            await self._cleanup(source)
+            # Retain before awaiting cleanup, like the cancellation path: the
+            # priming thread can finish with an error while cleanup runs.
             self._retain_background_task(priming)
+            await self._cleanup(source)
             timed_out = True
         except _InvalidPacketDuration:
             await self._cleanup(source)

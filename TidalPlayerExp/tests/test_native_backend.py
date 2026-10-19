@@ -103,12 +103,24 @@ class Session:
     def snapshot(self):
         return self.state
 
-    async def close(self):
+    def _idle(self) -> bool:
+        state = self.state
+        if state.current is not None:
+            return False
+        if not state.queued:
+            return True
+        # A halted queue never advances on its own, so it counts as idle.
+        return bool(getattr(state, "halted", False))
+
+    async def close(self, *, only_if_idle: bool = False):
+        if only_if_idle and not self._idle():
+            return False
         if self.failure:
             raise OSError("secret cleanup detail")
         self.closed = True
         if self.voice_client.guild.voice_client is self.voice_client:
             await self.voice_client.disconnect(force=True)
+        return True
 
 
 @pytest.fixture

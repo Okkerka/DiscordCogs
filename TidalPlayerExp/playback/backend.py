@@ -203,9 +203,15 @@ class NativePlaybackBackend:
         # Raise outside the handler so raw network exceptions are not retained.
         raise PlaybackUnavailable()
 
-    async def _dispose(self, session: NativePlaybackSession) -> None:
+    async def _dispose(self, session: NativePlaybackSession, *, only_if_idle: bool = False) -> None:
         self._retired.add(session)
         guild_id = session.guild_id
+        if only_if_idle and not await session.close(only_if_idle=True):
+            # The idle sweep decided from a snapshot; the session re-checked
+            # under its own lock and found a new track. Keep it owned instead
+            # of discarding a playback that just started.
+            self._retired.discard(session)
+            return
         if self._sessions.get(guild_id) is session:
             self._sessions.pop(guild_id, None)
             self._empty_since.pop(guild_id, None)
@@ -214,9 +220,9 @@ class NativePlaybackBackend:
         await session.close()
         self._retired.discard(session)
 
-    async def _try_dispose(self, session: NativePlaybackSession) -> bool:
+    async def _try_dispose(self, session: NativePlaybackSession, *, only_if_idle: bool = False) -> bool:
         try:
-            await self._dispose(session)
+            await self._dispose(session, only_if_idle=only_if_idle)
         except Exception:  # noqa: BLE001 - retain failed cleanup for explicit retry
             self._ensure_housekeeping()
             return False
@@ -233,14 +239,14 @@ class NativePlaybackBackend:
             current.exception()
         self._housekeeping = asyncio.create_task(self._housekeep())
 
-    async def close_guild(self, guild_id: int) -> None:
+    async def close_guild(self, guild_id: int, *, only_if_idle: bool = False) -> None:
         """Invalidate connects and close only this guild's owned resources."""
         removal = self._removals.get(guild_id)
         if removal is None:
             attempt = self._pending.get(guild_id)
             if attempt is not None:
                 self._invalidate(attempt)
-            removal = asyncio.create_task(self._close_guild(guild_id, attempt))
+            removal = asyncio.create_task(self._close_guild(guild_id, attempt, only_if_idle))
             self._removals[guild_id] = removal
             removal.add_done_callback(
                 lambda task: self._removal_finished(guild_id, task)
@@ -257,7 +263,9 @@ class NativePlaybackBackend:
         if not task.cancelled():
             task.exception()
 
-    async def _close_guild(self, guild_id: int, attempt: _Connection | None) -> None:
+    async def _close_guild(
+        self, guild_id: int, attempt: _Connection | None, only_if_idle: bool = False
+    ) -> None:
         if attempt is not None and attempt.task is not None:
             await asyncio.gather(attempt.task, return_exceptions=True)
             # A task cancelled before its first instruction cannot run finally.
@@ -266,7 +274,9 @@ class NativePlaybackBackend:
         sessions = {item for item in self._retired if item.guild_id == guild_id}
         if guild_id in self._sessions:
             sessions.add(self._sessions[guild_id])
-        results = await asyncio.gather(*(self._try_dispose(item) for item in sessions))
+        results = await asyncio.gather(
+            *(self._try_dispose(item, only_if_idle=only_if_idle) for item in sessions)
+        )
         if not all(results):
             raise PlaybackUnavailable()
 
@@ -308,7 +318,10 @@ class NativePlaybackBackend:
             empty_since = self._empty_since.setdefault(guild_id, now)
             if now - empty_since >= self._idle_timeout:
                 try:
-                    await self.close_guild(guild_id)
+                    # The decision comes from a snapshot, so let the session
+                    # re-check under its own lock: a track that arrived in the
+                    # meantime must not be discarded by a stale idle verdict.
+                    await self.close_guild(guild_id, only_if_idle=True)
                 except PlaybackUnavailable:
                     # Failed disposal remains owned and retryable by close.
                     continue

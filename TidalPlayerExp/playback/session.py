@@ -160,7 +160,8 @@ class NativePlaybackSession:
     def _position(self) -> float:
         if self._current is None:
             return 0.0
-        elapsed = 0.0 if self._started_at is None else (self._paused_at or time.monotonic()) - self._started_at
+        paused_at = self._paused_at if self._paused_at is not None else time.monotonic()
+        elapsed = 0.0 if self._started_at is None else paused_at - self._started_at
         return max(0.0, self._current.start_time + elapsed)
 
     def _owned(self) -> bool:
@@ -289,8 +290,10 @@ class NativePlaybackSession:
             self._volume = percent
             barrier = None
             if self._current is not None:
-                position = self._position() if self._current.meta["duration"] > 0 else 0.0
-                barrier = self._replace_current(position)
+                # Rebuffer at the position the listener is hearing, even when
+                # the track length is unknown: restarting at zero would replay
+                # the song from the beginning on every volume change.
+                barrier = self._replace_current(self._position())
         await self._wait_predecessor(barrier)
 
     async def set_paused(self, paused: bool) -> bool:
@@ -413,10 +416,17 @@ class NativePlaybackSession:
         if previous is not asyncio.current_task():
             await self._wait_predecessor(barrier)
 
-    async def close(self) -> None:
-        """Idempotently stop and disconnect only while the client is still owned."""
+    async def close(self, *, only_if_idle: bool = False) -> bool:
+        """Idempotently stop and disconnect only while the client is still owned.
+
+        With ``only_if_idle`` the decision is taken under the session lock, so
+        a track that arrived after the caller's snapshot keeps its playback
+        instead of being discarded by a stale idle decision.
+        """
         for _ in range(2):
             async with self._lock:
+                if only_if_idle and not self._idle():
+                    return False
                 if self._close_task is None or (
                     self._close_task.done()
                     and (self._close_task.cancelled() or self._close_task.exception() is not None)
@@ -430,7 +440,7 @@ class NativePlaybackSession:
                     previous = self._runner
                 close_task = self._close_task
             if previous is asyncio.current_task():
-                return
+                return True
             try:
                 await asyncio.shield(close_task)
             except asyncio.CancelledError:
@@ -440,7 +450,20 @@ class NativePlaybackSession:
                 # caller); build a fresh one instead of surfacing a phantom
                 # cancellation that would poison every later close().
                 continue
-            return
+            return True
+        return True
+
+    def _idle(self) -> bool:
+        """Whether the session holds no playback and may be closed.
+
+        A halted queue never advances on its own, so it counts as idle: a
+        voice connection must not be held open for it past the idle timeout.
+        """
+        if self._current is not None:
+            return False
+        if not self._queue:
+            return True
+        return self._failures >= 3 and not self._running
 
     async def _finish_close(self, previous: Awaitable[object] | None) -> None:
         await self._wait_predecessor(previous)

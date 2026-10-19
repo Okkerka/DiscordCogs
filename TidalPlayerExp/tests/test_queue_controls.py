@@ -75,6 +75,60 @@ async def test_volume_bounds_apply_to_every_new_source():
 
 
 @pytest.mark.asyncio
+async def test_volume_change_keeps_the_position_of_a_track_with_an_unknown_length():
+    """A track whose length the provider never reported must not restart."""
+    session, voice, resolver, factory, sink = setup()
+    seen = []
+    original = factory.create
+
+    async def create(source):
+        seen.append(source)
+        return await original(source)
+
+    factory.create = create
+    try:
+        unknown_length = replace(
+            entry(1), meta={**entry(1).meta, "duration": 0}, start_time=30.0
+        )
+        await session.enqueue(unknown_length)
+        await sink.expect("started")
+        assert seen[-1].start_time == 30.0
+
+        await session.set_volume(80)
+        await sink.expect("started")
+
+        assert seen[-1].volume == 80
+        assert seen[-1].start_time >= 30.0
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_idle_close_refuses_to_discard_a_track_that_already_arrived():
+    session, voice, resolver, factory, sink = setup()
+    try:
+        await session.enqueue(entry(1))
+        await sink.expect("started")
+
+        assert await session.close(only_if_idle=True) is False
+
+        assert not session.closed
+        assert session.snapshot().current is not None
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_idle_close_closes_a_session_without_playback():
+    session, voice, resolver, factory, sink = setup()
+    try:
+        assert await session.close(only_if_idle=True) is True
+        assert session.closed
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_seek_restarts_same_track_and_preserves_queue_and_pause():
     session, voice, resolver, factory, sink = setup()
     seen = []

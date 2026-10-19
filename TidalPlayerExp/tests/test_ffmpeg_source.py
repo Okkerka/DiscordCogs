@@ -125,6 +125,35 @@ async def test_uploaded_audio_reports_bounded_input_duration_at_start(ffmpeg_mod
         await factory.close()
 
 
+@pytest.mark.asyncio
+async def test_a_zero_exit_provider_failure_is_not_reported_as_a_finished_track(ffmpeg_module, tmp_path):
+    """A stream that a provider truncated must fail, even when FFmpeg exits zero."""
+    process = _Process(packets=(), returncode=0)
+    process.stderr = io.BytesIO(b"Connection reset by peer\n")
+    factory, _, _ = _factory(ffmpeg_module, tmp_path, lambda *a, **kw: process)
+
+    with pytest.raises(PlaybackStartError):
+        await factory.create(ResolvedSource("https://example.com/audio", {}))
+
+    report = factory.last_failure
+    assert "connection_failed" in report
+    assert "peer" not in report
+    await factory.close()
+
+
+@pytest.mark.asyncio
+async def test_a_clean_end_of_stream_is_still_a_normal_end(ffmpeg_module, tmp_path):
+    process = _Process(returncode=0)
+    process.stderr = io.BytesIO(b"Input #0, mp3, from 'https://example.com/audio':\n")
+    factory, _, _ = _factory(ffmpeg_module, tmp_path, lambda *a, **kw: process)
+
+    audio = await factory.create(ResolvedSource("https://example.com/audio", {}))
+
+    assert audio.read() == b"\x08audio"
+    assert audio.read() == b""
+    await factory.close()
+
+
 def test_duration_reader_handles_split_headers_without_waiting_for_pipe_eof(ffmpeg_module):
     release = threading.Event()
 
