@@ -23,17 +23,21 @@ YOUTUBE_SKIP_TITLES: Final = frozenset(
     {"[deleted video]", "deleted video", "private video", "[private video]"}
 )
 
-SPOTIFY_PLAYLIST_PATTERN: Final = re.compile(r"open\.spotify\.com/playlist/([a-zA-Z0-9]+)")
-SPOTIFY_TRACK_PATTERN: Final = re.compile(r"open\.spotify\.com/track/([a-zA-Z0-9]+)")
-SPOTIFY_ALBUM_PATTERN: Final = re.compile(r"open\.spotify\.com/album/([a-zA-Z0-9]+)")
 ISRC_PATTERN: Final = re.compile(r"^isrc:([A-Z]{2}[A-Z0-9]{3}\d{7})$", re.IGNORECASE)
 
 
-def truncate(text: str, limit: int) -> str:
-    """Shorten text to an exact display limit, preserving existing behavior."""
-    if len(text) > limit:
-        return text[:limit - 3] + "..."
-    return text
+def clamp_text(value: str, limit: int) -> str:
+    """Clamp text conservatively in UTF-16 units, including the ellipsis.
+
+    Discord counts string length in UTF-16 code units, so a limit measured in
+    code points would let emoji-heavy text exceed the limit it was given.
+    """
+    if limit <= 0:
+        return ""
+    encoded = value.encode("utf-16-le", errors="replace")
+    if len(encoded) <= limit * 2:
+        return value
+    return encoded[: (limit - 1) * 2].decode("utf-16-le", errors="ignore").rstrip("\\") + "…"
 
 
 def make_tidal_url(content_type: str, content_id: Any) -> str:

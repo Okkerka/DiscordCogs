@@ -87,7 +87,7 @@ def test_queue_panel_bounds_untrusted_track_text_and_serializes_as_components_v2
 
 def test_empty_queue_is_friendly_and_includes_supported_playback_state(real_queue_ui):
     snapshot = SimpleNamespace(
-        current=None, queued=(), paused=False, channel_id=None, volume=35, repeat=True, halted=False,
+        current=None, queued=(), paused=False, channel_id=None, volume=35, repeat="off", halted=False,
     )
 
     view, _ = _view(real_queue_ui, snapshot)
@@ -95,8 +95,19 @@ def test_empty_queue_is_friendly_and_includes_supported_playback_state(real_queu
 
     assert "No songs are waiting. Add one to keep the music going." in text
     assert "Volume: 35" in text
-    assert "Repeat: On" in text
+    assert "Repeat: Off" in text
     assert "Halted: Off" in text
+
+
+@pytest.mark.parametrize("mode,label", [("off", "Off"), ("track", "Track"), ("queue", "Queue")])
+def test_repeat_mode_is_rendered_as_a_label_not_a_raw_token(real_queue_ui, mode, label):
+    snapshot = SimpleNamespace(
+        current=None, queued=(), paused=False, channel_id=None, volume=35, repeat=mode, halted=False,
+    )
+
+    view, _ = _view(real_queue_ui, snapshot)
+
+    assert f"Repeat: {label}" in _text(view)
 
 
 def test_queue_bounds_unexpectedly_long_requester_ids_without_dropping_the_page(real_queue_ui):

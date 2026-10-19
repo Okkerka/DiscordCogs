@@ -4,17 +4,11 @@ from __future__ import annotations
 import re
 from urllib.parse import quote, urlsplit
 
+from ..domain.normalization import clamp_text
+
 _MARKDOWN = re.compile(r"([\\`*_{}\[\]|~#>])")
 
-
-def clamp_text(value: str, limit: int) -> str:
-    """Clamp text conservatively in UTF-16 units, including the ellipsis."""
-    if limit <= 0:
-        return ""
-    encoded = value.encode("utf-16-le", errors="replace")
-    if len(encoded) <= limit * 2:
-        return value
-    return encoded[: (limit - 1) * 2].decode("utf-16-le", errors="ignore").rstrip("\\") + "…"
+__all__ = ["clamp_text", "escape_display", "safe_display_url"]
 
 
 def escape_display(value: object, limit: int = 256) -> str:

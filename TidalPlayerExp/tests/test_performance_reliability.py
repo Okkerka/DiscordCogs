@@ -13,7 +13,7 @@ import pytest
 
 from TidalPlayerExp.tests.conftest import make_entry
 from TidalPlayerExp.domain.matching import select_best_tidal_track
-from TidalPlayerExp.ui.controller import _duration
+from TidalPlayerExp.ui.embeds import display_duration
 from TidalPlayerExp.ui.embeds import Messages
 
 
@@ -44,7 +44,7 @@ async def test_equivalent_search_queries_share_cache_entry(cog) -> None:
 
 
 def test_controller_duration_formats_hour_long_tracks() -> None:
-    assert _duration(3661) == "1:01:01"
+    assert display_duration({"duration": 3661}) == "1:01:01"
 
 
 @pytest.mark.asyncio

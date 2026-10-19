@@ -89,7 +89,7 @@ async def test_single_spotify_track_skips_unrelated_first_result(cog):
         patch.object(type(cog.tidal), "search", new=AsyncMock(return_value=[track(artist="John Smith"), right])),
         patch.object(type(cog), "_load_and_queue_track", new=AsyncMock()) as queue,
     ):
-        await cog._handle_spotify_track(ctx, "https://open.spotify.com/track/0123456789012345678901")
+        await cog._handle_spotify_track(ctx, "0123456789012345678901")
     queue.assert_awaited_once_with(ctx, right)
 
 
@@ -108,7 +108,7 @@ async def test_spotify_album_reuses_initial_metadata_snapshot(cog):
         patch.object(type(cog), "_run_spotify", new=run_spotify),
         patch.object(type(cog), "_process_track_list", new=AsyncMock()) as process,
     ):
-        await cog._handle_spotify_album(ctx, "https://open.spotify.com/album/0123456789012345678901")
+        await cog._handle_spotify_album(ctx, "0123456789012345678901")
     client.album.assert_called_once_with("0123456789012345678901")
     assert process.await_args.args[1:3] == ([item], "Album")
 

@@ -10,6 +10,28 @@ async def _run_now(_handler, operation, **_kwargs):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("share", [
+    "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC",
+    "https://open.spotify.com/intl-de/track/4uLU6hMCjMI75M1A2tKUQC",
+    "https://open.spotify.com/embed/track/4uLU6hMCjMI75M1A2tKUQC",
+    "https://open.spotify.com/intl-pt-BR/embed/track/4uLU6hMCjMI75M1A2tKUQC",
+])
+async def test_spotify_share_links_reach_the_provider_with_their_identifier(cog, share) -> None:
+    """A routed Spotify link must not be rejected by a second, stricter parse."""
+    ctx = SimpleNamespace(guild=SimpleNamespace(id=1), send=AsyncMock())
+    cog._defer = AsyncMock()
+    cog._initialized = True
+    cog.check_ready = AsyncMock(return_value=True)
+    cog._prepare_playback_session = AsyncMock(return_value=object())
+    handler = AsyncMock()
+    cog._handle_spotify_track = handler
+
+    await cog._play_request(ctx, query=share)
+
+    handler.assert_awaited_once_with(ctx, "4uLU6hMCjMI75M1A2tKUQC")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("method_name", "attribute"),
     [("_initialize_spotify", "sp"), ("_initialize_youtube", "yt")],

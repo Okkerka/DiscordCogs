@@ -25,10 +25,6 @@ def _short(value: str, limit: int = 100) -> str:
     return clamp_text(value, limit)
 
 
-def _duration(seconds: int) -> str:
-    return format_duration(max(0, int(seconds or 0)))
-
-
 def _track_info(meta: TrackMeta, *, autoplay_enabled: bool, position: float | None = None) -> str:
     # These budgets also reserve space for next-up text and controller labels
     # within Discord's 4000-character Components V2 message budget.
@@ -196,9 +192,18 @@ class PlayerControllerView(discord.ui.LayoutView):
         if not await safe_defer(interaction):
             return
         select = next(
-            item for item in self.walk_children()
-            if isinstance(item, discord.ui.Select) and item.custom_id == "tidalplayer:v2:suggestions"
+            (
+                item for item in self.walk_children()
+                if isinstance(item, discord.ui.Select) and item.custom_id == "tidalplayer:v2:suggestions"
+            ),
+            None,
         )
+        if select is None:
+            await interaction.followup.send(
+                "These suggestions expired. Play a track again to refresh them.",
+                ephemeral=True,
+            )
+            return
         if not select.values or select.values[0] == "none":
             await interaction.followup.send("No suggestion was selected.", ephemeral=True)
             return

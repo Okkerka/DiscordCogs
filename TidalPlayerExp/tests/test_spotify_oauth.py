@@ -409,7 +409,7 @@ async def test_spotify_playlist_requires_user_oauth_before_api_request(cog) -> N
 
     await cog._handle_spotify_playlist(
         ctx,
-        "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
+        "37i9dQZF1DXcBWIGoYBM5M",
     )
 
     cog.sp.playlist.assert_not_called()

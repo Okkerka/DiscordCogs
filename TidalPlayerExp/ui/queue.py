@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
 _PAGE_SIZE = 10
 _MENTIONS_NONE = discord.AllowedMentions.none()
+_REPEAT_LABELS = {"off": "Off", "track": "Track", "queue": "Queue"}
 
 
 def _display(value: object, limit: int) -> str:
@@ -64,6 +65,8 @@ class QueueView(discord.ui.LayoutView):
             if value is not None:
                 if isinstance(value, bool):
                     value = "On" if value else "Off"
+                elif field == "repeat":
+                    value = _REPEAT_LABELS.get(str(value).casefold(), str(value))
                 states.append(f"{label}: {_display(value, 48)}")
         return " · ".join(states)
 

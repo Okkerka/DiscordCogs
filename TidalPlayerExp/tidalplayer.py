@@ -34,10 +34,9 @@ from .domain.candidates import NormalizedCandidate
 from .domain.matching import select_best_tidal_track, select_confident_youtube_tidal_track
 from .domain.identity import normalize_identity_text, recording_signature
 from .domain.normalization import (
-    FILTER_REGEX, ISRC_PATTERN, SPOTIFY_ALBUM_PATTERN, SPOTIFY_PLAYLIST_PATTERN,
-    SPOTIFY_TRACK_PATTERN,
-    YOUTUBE_SKIP_TITLES, ensure_aware as _ensure_aware,
-    format_duration, make_tidal_url, truncate, utc_now as _utc_now,
+    FILTER_REGEX, ISRC_PATTERN,
+    YOUTUBE_SKIP_TITLES, clamp_text, ensure_aware as _ensure_aware,
+    format_duration, make_tidal_url, utc_now as _utc_now,
 )
 from .ui.embeds import (
     COLOR_BLUE, COLOR_GREEN, COLOR_PURPLE, COLOR_RED, COLOR_TEAL, Messages,
@@ -3403,7 +3402,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         if cancel_event is None:
             await ctx.send(embed=_error_embed(Messages.ERROR_BATCH_IN_PROGRESS))
             return
-        trunc_name = truncate(name, 50)
+        trunc_name = clamp_text(name, 50)
         total = len(items)
         initial_embed = discord.Embed(
             title=Messages.PROGRESS_QUEUEING.format(name=trunc_name, count=total), color=color
@@ -3456,7 +3455,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             if status == "Finished":
                 final = discord.Embed(
                     title=Messages.SUCCESS_PARTIAL_QUEUE.format(queued=queued, total=total, skipped=skipped),
-                    description=f"Source: {truncate(name, 100)}",
+                    description=f"Source: {clamp_text(name, 100)}",
                     color=color,
                 )
             else:
@@ -3595,7 +3594,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                     "album": self._handle_spotify_album,
                     "track": self._handle_spotify_track,
                 }
-                await handlers[provider_url.content_type](ctx, query)
+                await handlers[provider_url.content_type](ctx, provider_url.identifier)
             elif provider_url.provider in {ProviderKind.SOUNDCLOUD, ProviderKind.BANDCAMP}:
                 await self._handle_public_audio(ctx, provider_url)
             elif provider_url.content_type == "playlist":
@@ -3763,7 +3762,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                     self.attachment_resolver.discard(reference)
 
     @playback_request(batch=True)
-    async def _handle_spotify_playlist(self, ctx: commands.Context, url: str) -> None:
+    async def _handle_spotify_playlist(self, ctx: commands.Context, playlist_id: str) -> None:
         if not await self._spotify_ready():
             await ctx.send(embed=_error_embed(Messages.ERROR_NO_SPOTIFY))
             return
@@ -3775,11 +3774,6 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                 )
             )
             return
-        match = SPOTIFY_PLAYLIST_PATTERN.search(url)
-        if not match:
-            await ctx.send(embed=_error_embed(Messages.ERROR_INVALID_URL.format(platform="Spotify", content_type="playlist")))
-            return
-        playlist_id = match.group(1)
         try:
             meta = await self._run_spotify(
                 lambda client: client.playlist(playlist_id, fields="name,images"),
@@ -3797,15 +3791,10 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             await ctx.send(embed=_error_embed(Messages.ERROR_FETCH_FAILED))
 
     @playback_request()
-    async def _handle_spotify_track(self, ctx: commands.Context, url: str) -> None:
+    async def _handle_spotify_track(self, ctx: commands.Context, track_id: str) -> None:
         if not await self._spotify_ready():
             await ctx.send(embed=_error_embed(Messages.ERROR_NO_SPOTIFY))
             return
-        match = SPOTIFY_TRACK_PATTERN.search(url)
-        if not match:
-            await ctx.send(embed=_error_embed(Messages.ERROR_INVALID_URL.format(platform="Spotify", content_type="track")))
-            return
-        track_id = match.group(1)
         try:
             item = await self._run_spotify(
                 lambda client: client.track(track_id),
@@ -3830,15 +3819,10 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             await ctx.send(embed=_error_embed(Messages.ERROR_FETCH_FAILED))
 
     @playback_request(batch=True)
-    async def _handle_spotify_album(self, ctx: commands.Context, url: str) -> None:
+    async def _handle_spotify_album(self, ctx: commands.Context, album_id: str) -> None:
         if not await self._spotify_ready():
             await ctx.send(embed=_error_embed(Messages.ERROR_NO_SPOTIFY))
             return
-        match = SPOTIFY_ALBUM_PATTERN.search(url)
-        if not match:
-            await ctx.send(embed=_error_embed(Messages.ERROR_INVALID_URL.format(platform="Spotify", content_type="album")))
-            return
-        album_id = match.group(1)
         try:
             album_meta = await self._run_spotify(
                 lambda client: client.album(album_id),

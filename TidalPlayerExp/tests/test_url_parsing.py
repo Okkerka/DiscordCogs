@@ -39,47 +39,6 @@ def mod():
 
 
 # ---------------------------------------------------------------------------
-# Spotify patterns
-# ---------------------------------------------------------------------------
-
-class TestSpotifyPlaylistPattern:
-    def test_valid(self, mod):
-        assert mod.SPOTIFY_PLAYLIST_PATTERN.search(
-            "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"
-        )
-
-    def test_no_match_track(self, mod):
-        assert not mod.SPOTIFY_PLAYLIST_PATTERN.search(
-            "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC"
-        )
-
-    def test_extracts_id(self, mod):
-        m = mod.SPOTIFY_PLAYLIST_PATTERN.search(
-            "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"
-        )
-        assert m and m.group(1) == "37i9dQZF1DXcBWIGoYBM5M"
-
-
-class TestSpotifyTrackPattern:
-    def test_valid(self, mod):
-        assert mod.SPOTIFY_TRACK_PATTERN.search(
-            "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC"
-        )
-
-    def test_no_match_album(self, mod):
-        assert not mod.SPOTIFY_TRACK_PATTERN.search(
-            "https://open.spotify.com/album/1NAmidJlEaVgA3MpcPFYGq"
-        )
-
-
-class TestSpotifyAlbumPattern:
-    def test_valid(self, mod):
-        assert mod.SPOTIFY_ALBUM_PATTERN.search(
-            "https://open.spotify.com/album/1NAmidJlEaVgA3MpcPFYGq"
-        )
-
-
-# ---------------------------------------------------------------------------
 # YouTube provider URLs
 # ---------------------------------------------------------------------------
 
@@ -199,23 +158,33 @@ class TestISRCPattern:
 
 
 # ---------------------------------------------------------------------------
-# truncate helper
+# clamp_text helper
 # ---------------------------------------------------------------------------
 
-class TestTruncate:
+class TestClampText:
     def test_short_string_unchanged(self, mod):
-        assert mod.truncate("hello", 10) == "hello"
+        assert mod.clamp_text("hello", 10) == "hello"
 
     def test_exact_length_unchanged(self, mod):
-        assert mod.truncate("hello", 5) == "hello"
+        assert mod.clamp_text("hello", 5) == "hello"
 
     def test_long_string_truncated(self, mod):
-        result = mod.truncate("a" * 20, 10)
-        assert result == "a" * 7 + "..."
+        result = mod.clamp_text("a" * 20, 10)
+        assert result == "a" * 9 + "…"
         assert len(result) == 10
 
-    @given(st.text(max_size=300), st.integers(min_value=3, max_value=300))
+    def test_limit_below_the_ellipsis_still_respects_the_limit(self, mod):
+        for limit in (1, 2, 3):
+            assert len(mod.clamp_text("abcdef", limit)) <= limit
+
+    @given(st.text(max_size=300), st.integers(min_value=1, max_value=300))
     @settings(max_examples=300)
     def test_result_never_exceeds_limit(self, mod, text: str, limit: int):
-        result = mod.truncate(text, limit)
+        result = mod.clamp_text(text, limit)
         assert len(result) <= limit
+
+    @given(st.text(max_size=300), st.integers(min_value=1, max_value=300))
+    @settings(max_examples=300)
+    def test_result_never_exceeds_the_limit_in_utf16_units(self, mod, text: str, limit: int):
+        result = mod.clamp_text(text, limit)
+        assert len(result.encode("utf-16-le")) // 2 <= limit
