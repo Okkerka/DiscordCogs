@@ -31,6 +31,9 @@ _VARIANT_ALIASES = {
     "slowed down": "slowed",
     "sped up": "sped up",
 }
+# Words that only join two artist names never decide a match.
+_ARTIST_JOINERS = frozenset({"feat", "ft", "featuring", "and", "with"})
+
 # Remaster markers describe a mastering generation, not a different recording.
 # External providers usually omit them while Tidal keeps them in the version
 # suffix, so a one-sided remaster marker must not reject the catalog copy.
@@ -88,12 +91,34 @@ def _tokens(value: str) -> frozenset[str]:
     return frozenset(value.split())
 
 
+def _artist_tokens(value: str) -> set[str]:
+    """Return an artist credit's names without the words that join them."""
+    return {token for token in _normalize(value).split() if token not in _ARTIST_JOINERS}
+
+
 def _artist_is_explicit(artist: str, video_title: str, channel: str) -> bool:
     artist_tokens = _tokens(_normalize(artist))
     return bool(artist_tokens) and (
         artist_tokens <= _tokens(_normalize(video_title))
         or artist_tokens <= _tokens(_normalize(channel))
     )
+
+
+def _artist_matches(candidates: tuple[str, ...], artist: str) -> bool:
+    """Accept a catalog credit that names exactly the candidate's artists.
+
+    A Tidal track carries one artist string, while a multi-artist candidate
+    lists several names. The credit must name the same artists, no more and
+    no fewer, so a partial or unrelated credit never matches.
+    """
+    normalized = _normalize(artist)
+    if not normalized or not candidates:
+        return False
+    tokens = _artist_tokens(normalized)
+    union: set[str] = set()
+    for value in candidates:
+        union |= _artist_tokens(value)
+    return bool(union) and union == tokens
 
 
 def select_confident_youtube_tidal_track(
@@ -144,19 +169,24 @@ def select_best_tidal_track(query: str | NormalizedCandidate, tracks: Iterable[A
     normalized_query = _normalize(structured.query if structured else query)
     if not normalized_query:
         return None
+    # The candidate side of every comparison is the same for each track.
+    structured_variants = _recording_variants(structured.title) if structured else frozenset()
+    structured_identity = _identity_title(structured.title) if structured else ""
+    query_tokens = _tokens(normalized_query)
     best_track: Any | None = None
     best_score = 0.0
     best_exact = False
     for track in tracks:
-        title, artist = _normalize(_title(track)), _normalize(_artist(track))
+        raw_title = _title(track)
+        title, artist = _normalize(raw_title), _normalize(_artist(track))
         if not title:
             continue
         if structured:
-            if not artist or not any(_normalize(value) == artist for value in structured.artists):
+            if not artist or not _artist_matches(structured.artists, artist):
                 continue
-            if not _variants_match(_recording_variants(structured.title), _recording_variants(_title(track))):
+            if not _variants_match(structured_variants, _recording_variants(raw_title)):
                 continue
-            if _identity_title(structured.title) != _identity_title(_title(track)):
+            if structured_identity != _identity_title(raw_title):
                 continue
             duration = getattr(track, "duration", None)
             if (structured.duration and isinstance(duration, (int, float)) and duration > 0
@@ -165,10 +195,12 @@ def select_best_tidal_track(query: str | NormalizedCandidate, tracks: Iterable[A
             # The gates above already pinned the recording; score the canonical
             # title so a Tidal version suffix ("(Remastered 2011)") cannot dilute
             # the match below the threshold.
-            score_title = _identity_title(_title(track))
+            score_title = _identity_title(raw_title)
         else:
-            if normalized_query != title and not _artist_is_explicit(artist, normalized_query, ""):
-                continue
+            if normalized_query != title:
+                artist_tokens = _tokens(_normalize(_artist(track)))
+                if not (artist_tokens and artist_tokens <= query_tokens):
+                    continue
             score_title = title
         title_score = fuzz.token_set_ratio(normalized_query, score_title)
         combined_score = fuzz.token_set_ratio(normalized_query, _normalize(f"{score_title} {_artist(track)}"))

@@ -15,7 +15,6 @@ from .public_audio import PublicAudioResolver
 from .youtube_resolver import (
     YouTubeResolver,
     _metadata_from_mapping,
-    _validated_dependency_root,
 )
 
 _SEARCH_DEADLINE = 30.0
@@ -42,10 +41,8 @@ def _validated_query(query: object) -> str:
 
 
 def _search_args(worker: YouTubeResolver, query: str, platform: Literal["youtube", "soundcloud"]) -> list[str]:
-    root = _validated_dependency_root(worker._yt_dlp_locator())
-    args = worker._common_args("", root)
-    index = args.index("--js-runtimes")
-    del args[index:index + 2]
+    root = worker._resolved_dependency_root()
+    args = worker._common_args(None, root)
     if platform == "youtube":
         extractor = "^youtube:search$,^youtube$"
         template = _YOUTUBE_TEMPLATE

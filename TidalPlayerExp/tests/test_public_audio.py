@@ -121,6 +121,26 @@ def _source(url=SOUNDCLOUD, **changes):
 
 
 @pytest.mark.asyncio
+async def test_the_extractor_root_is_discovered_once_per_worker(tmp_path):
+    """Discovery scans installed distributions; it must not run per request."""
+    resolver, worker, calls = _resolver(tmp_path, _metadata())
+    discoveries = []
+    located = worker._yt_dlp_locator
+
+    def counting_locator():
+        discoveries.append(1)
+        return located()
+
+    worker._yt_dlp_locator = counting_locator
+    reference = SourceReference(SourceKind.SOUNDCLOUD, SOUNDCLOUD)
+
+    await resolver.fetch_metadata(reference)
+    await resolver.fetch_metadata(reference)
+
+    assert len(discoveries) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind,url", [("soundcloud", SOUNDCLOUD), ("bandcamp", BANDCAMP)])
 async def test_public_audio_metadata_detaches_safe_scalars_and_restricts_child_extractors(tmp_path, kind, url):
     resolver, worker, calls = _resolver(tmp_path, _metadata(url))

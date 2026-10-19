@@ -34,19 +34,36 @@ def parse_position(value: str) -> int | None:
     return total
 
 
+def _cooldown_query(ctx: commands.Context) -> str:
+    """Read the requested query, whichever way the command was invoked.
+
+    Cooldowns are prepared before the arguments are parsed, so the parsed
+    query is not always available. A slash invocation carries its options
+    and a prefix invocation carries the message text.
+    """
+    kwargs = getattr(ctx, "kwargs", None) or {}
+    if kwargs.get("query"):
+        return str(kwargs["query"]).lower()
+    interaction = getattr(ctx, "interaction", None)
+    data = getattr(interaction, "data", None) if interaction is not None else None
+    if data:
+        options = data.get("options") or []
+        return " ".join(str(option.get("value", "")) for option in options).lower()
+    message = getattr(ctx, "message", None)
+    content = str(getattr(message, "content", "") or "")
+    prefix = str(getattr(ctx, "prefix", "") or "")
+    if prefix and content.startswith(prefix):
+        content = content[len(prefix):]
+    command = getattr(ctx, "command", None)
+    name = str(getattr(command, "qualified_name", "") or "")
+    if name and content.lower().startswith(name.lower()):
+        content = content[len(name):]
+    return content.lower()
+
+
 def playback_cooldown(ctx: commands.Context) -> commands.Cooldown:
     """Per-user cooldown: 3.5s for normal searches/tracks, 10s for playlist/album imports."""
-    query = ""
-    if ctx.kwargs and "query" in ctx.kwargs:
-        query = str(ctx.kwargs["query"] or "").lower()
-    elif ctx.args and len(ctx.args) > 2:
-        query = " ".join(str(a) for a in ctx.args[2:]).lower()
-    elif getattr(ctx, "message", None) and ctx.message.content:
-        query = ctx.message.content.lower()
-    elif getattr(ctx, "interaction", None) and getattr(ctx.interaction, "data", None):
-        options = ctx.interaction.data.get("options", [])
-        query = " ".join(str(opt.get("value", "")) for opt in options).lower()
-
+    query = _cooldown_query(ctx)
     if any(k in query for k in ("playlist", "album", "mix", "/sets/")):
         return commands.Cooldown(1, 10.0)
     return commands.Cooldown(1, 3.5)

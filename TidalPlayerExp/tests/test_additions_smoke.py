@@ -40,6 +40,48 @@ def test_playback_cooldown_returns_longer_duration_for_playlists() -> None:
     assert cd_album.per == 10.0
 
 
+def test_playback_cooldown_reads_the_query_from_a_slash_invocation() -> None:
+    """The options are the only query a slash invocation carries."""
+    from TidalPlayerExp.commands import playback_cooldown
+
+    slash = SimpleNamespace(
+        kwargs={}, args=(),
+        message=None,
+        interaction=SimpleNamespace(data={"options": [{"value": "https://tidal.com/playlist/abc"}]}),
+    )
+    assert playback_cooldown(slash).per == 10.0
+
+    normal = SimpleNamespace(
+        kwargs={}, args=(),
+        message=None,
+        interaction=SimpleNamespace(data={"options": [{"value": "coldplay yellow"}]}),
+    )
+    assert playback_cooldown(normal).per == 3.5
+
+
+def test_playback_cooldown_reads_the_query_from_a_prefix_invocation() -> None:
+    """A prefix invocation carries the message text, not the parsed query."""
+    from TidalPlayerExp.commands import playback_cooldown
+
+    prefix = SimpleNamespace(
+        kwargs={}, args=(),
+        message=SimpleNamespace(content="[p]play https://tidal.com/playlist/abc"),
+        interaction=None,
+        prefix="[p]",
+        command=SimpleNamespace(qualified_name="play"),
+    )
+    assert playback_cooldown(prefix).per == 10.0
+
+    normal = SimpleNamespace(
+        kwargs={}, args=(),
+        message=SimpleNamespace(content="[p]play coldplay yellow"),
+        interaction=None,
+        prefix="[p]",
+        command=SimpleNamespace(qualified_name="play"),
+    )
+    assert playback_cooldown(normal).per == 3.5
+
+
 def test_track_info_displays_position_and_remaining() -> None:
     meta = _meta(duration=200)
     info = _track_info(meta, autoplay_enabled=False, position=50.0)

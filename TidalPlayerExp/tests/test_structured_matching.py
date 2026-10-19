@@ -38,6 +38,21 @@ def test_structured_metadata_selects_the_matching_recording():
     assert select_best_tidal_track(candidate, [track(artist="John Smith"), right]) is right
 
 
+@pytest.mark.parametrize("credit", ["A & B", "A, B", "A and B", "A feat. B"])
+def test_a_multi_artist_candidate_matches_a_credit_that_names_both_artists(credit):
+    """A catalog credit lists one string; a candidate can list several names."""
+    right = track(title="Night Drive", artist=credit)
+    candidate = NormalizedCandidate("Night Drive", ("A", "B"), source="spotify")
+    assert select_best_tidal_track(candidate, [right]) is right
+
+
+@pytest.mark.parametrize("credit", ["A", "A & C", "AB"])
+def test_a_credit_that_names_other_artists_never_matches_a_multi_artist_candidate(credit):
+    wrong = track(title="Night Drive", artist=credit)
+    candidate = NormalizedCandidate("Night Drive", ("A", "B"), source="spotify")
+    assert select_best_tidal_track(candidate, [wrong]) is None
+
+
 def test_missing_structured_artist_never_becomes_title_only_match():
     assert select_best_tidal_track(NormalizedCandidate("The Night We Met", ()), [track()]) is None
 

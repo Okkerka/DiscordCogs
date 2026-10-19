@@ -19,7 +19,6 @@ from .youtube_resolver import (
     YouTubeResolver,
     _safe_display,
     _valid_https_url,
-    _validated_dependency_root,
 )
 
 _KINDS = (SourceKind.SOUNDCLOUD, SourceKind.BANDCAMP)
@@ -92,12 +91,10 @@ class PublicAudioResolver:
     ) -> bytes:
         output = None
         try:
-            root = _validated_dependency_root(self._worker._yt_dlp_locator())
-            args = self._worker._common_args("", root)
-            # These extractors do not use a JS engine. Retain --no-js-runtimes
-            # while removing the YouTube worker's explicit Deno opt-in.
-            index = args.index("--js-runtimes")
-            del args[index:index + 2]
+            root = self._worker._resolved_dependency_root()
+            # These extractors do not use a JS engine, so the child runs with
+            # the JavaScript runtime disabled.
+            args = self._worker._common_args(None, root)
             extractor = "^soundcloud$" if kind is SourceKind.SOUNDCLOUD else "^Bandcamp$"
             if limit is not None:
                 extractor += ",^soundcloud:set$" if kind is SourceKind.SOUNDCLOUD else ",^Bandcamp:album$"

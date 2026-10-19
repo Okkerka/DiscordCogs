@@ -324,9 +324,14 @@ class YouTubeResolver:
             self._dependency_root_cache = cached
         return cached
 
-    def _common_args(self, deno: str, dependency_root: str) -> list[str]:
+    def _common_args(self, deno: str | None, dependency_root: str) -> list[str]:
         # netrc is opt-in in yt-dlp. Ignore configuration and never enable it;
         # there is no corresponding --no-netrc CLI option.
+        # The JavaScript runtime is named explicitly: extractors that need it
+        # get the Deno pair, the others run with the runtime disabled.
+        runtime = ["--no-js-runtimes"]
+        if deno:
+            runtime += ["--js-runtimes", f"deno:{deno}"]
         return [
             sys.executable,
             "-I",
@@ -335,9 +340,7 @@ class YouTubeResolver:
             dependency_root,
             "--ignore-config",
             "--no-plugin-dirs",
-            "--no-js-runtimes",
-            "--js-runtimes",
-            f"deno:{deno}",
+            *runtime,
             "--no-cache-dir",
             "--no-update",
             "--no-download",

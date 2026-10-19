@@ -87,6 +87,32 @@ async def test_youtube_search_queues_stable_metadata_and_only_a_bounded_projecte
 
 
 @pytest.mark.asyncio
+async def test_the_extractor_root_is_discovered_once_per_worker(tmp_path, monkeypatch):
+    """Discovery scans installed distributions; it must not run per request."""
+    worker = _worker(tmp_path)
+    discoveries = []
+    located = worker._yt_dlp_locator
+
+    def counting_locator():
+        discoveries.append(1)
+        return located()
+
+    worker._yt_dlp_locator = counting_locator
+
+    async def run_child(args: list[str], *, deadline: float, ceiling: int) -> bytes:
+        return json.dumps(_youtube()).encode()
+
+    monkeypatch.setattr(worker, "_run_child", run_child)
+    try:
+        await search_provider(worker, "a song", "youtube")
+        await search_provider(worker, "another song", "youtube")
+    finally:
+        await worker.close()
+
+    assert len(discoveries) == 1
+
+
+@pytest.mark.asyncio
 async def test_soundcloud_search_returns_only_a_canonical_public_track(tmp_path, monkeypatch):
     """Accepting arbitrary hosts or private SoundCloud results would enqueue unsafe references."""
     worker = _worker(tmp_path)
