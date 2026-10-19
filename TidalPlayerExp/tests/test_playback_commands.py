@@ -83,8 +83,9 @@ async def test_skip_command_names_the_actor(controls):
     await session.enqueue(entry(1))
     await sink.expect("started")
     await cog.skip_command(ctx)
-    text, kwargs = ctx.send.await_args.args[0], ctx.send.await_args.kwargs
-    assert text == "<@42> skipped 1."
+    view, kwargs = ctx.send.await_args.kwargs["view"], ctx.send.await_args.kwargs
+    assert view.text == "### ⏭ Skipped\n<@42> skipped **1**."
+    assert ctx.send.await_args.args == ()
     assert kwargs["allowed_mentions"].users is False
 
 
@@ -96,8 +97,11 @@ async def test_stop_command_names_the_actor(controls):
     await session.enqueue(entry(1))
     await sink.expect("started")
     await cog.stop_command(ctx)
-    text = ctx.send.await_args.args[0]
-    assert text == "⏹ <@42> stopped the playback. Queue cleared and imports cancelled."
+    view = ctx.send.await_args.kwargs["view"]
+    assert view.text == (
+        "### ⏹ Playback stopped\n"
+        "<@42> stopped the playback. Queue cleared and imports cancelled."
+    )
 
 
 @pytest.mark.asyncio

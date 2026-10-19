@@ -44,6 +44,7 @@ from .ui.embeds import (
     error_embed as _error_embed, make_queue_embed, success_embed as _success_embed,
 )
 from .ui.controller import PlayerControllerView
+from .ui.notice import skip_notice, stop_notice
 from .ui.queue import QueueView
 from .ui.interactions import safe_defer
 from .ui.display import clamp_text, escape_display
@@ -2863,9 +2864,9 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             return
         user = getattr(interaction, "user", None)
         who = getattr(user, "mention", None) or "Someone"
-        skipped = f"skipped {escape_display(title)}." if title else "skipped the current song."
         await interaction.followup.send(
-            f"{who} {skipped}", allowed_mentions=discord.AllowedMentions.none(),
+            view=skip_notice(who, title or None),
+            allowed_mentions=discord.AllowedMentions.none(),
         )
 
     async def can_control_player(self, interaction: discord.Interaction) -> bool:
@@ -3017,7 +3018,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         user = getattr(interaction, "user", None)
         who = getattr(user, "mention", None) or "Someone"
         await interaction.followup.send(
-            f"⏹ {who} stopped the playback. Queue cleared.",
+            view=stop_notice(who, "Queue cleared."),
             allowed_mentions=discord.AllowedMentions.none(),
         )
 

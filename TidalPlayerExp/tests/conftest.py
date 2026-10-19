@@ -185,6 +185,25 @@ def _make_discord_stub() -> types.ModuleType:
     discord.ui.LayoutView = _View
     discord.ui.Button = MagicMock()
 
+    class _Container:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.children: list[Any] = []
+            self.accent_colour = kwargs.get("accent_colour")
+
+        def add_item(self, item: Any) -> None:
+            self.children.append(item)
+
+    class _TextDisplay:
+        def __init__(self, content: str) -> None:
+            self.content = content
+
+    discord.ui.Container = _Container
+    discord.ui.TextDisplay = _TextDisplay
+    discord.ui.Separator = _Container
+    discord.SeparatorSpacing = MagicMock()
+    discord.SeparatorSpacing.small = 1
+    discord.Colour = discord.Color
+
     class _Modal:
         def __init_subclass__(cls, **_kwargs: Any) -> None:
             return super().__init_subclass__()

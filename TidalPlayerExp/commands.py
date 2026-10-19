@@ -11,6 +11,7 @@ from .domain.normalization import format_duration
 from .playback.interfaces import PlaybackSession
 from .playback.requests import current_request, playback_request
 from .ui.display import escape_display
+from .ui.notice import NoticeView, skip_notice, stop_notice
 
 # A cancelled import that is stuck in a provider call must not keep the guild's
 # batch claim until unload; stop releases it after this bounded grace.
@@ -81,6 +82,14 @@ class PlaybackCommands:
 
     async def _reply(self, ctx: commands.Context, text: str) -> None:
         await ctx.send(text, allowed_mentions=discord.AllowedMentions.none())
+
+    async def _reply_notice(self, ctx: commands.Context, view: NoticeView) -> None:
+        """Send a Components V2 confirmation that can never ping."""
+        try:
+            await ctx.send(view=view, allowed_mentions=discord.AllowedMentions.none())
+        except BaseException:
+            view.stop()
+            raise
 
     async def _control_session(self, ctx: commands.Context) -> PlaybackSession | None:
         await self._defer(ctx)
@@ -160,7 +169,7 @@ class PlaybackCommands:
             return
         who = getattr(ctx.author, "mention", None) or "Someone"
         await self._stop_playback(ctx.guild.id)
-        await self._reply(ctx, f"⏹ {who} stopped the playback. Queue cleared and imports cancelled.")
+        await self._reply_notice(ctx, stop_notice(who, "Queue cleared and imports cancelled."))
 
     @commands.hybrid_group(name="remove", fallback="track", invoke_without_command=True)
     @commands.guild_only()
@@ -261,10 +270,7 @@ class PlaybackCommands:
         if not await session.skip():
             await self._reply(ctx, "Nothing is playing.")
             return
-        if title:
-            await self._reply(ctx, f"{who} skipped {escape_display(title)}.")
-        else:
-            await self._reply(ctx, f"{who} skipped the current song.")
+        await self._reply_notice(ctx, skip_notice(who, title or None))
 
     @commands.hybrid_command(name="move")
     @commands.guild_only()
