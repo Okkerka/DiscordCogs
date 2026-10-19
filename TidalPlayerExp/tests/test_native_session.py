@@ -226,6 +226,33 @@ async def test_audio_duration_reaches_start_event_without_mutating_queued_metada
 
 
 @pytest.mark.asyncio
+async def test_pause_during_rebuffer_starts_the_replacement_paused():
+    voice, resolver, factory, sink = Voice(), Resolver(), Factory(), Sink()
+    session = NativePlaybackSession(1, voice, resolver, factory, sink)
+    try:
+        assert await session.enqueue(entry())
+        await sink.expect("started")
+
+        factory.entered.clear()
+        factory.gate = asyncio.Event()
+        seeking = asyncio.create_task(session.seek(5))
+        await factory.entered.wait()
+
+        # The replacement source is still loading: the click must be recorded
+        # instead of being dropped or inverted.
+        assert await session.set_paused(True) is True
+        factory.gate.set()
+        assert await seeking is True
+        await sink.expect("started")
+
+        assert sink.started[-1].start_time == 5
+        assert session.snapshot().paused is True
+        assert voice.paused is True
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_fifo_pause_resume_and_threaded_duplicate_end():
     session, voice, resolver, factory, sink = setup()
     assert await session.enqueue(entry(1))

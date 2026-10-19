@@ -105,7 +105,7 @@ async def test_stop_cancels_pending_recommendation_admission(cog):
     await ready.wait()
     await cog.controller_stop(interaction)
     release.set()
-    assert not await pending
+    assert await pending == "failed"
     session.enqueue.assert_not_awaited()
 
 

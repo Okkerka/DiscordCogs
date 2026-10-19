@@ -146,11 +146,19 @@ class _HandlerFake:
         return value
 
     async def _run_with_backoff(
-        self, func: Callable[[], object], timeout: float = 10.0
+        self,
+        func: Callable[[], object],
+        timeout: float = 10.0,
+        *,
+        semaphore: asyncio.Semaphore | None = None,
     ) -> object:
         del timeout
-        self.provider_calls += 1
-        return func()
+        if semaphore is None:
+            self.provider_calls += 1
+            return func()
+        async with semaphore:
+            self.provider_calls += 1
+            return func()
 
     async def unload(self) -> None:
         self.unload_calls += 1

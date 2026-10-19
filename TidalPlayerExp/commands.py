@@ -158,8 +158,9 @@ class PlaybackCommands:
         if not self._can_cancel_request(ctx, session):
             await self._reply(ctx, "Join the bot's voice channel to stop playback.")
             return
+        who = getattr(ctx.author, "mention", None) or "Someone"
         await self._stop_playback(ctx.guild.id)
-        await self._reply(ctx, "⏹ Playback stopped. Queue cleared and imports cancelled.")
+        await self._reply(ctx, f"⏹ {who} stopped the playback. Queue cleared and imports cancelled.")
 
     @commands.hybrid_group(name="remove", fallback="track", invoke_without_command=True)
     @commands.guild_only()
@@ -252,9 +253,18 @@ class PlaybackCommands:
     async def skip_command(self, ctx: commands.Context) -> None:
         """Skip the current song and continue with the next waiting track."""
         session = await self._control_session(ctx)
-        if session is not None:
-            skipped = await session.skip()
-            await self._reply(ctx, "Skipped." if skipped else "Nothing is playing.")
+        if session is None:
+            return
+        current = session.snapshot().current
+        title = str(current.meta.get("title") or "") if current is not None else ""
+        who = getattr(ctx.author, "mention", None) or "Someone"
+        if not await session.skip():
+            await self._reply(ctx, "Nothing is playing.")
+            return
+        if title:
+            await self._reply(ctx, f"{who} skipped {escape_display(title)}.")
+        else:
+            await self._reply(ctx, f"{who} skipped the current song.")
 
     @commands.hybrid_command(name="move")
     @commands.guild_only()

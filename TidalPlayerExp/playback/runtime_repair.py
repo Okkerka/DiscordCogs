@@ -559,7 +559,12 @@ class ManagedRuntime:
         except OSError as exc:
             raise RuntimeRepairError("activation_failed") from exc
         finally:
-            if marker is not None:
-                marker.unlink(missing_ok=True)
-            if stage is not None:
-                shutil.rmtree(stage)
+            # Cleanup must not replace the mapped error: a Windows handle still
+            # held by a just-run validation binary can make rmtree raise.
+            try:
+                if marker is not None:
+                    marker.unlink(missing_ok=True)
+                if stage is not None:
+                    shutil.rmtree(stage)
+            except OSError:
+                pass

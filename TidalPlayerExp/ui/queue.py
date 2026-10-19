@@ -10,6 +10,7 @@ from ..domain.normalization import format_duration
 from ..playback.models import PlaybackEntry, PlaybackSnapshot
 from .display import clamp_text, escape_display
 from .embeds import display_duration
+from .interactions import safe_defer
 
 if TYPE_CHECKING:
     from ..tidalplayer import TidalPlayerExp
@@ -149,7 +150,8 @@ class QueueView(discord.ui.LayoutView):
 
     async def _update(self, interaction: discord.Interaction, *, page_delta: int = 0) -> None:
         """Serialize button clicks so each edit reflects one authoritative snapshot."""
-        await interaction.response.defer()
+        if not await safe_defer(interaction):
+            return
         async with self._update_lock:
             if self.is_finished():
                 return
@@ -158,11 +160,15 @@ class QueueView(discord.ui.LayoutView):
             self._build_layout()
             try:
                 await interaction.edit_original_response(view=self, allowed_mentions=_MENTIONS_NONE)
-            except (discord.HTTPException, discord.Forbidden, discord.NotFound):
-                # The panel was deleted or is no longer editable; retire it
-                # instead of letting every later click fail the same way.
+            except (discord.NotFound, discord.Forbidden):
+                # The panel was deleted or lost access; retire it instead of
+                # letting every later click fail the same way.
                 self.message = None
                 self.stop()
+            except discord.HTTPException:
+                # Transient failure (429/5xx): keep the panel so the next click
+                # or refresh can retry the edit.
+                return
 
     async def _back(self, interaction: discord.Interaction) -> None:
         await self._update(interaction, page_delta=-1)

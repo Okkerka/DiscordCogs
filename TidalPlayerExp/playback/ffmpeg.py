@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.resources
+import ipaddress
 import logging
 import os
 import re
@@ -18,6 +19,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Protocol, cast
+from urllib.parse import urlsplit
 
 import discord
 from discord import oggparse
@@ -255,6 +257,40 @@ def _default_spawn(
         creationflags=creationflags,
     )
     return cast(_ChildProcess, process)
+
+
+def _public_media_url(url: str) -> bool:
+    """Reject LAN and cloud-metadata media URLs at the FFmpeg boundary.
+
+    Resolvers validate their own URLs, but a compromised provider response
+    (TIDAL manifest, uploads) must not pivot FFmpeg into the local network or a
+    cloud metadata endpoint. Loopback stays allowed: local sources are a
+    legitimate pattern, while link-local (169.254.0.0/16, the metadata
+    endpoint) and private ranges are not.
+    """
+    try:
+        parts = urlsplit(url)
+        _ = parts.port
+        hostname = parts.hostname
+    except (TypeError, ValueError):
+        return False
+    if parts.scheme.lower() not in {"https", "http"} or not hostname:
+        return False
+    host = hostname.strip("[]").casefold()
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    if host.endswith((".local", ".internal")):
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    if address.is_loopback:
+        return True
+    return not (
+        address.is_private or address.is_link_local
+        or address.is_multicast or address.is_reserved or address.is_unspecified
+    )
 
 
 def _has_control(value: str) -> bool:
@@ -595,7 +631,7 @@ class FFmpegSourceFactory:
     def _argv(
         capability: FFmpegCapability, source: ResolvedSource, *, copied: bool
     ) -> list[str]:
-        if _has_control(source.url):
+        if _has_control(source.url) or not _public_media_url(source.url):
             raise PlaybackStartError()
         headers = FFmpegSourceFactory._safe_headers(source.headers)
         argv = [
@@ -743,8 +779,10 @@ class FFmpegSourceFactory:
                 asyncio.shield(priming), timeout=_PRIME_TIMEOUT_SECONDS
             )
         except asyncio.CancelledError:
-            await asyncio.shield(self._cleanup(source))
+            # Retain before awaiting cleanup: a second cancellation during that
+            # await must not leave the priming thread unowned.
             self._retain_background_task(priming)
+            await asyncio.shield(self._cleanup(source))
             raise
         except TimeoutError:
             await self._cleanup(source)

@@ -31,7 +31,11 @@ class TidalHandler(Protocol):
     async def get_video(self, video_id: str) -> object | None: ...
 
     async def _run_with_backoff(
-        self, func: Callable[[], object], timeout: float = 10.0
+        self,
+        func: Callable[[], object],
+        timeout: float = 10.0,
+        *,
+        semaphore: asyncio.Semaphore | None = None,
     ) -> object: ...
 
 
@@ -97,10 +101,11 @@ class TidalSourceResolver:
 
     async def _provider_call(self, operation: Callable[[], object]) -> object:
         try:
-            async with self._handler.api_semaphore:
-                return await self._handler._run_with_backoff(
-                    operation, timeout=_PROVIDER_TIMEOUT
-                )
+            # Acquire per attempt: a retry backoff must not pin one of the five
+            # provider slots for the whole retry window.
+            return await self._handler._run_with_backoff(
+                operation, timeout=_PROVIDER_TIMEOUT, semaphore=self._handler.api_semaphore,
+            )
         except asyncio.CancelledError:
             raise
         except PlaybackUnavailable:

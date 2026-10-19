@@ -26,6 +26,18 @@ def test_tidal_share_variants_keep_the_media_identity(host, prefix, suffix, kind
     )
 
 
+@pytest.mark.parametrize("prefix", ["", "intl-de/", "intl-pt-BR/", "embed/", "intl-de/embed/"])
+@pytest.mark.parametrize("kind,identifier", [
+    ("track", "4uLU6hMCjMI75M1A2tKUQC"),
+    ("album", "1NAmidJlEaVgA3MpcPFYGq"),
+    ("playlist", "37i9dQZF1DXcBWIGoYBM5M"),
+])
+def test_spotify_locale_and_embed_share_variants_keep_the_media_identity(prefix, kind, identifier):
+    assert parse_provider_url(
+        f"https://open.spotify.com/{prefix}{kind}/{identifier}"
+    ) == ProviderURL(ProviderKind.SPOTIFY, kind, identifier)
+
+
 @pytest.mark.parametrize("url", [
     "https://youtube.com/watch/?v=dQw4w9WgXcQ&t=45s",
     "https://www.youtube.com/watch/?v=dQw4w9WgXcQ&list=PL-example&index=3",

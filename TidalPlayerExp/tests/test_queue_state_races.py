@@ -53,6 +53,23 @@ async def test_skip_and_track_start_advance_exactly_once(cog, native_session):
 
 
 @pytest.mark.asyncio
+async def test_stop_click_announces_the_actor(cog, native_session):
+    guild = SimpleNamespace(id=53)
+    current = make_entry(1)
+    native_session.current = current
+    cog._current_entries[guild.id] = current
+    interaction = make_controller_interaction(guild)
+    interaction.user = SimpleNamespace(mention="<@7>")
+
+    await cog.controller_stop(interaction)
+
+    native_session.stop.assert_awaited_once_with(clear_queue=True)
+    interaction.followup.send.assert_awaited_once()
+    assert interaction.followup.send.await_args.args[0] == "⏹ <@7> stopped the playback. Queue cleared."
+    assert interaction.followup.send.await_args.kwargs["allowed_mentions"].users is False
+
+
+@pytest.mark.asyncio
 async def test_skip_with_empty_queue_waits_for_end_event(cog, native_session):
     guild = SimpleNamespace(id=52)
     old = make_entry()
@@ -65,7 +82,8 @@ async def test_skip_with_empty_queue_waits_for_end_event(cog, native_session):
 
     assert cog._current_meta[guild.id] == old.meta
     cog._controller_view.assert_not_awaited()
-    interaction.followup.send.assert_not_awaited()
+    # The skip is announced to the channel without triggering an error path.
+    assert interaction.followup.send.await_args.args[0] == "Someone skipped Track 1."
     native_session.current = None
     await cog.queue_ended(guild.id, old)
     assert guild.id not in cog._current_meta

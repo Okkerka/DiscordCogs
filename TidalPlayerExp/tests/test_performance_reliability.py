@@ -508,7 +508,7 @@ async def test_recommendation_cannot_queue_a_song_already_in_the_queue(cog, nati
     )
     candidate = SimpleNamespace(id=2, name="Suggested", artist=SimpleNamespace(name="Artist"))
     cog._extract_meta = AsyncMock()
-    assert not await cog.queue_recommendation(interaction, candidate)
+    assert await cog.queue_recommendation(interaction, candidate) == "duplicate"
     cog._extract_meta.assert_not_awaited()
     native_session.enqueue.assert_not_awaited()
 
@@ -527,7 +527,7 @@ async def test_suggested_queue_confirmation_is_scheduled_for_deletion(cog, nativ
         patch.object(type(cog), "_extract_meta", new=AsyncMock(return_value=meta)),
         patch.object(type(cog), "_delete_after", new=AsyncMock()) as delete_after,
     ):
-        assert await cog.queue_recommendation(interaction, candidate)
+        assert await cog.queue_recommendation(interaction, candidate) == "queued"
         await asyncio.gather(*cog._tasks)
     assert native_session.entries[0].primary.identifier == "2"
     interaction.followup.send.assert_awaited_once()

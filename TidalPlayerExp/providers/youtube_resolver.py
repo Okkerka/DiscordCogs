@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import importlib.metadata
 import importlib.util
+import ipaddress
 import json
 import logging
 import math
@@ -68,6 +69,26 @@ def _safe_display(value: object, limit: int) -> str:
     return text if len(text) <= limit else text[: max(0, limit - 3)].rstrip() + "..."
 
 
+def _public_media_host(hostname: str) -> bool:
+    """Reject loopback/private/local literals before any media request.
+
+    The resolver only ever fetches provider CDNs; a hostile provider response
+    must not pivot the extraction child into the local network or a cloud
+    metadata endpoint.
+    """
+    host = hostname.strip("[]").casefold()
+    if not host or host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    return not (
+        address.is_private or address.is_loopback or address.is_link_local
+        or address.is_multicast or address.is_reserved or address.is_unspecified
+    )
+
+
 def _valid_https_url(value: object, *, limit: int | None = None) -> str:
     if (
         not isinstance(value, str)
@@ -85,6 +106,7 @@ def _valid_https_url(value: object, *, limit: int | None = None) -> str:
             and bool(parts.hostname)
             and parts.username is None
             and parts.password is None
+            and _public_media_host(parts.hostname)
             # Standard HTTPS URLs may omit an explicit port; ``parts.port``
             # access above still rejects malformed or out-of-range ports.
         )
@@ -285,6 +307,7 @@ class YouTubeResolver:
         self._process_factory = process_factory or asyncio.create_subprocess_exec
         self._deno_locator = deno_locator or _deno_path
         self._yt_dlp_locator = yt_dlp_locator or _yt_dlp_root
+        self._dependency_root_cache: str | None = None
         self._slots = asyncio.Semaphore(2)
         # Batch extraction may occupy at most one of the two shared slots, so a
         # 45 s playlist import can never queue an interactive resolve behind it.
@@ -297,6 +320,18 @@ class YouTubeResolver:
         self._late_factory_tasks: set[asyncio.Task[Any]] = set()
         self._closed = False
         self._state_lock = asyncio.Lock()
+
+    def _resolved_dependency_root(self) -> str:
+        """Locate and validate the extractor package root once per instance.
+
+        Discovery scans installed distributions and reads version files on the
+        event loop; the result cannot change while this cog stays loaded.
+        """
+        cached = self._dependency_root_cache
+        if cached is None:
+            cached = _validated_dependency_root(self._yt_dlp_locator())
+            self._dependency_root_cache = cached
+        return cached
 
     def _common_args(self, deno: str, dependency_root: str) -> list[str]:
         # netrc is opt-in in yt-dlp. Ignore configuration and never enable it;
@@ -608,7 +643,7 @@ class YouTubeResolver:
 
     async def _force_windows_tree(self, pid: int) -> bool:
         # taskkill.exe is an absolute system tool and is used only for our tracked PID.
-        system_root = os.environ.get("SystemRoot", r"C:\\Windows")
+        system_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR") or r"C:\Windows"
         taskkill = os.path.join(system_root, "System32", "taskkill.exe")
         if not os.path.isabs(taskkill) or not os.path.isfile(taskkill):
             return True
@@ -658,8 +693,7 @@ class YouTubeResolver:
             raise SourceResolutionError() from None
         try:
             deno = _validated_deno(self._deno_locator())
-            dependency_root = self._yt_dlp_locator()
-            dependency_root = _validated_dependency_root(dependency_root)
+            dependency_root = self._resolved_dependency_root()
             args = self._common_args(deno, dependency_root) + [
                 "--no-playlist",
                 "--format",
@@ -720,8 +754,7 @@ class YouTubeResolver:
             raise SourceResolutionError() from None
         try:
             deno = _validated_deno(self._deno_locator())
-            dependency_root = self._yt_dlp_locator()
-            dependency_root = _validated_dependency_root(dependency_root)
+            dependency_root = self._resolved_dependency_root()
             args = self._common_args(deno, dependency_root) + [
                 "--no-playlist",
                 "--print",
@@ -747,8 +780,7 @@ class YouTubeResolver:
             raise SourceResolutionError() from None
         try:
             deno = _validated_deno(self._deno_locator())
-            dependency_root = self._yt_dlp_locator()
-            dependency_root = _validated_dependency_root(dependency_root)
+            dependency_root = self._resolved_dependency_root()
             args = self._common_args(deno, dependency_root) + [
                 "--yes-playlist",
                 "--flat-playlist",

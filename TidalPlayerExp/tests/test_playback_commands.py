@@ -76,6 +76,31 @@ async def test_stop_clears_native_queue_and_cancels_initial_lookup(controls):
 
 
 @pytest.mark.asyncio
+async def test_skip_command_names_the_actor(controls):
+    cog, session, sink = controls
+    ctx = context()
+    ctx.author.mention = "<@42>"
+    await session.enqueue(entry(1))
+    await sink.expect("started")
+    await cog.skip_command(ctx)
+    text, kwargs = ctx.send.await_args.args[0], ctx.send.await_args.kwargs
+    assert text == "<@42> skipped 1."
+    assert kwargs["allowed_mentions"].users is False
+
+
+@pytest.mark.asyncio
+async def test_stop_command_names_the_actor(controls):
+    cog, session, sink = controls
+    ctx = context()
+    ctx.author.mention = "<@42>"
+    await session.enqueue(entry(1))
+    await sink.expect("started")
+    await cog.stop_command(ctx)
+    text = ctx.send.await_args.args[0]
+    assert text == "⏹ <@42> stopped the playback. Queue cleared and imports cancelled."
+
+
+@pytest.mark.asyncio
 async def test_overlapping_volume_commands_persist_in_application_order(controls, monkeypatch):
     cog, session, sink = controls
     setting = cog.config.guild_from_id(1).volume

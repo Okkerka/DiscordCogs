@@ -104,6 +104,12 @@ def parse_provider_url(value: str) -> ProviderURL | None:
             raise MalformedProviderURL("Unsupported Tidal collection identifier")
         return ProviderURL(ProviderKind.TIDAL, path[0], path[1])
     if host == "open.spotify.com":
+        # Share sheets prepend a locale prefix (/intl-de/track/...) and embed
+        # links are valid shares; both carry the standard <type>/<id> tail.
+        if path and path[0].startswith("intl-"):
+            path = path[1:]
+        if path and path[0] == "embed":
+            path = path[1:]
         if len(path) != 2 or path[0] not in _SPOTIFY_TYPES or not path[1].isalnum():
             raise MalformedProviderURL("Unsupported Spotify URL")
         return ProviderURL(ProviderKind.SPOTIFY, path[0], path[1])

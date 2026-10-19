@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import importlib.metadata
 import platform
@@ -62,6 +63,36 @@ def _voice_status(version: str | None, ready: bool) -> str:
     return "missing (install/update cog requirements, then reload TidalPlayerExp)"
 
 
+def _local_probe(
+    deno_locator: Callable[[], str] | None,
+    managed_deno_version: str | None,
+) -> tuple[list[str], str | None, bool]:
+    """Run filesystem/metadata probes off the event loop and format their lines."""
+    nacl_ready, dave_ready = _voice_runtime()
+    if deno_locator is None:
+        youtube_version, deno_ready = _youtube_readiness()
+    else:
+        youtube_version, deno_ready = _youtube_readiness(deno_locator=deno_locator)
+    lines = [
+        f"Python: {platform.python_version()}",
+        f"Red: {_version('Red-DiscordBot') or 'unknown'}",
+        f"discord.py: {_version('discord.py') or 'unknown'}",
+        f"PyNaCl: {_voice_status(_version('PyNaCl'), nacl_ready)}",
+        f"DAVE: {_voice_status(_version('davey'), dave_ready)}",
+        (
+            f"yt-dlp: {_safe_version(youtube_version) if youtube_version else 'missing or outdated'} "
+            f"({'ready' if youtube_version else 'requires 2026.8.19 or newer'})"
+        ),
+        f"YouTube EJS: {_version('yt-dlp-ejs') or 'missing; install/update cog requirements'}",
+        (
+            f"Deno: {_safe_version(managed_deno_version) if managed_deno_version else _version('deno') or 'missing'} "
+            f"({'managed; ' if managed_deno_version else ''}"
+            f"{'executable ready' if deno_ready else 'executable unavailable'})"
+        ),
+    ]
+    return lines, youtube_version, deno_ready
+
+
 async def collect_diagnostics(
     bot: Any,
     backend: NativePlaybackBackend,
@@ -77,17 +108,9 @@ async def collect_diagnostics(
     ``tidal_authenticated`` is the handler's cached status, not a fresh remote
     check. FFmpeg's owned, bounded capability probe is the only executable run.
     """
-    nacl_ready, dave_ready = _voice_runtime()
-    youtube_version, deno_ready = (
-        _youtube_readiness() if deno_locator is None else _youtube_readiness(deno_locator=deno_locator)
+    lines, youtube_version, deno_ready = await asyncio.to_thread(
+        _local_probe, deno_locator, managed_deno_version
     )
-    lines = [
-        f"Python: {platform.python_version()}",
-        f"Red: {_version('Red-DiscordBot') or 'unknown'}",
-        f"discord.py: {_version('discord.py') or 'unknown'}",
-        f"PyNaCl: {_voice_status(_version('PyNaCl'), nacl_ready)}",
-        f"DAVE: {_voice_status(_version('davey'), dave_ready)}",
-    ]
     try:
         capability = await source_factory.check()
     except Exception:  # noqa: BLE001 - one unavailable tool must not hide other results
@@ -105,18 +128,6 @@ async def collect_diagnostics(
         lines.append(f"FFmpeg last failure: {last_failure}")
         if last_failure.startswith("process_signal_"):
             lines.append("FFmpeg remedy: binary crashed; use [p]setup repair, then reload TidalPlayerExp")
-    lines.extend([
-        (
-            f"yt-dlp: {_safe_version(youtube_version) if youtube_version else 'missing or outdated'} "
-            f"({'ready' if youtube_version else 'requires 2026.8.19 or newer'})"
-        ),
-        f"YouTube EJS: {_version('yt-dlp-ejs') or 'missing; install/update cog requirements'}",
-        (
-            f"Deno: {_safe_version(managed_deno_version) if managed_deno_version else _version('deno') or 'missing'} "
-            f"({'managed; ' if managed_deno_version else ''}"
-            f"{'executable ready' if deno_ready else 'executable unavailable'})"
-        ),
-    ])
     if not youtube_version or not deno_ready:
         lines.append("YouTube remedy: install/update cog requirements, then reload TidalPlayerExp")
     if not deno_ready:

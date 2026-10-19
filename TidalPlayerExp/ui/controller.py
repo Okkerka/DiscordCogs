@@ -14,6 +14,7 @@ from .embeds import (
     source_link_label,
     source_quality_field,
 )
+from .interactions import safe_defer
 
 if TYPE_CHECKING:
     from ..domain.models import TrackMeta
@@ -192,7 +193,8 @@ class PlayerControllerView(discord.ui.LayoutView):
         await self.cog.controller_skip(interaction)
 
     async def _choose_suggestion(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer()
+        if not await safe_defer(interaction):
+            return
         select = next(
             item for item in self.walk_children()
             if isinstance(item, discord.ui.Select) and item.custom_id == "tidalplayer:v2:suggestions"
@@ -209,6 +211,8 @@ class PlayerControllerView(discord.ui.LayoutView):
             )
             return
 
-        queued = await self.cog.queue_recommendation(interaction, self.recommendations[index])
-        if not queued:
+        status = await self.cog.queue_recommendation(interaction, self.recommendations[index])
+        if status == "duplicate":
+            await interaction.followup.send("That suggestion is already in the queue.", ephemeral=True)
+        elif status != "queued":
             await interaction.followup.send("Could not queue that suggestion.", ephemeral=True)

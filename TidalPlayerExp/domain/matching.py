@@ -65,13 +65,22 @@ def _identity_title(value: str) -> str:
 
 
 def _title_forms(identity: str, artist: str) -> set[str]:
-    """Allow an explicit artist prefix/suffix without dropping song words."""
+    """Allow an explicit artist prefix/suffix without dropping song words.
+
+    Identities may have had official-marker words stripped while the artist
+    name still carries them (a band named "Audio Bullys"), and separators vary
+    between "Artist Title" and "Artist - Title"; try every spelling.
+    """
     forms = {identity}
-    prefix, suffix = f"{artist} ", f" {artist}"
-    if identity.startswith(prefix):
-        forms.add(identity[len(prefix):])
-    if identity.endswith(suffix):
-        forms.add(identity[:-len(suffix)])
+    for candidate in {artist, _identity_title(artist)}:
+        if not candidate:
+            continue
+        for separator in (" ", " - "):
+            prefix, suffix = f"{candidate}{separator}", f"{separator}{candidate}"
+            if identity.startswith(prefix):
+                forms.add(identity[len(prefix):])
+            if identity.endswith(suffix):
+                forms.add(identity[:-len(suffix)])
     return forms
 
 
@@ -101,6 +110,7 @@ def select_confident_youtube_tidal_track(
     normalized_channel = _normalize(channel)
     best_track: Any | None = None
     best_score = -1.0
+    best_exact = False
     for track in tracks:
         title = _title(track)
         artist = _artist(track)
@@ -114,14 +124,17 @@ def select_confident_youtube_tidal_track(
             continue
         if not _artist_is_explicit(artist, video_title, channel):
             continue
-        title_score = fuzz.token_set_ratio(video_identity, title_identity)
+        # token_sort (not token_set) so a title-subset candidate cannot saturate
+        # the score at 100 and outrank the full identity by tie order.
+        title_score = fuzz.token_sort_ratio(video_identity, title_identity)
         artist_score = max(
             fuzz.token_set_ratio(normalized_artist, normalized_channel),
             fuzz.token_set_ratio(normalized_artist, normalized_video_title),
         )
         score = title_score * 0.65 + artist_score * 0.35
-        if score > best_score:
-            best_track, best_score = track, score
+        exact = title_identity == video_identity
+        if score > best_score or (score == best_score and exact and not best_exact):
+            best_track, best_score, best_exact = track, score, exact
     return best_track
 
 
@@ -133,6 +146,7 @@ def select_best_tidal_track(query: str | NormalizedCandidate, tracks: Iterable[A
         return None
     best_track: Any | None = None
     best_score = 0.0
+    best_exact = False
     for track in tracks:
         title, artist = _normalize(_title(track)), _normalize(_artist(track))
         if not title:
@@ -159,6 +173,9 @@ def select_best_tidal_track(query: str | NormalizedCandidate, tracks: Iterable[A
         title_score = fuzz.token_set_ratio(normalized_query, score_title)
         combined_score = fuzz.token_set_ratio(normalized_query, _normalize(f"{score_title} {_artist(track)}"))
         score = (title_score * 0.55) + (combined_score * 0.45)
-        if score > best_score:
-            best_track, best_score = track, score
+        # Subset candidates saturate both metrics at 100; prefer a title that
+        # equals the query exactly before falling back to provider list order.
+        exact = normalized_query in {score_title, _normalize(_title(track))}
+        if score > best_score or (score == best_score and exact and not best_exact):
+            best_track, best_score, best_exact = track, score, exact
     return best_track if best_track is not None and best_score >= minimum_score else None

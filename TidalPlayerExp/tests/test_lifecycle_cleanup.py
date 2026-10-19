@@ -61,7 +61,10 @@ async def test_activate_controller_stops_old_view_and_records_only_success(cog) 
             7, failed, lambda _view: _raise_async(RuntimeError("send failed"))
         )
     failed.stop.assert_called_once()
-    assert 7 not in cog._controller_views
+    # A failed republish must leave the previously published panel registered
+    # and untouched: only a successful publish retires its predecessor.
+    assert cog._controller_views.get(7) is replacement
+    replacement.stop.assert_not_called()
 
 
 @pytest.mark.asyncio

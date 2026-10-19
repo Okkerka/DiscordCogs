@@ -19,7 +19,9 @@ FILTER_KEYWORDS: Final = frozenset(
 )
 FILTER_REGEX: Final = re.compile("|".join(re.escape(kw) for kw in FILTER_KEYWORDS), re.IGNORECASE)
 
-YOUTUBE_SKIP_TITLES: Final = frozenset({"[deleted video]", "private video", "[private video]"})
+YOUTUBE_SKIP_TITLES: Final = frozenset(
+    {"[deleted video]", "deleted video", "private video", "[private video]"}
+)
 
 SPOTIFY_PLAYLIST_PATTERN: Final = re.compile(r"open\.spotify\.com/playlist/([a-zA-Z0-9]+)")
 SPOTIFY_TRACK_PATTERN: Final = re.compile(r"open\.spotify\.com/track/([a-zA-Z0-9]+)")

@@ -294,10 +294,20 @@ class NativePlaybackSession:
         await self._wait_predecessor(barrier)
 
     async def set_paused(self, paused: bool) -> bool:
-        """Pause or resume only an active source owned by this session."""
+        """Pause or resume the active track, surviving rebuffer windows."""
         async with self._lock:
-            if self._closed or self._source is None or not self._owned():
+            if self._closed or not self._owned():
                 return False
+            if self._current is None and self._source is None:
+                return False
+            if self._source is None:
+                # Rebuffering (seek/volume): record the intent so the waiting
+                # replacement source starts in the requested state instead of
+                # dropping or inverting the click.
+                self._pause_on_start = paused
+                self._paused = paused
+                self._paused_at = time.monotonic() if paused else None
+                return True
             try:
                 if paused:
                     self._voice_client.pause()
@@ -405,22 +415,32 @@ class NativePlaybackSession:
 
     async def close(self) -> None:
         """Idempotently stop and disconnect only while the client is still owned."""
-        async with self._lock:
-            if self._close_task is None or (
-                self._close_task.done()
-                and not self._close_task.cancelled()
-                and self._close_task.exception() is not None
-            ):
-                self._closed = True
-                self._running = False
-                self._clear_queue()
-                previous = self._interrupt()
-                self._close_task = asyncio.create_task(self._finish_close(self._cleanup_barrier))
-            else:
-                previous = self._runner
-            close_task = self._close_task
-        if previous is not asyncio.current_task():
-            await asyncio.shield(close_task)
+        for _ in range(2):
+            async with self._lock:
+                if self._close_task is None or (
+                    self._close_task.done()
+                    and (self._close_task.cancelled() or self._close_task.exception() is not None)
+                ):
+                    self._closed = True
+                    self._running = False
+                    self._clear_queue()
+                    previous = self._interrupt()
+                    self._close_task = asyncio.create_task(self._finish_close(self._cleanup_barrier))
+                else:
+                    previous = self._runner
+                close_task = self._close_task
+            if previous is asyncio.current_task():
+                return
+            try:
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError:
+                if not close_task.cancelled():
+                    raise
+                # The stored task died cancelled (never requested by this
+                # caller); build a fresh one instead of surfacing a phantom
+                # cancellation that would poison every later close().
+                continue
+            return
 
     async def _finish_close(self, previous: Awaitable[object] | None) -> None:
         await self._wait_predecessor(previous)
@@ -511,7 +531,12 @@ class NativePlaybackSession:
             audio = await asyncio.shield(creation)
         except asyncio.CancelledError:
             try:
-                audio = await creation
+                audio = await asyncio.shield(creation)
+            except asyncio.CancelledError:
+                # A second cancellation must not abandon a shielded creation:
+                # when it eventually finishes, its source has to be cleaned.
+                self._retain_background_task(self._reap_creation(creation))
+                raise
             except Exception as error:  # noqa: BLE001 - factory owns failed creation cleanup
                 log.warning(
                     "Cancelled source creation failed (%s)", type(error).__name__
@@ -523,6 +548,15 @@ class NativePlaybackSession:
         if entry.meta["duration"] <= 0 and type(duration) is int and duration > 0:
             entry = replace(entry, meta={**entry.meta, "duration": duration})
         return entry, _OwnedAudio(audio)
+
+    async def _reap_creation(self, creation: asyncio.Task[Any]) -> None:
+        """Await an orphaned shielded creation and clean any source it produced."""
+        try:
+            audio = await creation
+        except Exception as error:  # noqa: BLE001 - failed creation owns cleanup
+            log.warning("Orphaned source creation failed (%s)", type(error).__name__)
+        else:
+            await asyncio.to_thread(_OwnedAudio(audio).cleanup)
 
     async def _prepare(
         self, entry: PlaybackEntry
