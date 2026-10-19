@@ -29,6 +29,9 @@ DEFAULT_ALERT_OFFSET_SECONDS: int = 300
 SECONDS_PER_DAY: int = 86400
 BROADCAST_SEND_DELAY: float = 0.1
 AUTO_DELETE_DELAY: int = 30
+SCHEDULER_IDLE_SLEEP_SECONDS: float = 60.0
+MIN_ALERT_OFFSET_SECONDS: int = 60
+MAX_ALERT_OFFSET_SECONDS: int = 3600
 
 
 def _timestamp_to_utc_seconds_of_day(timestamp: int) -> int:
@@ -148,21 +151,33 @@ class BossAlerts(commands.Cog):
         while True:
             try:
                 all_guilds = await self.config.all_guilds()
-                offset = DEFAULT_ALERT_OFFSET_SECONDS
-                for _guild_id, guild_config in all_guilds.items():
-                    candidate = self._get_guild_offset(boss_key, guild_config)
-                    if candidate != DEFAULT_ALERT_OFFSET_SECONDS:
-                        offset = candidate
-                        break
+                # Every guild has its own lead time, so the next wake-up is the
+                # earliest alert that is still ahead of us.
+                pending = []
+                for guild_id, guild_config in all_guilds.items():
+                    if not guild_config.get(f"{boss_key}_enabled", True):
+                        continue
+                    offset = self._get_guild_offset(boss_key, guild_config)
+                    spawn_ts = self._get_next_spawn_timestamp(boss_key, offset)
+                    pending.append((spawn_ts - offset, guild_id, guild_config, spawn_ts, offset))
 
-                next_spawn_ts = self._get_next_spawn_timestamp(boss_key, offset)
-                alert_ts = next_spawn_ts - offset
-                sleep_for = alert_ts - time.time()
+                if not pending:
+                    await asyncio.sleep(SCHEDULER_IDLE_SLEEP_SECONDS)
+                    continue
 
+                pending.sort(key=lambda item: item[0])
+                sleep_for = pending[0][0] - time.time()
                 if sleep_for > 0:
                     await asyncio.sleep(sleep_for)
 
-                await self._broadcast_alert(boss_key, boss_label, next_spawn_ts)
+                now = time.time()
+                for alert_at, guild_id, guild_config, spawn_ts, offset in pending:
+                    # Only the guilds whose own lead time has come are alerted.
+                    if alert_at > now + BROADCAST_SEND_DELAY:
+                        continue
+                    await self._send_alert(
+                        boss_key, boss_label, guild_id, guild_config, spawn_ts, offset
+                    )
                 await asyncio.sleep(1)
             except asyncio.CancelledError:
                 return
@@ -175,64 +190,60 @@ class BossAlerts(commands.Cog):
                 )
                 await asyncio.sleep(60)
 
-    async def _broadcast_alert(
+    async def _send_alert(
         self,
         boss_key: str,
         boss_label: str,
+        guild_id: int,
+        guild_config: dict,
         spawn_ts: int,
+        offset: int,
     ) -> None:
+        """Send one guild's alert at its own lead time."""
         channel_key = f"{boss_key}_channel"
         role_key = f"{boss_key}_role"
-        enabled_key = f"{boss_key}_enabled"
-        offset_key = f"{boss_key}_offset"
 
-        all_guilds = await self.config.all_guilds()
-        for guild_id, guild_config in all_guilds.items():
-            if not guild_config.get(enabled_key, True):
-                continue
+        channel_id = guild_config.get(channel_key)
+        role_id = guild_config.get(role_key)
 
-            channel_id = guild_config.get(channel_key)
-            role_id = guild_config.get(role_key)
-            offset = self._get_guild_offset(boss_key, guild_config)
+        if not isinstance(channel_id, int):
+            return
 
-            if not isinstance(channel_id, int):
-                continue
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            return
 
-            guild = self.bot.get_guild(guild_id)
-            if guild is None:
-                continue
+        channel = guild.get_channel(channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return
 
-            channel = guild.get_channel(channel_id)
-            if not isinstance(channel, discord.TextChannel):
-                continue
+        role = guild.get_role(role_id) if isinstance(role_id, int) else None
+        role_mention = f"{role.mention} " if role is not None else ""
+        allowed_mentions = discord.AllowedMentions(roles=[role] if role is not None else [])
 
-            role = guild.get_role(role_id) if isinstance(role_id, int) else None
-            role_mention = f"{role.mention} " if role is not None else ""
-            allowed_mentions = discord.AllowedMentions(roles=[role] if role is not None else [])
+        try:
+            msg = await channel.send(
+                f"{role_mention}{boss_label} spawns <t:{spawn_ts}:R> (<t:{spawn_ts}:t>).",
+                allowed_mentions=allowed_mentions,
+            )
+            delete_after = (spawn_ts + offset) - time.time()
+            if delete_after > 0:
+                asyncio.create_task(self._delete_message_after(delete_after, msg))
+        except discord.Forbidden:
+            log.warning(
+                "Missing send permission in guild=%s channel=%s",
+                guild_id,
+                channel_id,
+            )
+        except discord.HTTPException as exc:
+            log.error(
+                "Failed to send alert in guild=%s channel=%s: %s",
+                guild_id,
+                channel_id,
+                exc,
+            )
 
-            try:
-                msg = await channel.send(
-                    f"{role_mention}{boss_label} spawns <t:{spawn_ts}:R> (<t:{spawn_ts}:t>).",
-                    allowed_mentions=allowed_mentions,
-                )
-                delete_after = (spawn_ts + offset) - time.time()
-                if delete_after > 0:
-                    asyncio.create_task(self._delete_message_after(delete_after, msg))
-            except discord.Forbidden:
-                log.warning(
-                    "Missing send permission in guild=%s channel=%s",
-                    guild_id,
-                    channel_id,
-                )
-            except discord.HTTPException as exc:
-                log.error(
-                    "Failed to send alert in guild=%s channel=%s: %s",
-                    guild_id,
-                    channel_id,
-                    exc,
-                )
-
-            await asyncio.sleep(BROADCAST_SEND_DELAY)
+        await asyncio.sleep(BROADCAST_SEND_DELAY)
 
     @commands.Cog.listener()
     async def on_guild_remove(self, guild: discord.Guild) -> None:
@@ -304,6 +315,33 @@ class BossAlerts(commands.Cog):
             f"{label} alerts set in {target_channel.mention}.{role_text}\n"
             f"Alerts fire {offset // 60} minutes before each spawn.\n"
             f"Next spawn: <t:{next_spawn_ts}:F> ({next_minutes} min)."
+        )
+        asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
+
+    async def _set_offset(self, ctx: commands.Context, boss_key: str, minutes: int) -> None:
+        """Store the lead time this server wants for its alerts."""
+        if ctx.guild is None:
+            response = await ctx.send("This command can only be used in a server.")
+            asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
+            return
+
+        offset = minutes * 60
+        if not MIN_ALERT_OFFSET_SECONDS <= offset <= MAX_ALERT_OFFSET_SECONDS:
+            response = await ctx.send(
+                f"Choose a lead time between {MIN_ALERT_OFFSET_SECONDS // 60} and "
+                f"{MAX_ALERT_OFFSET_SECONDS // 60} minutes."
+            )
+            asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
+            return
+
+        guild_config = self.config.guild(ctx.guild)
+        await getattr(guild_config, f"{boss_key}_offset").set(offset)
+        label = self._get_label(boss_key)
+        next_spawn_ts = self._get_next_spawn_timestamp(boss_key, offset)
+
+        response = await ctx.send(
+            f"{label} alerts now fire {minutes} minutes before each spawn.\n"
+            f"Next spawn: <t:{next_spawn_ts}:F> (<t:{next_spawn_ts}:R>)."
         )
         asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
 
@@ -512,6 +550,13 @@ class BossAlerts(commands.Cog):
     async def parasol_ping_off(self, ctx: commands.Context) -> None:
         await self._toggle_alert(ctx, "parasol", False)
 
+    @parasol_ping.command(name="offset")
+    @commands.guild_only()
+    @commands.admin_or_permissions(manage_guild=True)
+    async def parasol_ping_offset(self, ctx: commands.Context, minutes: int) -> None:
+        """Set how many minutes before a spawn the alert fires."""
+        await self._set_offset(ctx, "parasol", minutes)
+
     @parasol.command(name="next")
     @commands.guild_only()
     async def parasol_next(self, ctx: commands.Context) -> None:
@@ -576,6 +621,13 @@ class BossAlerts(commands.Cog):
     async def doom_ping_off(self, ctx: commands.Context) -> None:
         await self._toggle_alert(ctx, "doom", False)
 
+    @doom_ping.command(name="offset")
+    @commands.guild_only()
+    @commands.admin_or_permissions(manage_guild=True)
+    async def doom_ping_offset(self, ctx: commands.Context, minutes: int) -> None:
+        """Set how many minutes before a spawn the alert fires."""
+        await self._set_offset(ctx, "doom", minutes)
+
     @doom.command(name="next")
     @commands.guild_only()
     async def doom_next(self, ctx: commands.Context) -> None:
@@ -600,11 +652,13 @@ class BossAlerts(commands.Cog):
     @parasol_ping_status.error
     @parasol_ping_on.error
     @parasol_ping_off.error
+    @parasol_ping_offset.error
     @doom_ping_add.error
     @doom_ping_remove.error
     @doom_ping_status.error
     @doom_ping_on.error
     @doom_ping_off.error
+    @doom_ping_offset.error
     @parasol_sync.error
     @doom_sync.error
     async def bossalerts_command_error(
