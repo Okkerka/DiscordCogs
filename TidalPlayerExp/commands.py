@@ -60,13 +60,20 @@ class PlaybackCommands:
             response = getattr(ctx.interaction, "response", None)
             if response is not None and response.is_done():
                 return
-            if hasattr(ctx, "defer") and callable(ctx.defer):
-                await ctx.defer()
-            else:
-                interaction = ctx.interaction
-                response = getattr(interaction, "response", None)
-                if response is not None and not response.is_done():
-                    await interaction.response.defer()
+            try:
+                if hasattr(ctx, "defer") and callable(ctx.defer):
+                    await ctx.defer()
+                else:
+                    interaction = ctx.interaction
+                    response = getattr(interaction, "response", None)
+                    if response is not None and not response.is_done():
+                        await interaction.response.defer()
+            except discord.NotFound:
+                # 10062: the interaction token is gone (the handler started too
+                # late, or the click predates a restart). Nothing can be
+                # answered, so abort the invocation instead of leaving an
+                # unhandled task exception in the command tree.
+                raise asyncio.CancelledError from None
 
     async def cog_before_invoke(self, ctx: commands.Context) -> None:
         if getattr(ctx, "interaction", None) is not None:

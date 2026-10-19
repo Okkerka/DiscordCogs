@@ -268,3 +268,20 @@ async def test_defer_is_idempotent_after_global_hook(cog):
     await cog.cog_before_invoke(ctx)
     await cog._defer(ctx)
     ctx.defer.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_expired_interaction_cancels_invocation_quietly(cog):
+    """10062 on defer must abort without an unhandled NotFound in the command tree."""
+    from TidalPlayerExp import commands as command_module
+
+    ctx = context()
+    ctx.interaction = SimpleNamespace(response=SimpleNamespace(is_done=lambda: False))
+    ctx.defer = AsyncMock(
+        side_effect=command_module.discord.NotFound(
+            SimpleNamespace(status=404, reason="Not Found"), "Unknown interaction"
+        )
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await cog.cog_before_invoke(ctx)
+    ctx.defer.assert_awaited_once()
