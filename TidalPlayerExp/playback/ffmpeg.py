@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import importlib.resources
-import ipaddress
 import logging
 import os
 import re
@@ -24,6 +23,7 @@ from urllib.parse import urlsplit
 import discord
 from discord import oggparse
 
+from ..domain.media_hosts import LOOPBACK, PUBLIC, classify_media_host
 from .errors import PlaybackStartError, PlaybackUnavailable
 from .models import ResolvedSource
 
@@ -266,7 +266,9 @@ def _public_media_url(url: str) -> bool:
     (TIDAL manifest, uploads) must not pivot FFmpeg into the local network or a
     cloud metadata endpoint. Loopback stays allowed: local sources are a
     legitimate pattern, while link-local (169.254.0.0/16, the metadata
-    endpoint) and private ranges are not.
+    endpoint) and private ranges are not. The shared policy also rejects the
+    non-canonical IPv4 spellings a resolver still accepts, such as
+    ``2852039166`` for 169.254.169.254.
     """
     try:
         parts = urlsplit(url)
@@ -276,21 +278,7 @@ def _public_media_url(url: str) -> bool:
         return False
     if parts.scheme.lower() not in {"https", "http"} or not hostname:
         return False
-    host = hostname.strip("[]").casefold()
-    if host == "localhost" or host.endswith(".localhost"):
-        return True
-    if host.endswith((".local", ".internal")):
-        return False
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        return True
-    if address.is_loopback:
-        return True
-    return not (
-        address.is_private or address.is_link_local
-        or address.is_multicast or address.is_reserved or address.is_unspecified
-    )
+    return classify_media_host(hostname) in {PUBLIC, LOOPBACK}
 
 
 def _has_control(value: str) -> bool:

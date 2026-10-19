@@ -7,7 +7,6 @@ import asyncio
 import contextlib
 import importlib.metadata
 import importlib.util
-import ipaddress
 import json
 import logging
 import math
@@ -24,6 +23,7 @@ from urllib.parse import urlsplit
 
 from packaging.version import Version
 
+from ..domain.media_hosts import PUBLIC, classify_media_host
 from ..playback import ResolvedSource, SourceKind, SourceReference
 from ..playback.errors import PlaybackUnavailable, SourceResolutionError
 
@@ -74,19 +74,10 @@ def _public_media_host(hostname: str) -> bool:
 
     The resolver only ever fetches provider CDNs; a hostile provider response
     must not pivot the extraction child into the local network or a cloud
-    metadata endpoint.
+    metadata endpoint. The shared policy also rejects the non-canonical IPv4
+    spellings a resolver still accepts.
     """
-    host = hostname.strip("[]").casefold()
-    if not host or host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
-        return False
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        return True
-    return not (
-        address.is_private or address.is_loopback or address.is_link_local
-        or address.is_multicast or address.is_reserved or address.is_unspecified
-    )
+    return classify_media_host(hostname) == PUBLIC
 
 
 def _valid_https_url(value: object, *, limit: int | None = None) -> str:
