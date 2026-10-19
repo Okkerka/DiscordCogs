@@ -84,7 +84,7 @@ async def test_skip_command_names_the_actor(controls):
     await sink.expect("started")
     await cog.skip_command(ctx)
     view, kwargs = ctx.send.await_args.kwargs["view"], ctx.send.await_args.kwargs
-    assert view.text == "### ⏭ Skipped\n<@42> skipped **1**."
+    assert view.text == "### Skipped\n**1**\nArtist\n-# Duration: 00:20 · Skipped by <@42>"
     assert ctx.send.await_args.args == ()
     assert kwargs["allowed_mentions"].users is False
 
@@ -99,8 +99,9 @@ async def test_stop_command_names_the_actor(controls):
     await cog.stop_command(ctx)
     view = ctx.send.await_args.kwargs["view"]
     assert view.text == (
-        "### ⏹ Playback stopped\n"
-        "<@42> stopped the playback. Queue cleared and imports cancelled."
+        "### Playback stopped\n"
+        "Queue has been cleared and imports cancelled.\n"
+        "-# Stopped by <@42>"
     )
 
 

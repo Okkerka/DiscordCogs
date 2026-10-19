@@ -66,7 +66,9 @@ async def test_stop_click_announces_the_actor(cog, native_session):
     native_session.stop.assert_awaited_once_with(clear_queue=True)
     interaction.followup.send.assert_awaited_once()
     view = interaction.followup.send.await_args.kwargs["view"]
-    assert view.text == "### ⏹ Playback stopped\n<@7> stopped the playback. Queue cleared."
+    assert view.text == (
+        "### Playback stopped\nQueue has been cleared.\n-# Stopped by <@7>"
+    )
     assert interaction.followup.send.await_args.kwargs["allowed_mentions"].users is False
 
 
@@ -85,7 +87,7 @@ async def test_skip_with_empty_queue_waits_for_end_event(cog, native_session):
     cog._controller_view.assert_not_awaited()
     # The skip is announced to the channel without triggering an error path.
     view = interaction.followup.send.await_args.kwargs["view"]
-    assert view.text == "### ⏭ Skipped\nSomeone skipped **Track 1**."
+    assert view.text == "### Skipped\n**Track 1**\nArtist\n-# Duration: 02:00 · Skipped by Someone"
     native_session.current = None
     await cog.queue_ended(guild.id, old)
     assert guild.id not in cog._current_meta

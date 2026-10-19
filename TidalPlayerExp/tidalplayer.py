@@ -2858,14 +2858,14 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             await interaction.followup.send("Nothing is playing.", ephemeral=True)
             return
         current = session.snapshot().current
-        title = str(current.meta.get("title") or "") if current is not None else ""
+        meta = current.meta if current is not None else None
         if not await session.skip():
             await interaction.followup.send("Nothing is playing.", ephemeral=True)
             return
         user = getattr(interaction, "user", None)
         who = getattr(user, "mention", None) or "Someone"
         await interaction.followup.send(
-            view=skip_notice(who, title or None),
+            view=skip_notice(who, meta),
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -3018,7 +3018,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         user = getattr(interaction, "user", None)
         who = getattr(user, "mention", None) or "Someone"
         await interaction.followup.send(
-            view=stop_notice(who, "Queue cleared."),
+            view=stop_notice(who, "Queue has been cleared."),
             allowed_mentions=discord.AllowedMentions.none(),
         )
 

@@ -169,7 +169,7 @@ class PlaybackCommands:
             return
         who = getattr(ctx.author, "mention", None) or "Someone"
         await self._stop_playback(ctx.guild.id)
-        await self._reply_notice(ctx, stop_notice(who, "Queue cleared and imports cancelled."))
+        await self._reply_notice(ctx, stop_notice(who, "Queue has been cleared and imports cancelled."))
 
     @commands.hybrid_group(name="remove", fallback="track", invoke_without_command=True)
     @commands.guild_only()
@@ -265,12 +265,12 @@ class PlaybackCommands:
         if session is None:
             return
         current = session.snapshot().current
-        title = str(current.meta.get("title") or "") if current is not None else ""
+        meta = current.meta if current is not None else None
         who = getattr(ctx.author, "mention", None) or "Someone"
         if not await session.skip():
             await self._reply(ctx, "Nothing is playing.")
             return
-        await self._reply_notice(ctx, skip_notice(who, title or None))
+        await self._reply_notice(ctx, skip_notice(who, meta))
 
     @commands.hybrid_command(name="move")
     @commands.guild_only()
