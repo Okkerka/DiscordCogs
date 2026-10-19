@@ -27,6 +27,10 @@ HAWK_ENABLED_GIF = "https://cdn.discordapp.com/attachments/1069748983293022249/1
 HAWK_DISABLED_GIF = "https://cdn.discordapp.com/attachments/1069748983293022249/1425831928644501624/4rMETw3.gif?ex=68ef9c76&is=68ee4af6&hm=39b6924ec16d99466f581f6f85427430d72d646729aa82566aa87e2b4ad24b3f&"
 
 BASE = discord.Color.purple()
+# The hawk question is answered with whole words, so an unrelated message
+# never triggers the reply.
+_HAWK_AFFIRMATIVE = frozenset({"yes", "yeah", "yep", "yea", "ye", "yuh", "yup"})
+_HAWK_NEGATIVE = frozenset({"no", "nope", "nah", "nuh", "naw"})
 ERROR = discord.Color.red()
 
 DURATION_RE = re.compile(r"(?i)\s*(\d+)\s*([dhms]?)")
@@ -494,8 +498,14 @@ class Utilities(commands.Cog):
             f"**{m.display_name}** (`{uid}`)" if (m := ctx.guild.get_member(uid)) else f"`{uid}` (not in server)"
             for uid in hawk_users
         ]
+        # Discord rejects a description longer than 4096 characters, so a long
+        # list is shortened instead of failing the command.
+        description = "\n".join(lines)
+        if len(description) > 4096:
+            shown = description[:4093]
+            description = f"{shown}\n... and {len(hawk_users) - shown.count(chr(10)) - 1} more"
         await ctx.send(
-            embed=discord.Embed(title="🐦 Hawk List", description="\n".join(lines), color=BASE).set_footer(
+            embed=discord.Embed(title="🐦 Hawk List", description=description, color=BASE).set_footer(
                 text=f"Total: {len(hawk_users)}"
             )
         )
@@ -514,7 +524,13 @@ class Utilities(commands.Cog):
             description=f"Removed {len(removed)} users who left the server.",
             color=BASE,
         )
-        embed.add_field(name="Removed User IDs", value=", ".join(str(u) for u in removed) if removed else "None")
+        removed_ids = ", ".join(str(u) for u in removed) if removed else "None"
+        if len(removed_ids) > 1024:
+            # Discord rejects a field value longer than 1024 characters.
+            kept = removed_ids[:1021]
+            remaining = len(removed) - kept.count(",") - 1
+            removed_ids = f"{kept}... and {remaining} more"
+        embed.add_field(name="Removed User IDs", value=removed_ids)
         await ctx.send(embed=embed)
 
     @commands.hybrid_command()
@@ -792,10 +808,13 @@ class Utilities(commands.Cog):
         if message.author.id != self.awaiting_hawk_response[message.guild.id]:
             return
         content = message.content.lower()
-        if any(w in content for w in {"yes", "yea", "ye", "yuh"}):
+        # Whole words only: a substring match would treat "bye" as a yes and
+        # "nope" as a no.
+        words = set(re.findall(r"[a-z]+", content))
+        if words & _HAWK_AFFIRMATIVE:
             await message.channel.send("I'm a hawk too")
             del self.awaiting_hawk_response[message.guild.id]
-        elif any(w in content for w in {"no", "nah", "nuh", "naw"}):
+        elif words & _HAWK_NEGATIVE:
             await message.channel.send("Fuck you then")
             del self.awaiting_hawk_response[message.guild.id]
 

@@ -113,6 +113,16 @@ class Moderation(commands.Cog):
         """Get moderators from cache."""
         return self._moderator_cache.get(guild_id, set())
 
+    @commands.Cog.listener()
+    async def on_guild_add(self, guild: discord.Guild) -> None:
+        """Load a newly joined guild, so its moderation rules apply at once."""
+        try:
+            guild_data = await self.config.guild_from_id(guild.id).all()
+            self._blocked_cache[guild.id] = set(guild_data.get("blocked_users", []) or [])
+            self._moderator_cache[guild.id] = set(guild_data.get("moderators", []) or [])
+        except Exception as e:
+            log.warning(f"Failed to load moderation caches for guild {guild.id}: {e}")
+
     async def _update_blocked_cache(self, guild_id: int, user_id: int, add: bool = True):
         """Update blocked users cache and database."""
         if guild_id not in self._blocked_cache:
@@ -1396,9 +1406,24 @@ class Moderation(commands.Cog):
                 timestamp = timestamp.replace(tzinfo=timezone.utc)
             warn_idx = start + i
 
+            # Discord rejects a field value longer than 1024 characters, so a
+            # long reason is shortened instead of failing the whole list.
+            value = (
+                f"**Reason:** {warning['reason']}\n"
+                f"**Moderator:** {mod_name}\n"
+                f"**Date:** <t:{int(timestamp.timestamp())}:R>"
+            )
+            if len(value) > 1024:
+                reason = str(warning["reason"])
+                overflow = len(value) - 1024
+                value = (
+                    f"**Reason:** {reason[:max(0, len(reason) - overflow)]}\n"
+                    f"**Moderator:** {mod_name}\n"
+                    f"**Date:** <t:{int(timestamp.timestamp())}:R>"
+                )
             embed.add_field(
                 name=f"Warning #{warn_idx}",
-                value=f"**Reason:** {warning['reason']}\n**Moderator:** {mod_name}\n**Date:** <t:{int(timestamp.timestamp())}:R>",
+                value=value,
                 inline=False,
             )
 
