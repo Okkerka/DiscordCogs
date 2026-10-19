@@ -177,7 +177,8 @@ async def test_stop_prevents_late_youtube_metadata_admission(cog):
 @pytest.mark.asyncio
 async def test_overlapping_controller_edits_release_every_superseded_view(cog):
     entered, release = asyncio.Event(), asyncio.Event()
-    older, newer = SimpleNamespace(stop=Mock()), SimpleNamespace(stop=Mock())
+    older = SimpleNamespace(stop=Mock(), _cache_key=11)
+    newer = SimpleNamespace(stop=Mock(), _cache_key=11)
 
     async def slow_edit(view):
         entered.set()
@@ -193,7 +194,10 @@ async def test_overlapping_controller_edits_release_every_superseded_view(cog):
         await asyncio.gather(first, second)
 
     assert cog._controller_views[1] is newer
-    older.stop.assert_called_once()
+    # Both panels live on the same message and share the same custom ids:
+    # stopping the replaced view would unregister the controls of the view
+    # that replaced it, so the superseded view is left alone.
+    older.stop.assert_not_called()
     newer.stop.assert_not_called()
 
 

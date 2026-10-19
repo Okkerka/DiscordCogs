@@ -715,11 +715,14 @@ class TidalHandler:
                 log.warning(f"Timed out checking Tidal login (attempt {attempt + 1}/{LOGIN_CHECK_RETRIES})")
                 if attempt < LOGIN_CHECK_RETRIES - 1:
                     await asyncio.sleep(2)
-            except Exception:
+            except Exception as error:
                 if session is not self.session:
                     return False
-                self._login_cache = False
-                self._login_cache_time = asyncio.get_running_loop().time()
+                # A transport error is not a login result. Caching it would
+                # block playback for the whole cache window, so drop the
+                # cached answer and let the next call try again.
+                log.warning("Could not check the Tidal login state (%s)", type(error).__name__)
+                self.invalidate_login_cache()
                 return False
         # Every attempt timed out: this call never observed a login, so a stale
         # cached True must not answer for it.
@@ -1290,7 +1293,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         self.yt: Optional[Any] = None
         self._youtube_retry_after = 0.0
         self._tasks: Set[asyncio.Task] = set()
-        self._guild_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._guild_locks: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()
         self._cancel_events: Dict[int, asyncio.Event] = {}
         self._last_progress_edit: Dict[int, float] = {}
         self._current_meta: Dict[int, TrackMeta] = {}
@@ -1471,6 +1474,19 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             self._controller_locks[guild_id] = lock
         return lock
 
+    def _guild_lock(self, guild_id: int) -> asyncio.Lock:
+        """Return the guild's playback lock.
+
+        The lock is dropped only when no coroutine holds it, so removing a
+        guild can never hand a second lock to a waiting caller while the
+        first one is still in use.
+        """
+        lock = self._guild_locks.get(guild_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._guild_locks[guild_id] = lock
+        return lock
+
     def _claim_batch(self, guild_id: int) -> asyncio.Event | None:
         if guild_id in self._cancel_events:
             return None
@@ -1518,10 +1534,13 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             previous = self._controller_views.pop(guild_id, None)
             self._controller_views[guild_id] = view
             published = True
-            if previous is not None:
-                # Retire the replaced view only after the new one is live: a
-                # failed Discord edit must never leave the visible panel with
-                # no registered view and inert controls.
+            if previous is not None and getattr(previous, "_cache_key", None) != getattr(
+                view, "_cache_key", None
+            ):
+                # Retire the replaced view only when it lives on another
+                # message. Both views use the same custom ids, so stopping a
+                # view that shares the message would unregister the new
+                # view's controls and leave the panel inert.
                 previous.stop()
             return result
         finally:
@@ -1628,7 +1647,6 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         if cancel_event is not None:
             cancel_event.set()
         self._stop_controller_view(guild_id)
-        self._guild_locks.pop(guild_id, None)
         self._cancel_guild_background_tasks(guild_id)
         message = self._controller_messages.pop(guild_id, None)
         self._playback_channels.pop(guild_id, None)
@@ -2196,7 +2214,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             await ctx.send(embed=_error_embed("Join my voice channel to queue music."))
             return None
         try:
-            async with self._guild_locks[ctx.guild.id]:
+            async with self._guild_lock(ctx.guild.id):
                 existing = await self.backend.get(ctx.guild.id)
                 # The ownership check belongs under the lock: the unlocked read
                 # can see a client that is about to be replaced, or miss one
@@ -2999,7 +3017,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             return
         # Read-modify-write under the guild lock: two rapid clicks must net to
         # one toggle instead of both setting the same state.
-        async with self._guild_locks[interaction.guild.id]:
+        async with self._guild_lock(interaction.guild.id):
             session = await self.backend.get(interaction.guild.id)
             if session is None or not await session.set_paused(not session.snapshot().paused):
                 await interaction.followup.send("No active player is available.", ephemeral=True)
@@ -4306,9 +4324,11 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                     f"You have {login_url.expires_in} seconds."
                 )
             except discord.Forbidden:
+                # The device code stays pending until it expires, but nobody
+                # received the link, so say what actually happened.
                 await ctx.send(embed=_error_embed(
-                    "I could not DM you the login link, so the Tidal login was cancelled. "
-                    "Allow direct messages from this server and try again."
+                    "I could not DM you the Tidal login link. Allow direct messages "
+                    "from this server and try again; a pending login expires on its own."
                 ))
                 return
             await ctx.send(embed=_success_embed("Check your DMs for the Tidal login link."))

@@ -173,6 +173,8 @@ def _make_discord_stub() -> types.ModuleType:
             self.timeout = timeout
             self.children: list = []
             self.stopped = False
+            # The real view records the message it is attached to.
+            self._cache_key: int | None = None
 
         def add_item(self, item: Any) -> None:
             self.children.append(item)

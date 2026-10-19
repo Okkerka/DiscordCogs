@@ -134,6 +134,27 @@ async def test_login_check_timeouts_never_report_a_stale_cached_login(cog, monke
 
 
 @pytest.mark.asyncio
+async def test_a_transient_login_check_error_does_not_cache_a_negative_result(cog, monkeypatch):
+    """A transport error must not block playback for the whole cache window."""
+    calls = []
+
+    def failing_check():
+        calls.append(1)
+        raise RuntimeError("connection reset")
+
+    cog.tidal.session = SimpleNamespace(check_login=failing_check)
+    cog.tidal.invalidate_login_cache()
+    monkeypatch.setattr("TidalPlayerExp.tidalplayer.LOGIN_CHECK_RETRIES", 1)
+
+    assert await cog.tidal.is_logged_in() is False
+    assert len(calls) == 1
+    # The next call must ask the provider again instead of answering from a
+    # cached negative result that was never observed.
+    assert await cog.tidal.is_logged_in() is False
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("old_result", [True, False, RuntimeError("old credentials")])
 async def test_login_check_cannot_restore_or_invalidate_session_after_logout(cog, old_result):
     loop = asyncio.get_running_loop()

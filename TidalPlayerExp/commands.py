@@ -229,7 +229,7 @@ class PlaybackCommands:
         if not 0 <= percent <= 150:
             await self._reply(ctx, "Volume must be between 0 and 150.")
             return
-        async with self._guild_locks[ctx.guild.id]:
+        async with self._guild_lock(ctx.guild.id):
             if self._closing or await self.backend.get(ctx.guild.id) is not session:
                 await self._reply(ctx, "The voice session changed. Try volume again.")
                 return

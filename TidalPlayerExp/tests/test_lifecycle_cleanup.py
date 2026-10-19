@@ -41,9 +41,21 @@ async def test_cog_unload_awaits_tasks_closes_session_and_stops_views(cog) -> No
 
 
 @pytest.mark.asyncio
+async def test_guild_removal_keeps_the_playback_lock_identity(cog) -> None:
+    """Removing a guild must not hand a second lock to a waiting caller."""
+    lock = cog._guild_lock(7)
+
+    await cog.on_guild_remove(SimpleNamespace(id=7))
+
+    assert cog._guild_lock(7) is lock
+
+
+@pytest.mark.asyncio
 async def test_activate_controller_stops_old_view_and_records_only_success(cog) -> None:
     old = MagicMock()
+    old._cache_key = 99
     replacement = MagicMock()
+    replacement._cache_key = 99
     cog._controller_views[7] = old
     send = AsyncMock(return_value=SimpleNamespace(id=99))
 
@@ -51,11 +63,20 @@ async def test_activate_controller_stops_old_view_and_records_only_success(cog) 
         7, replacement, lambda view: send(view=view)
     )
 
-    old.stop.assert_called_once()
+    # Both views live on the same message and share the same custom ids, so
+    # stopping the replaced one would unregister the new view's controls.
+    old.stop.assert_not_called()
     assert cog._controller_views[7] is replacement
     assert message.id == 99
 
+    moved = MagicMock()
+    moved._cache_key = 100
+    await cog._activate_controller_view(7, moved, lambda view: send(view=view))
+    # A panel that moved to another message retires the view left behind.
+    replacement.stop.assert_called_once()
+
     failed = MagicMock()
+    failed._cache_key = 99
     with pytest.raises(RuntimeError):
         await cog._activate_controller_view(
             7, failed, lambda _view: _raise_async(RuntimeError("send failed"))
@@ -63,8 +84,8 @@ async def test_activate_controller_stops_old_view_and_records_only_success(cog) 
     failed.stop.assert_called_once()
     # A failed republish must leave the previously published panel registered
     # and untouched: only a successful publish retires its predecessor.
-    assert cog._controller_views.get(7) is replacement
-    replacement.stop.assert_not_called()
+    assert cog._controller_views.get(7) is moved
+    moved.stop.assert_not_called()
 
 
 @pytest.mark.asyncio
