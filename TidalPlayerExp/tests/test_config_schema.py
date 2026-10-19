@@ -41,8 +41,8 @@ def test_global_defaults_token_fields(cog):
 
 
 def test_global_defaults_schema_version(cog):
-    """_schema_version default must be 3."""
-    assert cog.config._schema_version._value == 3
+    """_schema_version must default to None so the migration can detect it."""
+    assert cog.config._schema_version._value is None
 
 
 # --- Guild schema defaults ---------------------------------------------------
@@ -83,16 +83,31 @@ def test_oauth_field_names_present(mod):
 # --- Migration ---------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_migration_sets_schema_v3(cog):
-    """_migrate_config must set _schema_version to 3 when called."""
-    cog.config._schema_version._value = 1  # simulate older installation
+async def test_migration_sets_schema_v3_and_clears_legacy_keys(cog):
+    """A never-migrated install (default None) must run the cleanup once."""
+    cog.config._schema_version._value = None
     await cog._migrate_config()
     assert cog.config._schema_version._value == 3
+    assert cog.config._cleared == [
+        ("spotify_client_id",),
+        ("spotify_client_secret",),
+        ("youtube_api_key",),
+    ]
 
 
 @pytest.mark.asyncio
 async def test_migration_is_idempotent(cog):
     """Running migration twice must not raise and must leave version at 3."""
     await cog._migrate_config()
+    first_pass = list(cog.config._cleared)
     await cog._migrate_config()
     assert cog.config._schema_version._value == 3
+    assert cog.config._cleared == first_pass
+
+
+@pytest.mark.asyncio
+async def test_migration_skips_clearing_for_current_install(cog):
+    """An install already at the current schema must not touch stored keys."""
+    cog.config._schema_version._value = 3
+    await cog._migrate_config()
+    assert cog.config._cleared == []

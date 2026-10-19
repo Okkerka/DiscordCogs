@@ -119,6 +119,14 @@ class NativePlaybackBackend:
         assert attempt.task is not None
         try:
             return await asyncio.shield(attempt.task)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if attempt.invalid and current is not None and current.cancelling() == 0:
+                # The shared attempt was cancelled out from under this waiter
+                # (voice-state change/close); report an actionable failure
+                # instead of a bare cancellation.
+                raise PlaybackUnavailable() from None
+            raise
         finally:
             attempt.waiters -= 1
             if attempt.waiters == 0 and not attempt.task.done():

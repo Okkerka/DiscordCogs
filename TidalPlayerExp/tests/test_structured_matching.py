@@ -9,8 +9,9 @@ from TidalPlayerExp.domain.candidates import NormalizedCandidate
 from TidalPlayerExp.domain.matching import select_best_tidal_track
 
 
-def track(title="The Night We Met", artist="Lord Huron", **changes):
-    return SimpleNamespace(id=12, name=title, full_name=None,
+def track(title="The Night We Met", artist="Lord Huron", full_name=None, **changes):
+    # ``full_name`` mirrors tidalapi: the plain ``name`` plus a parenthesised version.
+    return SimpleNamespace(id=12, name=title, full_name=full_name,
                            artist=SimpleNamespace(name=artist), **changes)
 
 
@@ -110,3 +111,16 @@ async def test_spotify_album_reuses_initial_metadata_snapshot(cog):
         await cog._handle_spotify_album(ctx, "https://open.spotify.com/album/0123456789012345678901")
     client.album.assert_called_once_with("0123456789012345678901")
     assert process.await_args.args[1:3] == ([item], "Album")
+
+
+def test_structured_match_accepts_one_sided_tidal_remaster_version():
+    # tidalapi exposes version notes as ``full_name`` -> "Title (Remastered 2011)".
+    remastered = track(full_name="The Night We Met (Remastered 2011)")
+    candidate = NormalizedCandidate("The Night We Met", ("Lord Huron",), source="spotify")
+    assert select_best_tidal_track(candidate, [remastered]) is remastered
+
+
+def test_structured_match_still_rejects_one_sided_tidal_live_version():
+    live = track(full_name="The Night We Met (Live)")
+    candidate = NormalizedCandidate("The Night We Met", ("Lord Huron",), source="spotify")
+    assert select_best_tidal_track(candidate, [live]) is None

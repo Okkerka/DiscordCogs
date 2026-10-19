@@ -212,6 +212,26 @@ async def test_cancel_imports_prevents_future_admission_and_preserves_already_qu
 
 
 @pytest.mark.asyncio
+async def test_stopped_session_mid_playlist_reports_cancelled_import(cog, playlist_ctx, native_session):
+    """A generation bump between admissions must not report a finished import."""
+    original_enqueue = native_session._enqueue
+
+    def enqueue(entry):
+        result = original_enqueue(entry)
+        cog._stop_generations[playlist_ctx.guild.id] += 1
+        return result
+
+    native_session.enqueue.side_effect = enqueue
+    await cog._handle_youtube_playlist(playlist_ctx, PLAYLIST_ID)
+
+    assert len(native_session.entries) == 1
+    final = playlist_ctx.send.return_value.edit.await_args.kwargs["embed"]
+    assert "Cancelled" in final.title
+    assert "Queued 1/2" in final.description
+    assert not cog._cancel_events
+
+
+@pytest.mark.asyncio
 async def test_queue_capacity_stops_catalog_work_and_reports_remaining(cog, playlist_ctx, native_session):
     cog.tidal.is_logged_in.return_value = True
     cog.youtube_resolver.fetch_playlist.return_value = tuple(_video(f"{i:011d}") for i in range(25))

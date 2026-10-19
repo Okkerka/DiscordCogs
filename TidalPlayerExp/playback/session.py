@@ -373,8 +373,12 @@ class NativePlaybackSession:
 
     @staticmethod
     async def _wait_predecessor(previous: Awaitable[object] | None) -> None:
-        if previous is not None:
-            await asyncio.shield(asyncio.gather(previous, return_exceptions=True))
+        if previous is None or previous is asyncio.current_task():
+            # A re-entrant sink call (seek/set_volume/skip from the worker) must
+            # return so the old worker can unwind; awaiting our own task would
+            # deadlock until the session is closed.
+            return
+        await asyncio.shield(asyncio.gather(previous, return_exceptions=True))
 
     async def stop(self, *, clear_queue: bool = True) -> None:
         """Stop without queue-end events and optionally retain waiting entries."""

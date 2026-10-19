@@ -56,7 +56,7 @@ def test_youtube_tidal_match_rejects_uncertain_recordings(
 
 @pytest.mark.parametrize(
     "variant",
-    ["Cover", "Remix", "Live", "Karaoke", "Instrumental", "Nightcore", "Sped Up", "Slowed Down", "Reverb", "Remastered", "Acoustic"],
+    ["Cover", "Remix", "Live", "Karaoke", "Instrumental", "Nightcore", "Sped Up", "Slowed Down", "Reverb", "Acoustic"],
 )
 @pytest.mark.parametrize("direction", ["video", "tidal"])
 def test_youtube_tidal_recording_variants_must_match_symmetrically(variant: str, direction: str) -> None:
@@ -65,6 +65,21 @@ def test_youtube_tidal_recording_variants_must_match_symmetrically(variant: str,
     candidate = _tidal_candidate(tidal_title, "AZALI")
 
     assert select_confident_youtube_tidal_track(video_title, "AZALI", [candidate]) is None
+
+
+@pytest.mark.parametrize("direction", ["video", "tidal"])
+@pytest.mark.parametrize("marker", ["Remastered", "Remaster", "Remastered 2011"])
+def test_youtube_tidal_remaster_markers_are_catalog_noise(marker: str, direction: str) -> None:
+    """A remaster note is a mastering generation, not a different recording.
+
+    Tidal writes it into ``full_name`` ("Title (Remastered 2011)") while YouTube
+    uploads usually omit it, so a one-sided remaster marker must still match.
+    """
+    video_title = f"AZALI - Rivals{f' ({marker})' if direction == 'video' else ''}"
+    tidal_title = f"Rivals{f' ({marker})' if direction == 'tidal' else ''}"
+    candidate = _tidal_candidate(tidal_title, "AZALI")
+
+    assert select_confident_youtube_tidal_track(video_title, "AZALI", [candidate]) is candidate
 
 
 def test_youtube_tidal_match_accepts_equal_recording_variant() -> None:

@@ -22,11 +22,20 @@ async def test_device_login_cannot_commit_after_logout_or_unload(cog, monkeypatc
     state_ready = asyncio.Event()
     release = asyncio.Event()
     expiry = datetime.now(timezone.utc) + timedelta(hours=6)
+    class _DeviceFuture:
+        """Stand-in for the concurrent.futures.Future tidalapi's device flow returns."""
+
+        def done(self) -> bool:
+            return True
+
+        def result(self) -> bool:
+            return True
+
     session = SimpleNamespace(
         expiry_time=expiry, token_type="Bearer", access_token="old-access",
         refresh_token="old-refresh", login_oauth=lambda: (
             SimpleNamespace(verification_uri_complete="https://login.tidal.com/test", expires_in=120),
-            SimpleNamespace(result=lambda: True),
+            _DeviceFuture(),
         ),
     )
     cog.tidal.session = session
@@ -36,7 +45,9 @@ async def test_device_login_cannot_commit_after_logout_or_unload(cog, monkeypatc
         nonlocal calls
         calls += 1
         result = operation()
-        if calls == 3:
+        # The device flow now completes without an executor call, so the snapshot
+        # lookup is where the test interleaves logout/unload with the commit.
+        if calls == 2:
             state_ready.set()
             await release.wait()
         return result
@@ -57,6 +68,69 @@ async def test_device_login_cannot_commit_after_logout_or_unload(cog, monkeypatc
     finally:
         release.set()
         await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_device_login_polls_instead_of_holding_an_executor_worker(cog, monkeypatch):
+    """An already-resolved flow completes without any executor round trip."""
+    polled = []
+    blocked = AsyncMock()
+
+    class _Future:
+        def done(self) -> bool:
+            return True
+
+        def result(self) -> bool:
+            polled.append("result")
+            return True
+
+    monkeypatch.setattr(type(cog.tidal), "_run_blocking", blocked)
+    await cog.tidal._await_device_login(
+        _Future(),
+        SimpleNamespace(verification_uri_complete="https://login.tidal.com/test", expires_in=120),
+    )
+    blocked.assert_not_awaited()
+    assert polled == ["result"]
+
+
+@pytest.mark.asyncio
+async def test_device_login_gives_up_without_pinning_a_worker(cog, monkeypatch):
+    """An abandoned browser flow cannot occupy a bounded executor slot."""
+    blocked = AsyncMock()
+    monkeypatch.setattr(type(cog.tidal), "_run_blocking", blocked)
+    monkeypatch.setattr("TidalPlayerExp.tidalplayer.DEVICE_LOGIN_POLL_INTERVAL", 0.01)
+
+    class _Future:
+        def done(self) -> bool:
+            return False
+
+        def result(self) -> bool:
+            raise AssertionError("result must not be read before the flow completes")
+
+    with pytest.raises(asyncio.TimeoutError):
+        await cog.tidal._await_device_login(
+            _Future(), SimpleNamespace(verification_uri_complete="https://x", expires_in=0.05)
+        )
+    blocked.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_login_check_timeouts_never_report_a_stale_cached_login(cog, monkeypatch):
+    """A timed-out check must not answer with the previous cache entry."""
+    attempts = []
+
+    async def timing_out(_handler, operation, timeout):
+        attempts.append(operation)
+        raise asyncio.TimeoutError
+
+    cog.tidal.session = SimpleNamespace(check_login=lambda: True)
+    cog.tidal._login_cache = True
+    cog.tidal._login_cache_time = asyncio.get_running_loop().time() - 1000.0
+    monkeypatch.setattr(type(cog.tidal), "_run_blocking", timing_out)
+    monkeypatch.setattr("TidalPlayerExp.tidalplayer.LOGIN_CHECK_RETRIES", 1)
+
+    assert await cog.tidal.is_logged_in() is False
+    assert len(attempts) == 1
 
 
 @pytest.mark.asyncio

@@ -72,7 +72,8 @@ class FakeConfig:
         self.access_token = _ConfigValue(None)
         self.refresh_token = _ConfigValue(None)
         self.expiry_time = _ConfigValue(None)
-        self._schema_version = _ConfigValue(3)
+        self._schema_version = _ConfigValue(None)
+        self._cleared: list[tuple[str, ...]] = []
         self._guild_configs: dict[int, FakeGuildConfig] = {}
         self._global_lock = asyncio.Lock()
 
@@ -121,8 +122,8 @@ class FakeConfig:
             else:
                 setattr(self, key, _ConfigValue(deepcopy(value)))
 
-    async def clear_raw(self, *_args: Any) -> None:
-        pass
+    async def clear_raw(self, *args: Any) -> None:
+        self._cleared.append(tuple(str(arg) for arg in args))
 
 
 # ---------------------------------------------------------------------------

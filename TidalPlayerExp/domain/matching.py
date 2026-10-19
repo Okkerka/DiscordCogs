@@ -18,7 +18,11 @@ _RECORDING_VARIANT_PHRASES = (
     "remaster", "acoustic",
 )
 _VARIANT_RE = re.compile(
-    r"(?<!\w)(?:" + "|".join(re.escape(value) for value in _RECORDING_VARIANT_PHRASES) + r")(?!\w)"
+    r"(?<!\w)(" + "|".join(re.escape(value) for value in _RECORDING_VARIANT_PHRASES) + r")(?!\w)"
+    # Tidal encodes versions as "Remastered 2011" in ``full_name``; the year
+    # residue would otherwise defeat identity comparison against providers
+    # that omit the suffix.
+    r"(?:\s+(?:19|20)\d{2})?"
 )
 _VARIANT_ALIASES = {
     "remaster": "remaster",
@@ -27,6 +31,10 @@ _VARIANT_ALIASES = {
     "slowed down": "slowed",
     "sped up": "sped up",
 }
+# Remaster markers describe a mastering generation, not a different recording.
+# External providers usually omit them while Tidal keeps them in the version
+# suffix, so a one-sided remaster marker must not reject the catalog copy.
+_VARIANT_NOISE = frozenset({"remaster"})
 
 
 def _normalize(value: str) -> str:
@@ -42,7 +50,12 @@ def _artist(track: Any) -> str:
 
 
 def _recording_variants(value: str) -> frozenset[str]:
-    return frozenset(_VARIANT_ALIASES.get(match.group(0), match.group(0)) for match in _VARIANT_RE.finditer(_normalize(value)))
+    return frozenset(_VARIANT_ALIASES.get(match.group(1), match.group(1)) for match in _VARIANT_RE.finditer(_normalize(value)))
+
+
+def _variants_match(left: frozenset[str], right: frozenset[str]) -> bool:
+    """Allow a one-sided remaster marker; require every other variant to agree."""
+    return left == right or (left ^ right) <= _VARIANT_NOISE
 
 
 def _identity_title(value: str) -> str:
@@ -95,7 +108,7 @@ def select_confident_youtube_tidal_track(
         title_identity = _identity_title(title)
         if not title_identity or not normalized_artist:
             continue
-        if _recording_variants(title) != video_variants:
+        if not _variants_match(_recording_variants(title), video_variants):
             continue
         if not (_title_forms(title_identity, normalized_artist) & _title_forms(video_identity, normalized_artist)):
             continue
@@ -127,7 +140,7 @@ def select_best_tidal_track(query: str | NormalizedCandidate, tracks: Iterable[A
         if structured:
             if not artist or not any(_normalize(value) == artist for value in structured.artists):
                 continue
-            if _recording_variants(structured.title) != _recording_variants(_title(track)):
+            if not _variants_match(_recording_variants(structured.title), _recording_variants(_title(track))):
                 continue
             if _identity_title(structured.title) != _identity_title(_title(track)):
                 continue
@@ -135,10 +148,16 @@ def select_best_tidal_track(query: str | NormalizedCandidate, tracks: Iterable[A
             if (structured.duration and isinstance(duration, (int, float)) and duration > 0
                     and abs(duration - structured.duration) > max(10, structured.duration * .05)):
                 continue
-        elif normalized_query != title and not _artist_is_explicit(artist, normalized_query, ""):
-            continue
-        title_score = fuzz.token_set_ratio(normalized_query, _normalize(_title(track)))
-        combined_score = fuzz.token_set_ratio(normalized_query, _normalize(f"{_title(track)} {_artist(track)}"))
+            # The gates above already pinned the recording; score the canonical
+            # title so a Tidal version suffix ("(Remastered 2011)") cannot dilute
+            # the match below the threshold.
+            score_title = _identity_title(_title(track))
+        else:
+            if normalized_query != title and not _artist_is_explicit(artist, normalized_query, ""):
+                continue
+            score_title = title
+        title_score = fuzz.token_set_ratio(normalized_query, score_title)
+        combined_score = fuzz.token_set_ratio(normalized_query, _normalize(f"{score_title} {_artist(track)}"))
         score = (title_score * 0.55) + (combined_score * 0.45)
         if score > best_score:
             best_track, best_score = track, score

@@ -9,7 +9,7 @@ import asyncio
 import logging
 import os
 import secrets
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Mapping
 from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -110,6 +110,20 @@ def _log_provider_failure(provider: str, operation: str, error: BaseException) -
     log.warning("%s %s failed (%s)", provider, operation, type(error).__name__)
 
 
+def _first_image_url(images: Any) -> str | None:
+    """First usable URL from a provider image list, tolerating odd payloads."""
+    if not isinstance(images, list):
+        return None
+    for entry in images:
+        if isinstance(entry, dict):
+            url = entry.get("url")
+        else:
+            url = entry
+        if isinstance(url, str) and url:
+            return url
+    return None
+
+
 async def _delete_message_safe(message: discord.Message) -> None:
     """Delete a Discord message, silently ignoring all expected errors."""
     try:
@@ -125,6 +139,8 @@ LOGIN_CACHE_TTL = 300.0
 PROGRESS_EDIT_RATELIMIT = 1.5
 LOGIN_CHECK_TIMEOUT = 10.0
 LOGIN_CHECK_RETRIES = 2
+DEVICE_LOGIN_TIMEOUT = 300.0       # Upper bound for the device-code browser flow.
+DEVICE_LOGIN_POLL_INTERVAL = 1.0   # Poll the flow instead of pinning an executor worker.
 COG_LOAD_TIMEOUT = 90.0
 PAGINATION_LIMIT = 100
 MAX_ITEMS = 1000
@@ -144,6 +160,16 @@ SPOTIFY_REDIRECT_URI = "http://127.0.0.1:2402/callback"
 SPOTIFY_OAUTH_SCOPE = "playlist-read-private playlist-read-collaborative"
 SPOTIFY_LOGIN_TTL = 600.0
 YOUTUBE_MATCH_TIMEOUT = 8.0
+PROVIDER_RETRY_COOLDOWN = 60.0  # Lazy re-init backoff after a failed provider build.
+
+
+def _spotify_fingerprint(tokens: "Mapping[str, str]") -> Tuple[str, str, str]:
+    """Identify an applied token set; Red dispatches the merged service dict."""
+    return (
+        str(tokens.get("client_id") or ""),
+        str(tokens.get("client_secret") or ""),
+        str(tokens.get("refresh_token") or ""),
+    )
 
 
 _CACHE_CAPS: Dict[str, int] = {
@@ -450,6 +476,23 @@ class TidalHandler:
         # a worker while its synchronous provider request is still running.
         return await asyncio.wait_for(asyncio.shield(future), timeout=remaining)
 
+    async def _await_device_login(self, future: Any, login_url: Any) -> None:
+        """Wait for tidalapi's device-code future without pinning an executor worker.
+
+        ``session.login_oauth`` returns a ``concurrent.futures.Future`` that only
+        resolves once the owner approves the device in a browser. Waiting on it
+        through ``_run_blocking`` would hold a pool worker (and its slot) for the
+        whole window, so poll the future from the event loop instead.
+        """
+        expires_in = getattr(login_url, "expires_in", None)
+        budget = float(expires_in) if isinstance(expires_in, (int, float)) and expires_in > 0 else DEVICE_LOGIN_TIMEOUT
+        deadline = asyncio.get_running_loop().time() + min(budget, DEVICE_LOGIN_TIMEOUT)
+        while not future.done():
+            if asyncio.get_running_loop().time() >= deadline:
+                raise asyncio.TimeoutError
+            await asyncio.sleep(DEVICE_LOGIN_POLL_INTERVAL)
+        future.result()
+
     async def _run_with_backoff(self, func: Callable[[], Any], timeout: float = 10.0) -> Any:
         delay = RATELIMIT_BACKOFF_BASE
         last_exc: Optional[Exception] = None
@@ -461,7 +504,9 @@ class TidalHandler:
                 status = getattr(e, "status", None) or getattr(e, "status_code", None)
                 if status is None and hasattr(e, "response") and e.response is not None:
                     status = getattr(e.response, "status_code", None)
-                is_unauthorized = status == 401 or "401" in str(e).lower() or "unauthorized" in str(e).lower()
+                # Structured status only: provider messages can contain IDs and
+                # durations, so a substring match false-positives on "401".
+                is_unauthorized = status == 401
                 if is_unauthorized:
                     log.warning("Encountered 401 Unauthorized from Tidal API. Attempting token refresh...")
                     refreshed = await self.refresh_tokens(force=True)
@@ -641,7 +686,9 @@ class TidalHandler:
                 self._login_cache = False
                 self._login_cache_time = asyncio.get_running_loop().time()
                 return False
-        return self._login_cache if self._login_cache is not None else False
+        # Every attempt timed out: this call never observed a login, so a stale
+        # cached True must not answer for it.
+        return False
 
     async def _auto_refresh_tokens(self) -> None:
         await self.bot.wait_until_ready()
@@ -1130,11 +1177,16 @@ class TidalHandler:
         log.error("No playable Tidal stream URL available for track %s.", track_id)
         return None
     def _extract_tracks(self, result: Any) -> List[Any]:
+        def _page_items(value: Any) -> List[Any]:
+            items = getattr(value, "items", None)
+            # A mapping's ``items`` is a bound method, not a track page.
+            return items if isinstance(items, list) else []
+
         if (t := getattr(result, "tracks", None)) is not None:
-            return t if isinstance(t, list) else getattr(t, "items", [])
+            return t if isinstance(t, list) else _page_items(t)
         if isinstance(result, dict):
             t = result.get("tracks", [])
-            return t if isinstance(t, list) else getattr(t, "items", [])
+            return t if isinstance(t, list) else _page_items(t)
         return result if isinstance(result, list) else []
 
     def _filter_tracks(self, tracks: List[Any]) -> List[Any]:
@@ -1155,7 +1207,8 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         "_controller_recommendation_tasks", "_controller_last_refresh", "_current_entries",
         "_recommendation_lookup_slots", "_lastfm_session", "youtube_resolver", "source_factory", "_closing", "_guild_generations",
         "_persistent_view", "_controller_views", "_controller_locks", "_stop_generations", "public_audio_resolver",
-        "_spotify_auth_manager", "_spotify_refresh_token", "_spotify_login_states",
+        "_spotify_auth_manager", "_spotify_refresh_token", "_spotify_fingerprint", "_spotify_retry_after",
+        "_spotify_login_states", "_youtube_retry_after",
         "_spotify_login_views", "_spotify_auth_lock", "_spotify_commit_lock",
         "runtime", "attachment_resolver",
     )
@@ -1185,11 +1238,14 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         self.sp: Optional[Any] = None
         self._spotify_auth_manager: Optional[Any] = None
         self._spotify_refresh_token: Optional[str] = None
+        self._spotify_fingerprint: Optional[Tuple[str, str, str]] = None
+        self._spotify_retry_after = 0.0
         self._spotify_login_states: Dict[int, Tuple[str, float]] = {}
         self._spotify_login_views: Dict[int, SpotifyLoginView] = {}
         self._spotify_auth_lock = asyncio.Lock()
         self._spotify_commit_lock = asyncio.Lock()
         self.yt: Optional[Any] = None
+        self._youtube_retry_after = 0.0
         self._tasks: Set[asyncio.Task] = set()
         self._guild_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._cancel_events: Dict[int, asyncio.Event] = {}
@@ -1281,7 +1337,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                 await self.config.clear_raw("spotify_client_secret")
                 await self.config.clear_raw("youtube_api_key")
                 await self.config._schema_version.set(SCHEMA_VERSION)
-                log.info("TidalPlayerExp: config migrated to schema v3 (cleared legacy API keys)")
+                log.info("TidalPlayerExp: config migrated to schema v%s (cleared legacy API keys)", SCHEMA_VERSION)
         except Exception as error:
             log.warning("Config migration check failed (non-fatal; %s)", type(error).__name__)
 
@@ -1322,6 +1378,8 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         self.sp = None
         self._spotify_auth_manager = None
         self._spotify_refresh_token = None
+        self._spotify_fingerprint = None
+        self._spotify_retry_after = 0.0
         self._spotify_login_states.clear()
         for view in self._spotify_login_views.values():
             view.stop()
@@ -1429,6 +1487,27 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         if isinstance(error, (commands.MissingPermissions, commands.BotMissingPermissions)):
             await ctx.send(embed=_error_embed("You do not have permission to run this command."))
             return
+        feedback_cls = getattr(commands, "UserFeedbackCheckFailure", None)
+        if (
+            isinstance(feedback_cls, type)
+            and feedback_cls is not Exception
+            and isinstance(error, feedback_cls)
+        ):
+            # Red's UserFeedbackCheckFailure carries the message the check wanted
+            # the user to see (e.g. a failed startup); do not mask it.
+            message = getattr(error, "message", None) or str(error) or "You cannot run this command right now."
+            await ctx.send(embed=_error_embed(message))
+            return
+        no_private_cls = getattr(commands, "NoPrivateMessage", None)
+        if isinstance(no_private_cls, type) and isinstance(error, no_private_cls):
+            await ctx.send(embed=_error_embed("This command cannot be used in direct messages."))
+            return
+        disabled_cls = getattr(commands, "DisabledCommand", None)
+        if isinstance(disabled_cls, type) and isinstance(error, disabled_cls):
+            name = getattr(ctx, "command", None)
+            text = f"The command `{name}` is disabled." if name else "That command is disabled."
+            await ctx.send(embed=_error_embed(text))
+            return
         if isinstance(error, commands.UserInputError):
             await ctx.send(embed=_error_embed("Invalid argument or missing required value. Check this command's help for the expected values."))
             return
@@ -1465,6 +1544,19 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             return
         if isinstance(error, (app_commands.MissingPermissions, app_commands.BotMissingPermissions)):
             await _respond("You do not have permission to run this command.")
+            return
+        feedback_cls = getattr(app_commands, "UserFeedbackCheckFailure", None)
+        if (
+            isinstance(feedback_cls, type)
+            and feedback_cls is not Exception
+            and isinstance(error, feedback_cls)
+        ):
+            message = getattr(error, "message", None) or str(error) or "You cannot run this command right now."
+            await _respond(message)
+            return
+        no_private_cls = getattr(app_commands, "NoPrivateMessage", None)
+        if isinstance(no_private_cls, type) and isinstance(error, no_private_cls):
+            await _respond("This command cannot be used in direct messages.")
             return
         if isinstance(error, app_commands.CheckFailure):
             await _respond("You cannot run this command right now.")
@@ -1617,25 +1709,42 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         elapsed = asyncio.get_running_loop().time() - t0
         log.info("TidalPlayerExp providers initialized in %.2fs", elapsed)
 
-    async def _initialize_spotify(self) -> None:
+    async def _initialize_spotify(
+        self, *, tokens: Mapping[str, str] | None = None, retry_if_missing: bool = False,
+    ) -> None:
         async with self._spotify_commit_lock:
+            if tokens is not None and self._spotify_fingerprint == _spotify_fingerprint(tokens):
+                # Persisting a rotated refresh token notifies this cog as well;
+                # rebuilding for our own write would blank the live client.
+                return
+            if retry_if_missing:
+                if self.sp is not None or self._closing:
+                    return
+                now = asyncio.get_running_loop().time()
+                if now < self._spotify_retry_after:
+                    return
+                self._spotify_retry_after = now + PROVIDER_RETRY_COOLDOWN
             await self._initialize_spotify_locked()
+            if retry_if_missing and self.sp is not None:
+                self._spotify_retry_after = 0.0
 
     async def _initialize_spotify_locked(self) -> None:
-        """Initialize while holding the shared credential commit boundary."""
+        """Build a fresh client, then swap it in; readers never see a half state."""
         async with self._spotify_auth_lock:
-            self.sp = None
-            self._spotify_auth_manager = None
-            self._spotify_refresh_token = None
             if not SPOTIFY_AVAILABLE:
+                self._apply_spotify(None, None, None, ("", "", ""))
                 return
             tokens = await self.bot.get_shared_api_tokens("spotify")
             cid = tokens.get("client_id")
             csec = tokens.get("client_secret")
             if not cid or not csec:
+                self._apply_spotify(None, None, None, ("", "", ""))
                 return
+            client: Any | None = None
+            oauth: Any | None = None
+            refresh_token: str | None = None
+            stored_refresh_token = tokens.get("refresh_token")
             try:
-                stored_refresh_token = tokens.get("refresh_token")
                 if stored_refresh_token:
                     token_info = {
                         "access_token": "",
@@ -1653,36 +1762,67 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                         timeout=15.0,
                     )
                     if isinstance(validated, dict) and validated.get("refresh_token"):
-                        self.sp = await self.tidal._run_blocking(
+                        client = await self.tidal._run_blocking(
                             lambda: spotipy.Spotify(
                                 auth_manager=oauth,
                                 requests_timeout=15.0,
                             ),
                             timeout=15.0,
                         )
-                        self._spotify_auth_manager = oauth
                         refresh_token = str(validated["refresh_token"])
                         if refresh_token != stored_refresh_token:
                             await self.bot.set_shared_api_tokens(
                                 "spotify",
                                 refresh_token=refresh_token,
                             )
-                        self._spotify_refresh_token = refresh_token
-                        return
 
-                self.sp = await self.tidal._run_blocking(
-                    lambda: spotipy.Spotify(
-                        client_credentials_manager=SpotifyClientCredentials(
-                            cid,
-                            csec,
-                            cache_handler=MemoryCacheHandler(),
+                if client is None:
+                    oauth = None
+                    client = await self.tidal._run_blocking(
+                        lambda: spotipy.Spotify(
+                            client_credentials_manager=SpotifyClientCredentials(
+                                cid,
+                                csec,
+                                cache_handler=MemoryCacheHandler(),
+                            ),
+                            requests_timeout=15.0,
                         ),
-                        requests_timeout=15.0,
-                    ),
-                    timeout=15.0,
-                )
+                        timeout=15.0,
+                    )
             except Exception as error:
                 _log_provider_failure("Spotify", "client initialization", error)
+                client = None
+                oauth = None
+                refresh_token = None
+            applied_token = refresh_token if refresh_token is not None else str(stored_refresh_token or "")
+            self._apply_spotify(client, oauth, refresh_token, (str(cid), str(csec), applied_token))
+
+    def _apply_spotify(
+        self,
+        client: Any | None,
+        manager: Any | None,
+        refresh_token: str | None,
+        fingerprint: Tuple[str, str, str],
+    ) -> None:
+        """Swap the Spotify client in one assignment each; never mid-build."""
+        self.sp = client
+        self._spotify_auth_manager = manager
+        self._spotify_refresh_token = refresh_token
+        self._spotify_fingerprint = fingerprint
+
+    async def _spotify_ready(self) -> bool:
+        """Retry a failed Spotify build lazily, with a cooldown, on first use."""
+        if self.sp is not None:
+            return True
+        await self._initialize_spotify(retry_if_missing=True)
+        return self.sp is not None
+
+    async def _youtube_ready(self) -> bool:
+        """Retry a failed YouTube build lazily, with a cooldown, on first use."""
+        if self.yt is not None:
+            return True
+        await self._initialize_youtube(retry_if_missing=True)
+        return self.yt is not None
 
     @staticmethod
     def _parse_spotify_callback(callback_url: str, expected_state: str) -> str:
@@ -1806,6 +1946,10 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         client = self.sp
         oauth = self._spotify_auth_manager
         if client is None:
+            await self._initialize_spotify(retry_if_missing=True)
+            client = self.sp
+            oauth = self._spotify_auth_manager
+        if client is None:
             raise RuntimeError("Spotify client is unavailable")
         result = await self.tidal._run_blocking(
             lambda: operation(client),
@@ -1826,31 +1970,49 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                                 refresh_token=refresh_token,
                             )
                             self._spotify_refresh_token = refresh_token
+                            if self._spotify_fingerprint is not None:
+                                # The write dispatches our own token listener;
+                                # record it so the listener treats it as a no-op.
+                                self._spotify_fingerprint = (
+                                    self._spotify_fingerprint[0],
+                                    self._spotify_fingerprint[1],
+                                    refresh_token,
+                                )
             except Exception as error:
                 _log_provider_failure("Spotify", "token persistence", error)
         return result
 
-    async def _initialize_youtube(self) -> None:
-        self.yt = None
-        if not YOUTUBE_API_AVAILABLE:
-            return
-        tokens = await self.bot.get_shared_api_tokens("youtube")
-        key = tokens.get("api_key")
-        if key:
-            try:
-                from .providers.google_transport import IsolatedHttpRequest
-                self.yt = await self.tidal._run_blocking(
-                    lambda: build("youtube", "v3", developerKey=key, cache_discovery=False,
-                                  requestBuilder=IsolatedHttpRequest),
-                    timeout=15.0,
-                )
-            except Exception as error:
-                _log_provider_failure("YouTube", "client initialization", error)
+    async def _initialize_youtube(self, *, retry_if_missing: bool = False) -> None:
+        if retry_if_missing:
+            if self.yt is not None or self._closing:
+                return
+            now = asyncio.get_running_loop().time()
+            if now < self._youtube_retry_after:
+                return
+            self._youtube_retry_after = now + PROVIDER_RETRY_COOLDOWN
+        client: Any | None = None
+        if YOUTUBE_API_AVAILABLE:
+            tokens = await self.bot.get_shared_api_tokens("youtube")
+            key = tokens.get("api_key")
+            if key:
+                try:
+                    from .providers.google_transport import IsolatedHttpRequest
+                    client = await self.tidal._run_blocking(
+                        lambda: build("youtube", "v3", developerKey=key, cache_discovery=False,
+                                      requestBuilder=IsolatedHttpRequest),
+                        timeout=15.0,
+                    )
+                except Exception as error:
+                    _log_provider_failure("YouTube", "client initialization", error)
+        # Swap only after the build; a failed rebuild clears the stale client.
+        self.yt = client
+        if retry_if_missing and client is not None:
+            self._youtube_retry_after = 0.0
 
     @commands.Cog.listener()
     async def on_red_api_tokens_update(self, service_name: str, api_tokens: Dict[str, str]) -> None:
         if service_name == "spotify":
-            await self._initialize_spotify()
+            await self._initialize_spotify(tokens=api_tokens)
         elif service_name == "youtube":
             await self._initialize_youtube()
 
@@ -1970,12 +2132,15 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         if session is not None and session.snapshot().channel_id != channel.id:
             await ctx.send(embed=_error_embed("Join my voice channel to queue music."))
             return None
-        if session is None and ctx.guild.voice_client is not None:
-            await ctx.send(embed=_error_embed("Another cog owns this server's voice connection."))
-            return None
         try:
             async with self._guild_locks[ctx.guild.id]:
                 existing = await self.backend.get(ctx.guild.id)
+                # The ownership check belongs under the lock: the unlocked read
+                # can see a client that is about to be replaced, or miss one
+                # that appears while this request waits.
+                if existing is None and ctx.guild.voice_client is not None:
+                    await ctx.send(embed=_error_embed("Another cog owns this server's voice connection."))
+                    return None
                 initial_volume = await self.config.guild(ctx.guild).volume() if existing is None else None
                 session = await self.backend.connect(ctx.guild, channel)
                 if type(initial_volume) is int and 0 <= initial_volume <= 150 and initial_volume != 100:
@@ -2197,6 +2362,9 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             if cancel is None:
                 await ctx.send(embed=_error_embed(Messages.ERROR_BATCH_IN_PROGRESS))
                 return
+        message: discord.Message | None = None
+        queued = skipped = total = 0
+        status = "Cancelled"
         try:
             if parsed.content_type == "track":
                 item = await self.public_audio_resolver.fetch_metadata(
@@ -2209,7 +2377,6 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             message = await ctx.send(embed=discord.Embed(title=f"Importing {label} collection", color=COLOR_BLUE))
             items = await self.public_audio_resolver.fetch_collection(parsed.identifier, 100)
             total = len(items)
-            queued = skipped = 0
             interrupted = False
             for item in items:
                 if (cancel.is_set() or self._closing or stop_generation != self._stop_generations[guild_id]
@@ -2219,6 +2386,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                 entry = PlaybackEntry(secrets.token_hex(12), item.reference, None, item.meta, ctx.author.id)
                 if not await self._admit_entry(ctx, session, entry, show_embed=False, stop_generation=stop_generation):
                     skipped = total - queued
+                    interrupted = True
                     break
                 queued += 1
                 if queued % SEARCH_BATCH_SIZE == 0:
@@ -2226,23 +2394,28 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                         title=f"Importing {label} collection",
                         description=f"Queued {queued}/{total}. Skipped {skipped}.", color=COLOR_BLUE,
                     ))
-            status = "Cancelled" if interrupted or cancel.is_set() else "Finished"
+            status = self._import_status(interrupted, cancel)
             if queued:
                 await self._refresh_controller(guild_id, force=True)
-            await message.edit(embed=discord.Embed(
-                title=f"{status} importing {label} collection",
-                description=f"Queued {queued}/{total}. Skipped {skipped}.", color=COLOR_BLUE,
-            ))
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            status = "Failed"
             _log_provider_failure(label, "public audio import", error)
-            await ctx.send(embed=_error_embed(
-                f"Could not read playable audio from this {label} link. "
-                "SoundCloud private tracks need a valid shared link; preview-only, "
-                "premium-only, or unavailable releases cannot be played."
-            ))
+            if isinstance(error, (PlaybackUnavailable, SourceResolutionError)):
+                text = (
+                    f"Could not read playable audio from this {label} link. "
+                    "SoundCloud private tracks need a valid shared link; preview-only, "
+                    "premium-only, or unavailable releases cannot be played."
+                )
+            else:
+                text = Messages.ERROR_FETCH_FAILED
+            await ctx.send(embed=_error_embed(text))
         finally:
+            await self._edit_import_status(
+                message, f"{label} collection", status,
+                queued=queued, total=total, skipped=skipped, color=COLOR_BLUE,
+            )
             if cancel is not None:
                 self._release_batch(guild_id, cancel)
 
@@ -2442,11 +2615,13 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             self._recommendation_tasks[guild_id] = task
             self._recommendation_task_sources[guild_id] = source
 
+        failed = False
         try:
             recommendations = await asyncio.shield(task)
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            failed = True
             log.warning("Could not load recommendations for guild %s (%s)", guild_id, type(error).__name__)
             recommendations = []
         finally:
@@ -2454,7 +2629,10 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                 self._recommendation_tasks.pop(guild_id, None)
                 self._recommendation_task_sources.pop(guild_id, None)
 
-        self._recommendation_cache[guild_id] = (source, recommendations)
+        if not failed:
+            # Only a completed lookup may be remembered; a failure must stay
+            # retryable for the same track instead of caching an empty list.
+            self._recommendation_cache[guild_id] = (source, recommendations)
         return recommendations
 
     def _schedule_controller_recommendations(self, guild_id: int) -> None:
@@ -2847,16 +3025,63 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             await ctx.send(embed=_error_embed(Messages.ERROR_TIMEOUT))
         return selected
 
+    @staticmethod
+    def _import_status(interrupted: bool, cancel: asyncio.Event) -> str:
+        """One status rule for every collection import: nothing else counts as finished."""
+        return "Cancelled" if interrupted or cancel.is_set() else "Finished"
+
+    @staticmethod
+    async def _edit_import_status(
+        message: discord.Message | None,
+        label: str,
+        status: str,
+        *,
+        queued: int,
+        total: int,
+        skipped: int,
+        color: int,
+    ) -> None:
+        """Best-effort final edit of a collection-import progress message."""
+        if message is None:
+            return
+        title = f"Import failed: {label}" if status == "Failed" else f"{status} importing {label}"
+        embed = discord.Embed(
+            title=title,
+            description=f"Queued {queued}/{total}. Skipped {skipped}.",
+            color=color,
+        )
+        try:
+            await message.edit(embed=embed)
+        except Exception:
+            return
+
     async def _edit_progress_message(self, msg: discord.Message, embed: discord.Embed) -> None:
-        guild_id = msg.guild.id if msg.guild else msg.id
+        # Rate-limit per message, never per guild: two concurrent imports share a
+        # guild, and a DM has no guild at all. Keying on the guild would let one
+        # message suppress every other one, while keying on a DM's message id
+        # would disable the limit entirely.
         now = asyncio.get_running_loop().time()
-        if now - self._last_progress_edit.get(guild_id, 0.0) < PROGRESS_EDIT_RATELIMIT:
+        last_edit = self._last_progress_edit.get(msg.id)
+        if last_edit is not None and now - last_edit < PROGRESS_EDIT_RATELIMIT:
             return
         try:
             await msg.edit(embed=embed)
-            self._last_progress_edit[guild_id] = now
         except Exception:
-            pass
+            return
+        # A message only needs to be remembered until its window expires, so the
+        # map stays bounded by concurrent imports instead of growing forever.
+        self._prune_progress_edits(now)
+        self._last_progress_edit[msg.id] = now
+
+    def _prune_progress_edits(self, now: float) -> None:
+        """Forget edit timestamps whose rate-limit window has already passed."""
+        stale = [
+            message_id
+            for message_id, edited_at in self._last_progress_edit.items()
+            if now - edited_at >= PROGRESS_EDIT_RATELIMIT
+        ]
+        for message_id in stale:
+            self._last_progress_edit.pop(message_id, None)
 
     async def _fetch_all_spotify_tracks(self, playlist_id: str) -> List[Any]:
         all_items: List[Any] = []
@@ -3406,7 +3631,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                 timeout=15.0,
             )
             items = await self._fetch_all_spotify_tracks(playlist_id)
-            thumb = meta.get("images", [{}])[0].get("url") if meta.get("images") else None
+            thumb = _first_image_url(meta.get("images"))
             await self._process_track_list(
                 ctx, items, meta.get("name", "Spotify Playlist"),
                 _spotify_item_to_query, color=COLOR_GREEN, thumbnail_url=thumb,
@@ -3464,7 +3689,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                 timeout=15.0,
             )
             items, album_name = await self._fetch_all_spotify_album_tracks(album_id, album_meta)
-            thumb = album_meta.get("images", [{}])[0].get("url") if album_meta.get("images") else None
+            thumb = _first_image_url(album_meta.get("images"))
             await self._process_track_list(
                 ctx, items, album_name,
                 _spotify_album_item_to_query, color=COLOR_GREEN, thumbnail_url=thumb,
@@ -3479,15 +3704,18 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         if session is None:
             return
         guild_id = ctx.guild.id
+        stop_generation = self._stop_generations[guild_id]
         cancel = self._claim_batch(guild_id)
         if cancel is None:
             await ctx.send(embed=_error_embed(Messages.ERROR_BATCH_IN_PROGRESS))
             return
-        queued = skipped = 0
+        message: discord.Message | None = None
+        queued = skipped = total = 0
+        status = "Cancelled"
         try:
             message = await ctx.send(embed=discord.Embed(title="Importing YouTube playlist", color=COLOR_RED))
             videos: list[YouTubeVideoMetadata] = []
-            if self.yt is not None:
+            if await self._youtube_ready():
                 try:
                     items = await self._fetch_all_youtube_tracks(playlist_id)
                     for item in items:
@@ -3508,36 +3736,43 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                     deduplicated.setdefault(video.video_id, video)
             videos = list(deduplicated.values())[:MAX_ITEMS]
             total = len(videos)
+            interrupted = False
             for start in range(0, total, SEARCH_BATCH_SIZE):
-                if cancel.is_set() or self._closing or await self.backend.get(guild_id) is not session:
+                if (cancel.is_set() or self._closing or stop_generation != self._stop_generations[guild_id]
+                        or await self.backend.get(guild_id) is not session):
+                    interrupted = True
                     break
                 entries = await asyncio.gather(*(self._youtube_entry(video, ctx.author.id) for video in videos[start:start + SEARCH_BATCH_SIZE]))
                 for entry in entries:
-                    if cancel.is_set() or self._closing or await self.backend.get(guild_id) is not session:
+                    if (cancel.is_set() or self._closing or stop_generation != self._stop_generations[guild_id]
+                            or await self.backend.get(guild_id) is not session):
+                        interrupted = True
                         break
-                    if not await self._admit_entry(ctx, session, entry, show_embed=False):
+                    if not await self._admit_entry(ctx, session, entry, show_embed=False, stop_generation=stop_generation):
                         skipped = total - queued
+                        interrupted = True
                         break
                     queued += 1
-                if skipped:
+                if interrupted:
                     break
                 await self._edit_progress_message(message, discord.Embed(
                     title="Importing YouTube playlist",
                     description=f"Queued {queued}/{total}. Skipped {skipped}.", color=COLOR_RED,
                 ))
-            status = "Cancelled" if cancel.is_set() else "Finished"
+            status = self._import_status(interrupted, cancel)
             if queued:
                 await self._refresh_controller(guild_id, force=True)
-            await message.edit(embed=discord.Embed(
-                title=f"{status} importing YouTube playlist",
-                description=f"Queued {queued}/{total}. Skipped {skipped}.", color=COLOR_RED,
-            ))
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            status = "Failed"
             _log_provider_failure("YouTube", "playlist import", error)
             await ctx.send(embed=_error_embed(Messages.ERROR_FETCH_FAILED))
         finally:
+            await self._edit_import_status(
+                message, "YouTube playlist", status,
+                queued=queued, total=total, skipped=skipped, color=COLOR_RED,
+            )
             self._release_batch(guild_id, cancel)
 
     @commands.hybrid_command(name="tidalsearch")
@@ -3671,7 +3906,8 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             isrc = ISRC_PATTERN.match(query).group(1).upper()
             track = await self.tidal.get_track_by_isrc(isrc)
         if not track:
-            results = await self.tidal.search(query)
+            filter_remixes = await self.config.guild(ctx.guild).filter_remixes()
+            results = await self.tidal.search(query, filter_remixes=filter_remixes)
             if results:
                 track = results[0]
         if not track:
@@ -3907,12 +4143,19 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             login_url, future = await self.tidal._run_blocking(
                 session.login_oauth, timeout=15.0
             )
-            await ctx.author.send(
-                f"Open this URL to authenticate with Tidal:\n<{login_url.verification_uri_complete}>\n"
-                f"You have {login_url.expires_in} seconds."
-            )
+            try:
+                await ctx.author.send(
+                    f"Open this URL to authenticate with Tidal:\n<{login_url.verification_uri_complete}>\n"
+                    f"You have {login_url.expires_in} seconds."
+                )
+            except discord.Forbidden:
+                await ctx.send(embed=_error_embed(
+                    "I could not DM you the login link, so the Tidal login was cancelled. "
+                    "Allow direct messages from this server and try again."
+                ))
+                return
             await ctx.send(embed=_success_embed("Check your DMs for the Tidal login link."))
-            await self.tidal._run_blocking(lambda: future.result(), timeout=120.0)
+            await self.tidal._await_device_login(future, login_url)
             def _get_state():
                 return (
                     session.expiry_time,

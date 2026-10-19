@@ -36,7 +36,10 @@ async def test_shared_token_update_reinitializes_provider(
     with patch.object(type(cog), initializer, new=AsyncMock()) as initialize:
         await cog.on_red_api_tokens_update(service_name, {})
 
-    initialize.assert_awaited_once_with()
+    if service_name == "spotify":
+        initialize.assert_awaited_once_with(tokens={})
+    else:
+        initialize.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
@@ -132,3 +135,95 @@ async def test_initialize_apis_does_not_log_raw_provider_exception(cog, caplog) 
     assert secret not in caplog.text
     assert "https://" not in caplog.text
     assert "RuntimeError" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_own_refresh_token_write_does_not_rebuild_spotify(cog) -> None:
+    """A rotated token persisted by the cog must not blank the live client."""
+    cog.sp = object()
+    cog._spotify_fingerprint = ("client", "secret", "refresh-a")
+    with patch.object(type(cog), "_initialize_spotify_locked", new=AsyncMock()) as rebuild:
+        await cog.on_red_api_tokens_update(
+            "spotify",
+            {"client_id": "client", "client_secret": "secret", "refresh_token": "refresh-a"},
+        )
+        rebuild.assert_not_awaited()
+
+        await cog.on_red_api_tokens_update(
+            "spotify",
+            {"client_id": "client", "client_secret": "secret", "refresh_token": "refresh-b"},
+        )
+    rebuild.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_missing_spotify_client_is_rebuilt_lazily(cog) -> None:
+    """A transient init failure must recover on the next use, not only on reload."""
+    client = object()
+
+    async def rebuild() -> None:
+        cog.sp = client
+
+    cog.sp = None
+    cog._spotify_retry_after = 0.0
+    with patch.object(type(cog), "_initialize_spotify_locked", new=AsyncMock(side_effect=rebuild)):
+        assert await cog._spotify_ready() is True
+    assert cog.sp is client
+    assert cog._spotify_retry_after == 0.0
+
+
+@pytest.mark.asyncio
+async def test_failed_spotify_rebuild_is_throttled(cog) -> None:
+    """Repeated uses must not start a provider build on every request."""
+    rebuild = AsyncMock()
+    cog.sp = None
+    cog._spotify_retry_after = 0.0
+    with patch.object(type(cog), "_initialize_spotify_locked", new=rebuild):
+        assert await cog._spotify_ready() is False
+        assert await cog._spotify_ready() is False
+    rebuild.assert_awaited_once()
+    assert cog._spotify_retry_after > 0
+
+
+@pytest.mark.asyncio
+async def test_missing_youtube_client_is_rebuilt_lazily(cog, monkeypatch) -> None:
+    import sys
+    import types
+
+    from TidalPlayerExp import tidalplayer as module
+
+    transport = types.ModuleType("TidalPlayerExp.providers.google_transport")
+    transport.IsolatedHttpRequest = object
+    monkeypatch.setitem(sys.modules, "TidalPlayerExp.providers.google_transport", transport)
+    monkeypatch.setattr(module, "YOUTUBE_API_AVAILABLE", True)
+    cog.bot.get_shared_api_tokens = AsyncMock(return_value={"api_key": "key"})
+    client = object()
+    monkeypatch.setattr(module, "build", MagicMock(return_value=client))
+    cog.yt = None
+    cog._youtube_retry_after = 0.0
+
+    assert await cog._youtube_ready() is True
+    assert cog.yt is client
+    assert cog._youtube_retry_after == 0.0
+
+
+@pytest.mark.asyncio
+async def test_failed_youtube_rebuild_is_throttled(cog, monkeypatch) -> None:
+    import sys
+    import types
+
+    from TidalPlayerExp import tidalplayer as module
+
+    transport = types.ModuleType("TidalPlayerExp.providers.google_transport")
+    transport.IsolatedHttpRequest = object
+    monkeypatch.setitem(sys.modules, "TidalPlayerExp.providers.google_transport", transport)
+    monkeypatch.setattr(module, "YOUTUBE_API_AVAILABLE", True)
+    cog.bot.get_shared_api_tokens = AsyncMock(return_value={"api_key": "key"})
+    monkeypatch.setattr(module, "build", MagicMock(side_effect=RuntimeError("down")))
+    cog.yt = None
+    cog._youtube_retry_after = 0.0
+
+    assert await cog._youtube_ready() is False
+    assert await cog._youtube_ready() is False
+    assert cog.yt is None
+    assert cog._youtube_retry_after > 0

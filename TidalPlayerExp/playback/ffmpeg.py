@@ -529,9 +529,21 @@ class FFmpegSourceFactory:
 
         if self._closed:
             raise PlaybackUnavailable()
-        if self._capability_task is None:
-            self._capability_task = asyncio.create_task(self._perform_check())
-        return await asyncio.shield(self._capability_task)
+        task = self._capability_task
+        if task is None:
+            task = asyncio.create_task(self._perform_check())
+            self._capability_task = task
+            task.add_done_callback(self._forget_failed_check)
+        return await asyncio.shield(task)
+
+    def _forget_failed_check(self, task: asyncio.Task[FFmpegCapability]) -> None:
+        """Let a later call retry instead of disabling playback until reload."""
+
+        if task.cancelled() or task.exception() is None:
+            return
+        if self._capability_task is task:
+            self._capability_task = None
+        self._record_failure("capability_probe_failed")
 
     async def close(self) -> None:
         """Reject new work and account for the factory's bounded background work."""

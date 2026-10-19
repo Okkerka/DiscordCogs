@@ -14,6 +14,7 @@ from TidalPlayerExp.providers.tidal_source import CompositeSourceResolver
 from TidalPlayerExp.providers.public_audio import PublicAudioMetadata
 from TidalPlayerExp.providers.urls import parse_provider_url
 from TidalPlayerExp.tests.test_youtube_fallback import _context
+from TidalPlayerExp.ui.embeds import Messages
 
 
 def _metadata(url):
@@ -155,6 +156,25 @@ async def test_public_collection_failure_releases_claim_without_leaking_details(
         assert "secret" not in public_ctx.send.await_args.kwargs["embed"].description
     assert not cog._cancel_events
     native_session.enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_public_collection_failure_replaces_progress_message(cog, public_ctx, native_session):
+    cog.public_audio_resolver.fetch_collection.side_effect = RuntimeError("token=secret")
+    await cog.tplay(public_ctx, query="https://soundcloud.com/artist/sets/set")
+
+    final = public_ctx.send.return_value.edit.await_args.kwargs["embed"]
+    assert final.title == "Import failed: SoundCloud collection"
+    assert public_ctx.send.await_args.kwargs["embed"].description == Messages.ERROR_FETCH_FAILED
+
+
+@pytest.mark.asyncio
+async def test_public_collection_source_failure_keeps_playable_advice(cog, public_ctx, native_session):
+    cog.public_audio_resolver.fetch_collection.side_effect = PlaybackUnavailable("preview only")
+    await cog.tplay(public_ctx, query="https://soundcloud.com/artist/sets/set")
+
+    assert "SoundCloud private tracks" in public_ctx.send.await_args.kwargs["embed"].description
+    assert "Import failed" in public_ctx.send.return_value.edit.await_args.kwargs["embed"].title
 
 
 @pytest.mark.asyncio

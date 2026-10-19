@@ -14,7 +14,10 @@ GLOBAL_DEFAULTS: Final = {
     "access_token": None,
     "refresh_token": None,
     "expiry_time": None,
-    "_schema_version": SCHEMA_VERSION,
+    # Must stay None: Red returns defaults for keys that were never stored, so a
+    # non-None default would make "never migrated" indistinguishable from
+    # "already migrated" and the legacy-key cleanup could never run.
+    "_schema_version": None,
 }
 
 GUILD_DEFAULTS: Final = {
