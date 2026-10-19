@@ -23,6 +23,7 @@ MODULE_NAME = "TidalPlayerExp.tidalplayer"
 
 REQUIRED_COMMAND_NAMES = {
     "tplay",
+    "yplay",
     "tsearch",
     "tnowplaying",
     "tqueue",

@@ -1,6 +1,7 @@
 """Shared prefix/slash playback controls; sessions own all queue mutations."""
 from __future__ import annotations
 
+import asyncio
 from typing import Literal
 
 import discord
@@ -10,6 +11,10 @@ from .domain.normalization import format_duration
 from .playback.interfaces import PlaybackSession
 from .playback.requests import current_request, playback_request
 from .ui.display import escape_display
+
+# A cancelled import that is stuck in a provider call must not keep the guild's
+# batch claim until unload; stop releases it after this bounded grace.
+BATCH_RELEASE_GRACE = 5.0
 
 
 def parse_position(value: str) -> int | None:
@@ -89,8 +94,20 @@ class PlaybackCommands:
         self._stop_generations[guild_id] += 1
         self._guild_generations[guild_id] += 1
         event = self._cancel_events.get(guild_id)
-        if event is not None:
-            event.set()
+        if event is None:
+            return
+        event.set()
+        # The owner task releases the claim when it reaches its finally block;
+        # if it is wedged in a provider call, force the release after a grace
+        # so a later request is not rejected as "batch in progress" forever.
+        task = asyncio.create_task(self._release_batch_after_grace(guild_id, event))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _release_batch_after_grace(self, guild_id: int, event: asyncio.Event) -> None:
+        """Release a cancelled batch claim once its wind-down grace expires."""
+        await asyncio.sleep(BATCH_RELEASE_GRACE)
+        self._release_batch(guild_id, event)
 
     async def _stop_playback(self, guild_id: int) -> None:
         """One Stop implementation for command, slash command, and player button."""
@@ -332,6 +349,7 @@ class PlaybackCommands:
             "**Native music commands**\n"
             "`play <link/search>` — TIDAL, YouTube, SoundCloud, Bandcamp, or Spotify imports.\n"
             "`playfrom <platform> <search>` — choose tidal, youtube, or soundcloud; `/play` stays query-only.\n"
+            "`yplay <search/link>` — force YouTube search or one YouTube video, never a TIDAL match.\n"
             "`playfile` or `/playfile file:<upload>` — Play audio/video uploads (including MP4), up to 50 MiB.\n"
             "`queue` · `now` · `tidalsearch <query>`\n"
             "`pause` · `resume` · `skip` · `stop` (stops audio, clears queue, cancels imports)\n"

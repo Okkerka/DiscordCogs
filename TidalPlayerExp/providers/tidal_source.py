@@ -88,6 +88,10 @@ class TidalSourceResolver:
             return await operation()
         except asyncio.CancelledError:
             raise
+        except PlaybackUnavailable:
+            # Capacity/connectivity is transient; the resolver must not turn it
+            # into a permanent source failure.
+            raise
         except Exception:  # noqa: BLE001 - provider failures are deliberately discarded
             return _FAILED
 
@@ -98,6 +102,8 @@ class TidalSourceResolver:
                     operation, timeout=_PROVIDER_TIMEOUT
                 )
         except asyncio.CancelledError:
+            raise
+        except PlaybackUnavailable:
             raise
         except Exception:  # noqa: BLE001 - provider failures are deliberately discarded
             return _FAILED

@@ -152,7 +152,9 @@ is not a guarantee that every site or individual track currently works.
   that same YouTube video. A fallback displays the YouTube title and link.
   Matching requires the complete song title, explicit artist identity, and
   matching recording variants; a shorter title such as "Love" cannot substitute
-  for "Love Song". Uncertain matches stay on YouTube.
+  for "Love Song". Uncertain matches stay on YouTube. Use `[p]yplay` to force
+  that outcome deliberately: it searches YouTube (or takes one YouTube video
+  link) and never tries the TIDAL catalog.
 - TIDAL media links accept `/browse/`, a trailing `/u` share suffix, and ordinary
   trailing slashes. YouTube watch, `youtu.be`, mobile, Music, Shorts, Live and
   embed links are supported, including `youtube-nocookie.com` video embeds.
@@ -208,6 +210,7 @@ keep the old `tplay`, `tqueue`, `tsearch`, `tnowplaying`, `tpl`, or `tidalsetup`
 | --- | --- |
 | `play <link/search>` | Play supported media or search TIDAL. Slash `/play` takes only `query`. |
 | `playfrom <platform> <search>` | Search TIDAL, YouTube, or SoundCloud explicitly. Slash `/playfrom` takes `platform` and `query`. |
+| `yplay <link/search>` | Force YouTube: search YouTube or play one YouTube video, never a TIDAL catalog match. Rejects playlists and other sites. |
 | `playfile` | Attach one audio/video file to the prefix message, or use `/playfile file:<attachment>`. |
 | `playnext <link/search>` | Put one track next, without interrupting the current song. Collections use `play`. |
 | `queue` | Components V2 panel with current song, numbered waiting songs, durations, requester IDs, paging and refresh. |

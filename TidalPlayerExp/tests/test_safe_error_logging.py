@@ -85,6 +85,14 @@ async def test_recommendation_failure_log_does_not_include_provider_url(cog, cap
 
 
 @pytest.mark.asyncio
+async def test_failed_recommendation_lookup_stays_retryable(cog) -> None:
+    """A provider failure must not be cached as an empty suggestion list."""
+    cog._radio_candidates = AsyncMock(side_effect=RuntimeError(SECRET))
+    assert await cog._get_recommendations(1, {"track_id": "123"}) == []
+    assert 1 not in cog._recommendation_cache
+
+
+@pytest.mark.asyncio
 async def test_replaced_abandoned_recommendation_task_retrieves_late_failure(cog) -> None:
     loop = asyncio.get_running_loop()
     reports = []

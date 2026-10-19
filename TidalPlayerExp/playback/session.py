@@ -133,6 +133,7 @@ class NativePlaybackSession:
         self._runner: asyncio.Task[None] | None = None
         self._cleanup_barrier: asyncio.Future[list[object]] | None = None
         self._close_task: asyncio.Task[None] | None = None
+        self._retained_tasks: set[asyncio.Task[None]] = set()
 
     @property
     def guild_id(self) -> int:
@@ -148,7 +149,9 @@ class NativePlaybackSession:
 
     def snapshot(self) -> PlaybackSnapshot:
         """Return detached immutable state; all mutations occur on the event loop."""
-        channel_id = self._voice_client.channel.id if self._owned() else None
+        # A cached channel can be momentarily absent while a move re-identifies.
+        channel = getattr(self._voice_client, "channel", None) if self._owned() else None
+        channel_id = getattr(channel, "id", None)
         return PlaybackSnapshot(
             self._current, tuple(self._queue), self._paused, channel_id,
             self._volume, self._repeat, self._position(), self._failures >= 3 and not self._running,
@@ -161,7 +164,9 @@ class NativePlaybackSession:
         return max(0.0, self._current.start_time + elapsed)
 
     def _owned(self) -> bool:
-        return self._voice_client.guild.voice_client is self._voice_client
+        # A voice client can be detached from its guild during teardown.
+        guild = getattr(self._voice_client, "guild", None)
+        return guild is not None and guild.voice_client is self._voice_client
 
     async def enqueue(
         self, entry: PlaybackEntry, *, start_if_idle: bool = True, next_up: bool = False
@@ -381,12 +386,16 @@ class NativePlaybackSession:
         await asyncio.shield(asyncio.gather(previous, return_exceptions=True))
 
     async def stop(self, *, clear_queue: bool = True) -> None:
-        """Stop without queue-end events and optionally retain waiting entries."""
+        """Stop without queue-end events and optionally retain waiting entries.
+
+        Retaining the queue also retains the session's playback preferences and
+        halt state; only a stop that discards the queue resets them.
+        """
         async with self._lock:
             if clear_queue:
                 self._clear_queue()
-            self._repeat = "off"
-            self._failures = 0
+                self._repeat = "off"
+                self._failures = 0
             self._running = False
             previous = self._interrupt()
             barrier = self._cleanup_barrier
@@ -426,6 +435,17 @@ class NativePlaybackSession:
                 failed = True
         if failed:
             raise PlaybackUnavailable()
+
+    def _retain_background_task(self, task: asyncio.Task[None]) -> None:
+        """Keep and consume a bounded task whose waiter was cancelled twice."""
+
+        def task_finished(finished: asyncio.Task[None]) -> None:
+            self._retained_tasks.discard(finished)
+            if not finished.cancelled():
+                finished.exception()
+
+        self._retained_tasks.add(task)
+        task.add_done_callback(task_finished)
 
     async def _notify(
         self, event: str, entry: PlaybackEntry | None, generation: int
@@ -612,8 +632,13 @@ class NativePlaybackSession:
                     try:
                         await asyncio.shield(cleanup)
                     except asyncio.CancelledError:
-                        await cleanup
-                        raise
+                        try:
+                            await asyncio.shield(cleanup)
+                        except asyncio.CancelledError:
+                            # A second cancellation must not abandon the thread
+                            # or leak its exception: retain and consume it.
+                            self._retain_background_task(cleanup)
+                            raise
                     finally:
                         self._source = None
             async with self._lock:

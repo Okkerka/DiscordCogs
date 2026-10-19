@@ -9,7 +9,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from TidalPlayerExp.playback import SourceKind, SourceReference, SourceResolutionError
+from TidalPlayerExp.playback import PlaybackUnavailable, SourceKind, SourceReference, SourceResolutionError
 from TidalPlayerExp.providers.urls import MalformedProviderURL, parse_provider_url
 from TidalPlayerExp.providers.youtube_resolver import YouTubeResolver
 
@@ -326,4 +326,18 @@ async def test_public_audio_invalid_references_do_not_spawn(tmp_path):
     with pytest.raises(SourceResolutionError):
         await resolver.fetch_collection(SOUNDCLOUD)
     assert not calls
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_public_audio_keeps_transient_capacity_errors_distinct(tmp_path, monkeypatch):
+    """A busy worker must stay retryable instead of becoming a permanent failure."""
+    resolver, worker, _calls = _resolver(tmp_path, b"")
+
+    async def run_child(*_args, **_kwargs) -> bytes:
+        raise PlaybackUnavailable()
+
+    monkeypatch.setattr(worker, "_run_child", run_child)
+    with pytest.raises(PlaybackUnavailable):
+        await resolver.fetch_metadata(SourceReference(SourceKind.SOUNDCLOUD, SOUNDCLOUD))
     await worker.close()

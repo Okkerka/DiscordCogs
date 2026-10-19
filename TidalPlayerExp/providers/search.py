@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from typing import Literal
 
 from ..domain.models import TrackMeta
-from ..playback.errors import SourceResolutionError
+from ..playback.errors import PlaybackUnavailable, SourceResolutionError
 from ..playback.models import SourceKind, SourceReference
 from .public_audio import PublicAudioResolver
 from .youtube_resolver import (
@@ -129,6 +129,9 @@ async def search_provider(
             return _youtube_result(payload)
         return _soundcloud_result(payload)
     except asyncio.CancelledError:
+        raise
+    except PlaybackUnavailable:
+        # Capacity/connectivity is transient and must stay distinguishable.
         raise
     except Exception:  # noqa: BLE001 - subprocess and provider details are untrusted
         raise SourceResolutionError() from None

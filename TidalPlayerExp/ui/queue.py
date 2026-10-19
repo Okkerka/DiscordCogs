@@ -156,7 +156,13 @@ class QueueView(discord.ui.LayoutView):
             self.snapshot = await self._load_snapshot()
             self.page = max(0, self.page + page_delta)
             self._build_layout()
-            await interaction.edit_original_response(view=self, allowed_mentions=_MENTIONS_NONE)
+            try:
+                await interaction.edit_original_response(view=self, allowed_mentions=_MENTIONS_NONE)
+            except (discord.HTTPException, discord.Forbidden, discord.NotFound):
+                # The panel was deleted or is no longer editable; retire it
+                # instead of letting every later click fail the same way.
+                self.message = None
+                self.stop()
 
     async def _back(self, interaction: discord.Interaction) -> None:
         await self._update(interaction, page_delta=-1)

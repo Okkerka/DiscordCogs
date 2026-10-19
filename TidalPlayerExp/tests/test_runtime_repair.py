@@ -502,6 +502,41 @@ def test_unselected_archive_paths_are_not_extracted(kind, tmp_path):
     assert sorted(p.name for p in tmp_path.iterdir()) == ["archive", "ffmpeg"]
 
 
+def test_extraction_deadline_reports_a_distinct_code(tmp_path, monkeypatch):
+    import threading
+
+    body = _tar_xz({"ffmpeg": b"binary"})
+    path = tmp_path / "archive"
+    path.write_bytes(body)
+    asset = _asset("https://example.invalid/archive", body, "tar.xz", "ffmpeg")
+    monkeypatch.setattr(runtime_repair, "_EXTRACT_DEADLINE", -1.0)
+    with pytest.raises(runtime_repair.RuntimeRepairError) as error:
+        runtime_repair._extract(asset, path, tmp_path / "ffmpeg", threading.Event())
+    assert error.value.code == "archive_timeout"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "code"),
+    [
+        (TimeoutError(), "download_timeout"),
+        (OSError("disk"), "download_io"),
+        (ValueError("bad length"), "download_size"),
+        (runtime_repair.aiohttp.ClientConnectionError(), "download_failed"),
+    ],
+)
+async def test_download_failures_keep_distinct_diagnostic_codes(tmp_path, failure, code):
+    class Failing:
+        def get(self, _url):
+            raise failure
+
+    runtime = runtime_repair.ManagedRuntime(tmp_path / "runtime")
+    asset = _asset("https://example.invalid/archive", b"", "tar.xz", "ffmpeg")
+    with pytest.raises(runtime_repair.RuntimeRepairError) as error:
+        await runtime._download(Failing(), asset, tmp_path / "archive")
+    assert error.value.code == code
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["probe", "activation"])
 async def test_failure_preserves_previous_pair(failure, tmp_path, successful_boundaries, monkeypatch):

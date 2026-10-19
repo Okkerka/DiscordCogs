@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -490,3 +491,75 @@ async def test_failed_disconnect_is_sanitized_and_retryable():
     voice.disconnect = Voice.disconnect.__get__(voice)
     await session.close()
     assert voice.disconnects == 1
+
+
+def test_snapshot_tolerates_a_client_without_a_cached_channel():
+    session, voice, _resolver, _factory, _sink = setup()
+    voice.channel = None
+    assert session.snapshot().channel_id is None
+
+
+def test_snapshot_tolerates_a_client_detached_from_its_guild():
+    session, voice, _resolver, _factory, _sink = setup()
+    voice.guild = None
+    assert session.snapshot().channel_id is None
+
+
+@pytest.mark.asyncio
+async def test_stop_without_queue_clear_retains_repeat_mode():
+    session, _voice, _resolver, _factory, _sink = setup()
+    try:
+        await session.set_repeat("queue")
+        await session.stop(clear_queue=False)
+        assert session.snapshot().repeat == "queue"
+        await session.stop()
+        assert session.snapshot().repeat == "off"
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_double_cancellation_retains_and_consumes_blocked_cleanup():
+    loop = asyncio.get_running_loop()
+    release, finished, cleaning = threading.Event(), threading.Event(), asyncio.Event()
+
+    class BlockingSource(Source):
+        def cleanup(self):
+            try:
+                loop.call_soon_threadsafe(cleaning.set)
+            except RuntimeError:
+                return  # Collected after the loop closed; nothing left to signal.
+            assert release.wait(timeout=5)
+            finished.set()
+
+    session, _voice, _resolver, factory, sink = setup()
+
+    async def create(resolved):
+        source = BlockingSource()
+        factory.sources.append(source)
+        return source
+
+    factory.create = create
+    try:
+        await session.enqueue(entry())
+        await sink.expect("started")
+        runner = session._runner
+        runner.cancel()
+        await asyncio.wait_for(cleaning.wait(), 2)
+        runner.cancel()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        runner.cancel()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert runner.done() and runner.cancelled()
+        assert len(session._retained_tasks) == 1
+    finally:
+        release.set()
+    for _ in range(200):
+        if not session._retained_tasks:
+            break
+        await asyncio.sleep(0.01)
+    assert finished.is_set()
+    assert not session._retained_tasks
+    await session.close()

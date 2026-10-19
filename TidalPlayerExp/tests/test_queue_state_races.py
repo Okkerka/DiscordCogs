@@ -1,5 +1,6 @@
 """Controller and sink concurrency against the authoritative native session."""
 import asyncio
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -148,3 +149,69 @@ async def test_stale_end_callback_cannot_clear_active_track(cog, native_session)
     await cog.queue_ended(1, make_entry(2))
     assert cog._current_meta[1] == current.meta
     cog._schedule_autoplay.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_skip_click_cannot_apply_to_the_next_track(cog, native_session):
+    """A click dispatched before a boundary must not skip the replacement track."""
+    guild = SimpleNamespace(id=54)
+    native_session.current = make_entry()
+    interaction = make_controller_interaction(guild)
+
+    async def track_changed() -> None:
+        cog._guild_generations[guild.id] += 1
+
+    interaction.response.defer.side_effect = track_changed
+    await cog.controller_skip(interaction)
+
+    native_session.skip.assert_not_awaited()
+    interaction.followup.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_deleted_controller_message_is_unmapped(cog, native_session):
+    """A deleted panel must not keep receiving edits on every refresh."""
+    guild_id = 55
+    entry = make_entry()
+    native_session.current = entry
+    cog._current_entries[guild_id] = entry
+    cog._current_meta[guild_id] = entry.meta
+    cog._controller_meta[guild_id] = entry.meta
+    response = SimpleNamespace(status=404, reason="Not Found")
+    # The cog may have been imported against the suite's discord stub; raise the
+    # exception class that its except clause actually names.
+    cog_discord = sys.modules[type(cog).__module__].discord
+    message = SimpleNamespace(
+        id=400,
+        edit=AsyncMock(side_effect=cog_discord.NotFound(response, "Unknown Message")),
+    )
+    cog._controller_messages[guild_id] = message
+    cog._controller_view = AsyncMock(return_value=MagicMock())
+
+    await cog._refresh_controller(guild_id)
+    assert guild_id not in cog._controller_messages
+    message.edit.assert_awaited_once()
+
+    # A later refresh must not retry the deleted message.
+    cog._controller_last_refresh.pop(guild_id, None)
+    await cog._refresh_controller(guild_id)
+    message.edit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_stop_force_releases_a_wedged_batch_claim(cog, monkeypatch):
+    """A stuck provider call must not reject new imports until the cog unloads."""
+    from TidalPlayerExp import commands as command_module
+
+    monkeypatch.setattr(command_module, "BATCH_RELEASE_GRACE", 0)
+    guild_id = 56
+    event = cog._claim_batch(guild_id)
+    assert event is not None
+    assert cog._claim_batch(guild_id) is None
+
+    cog._cancel_imports(guild_id)
+    await asyncio.gather(*tuple(cog._tasks))
+
+    assert event.is_set()
+    assert guild_id not in cog._cancel_events
+    assert cog._claim_batch(guild_id) is not None

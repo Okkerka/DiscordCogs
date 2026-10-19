@@ -35,7 +35,9 @@ _MAX_PLAYLIST_LIMIT = 100
 _VIDEO_DEADLINE = 30.0
 _PLAYLIST_DEADLINE = 45.0
 _GRACE_PERIOD = 0.25
+_REAP_ATTEMPTS = 3
 _CLOSE_DEADLINE = 1.0
+_CLOSE_TOTAL_DEADLINE = 5.0
 _READ_CHUNK = 4096
 _ALLOWED_HEADERS = {"user-agent": "User-Agent", "referer": "Referer", "origin": "Origin"}
 _MIN_YT_DLP_VERSION = Version("2026.8.19")
@@ -284,6 +286,9 @@ class YouTubeResolver:
         self._deno_locator = deno_locator or _deno_path
         self._yt_dlp_locator = yt_dlp_locator or _yt_dlp_root
         self._slots = asyncio.Semaphore(2)
+        # Batch extraction may occupy at most one of the two shared slots, so a
+        # 45 s playlist import can never queue an interactive resolve behind it.
+        self._batch_slots = asyncio.Semaphore(1)
         self._children: set[Any] = set()
         self._reapers: dict[Any, asyncio.Task[None]] = {}
         self._cleanup_futures: dict[Any, asyncio.Future[bool]] = {}
@@ -430,13 +435,19 @@ class YouTubeResolver:
             output.extend(chunk)
         return bytes(output)
 
-    async def _run_child(self, args: list[str], *, deadline: float, ceiling: int) -> bytes:
+    async def _run_child(
+        self, args: list[str], *, deadline: float, ceiling: int, batch: bool = False,
+    ) -> bytes:
         child: Any | None = None
         slot_acquired = False
         slot_handed_off = False
+        batch_acquired = False
 
         try:
             async with asyncio.timeout(deadline) as timeout:
+                if batch:
+                    await self._batch_slots.acquire()
+                    batch_acquired = True
                 await self._slots.acquire()
                 slot_acquired = True
                 try:
@@ -470,6 +481,8 @@ class YouTubeResolver:
                 slot_handed_off = slot_handed_off or not reaped
             if slot_acquired and not slot_handed_off and child is None:
                 self._slots.release()
+            if batch_acquired:
+                self._batch_slots.release()
 
     async def _cleanup_child(self, child: Any, *, release_slot: bool) -> bool:
         async with self._state_lock:
@@ -497,6 +510,11 @@ class YouTubeResolver:
                 return True
             self._register_reaper(child, release_slot=release_slot)
             return False
+        except asyncio.CancelledError:
+            # A second cancellation must not orphan the child (and its slot):
+            # hand it to an independent reaper, then let cancellation propagate.
+            self._register_reaper(child, release_slot=release_slot)
+            raise
         finally:
             async with self._state_lock:
                 current = self._cleanup_futures.pop(child, None)
@@ -511,11 +529,21 @@ class YouTubeResolver:
         self._track_cleanup_task(task)
 
     async def _reap_owned(self, child: Any, *, release_slot: bool) -> None:
-        while not await self._wait_bounded(child):
+        reaped = False
+        for _ in range(_REAP_ATTEMPTS):
+            if await self._wait_bounded(child):
+                reaped = True
+                break
             force = getattr(child, "kill", None)
             if callable(force):
                 with contextlib.suppress(Exception):
                     force()
+        if not reaped and await self._wait_bounded(child):
+            reaped = True
+        if not reaped:
+            # An unkillable child must not pin capacity forever; it is already
+            # detached from the queue, so release the slot and the reference.
+            log.warning("Reaped child did not exit within the attempt cap")
         async with self._state_lock:
             self._children.discard(child)
             self._reapers.pop(child, None)
@@ -565,13 +593,9 @@ class YouTubeResolver:
             child_reaped = await self._wait_bounded(child)
             return child_reaped and helper_reaped
         except asyncio.CancelledError:
-            # Cleanup must finish even when the caller goes away.
-            with contextlib.suppress(Exception):
-                kill = getattr(child, "kill", None)
-                if callable(kill):
-                    kill()
-                return await self._wait_bounded(child)
-            return False
+            # Cleanup ownership moves to _cleanup_child, which hands the child
+            # to a shielded reaper before re-raising the cancellation.
+            raise
 
     async def _wait_bounded(self, child: Any) -> bool:
         try:
@@ -737,7 +761,9 @@ class YouTubeResolver:
             ]
             # A playlist contains one projected document per item, not one
             # video's document. The validated 100-item cap bounds this to 400 KiB.
-            output = await self._run_child(args, deadline=_PLAYLIST_DEADLINE, ceiling=limit * 4096)
+            output = await self._run_child(
+                args, deadline=_PLAYLIST_DEADLINE, ceiling=limit * 4096, batch=True,
+            )
             text = output.decode("utf-8")
             if sum(1 for line in text.splitlines() if line.strip()) > limit:
                 raise ValueError
@@ -759,34 +785,49 @@ class YouTubeResolver:
     async def close(self) -> None:
         async with self._state_lock:
             self._closed = True
-        while True:
-            async with self._state_lock:
-                children = tuple(
-                    child for child in self._children if child not in self._reapers and child not in self._cleanup_futures
-                )
-                reapers = tuple(self._reapers.values())
-                factories = tuple(self._factory_tasks)
-                cleanup = tuple(self._cleanup_tasks)
-                terminating = tuple(self._cleanup_futures.values())
-            if children:
-                cleanup_tasks = [
-                    asyncio.create_task(self._cleanup_child(child, release_slot=True))
-                    for child in children
-                ]
-                for task in cleanup_tasks:
-                    self._track_cleanup_task(task)
-                await asyncio.shield(asyncio.gather(*cleanup_tasks, return_exceptions=True))
-                continue
-            pending = tuple(dict.fromkeys((*reapers, *factories, *cleanup, *terminating)))
-            if not pending:
-                return
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(asyncio.gather(*pending, return_exceptions=True)),
-                    timeout=_CLOSE_DEADLINE,
-                )
-            except asyncio.TimeoutError:
-                raise PlaybackUnavailable() from None
+        try:
+            async with asyncio.timeout(_CLOSE_TOTAL_DEADLINE):
+                while True:
+                    async with self._state_lock:
+                        children = tuple(
+                            child
+                            for child in self._children
+                            if child not in self._reapers and child not in self._cleanup_futures
+                        )
+                        reapers = tuple(self._reapers.values())
+                        factories = tuple(self._factory_tasks)
+                        cleanup = tuple(self._cleanup_tasks)
+                        terminating = tuple(self._cleanup_futures.values())
+                    if children:
+                        cleanup_tasks = [
+                            asyncio.create_task(self._cleanup_child(child, release_slot=True))
+                            for child in children
+                        ]
+                        for task in cleanup_tasks:
+                            self._track_cleanup_task(task)
+                        await asyncio.shield(asyncio.gather(*cleanup_tasks, return_exceptions=True))
+                        continue
+                    # A finished task stays registered until the loop runs its done
+                    # callback.  Awaiting it costs nothing, but feeding it back in each
+                    # iteration would spin this loop without ever yielding, starving the
+                    # very callbacks that would remove it -- so only pending work is
+                    # awaited here, and the whole loop is bounded by one deadline.
+                    pending = tuple(
+                        item
+                        for item in dict.fromkeys((*reapers, *factories, *cleanup, *terminating))
+                        if not item.done()
+                    )
+                    if not pending:
+                        return
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(asyncio.gather(*pending, return_exceptions=True)),
+                            timeout=_CLOSE_DEADLINE,
+                        )
+                    except asyncio.TimeoutError:
+                        raise PlaybackUnavailable() from None
+        except asyncio.TimeoutError:
+            raise PlaybackUnavailable() from None
 
 
 __all__ = ["YouTubeResolver", "YouTubeVideoMetadata", "parse_youtube_api_duration"]

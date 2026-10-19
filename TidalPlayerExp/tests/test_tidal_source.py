@@ -587,3 +587,21 @@ async def test_actual_handler_keeps_cancelled_provider_work_bounded(cog) -> None
         finally:
             release.set()
             await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_transient_capacity_error_from_catalog_call_is_not_retyped() -> None:
+    """A busy provider must stay retryable instead of becoming a permanent failure."""
+    handler = _HandlerFake(tracks=[PlaybackUnavailable()])
+    resolver = TidalSourceResolver(handler)
+    with pytest.raises(PlaybackUnavailable):
+        await resolver.resolve(SourceReference(SourceKind.TIDAL, "123"))
+
+
+@pytest.mark.asyncio
+async def test_transient_capacity_error_from_provider_call_is_not_retyped() -> None:
+    track = _DirectTrack(PlaybackUnavailable())
+    handler = _HandlerFake(tracks=[track])
+    resolver = TidalSourceResolver(handler)
+    with pytest.raises(PlaybackUnavailable):
+        await resolver.resolve(SourceReference(SourceKind.TIDAL, "123"))

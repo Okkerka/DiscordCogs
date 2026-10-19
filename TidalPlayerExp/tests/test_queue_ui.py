@@ -194,3 +194,24 @@ async def test_overlapping_next_clicks_each_advance_one_page(real_queue_ui):
         release.set()
         await asyncio.gather(*tasks, return_exceptions=True)
         view.stop()
+
+
+@pytest.mark.asyncio
+async def test_queue_view_retires_itself_when_the_panel_is_deleted(real_queue_ui):
+    """A vanished panel must not keep failing every later button click."""
+    snapshot = PlaybackSnapshot(None, (), False, None)
+    view, _cog = _view(real_queue_ui, snapshot)
+    response = SimpleNamespace(status=404, reason="Not Found")
+    interaction = SimpleNamespace(
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(
+            side_effect=real_discord.NotFound(response, "Unknown Message")
+        ),
+    )
+
+    await view._update(interaction)
+    assert view.is_finished()
+    assert view.message is None
+
+    await view._update(interaction)
+    assert interaction.edit_original_response.await_count == 1

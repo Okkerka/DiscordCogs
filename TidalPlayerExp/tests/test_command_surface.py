@@ -10,7 +10,7 @@ from TidalPlayerExp.tidalplayer import TidalPlayerExp
 from redbot.core.commands import HybridCommand, HybridGroup
 import discord
 commands = {c.name: c for c in TidalPlayerExp.__cog_commands__ if c.parent is None}
-required = {'play','playfrom','playfile','playnext','queue','stop','remove','clear','volume','pause','resume','skip',
+required = {'play','playfrom','yplay','playfile','playnext','queue','stop','remove','clear','volume','pause','resume','skip',
             'now','move','shuffle','repeat','seek','replay','autoplay','retry','musichelp',
             'tidalsearch','tplaylist','setup','tfilter','tinteractive'}
 assert required <= commands.keys(), required - commands.keys()

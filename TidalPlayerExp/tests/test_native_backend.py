@@ -533,6 +533,73 @@ async def test_housekeeping_retries_failed_idle_cleanup(environment):
 
 
 @pytest.mark.asyncio
+async def test_housekeeping_survives_a_broken_snapshot(environment):
+    e = environment
+    now = [0.0]
+    ticks = asyncio.Queue()
+    slept = asyncio.Event()
+
+    async def sleep(interval):
+        slept.set()
+        await ticks.get()
+
+    async def tick(at):
+        await asyncio.wait_for(slept.wait(), 2)
+        slept.clear()
+        now[0] = at
+        ticks.put_nowait(None)
+        await asyncio.wait_for(slept.wait(), 2)
+
+    e.backend._clock = lambda: now[0]
+    e.backend._sleep = sleep
+    session = await e.backend.connect(e.guild, e.channel)
+
+    def explode():
+        raise AttributeError("'NoneType' object has no attribute 'id'")
+
+    session.snapshot = explode
+    await tick(0)
+    assert not session.closed
+    # The loop must survive the broken sweep and keep closing out idle sessions.
+    session.snapshot = lambda: PlaybackSnapshot(None, (), False, 10)
+    e.backend._empty_since.pop(e.guild.id, None)
+    await tick(121)
+    assert not session.closed
+    await tick(241)
+    assert session.closed
+    await e.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_housekeeping_counts_a_halted_queue_as_idle(environment):
+    e = environment
+    now = [0.0]
+    ticks = asyncio.Queue()
+    slept = asyncio.Event()
+
+    async def sleep(interval):
+        slept.set()
+        await ticks.get()
+
+    async def tick(at):
+        await asyncio.wait_for(slept.wait(), 2)
+        slept.clear()
+        now[0] = at
+        ticks.put_nowait(None)
+        await asyncio.wait_for(slept.wait(), 2)
+
+    e.backend._clock = lambda: now[0]
+    e.backend._sleep = sleep
+    session = await e.backend.connect(e.guild, e.channel)
+    session.state = PlaybackSnapshot(None, (object(),), False, 10, halted=True)
+    await tick(0)
+    assert not session.closed
+    await tick(121)
+    assert session.closed
+    await e.backend.close()
+
+
+@pytest.mark.asyncio
 async def test_replacement_during_connect_is_untouched(environment):
     e = environment
     replacement = Voice(e.channel)

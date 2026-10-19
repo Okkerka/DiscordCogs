@@ -30,7 +30,8 @@ _CAPABILITY_CLOSE_TIMEOUT_SECONDS = 31.0
 _PRIME_TIMEOUT_SECONDS = 20.0
 _PROBE_OUTPUT_LIMIT = 256 * 1024
 _PROCESS_WAIT_SECONDS = 0.5
-_EOF_WAIT_SECONDS = 0.1
+_EOF_WAIT_SECONDS = 1.0
+_PRIME_PROBE_PACKETS = 3
 _METADATA_WAIT_SECONDS = 0.25
 _VERSION_PATTERN = re.compile(r"\Affmpeg version ([^\s]+)")
 _INPUT_DURATION_PATTERN = re.compile(
@@ -333,7 +334,7 @@ class _FFmpegAudioSource(discord.AudioSource):
     def __init__(self, process: _ChildProcess, *, copied: bool, inspect_duration: bool = False) -> None:
         self._process = process
         self._copied = copied
-        self._buffered: bytes | None = None
+        self._buffered: list[bytes] = []
         self._closed = False
         self._state_lock = threading.Lock()
         self._read_lock = threading.Lock()
@@ -398,7 +399,10 @@ class _FFmpegAudioSource(discord.AudioSource):
                 try:
                     returncode = self._process.wait(timeout=_EOF_WAIT_SECONDS)
                 except subprocess.TimeoutExpired:
-                    returncode = -1
+                    # stdout EOF already delivered every packet; a process that
+                    # needs longer to exit is slow, not broken. Let cleanup reap
+                    # it instead of halting the queue with a false crash.
+                    returncode = 0
                 except Exception:  # noqa: BLE001 - process errors are redacted at this boundary
                     returncode = -1
             if returncode not in (None, 0):
@@ -409,13 +413,18 @@ class _FFmpegAudioSource(discord.AudioSource):
         return packet
 
     def prime(self) -> None:
-        """Read and retain the first real audio packet before playback starts."""
+        """Read and validate the first audio packets before playback starts."""
 
         with self._read_lock:
-            packet = self._next_audio_packet()
-            if not packet:
+            packets: list[bytes] = []
+            for _ in range(_PRIME_PROBE_PACKETS):
+                packet = self._next_audio_packet()
+                if not packet:
+                    break
+                packets.append(packet)
+            if not packets:
                 raise self._mark_failed()
-            self._buffered = packet
+            self._buffered = packets
         self._stderr.wait_metadata()
 
     def read(self) -> bytes:
@@ -424,10 +433,8 @@ class _FFmpegAudioSource(discord.AudioSource):
             with self._state_lock:
                 if self._closed:
                     return b""
-            if self._buffered is not None:
-                packet = self._buffered
-                self._buffered = None
-                return packet
+            if self._buffered:
+                return self._buffered.pop(0)
             try:
                 return self._next_audio_packet()
             except _InvalidPacketDuration:

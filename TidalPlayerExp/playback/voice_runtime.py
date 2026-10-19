@@ -34,7 +34,7 @@ def initialize_voice_runtime() -> None:
             client.__dict__.update(nacl=nacl, has_nacl=True)
             client.VoiceClient.warn_nacl = False
 
-    if not (client.has_dave and state.has_dave):
+    if not (getattr(client, "has_dave", False) and getattr(state, "has_dave", False)):
         try:
             davey = importlib.import_module("davey")
             if (

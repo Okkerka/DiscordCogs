@@ -836,10 +836,12 @@ async def test_copy_retries_once_with_transcode_when_primed_packet_is_not_20ms(
 
 
 @pytest.mark.asyncio
-async def test_copy_validates_every_later_packet_before_returning_it(
+async def test_copy_validates_packets_after_the_prime_probe(
     ffmpeg_module: Any, tmp_path: Path
 ) -> None:
-    process = _Process((b"OpusHead", b"OpusTags", b"\x08first", b"\x00ten-ms"))
+    process = _Process(
+        (b"OpusHead", b"OpusTags", b"\x08first", b"\x08second", b"\x08third", b"\x00ten-ms")
+    )
     factory, _, _ = _factory(ffmpeg_module, tmp_path, lambda _argv, **_kwargs: process)
     audio = await factory.create(
         ResolvedSource(
@@ -852,6 +854,8 @@ async def test_copy_validates_every_later_packet_before_returning_it(
     )
 
     assert audio.read() == b"\x08first"
+    assert audio.read() == b"\x08second"
+    assert audio.read() == b"\x08third"
     with pytest.raises(PlaybackStartError) as caught:
         audio.read()
 
@@ -861,7 +865,39 @@ async def test_copy_validates_every_later_packet_before_returning_it(
 
 
 @pytest.mark.asyncio
-async def test_read_detects_nonzero_exit_that_races_with_stdout_eof(
+async def test_copy_retries_with_transcode_when_an_early_packet_is_not_20ms(
+    ffmpeg_module: Any, tmp_path: Path
+) -> None:
+    processes = [
+        _Process((b"OpusHead", b"OpusTags", b"\x08first", b"\x00ten-ms")),
+        _Process((b"OpusHead", b"OpusTags", b"\x08first", b"\x08second")),
+    ]
+    calls: list[tuple[str, ...]] = []
+
+    def spawn(argv: Sequence[str], **_kwargs: Any) -> _Process:
+        calls.append(tuple(argv))
+        return processes[len(calls) - 1]
+
+    factory, _, _ = _factory(ffmpeg_module, tmp_path, spawn)
+    audio = await factory.create(
+        ResolvedSource(
+            "https://media.example/stream",
+            {},
+            codec="opus",
+            sample_rate=48_000,
+            channels=2,
+        )
+    )
+
+    assert len(calls) == 2
+    assert ("-c:a", "copy") == calls[0][calls[0].index("-c:a") : calls[0].index("-c:a") + 2]
+    assert ("-c:a", "libopus") == calls[1][calls[1].index("-c:a") : calls[1].index("-c:a") + 2]
+    assert processes[0].stdout.closed
+    assert audio.read() == b"\x08first"
+
+
+@pytest.mark.asyncio
+async def test_nonzero_exit_that_races_with_stdout_eof_is_detected(
     ffmpeg_module: Any, tmp_path: Path
 ) -> None:
     class ExitAfterEofProcess(_Process):
@@ -876,18 +912,17 @@ async def test_read_detects_nonzero_exit_that_races_with_stdout_eof(
 
     process = ExitAfterEofProcess()
     factory, _, _ = _factory(ffmpeg_module, tmp_path, lambda _argv, **_kwargs: process)
-    audio = await factory.create(ResolvedSource("https://media.example/stream", {}))
 
-    assert audio.read() == b"\x08first"
     with pytest.raises(PlaybackStartError):
-        audio.read()
+        await factory.create(ResolvedSource("https://media.example/stream", {}))
 
     assert process.wait_calls >= 1
     assert process.stdout.closed
+    assert "exit=9" in factory.last_failure
 
 
 @pytest.mark.asyncio
-async def test_read_treats_unconfirmed_eof_timeout_as_sanitized_failure(
+async def test_read_treats_a_slow_exit_after_eof_as_a_clean_end(
     ffmpeg_module: Any, tmp_path: Path
 ) -> None:
     process = _Process(
@@ -898,12 +933,10 @@ async def test_read_treats_unconfirmed_eof_timeout_as_sanitized_failure(
     audio = await factory.create(ResolvedSource("https://media.example/stream", {}))
 
     assert audio.read() == b"\x08first"
-    with pytest.raises(PlaybackStartError) as caught:
-        audio.read()
+    assert audio.read() == b""
+    assert process.wait_calls >= 1
 
-    assert str(caught.value) == "Playback start failed"
-    assert caught.value.__cause__ is None
-    assert caught.value.__context__ is None
+    audio.cleanup()
     assert process.terminate_calls == 1
     assert process.stdout.closed
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -15,6 +16,8 @@ from .session import NativePlaybackSession
 
 if TYPE_CHECKING:
     from .ffmpeg import AudioSourceFactory
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -221,8 +224,14 @@ class NativePlaybackBackend:
 
     def _ensure_housekeeping(self) -> None:
         """Retry retained cleanup even when no connection has succeeded yet."""
-        if not self._closing and self._housekeeping is None:
-            self._housekeeping = asyncio.create_task(self._housekeep())
+        if self._closing:
+            return
+        current = self._housekeeping
+        if current is not None and not current.done():
+            return
+        if current is not None and not current.cancelled():
+            current.exception()
+        self._housekeeping = asyncio.create_task(self._housekeep())
 
     async def close_guild(self, guild_id: int) -> None:
         """Invalidate connects and close only this guild's owned resources."""
@@ -264,35 +273,45 @@ class NativePlaybackBackend:
     async def _housekeep(self) -> None:
         while True:
             await self._sleep(self._housekeeping_interval)
-            # Failed disposal removes a session from _sessions but retains
-            # ownership here. Retry it without touching an active handshake.
-            for retired in tuple(self._retired):
-                guild_id = retired.guild_id
-                # Another guild's cleanup can yield long enough for this one
-                # to recover and reconnect. Never act on its old identity.
-                if (
-                    retired not in self._retired
-                    or guild_id in self._pending
-                    or guild_id in self._removals
-                ):
-                    continue
+            try:
+                await self._sweep()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - one bad sweep must not end housekeeping
+                log.warning("Housekeeping sweep failed (%s)", type(error).__name__)
+
+    async def _sweep(self) -> None:
+        # Failed disposal removes a session from _sessions but retains
+        # ownership here. Retry it without touching an active handshake.
+        for retired in tuple(self._retired):
+            guild_id = retired.guild_id
+            # Another guild's cleanup can yield long enough for this one
+            # to recover and reconnect. Never act on its old identity.
+            if (
+                retired not in self._retired
+                or guild_id in self._pending
+                or guild_id in self._removals
+            ):
+                continue
+            try:
+                await self.close_guild(guild_id)
+            except PlaybackUnavailable:
+                continue
+        now = self._clock()
+        for guild_id, session in tuple(self._sessions.items()):
+            state = session.snapshot()
+            # A halted queue never advances on its own; holding voice open for
+            # it would bypass the idle timeout indefinitely.
+            if state.current is not None or (state.queued and not state.halted):
+                self._empty_since.pop(guild_id, None)
+                continue
+            empty_since = self._empty_since.setdefault(guild_id, now)
+            if now - empty_since >= self._idle_timeout:
                 try:
                     await self.close_guild(guild_id)
                 except PlaybackUnavailable:
+                    # Failed disposal remains owned and retryable by close.
                     continue
-            now = self._clock()
-            for guild_id, session in tuple(self._sessions.items()):
-                state = session.snapshot()
-                if state.current is not None or state.queued:
-                    self._empty_since.pop(guild_id, None)
-                    continue
-                empty_since = self._empty_since.setdefault(guild_id, now)
-                if now - empty_since >= self._idle_timeout:
-                    try:
-                        await self.close_guild(guild_id)
-                    except PlaybackUnavailable:
-                        # Failed disposal remains owned and retryable by close.
-                        continue
 
     async def close(self) -> None:
         """Fail closed, attempt every cleanup, and retry only unfinished work."""

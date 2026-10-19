@@ -35,6 +35,9 @@ _LICENSE_LIMIT = 1024 * 1024
 _ARCHIVE_LIMIT = 1024 * 1024 * 1024
 _PROBE_TIMEOUT = 15
 _STAGING_MAX_AGE = 24 * 60 * 60
+_DOWNLOAD_CONNECT_TIMEOUT = 30
+_DOWNLOAD_IDLE_TIMEOUT = 30
+_EXTRACT_DEADLINE = 120.0
 _RUNTIME_FILES = frozenset({
     "ffmpeg", "ffmpeg.exe", "deno", "deno.exe", "runtime.json", "FFMPEG-LICENSE.txt",
     "ffmpeg.download", "deno.download",
@@ -49,8 +52,9 @@ class RuntimeRepairError(Exception):
     def __init__(self, code: str) -> None:
         allowed = {
             "invalid_tool", "unsupported_platform", "closed", "busy",
-            "download_failed", "download_size", "checksum_mismatch",
-            "archive_invalid", "archive_member_invalid", "extracted_too_large",
+            "download_failed", "download_size", "download_timeout", "download_io",
+            "checksum_mismatch", "archive_invalid", "archive_timeout",
+            "archive_member_invalid", "extracted_too_large",
             "probe_failed", "activation_failed", "cleanup_failed",
         }
         self.code = code if code in allowed else "activation_failed"
@@ -155,11 +159,14 @@ def _digest(path: Path, check: Callable[[], None]) -> str:
 
 
 def _extract(asset: _Asset, archive_path: Path, destination: Path, stop: threading.Event) -> str:
-    deadline = time.monotonic() + 120
+    deadline = time.monotonic() + _EXTRACT_DEADLINE
 
     def check() -> None:
-        if stop.is_set() or time.monotonic() > deadline:
-            raise RuntimeRepairError("archive_invalid")
+        if stop.is_set():
+            raise RuntimeRepairError("closed")
+        if time.monotonic() > deadline:
+            # A slow disk must not masquerade as a corrupt download.
+            raise RuntimeRepairError("archive_timeout")
 
     if _digest(archive_path, check) != asset.sha256:
         raise RuntimeRepairError("checksum_mismatch")
@@ -479,7 +486,13 @@ class ManagedRuntime:
                         output.write(chunk)
                 if total != asset.size:
                     raise RuntimeRepairError("download_size")
-        except (aiohttp.ClientError, OSError, ValueError, TimeoutError) as exc:
+        except TimeoutError as exc:
+            raise RuntimeRepairError("download_timeout") from exc
+        except OSError as exc:
+            raise RuntimeRepairError("download_io") from exc
+        except ValueError as exc:
+            raise RuntimeRepairError("download_size") from exc
+        except aiohttp.ClientError as exc:
             raise RuntimeRepairError("download_failed") from exc
 
     async def _repair(self) -> None:
@@ -513,7 +526,13 @@ class ManagedRuntime:
             stage = Path(tempfile.mkdtemp(prefix=".staging-", dir=root))
             metadata = bundle.identity()
             async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=300, connect=30, sock_read=30),
+                # Bound stalls, not total duration: a large archive on a slow
+                # link must still make progress instead of dying at a fixed cap.
+                timeout=aiohttp.ClientTimeout(
+                    total=None,
+                    connect=_DOWNLOAD_CONNECT_TIMEOUT,
+                    sock_read=_DOWNLOAD_IDLE_TIMEOUT,
+                ),
                 auto_decompress=False, trust_env=False,
             ) as session:
                 for tool, asset in (("ffmpeg", bundle.ffmpeg), ("deno", bundle.deno)):

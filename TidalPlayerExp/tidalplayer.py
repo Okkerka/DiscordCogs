@@ -1574,24 +1574,31 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
 
     @commands.Cog.listener()
     async def on_guild_remove(self, guild: discord.Guild) -> None:
-        self._stop_generations[guild.id] += 1
-        cancel_event = self._cancel_events.pop(guild.id, None)
+        guild_id = guild.id
+        self._stop_generations[guild_id] += 1
+        cancel_event = self._cancel_events.pop(guild_id, None)
         if cancel_event is not None:
             cancel_event.set()
-        self._stop_controller_view(guild.id)
-        self._guild_locks.pop(guild.id, None)
-        self._cancel_guild_background_tasks(guild.id)
-        self._controller_messages.pop(guild.id, None)
-        self._playback_channels.pop(guild.id, None)
-        self._controller_meta.pop(guild.id, None)
-        self._recent_track_ids.pop(guild.id, None)
-        self._recent_track_signatures.pop(guild.id, None)
-        self._current_meta.pop(guild.id, None)
-        self._last_progress_edit.pop(guild.id, None)
-        self._controller_last_refresh.pop(guild.id, None)
-        self._guild_generations[guild.id] += 1
-        self._current_entries.pop(guild.id, None)
-        await self.backend.close_guild(guild.id)
+        self._stop_controller_view(guild_id)
+        self._guild_locks.pop(guild_id, None)
+        self._cancel_guild_background_tasks(guild_id)
+        self._controller_messages.pop(guild_id, None)
+        self._playback_channels.pop(guild_id, None)
+        self._controller_meta.pop(guild_id, None)
+        self._recent_track_ids.pop(guild_id, None)
+        self._recent_track_signatures.pop(guild_id, None)
+        self._current_meta.pop(guild_id, None)
+        self._controller_last_refresh.pop(guild_id, None)
+        self._guild_generations[guild_id] += 1
+        self._current_entries.pop(guild_id, None)
+        # This handler also runs for a voice disconnect or channel move, where the
+        # guild is still joined and a later request must keep seeing a bumped
+        # counter. Only drop the counters once the bot actually leaves: nothing can
+        # still reference this guild id, and keeping them leaks one entry per guild.
+        if self.bot.get_guild(guild_id) is None:
+            self._stop_generations.pop(guild_id, None)
+            self._guild_generations.pop(guild_id, None)
+        await self.backend.close_guild(guild_id)
 
     @commands.Cog.listener()
     async def on_cog_add(self, cog: commands.Cog) -> None:
@@ -2281,7 +2288,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
 
     async def _youtube_video_metadata(self, video_id: str) -> YouTubeVideoMetadata:
         reference = SourceReference(SourceKind.YOUTUBE, video_id)
-        if self.yt is not None:
+        if await self._youtube_ready():
             try:
                 response = await self.tidal._run_blocking(
                     self.yt.videos().list(part="snippet,contentDetails", id=video_id, maxResults=1).execute, timeout=15.0,
@@ -2473,7 +2480,9 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             await asyncio.sleep(delay)
             await _delete_message_safe(message)
         except asyncio.CancelledError:
-            return
+            # Cancellation during unload must propagate like every other handler
+            # here; the finally still unregisters the task either way.
+            raise
         finally:
             task = asyncio.current_task()
             if task is not None:
@@ -2717,7 +2726,6 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
 
     def _make_queued_embed(self, meta: TrackMeta) -> discord.Embed:
         """Return a compact embed confirming a track was added to the queue."""
-        from .ui.embeds import make_queue_embed
         return make_queue_embed(meta)
 
     async def _resend_controller_for_track_start(
@@ -2776,10 +2784,17 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             recent_signatures.append(signature)
 
     async def controller_skip(self, interaction: discord.Interaction) -> None:
+        """Skip the track the panel showed, never the one that replaced it."""
         if interaction.guild is None:
             return
+        guild_id = interaction.guild.id
+        # Track starts and enqueues bump this counter; a click dispatched before
+        # a boundary must not skip a track the user never saw.
+        generation = self._guild_generations[guild_id]
         await interaction.response.defer()
-        session = await self.backend.get(interaction.guild.id)
+        if self._closing or generation != self._guild_generations[guild_id]:
+            return
+        session = await self.backend.get(guild_id)
         if session is None or not await session.skip():
             await interaction.followup.send("Nothing is playing.", ephemeral=True)
 
@@ -2873,7 +2888,11 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                     still_current=still_current,
                 )
             except (discord.HTTPException, discord.Forbidden, discord.NotFound):
-                pass
+                # The panel was deleted or lost access: stop mapping to it so
+                # every later refresh does not retry a message that is gone.
+                if self._controller_messages.get(guild_id) is message:
+                    self._controller_messages.pop(guild_id, None)
+                    self._stop_controller_view(guild_id)
 
 
     async def controller_toggle_autoplay(self, interaction: discord.Interaction) -> None:
@@ -2892,6 +2911,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         await self._refresh_controller(interaction.guild.id, interaction)
 
     async def controller_toggle_pause(self, interaction: discord.Interaction) -> None:
+        """Toggle the player; pause is session-wide rather than track-scoped."""
         if interaction.guild is None:
             return
         await interaction.response.defer()
@@ -2902,6 +2922,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         await self._refresh_controller(interaction.guild.id, interaction)
 
     async def controller_stop(self, interaction: discord.Interaction) -> None:
+        """Stop the player and clear its queue, regardless of the current track."""
         if interaction.guild is None:
             return
         guild_id = interaction.guild.id
@@ -3237,7 +3258,11 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             _log_provider_failure("Tidal", "batch track resolution", error)
             return None
 
-    @playback_request(batch=True)
+    # NOTE: deliberately not decorated with @playback_request(batch=True):
+    # every caller (_handle_album, _handle_playlist, ...) is already a
+    # batch=True handler, so decorating this would make the inner claim fail
+    # against the outer one. The decorator on the caller is the sole claimant
+    # and its event is reused via request.batch below.
     async def _process_track_list(
         self,
         ctx: commands.Context,
@@ -3258,7 +3283,14 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             return
         guild_id = ctx.guild.id
         request = current_request(self, ctx)
-        cancel_event = request.batch if request is not None else self._claim_batch(guild_id)
+        # The outer batch=True handler (or this method, when called without one)
+        # is the sole claimant; reuse an attached event and only release an
+        # event this method claimed itself.
+        cancel_event = request.batch if request is not None else None
+        owns_batch = False
+        if cancel_event is None:
+            cancel_event = self._claim_batch(guild_id)
+            owns_batch = cancel_event is not None
         if cancel_event is None:
             await ctx.send(embed=_error_embed(Messages.ERROR_BATCH_IN_PROGRESS))
             return
@@ -3272,7 +3304,8 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         try:
             pmsg = await ctx.send(embed=initial_embed)
         except BaseException:
-            self._release_batch(guild_id, cancel_event)
+            if owns_batch:
+                self._release_batch(guild_id, cancel_event)
             raise
         queued, skipped, last_up = 0, 0, 0
         try:
@@ -3325,7 +3358,8 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             except Exception:
                 pass
         finally:
-            self._release_batch(guild_id, cancel_event)
+            if owns_batch:
+                self._release_batch(guild_id, cancel_event)
 
     @playback_request()
     async def _handle_track(self, ctx: commands.Context, tid: str) -> None:
@@ -3485,13 +3519,6 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
     @commands.dynamic_cooldown(playback_cooldown, commands.BucketType.user)
     async def yplay(self, ctx: commands.Context, *, query: str) -> None:
         """Play a YouTube search result or YouTube video, never a TIDAL match."""
-        from .playback.models import SourceKind, SourceReference
-        from .providers.urls import (
-            MalformedProviderURL,
-            ProviderKind,
-            parse_provider_url,
-        )
-
         query = query.strip()
         if not query:
             await self._reply(ctx, "Give me a YouTube search or video link.")
@@ -3609,7 +3636,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
 
     @playback_request(batch=True)
     async def _handle_spotify_playlist(self, ctx: commands.Context, url: str) -> None:
-        if not self.sp:
+        if not await self._spotify_ready():
             await ctx.send(embed=_error_embed(Messages.ERROR_NO_SPOTIFY))
             return
         if self._spotify_auth_manager is None:
@@ -3642,7 +3669,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
 
     @playback_request()
     async def _handle_spotify_track(self, ctx: commands.Context, url: str) -> None:
-        if not self.sp:
+        if not await self._spotify_ready():
             await ctx.send(embed=_error_embed(Messages.ERROR_NO_SPOTIFY))
             return
         match = SPOTIFY_TRACK_PATTERN.search(url)
@@ -3675,7 +3702,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
 
     @playback_request(batch=True)
     async def _handle_spotify_album(self, ctx: commands.Context, url: str) -> None:
-        if not self.sp:
+        if not await self._spotify_ready():
             await ctx.send(embed=_error_embed(Messages.ERROR_NO_SPOTIFY))
             return
         match = SPOTIFY_ALBUM_PATTERN.search(url)

@@ -13,7 +13,7 @@ from ..domain.public_audio_urls import (
     canonical_public_audio_url,
     parse_public_audio_url,
 )
-from ..playback.errors import SourceResolutionError
+from ..playback.errors import PlaybackUnavailable, SourceResolutionError
 from ..playback.models import PlaybackEntry, ResolvedSource, SourceKind, SourceReference
 from .youtube_resolver import (
     YouTubeResolver,
@@ -112,7 +112,12 @@ class PublicAudioResolver:
             output = await self._worker._run_child(
                 args, deadline=45.0 if limit is not None else 30.0,
                 ceiling=limit * 4096 if limit is not None else 16 * 1024,
+                batch=limit is not None,
             )
+        except PlaybackUnavailable:
+            # Capacity/connectivity is transient: keep the typed error so the
+            # caller can retry instead of reporting a permanent failure.
+            raise
         except Exception:  # noqa: BLE001 - discard subprocess/provider exception details
             output = None
         if output is None:

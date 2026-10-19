@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from TidalPlayerExp.playback import SourceKind, SourceResolutionError
+from TidalPlayerExp.playback import PlaybackUnavailable, SourceKind, SourceResolutionError
 from TidalPlayerExp.providers.search import search_provider
 from TidalPlayerExp.providers.youtube_resolver import YouTubeResolver
 
@@ -188,5 +188,21 @@ async def test_search_propagates_cancellation_from_the_shared_worker(tmp_path, m
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_search_keeps_transient_capacity_errors_distinct(tmp_path, monkeypatch):
+    """A busy worker must not be reported as a permanent source failure."""
+    worker = _worker(tmp_path)
+
+    async def run_child(*_args, **_kwargs) -> bytes:
+        raise PlaybackUnavailable()
+
+    monkeypatch.setattr(worker, "_run_child", run_child)
+    try:
+        with pytest.raises(PlaybackUnavailable):
+            await search_provider(worker, "song", "youtube")
     finally:
         await worker.close()

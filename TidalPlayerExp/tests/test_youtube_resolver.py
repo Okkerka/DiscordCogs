@@ -671,7 +671,8 @@ async def test_close_terminates_live_children(tmp_path) -> None:
 
     resolver = YouTubeResolver(process_factory=factory, deno_locator=lambda: str(deno))
     task = asyncio.create_task(resolver.resolve(_reference()))
-    await process.stdout.started.wait()
+    # Bounded so a missing extractor dependency fails instead of hanging the suite.
+    await asyncio.wait_for(process.stdout.started.wait(), timeout=10)
     await resolver.close()
     assert process.terminated
     task.cancel()
@@ -715,6 +716,58 @@ async def test_two_child_capacity_and_cancelled_waiter_reap_before_release(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_reaper_gives_up_after_bounded_attempts(monkeypatch) -> None:
+    """An unkillable child must not pin a slot (or the reaper task) forever."""
+    module = __import__("TidalPlayerExp.providers.youtube_resolver", fromlist=["YouTubeResolver"])
+    monkeypatch.setattr(module, "_GRACE_PERIOD", 0.01)
+    monkeypatch.setattr(module, "_REAP_ATTEMPTS", 2)
+
+    class Unkillable:
+        def __init__(self) -> None:
+            self.kill_calls = 0
+
+        async def wait(self) -> int:
+            await asyncio.Future()
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+    resolver = YouTubeResolver()
+    await resolver._slots.acquire()
+    child = Unkillable()
+    resolver._register_reaper(child, release_slot=True)
+    reaper = resolver._reapers[child]
+    await asyncio.wait_for(reaper, timeout=2)
+
+    assert child.kill_calls == 2
+    assert resolver._slots._value == 2
+    assert child not in resolver._reapers
+    assert child not in resolver._children
+    await resolver.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_cleanup_hands_the_child_to_a_reaper(monkeypatch) -> None:
+    """A second cancellation must not orphan a child and leak its slot."""
+    resolver = YouTubeResolver()
+    await resolver._slots.acquire()
+    child = _RunningProcess()
+
+    async def interrupted(_child: object) -> bool:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(resolver, "_terminate", interrupted)
+    with pytest.raises(asyncio.CancelledError):
+        await resolver._cleanup_child(child, release_slot=True)
+
+    reaper = resolver._reapers[child]
+    await asyncio.wait_for(reaper, timeout=2)
+    assert resolver._slots._value == 2
+    assert child not in resolver._reapers
+    await resolver.close()
+
+
+@pytest.mark.asyncio
 async def test_deadline_includes_waiting_for_child_capacity() -> None:
     async def factory(*args: object, **kwargs: object) -> _Process:
         raise AssertionError("a timed-out waiter must never spawn a child")
@@ -735,6 +788,46 @@ async def test_deadline_includes_waiting_for_child_capacity() -> None:
         resolver._slots.release()
         resolver._slots.release()
         await resolver.close()
+
+
+@pytest.mark.asyncio
+async def test_batch_extraction_cannot_starve_interactive_children(tmp_path) -> None:
+    """A playlist import must never occupy both slots an interactive resolve needs."""
+    processes: list[tuple[str, _RunningProcess]] = []
+
+    async def factory(*args: object, **kwargs: object) -> _RunningProcess:
+        process = _RunningProcess()
+        processes.append((str(args[0]), process))
+        return process
+
+    deno = tmp_path / "deno"
+    deno.write_bytes(b"")
+    resolver = YouTubeResolver(process_factory=factory, deno_locator=lambda: str(deno))
+    first = asyncio.create_task(
+        resolver._run_child(["first"], deadline=5, ceiling=1024, batch=True)
+    )
+    second = asyncio.create_task(
+        resolver._run_child(["second"], deadline=5, ceiling=1024, batch=True)
+    )
+    while not processes:
+        await asyncio.sleep(0)
+    interactive = asyncio.create_task(
+        resolver._run_child(["interactive"], deadline=5, ceiling=1024)
+    )
+    try:
+        for _ in range(200):
+            if len(processes) >= 2:
+                break
+            await asyncio.sleep(0)
+        assert {name for name, _ in processes} == {"first", "interactive"}
+        assert not second.done(), "the second batch child must wait for the batch lane"
+    finally:
+        for task in (first, second, interactive):
+            task.cancel()
+        await asyncio.gather(first, second, interactive, return_exceptions=True)
+        await resolver.close()
+    assert resolver._slots._value == 2
+    assert resolver._batch_slots._value == 1
 
 
 @pytest.mark.asyncio
