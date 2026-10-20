@@ -380,3 +380,56 @@ async def test_failed_restore_preserves_credentials_and_invalidates_login(fake_b
         assert "credential-in-provider-exception" not in caplog.text
     finally:
         await handler.unload()
+
+
+@pytest.mark.asyncio
+async def test_stored_restore_cannot_resurrect_credentials_after_logout(fake_bot, monkeypatch):
+    """A logout that wins over a running restore must keep the cleared state."""
+    from TidalPlayerExp.providers.tokens import TokenSnapshot
+
+    handler = _make_handler(fake_bot)
+    expiry = datetime.now(timezone.utc) + timedelta(hours=6)
+    credentials = _credentials(expiry)
+    await handler.tokens.replace(TokenSnapshot(**credentials))
+
+    restore_ready = asyncio.Event()
+    release = asyncio.Event()
+    session = SimpleNamespace(
+        token_type="Bearer", access_token="stored-access", refresh_token="stored-refresh",
+        expiry_time=expiry, check_login=lambda: False,
+    )
+
+    def load(token_type, access_token, refresh_token, expiry_time):
+        # tidalapi may renew credentials while accepting the stored session.
+        session.access_token = "refreshed-access"
+        return True
+
+    session.load_oauth_session = load
+
+    async def blocked_restore(_handler, operation, timeout=10.0):
+        result = operation()
+        # The SDK worker accepted the stored session; hold the commit point
+        # open until the owner's logout has completed first.
+        restore_ready.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(type(handler), "_run_blocking", blocked_restore)
+    handler.session = session
+    pending = None
+    try:
+        pending = asyncio.create_task(handler.initialize(credentials))
+        await asyncio.wait_for(restore_ready.wait(), timeout=1)
+        await handler.logout()
+        release.set()
+        await asyncio.wait_for(pending, timeout=1)
+
+        # Neither the renewed credentials nor a stale login state may survive
+        # the logout: the cleared owner decision wins without a resurrection.
+        assert await handler.tokens.restore() is None
+        assert handler._login_cache is not True
+    finally:
+        release.set()
+        if pending is not None:
+            await asyncio.gather(pending, return_exceptions=True)
+        await handler.unload()

@@ -9,6 +9,7 @@ import asyncio
 import logging
 import os
 import secrets
+import unicodedata
 from collections.abc import Awaitable, Mapping
 from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -563,13 +564,14 @@ class TidalHandler:
             raise last_exc
         raise RuntimeError("_run_with_backoff exhausted retries with no exception captured")
 
-    def _session_token_snapshot(self) -> TokenSnapshot:
+    def _session_token_snapshot(self, session: Any | None = None) -> TokenSnapshot:
         """Validate the current session credentials before persisting them."""
-        expiry = self.session.expiry_time
+        session = session if session is not None else self.session
+        expiry = session.expiry_time
         snapshot = TokenSnapshot(
-            token_type=self.session.token_type,
-            access_token=self.session.access_token,
-            refresh_token=self.session.refresh_token,
+            token_type=session.token_type,
+            access_token=session.access_token,
+            refresh_token=session.refresh_token,
             expiry_time=int(_ensure_aware(expiry).timestamp()) if expiry else 0,
         )
         if not snapshot.is_complete:
@@ -579,7 +581,8 @@ class TidalHandler:
     async def initialize(self, creds: Dict[str, Any]) -> None:
         self._login_cache = False
         self._login_cache_time = asyncio.get_running_loop().time()
-        if not self.session or not creds.get("access_token"):
+        session = self.session
+        if not session or not creds.get("access_token"):
             return
         try:
             expiry = (
@@ -587,21 +590,31 @@ class TidalHandler:
                 if creds.get("expiry_time")
                 else None
             )
+            # Bind the session now: a logout during the restore must not load
+            # stored credentials into its tokenless replacement.
             def _load() -> TokenSnapshot:
-                loaded = self.session.load_oauth_session(
+                loaded = session.load_oauth_session(
                     creds["token_type"], creds["access_token"], creds["refresh_token"], expiry
                 )
                 if not loaded:
                     raise RuntimeError("Tidal rejected the stored session")
-                return self._session_token_snapshot()
+                return self._session_token_snapshot(session)
 
             snapshot = await self._run_blocking(_load, timeout=15.0)
-            # tidalapi can refresh expired credentials while loading the session.
-            if snapshot != TokenSnapshot.from_mapping(creds):
-                await self.tokens.replace(snapshot)
-            self._login_cache = True
-            self._login_cache_time = asyncio.get_running_loop().time()
-            log.info("Tidal session loaded successfully")
+            # The restore runs outside the refresh lock, so a logout may have
+            # completed meanwhile. Its cleared state wins: never resurrect
+            # credentials, and never mark the detached session logged in.
+            async with self._refresh_lock:
+                if self.session is not session:
+                    _log_provider_failure("Tidal", "session restore", RuntimeError("session replaced"))
+                    self.invalidate_login_cache()
+                    return
+                # tidalapi can refresh expired credentials while loading the session.
+                if snapshot != TokenSnapshot.from_mapping(creds):
+                    await self.tokens.replace(snapshot)
+                self._login_cache = True
+                self._login_cache_time = asyncio.get_running_loop().time()
+                log.info("Tidal session loaded successfully")
         except asyncio.TimeoutError:
             log.warning("Timed out loading Tidal session from stored credentials")
             # Never cache a negative nobody observed: the stored token may be
@@ -782,26 +795,29 @@ class TidalHandler:
     async def _search_uncached(
         self, query: str, filter_remixes: bool, cache_key: str,
     ) -> List[Any]:
-        async with self.api_semaphore:
-            try:
-                def run_search():
-                    if TIDAL_MODELS_AVAILABLE and TidalTrack is not None:
-                        return self.session.search(query, models=[TidalTrack])
-                    return self.session.search(query)
-                result = await self._run_with_backoff(run_search, timeout=10.0)
-                tracks = self._extract_tracks(result)
-                filtered = self._filter_tracks(tracks) if filter_remixes else tracks
-                # Empty pages are cached as well: the filter flag is part of the
-                # cache key, so toggling it re-queries while an unchanged
-                # setting reuses the provider's answer.
-                self._set_cached("search", cache_key, filtered, 600.0)
-                return filtered
-            except asyncio.TimeoutError:
-                log.warning("Tidal catalog search timed out")
-                return []
-            except Exception as error:
-                _log_provider_failure("Tidal", "catalog search", error)
-                return []
+        try:
+            def run_search():
+                if TIDAL_MODELS_AVAILABLE and TidalTrack is not None:
+                    return self.session.search(query, models=[TidalTrack])
+                return self.session.search(query)
+            # Acquire per attempt: a retry backoff must not pin one of the five
+            # provider slots across the whole retry window.
+            result = await self._run_with_backoff(
+                run_search, timeout=10.0, semaphore=self.api_semaphore,
+            )
+            tracks = self._extract_tracks(result)
+            filtered = self._filter_tracks(tracks) if filter_remixes else tracks
+            # Empty pages are cached as well: the filter flag is part of the
+            # cache key, so toggling it re-queries while an unchanged
+            # setting reuses the provider's answer.
+            self._set_cached("search", cache_key, filtered, 600.0)
+            return filtered
+        except asyncio.TimeoutError:
+            log.warning("Tidal catalog search timed out")
+            return []
+        except Exception as error:
+            _log_provider_failure("Tidal", "catalog search", error)
+            return []
 
     async def get_track_by_isrc(self, isrc: str) -> Optional[Any]:
         if not self.session:
@@ -813,25 +829,24 @@ class TidalHandler:
         return await self._coalesce("isrc", isrc, lambda: self._get_track_by_isrc_uncached(isrc))
 
     async def _get_track_by_isrc_uncached(self, isrc: str) -> Optional[Any]:
-        async with self.api_semaphore:
-            try:
-                def _fetch():
-                    if hasattr(self.session, "get_tracks_by_isrc"):
-                        results = self.session.get_tracks_by_isrc(isrc)
-                        if isinstance(results, (list, tuple)):
-                            return results[0] if results else None
-                    return _CACHE_MISS
-                res = await self._run_with_backoff(_fetch, timeout=10.0)
-                if res is _CACHE_MISS:
-                    return None
-                if res:
-                    self._set_cached("isrc", isrc, res, 3600.0)
-                elif res is None:
-                    self._set_cached("isrc", isrc, None, 30.0)
-                return res
-            except Exception as error:
-                _log_provider_failure("Tidal", "ISRC lookup", error)
+        try:
+            def _fetch():
+                if hasattr(self.session, "get_tracks_by_isrc"):
+                    results = self.session.get_tracks_by_isrc(isrc)
+                    if isinstance(results, (list, tuple)):
+                        return results[0] if results else None
+                return _CACHE_MISS
+            res = await self._run_with_backoff(_fetch, timeout=10.0, semaphore=self.api_semaphore)
+            if res is _CACHE_MISS:
                 return None
+            if res:
+                self._set_cached("isrc", isrc, res, 3600.0)
+            elif res is None:
+                self._set_cached("isrc", isrc, None, 30.0)
+            return res
+        except Exception as error:
+            _log_provider_failure("Tidal", "ISRC lookup", error)
+            return None
 
     async def get_track(self, track_id: str) -> Optional[Any]:
         if not self.session:
@@ -908,15 +923,16 @@ class TidalHandler:
         cached = self._get_cached("video", video_id)
         if cached is not _CACHE_MISS:
             return cached
-        async with self.api_semaphore:
-            try:
-                res = await self._run_with_backoff(lambda: self.session.video(video_id), timeout=10.0)
-                if res:
-                    self._set_cached("video", video_id, res, 3600.0)
-                return res
-            except Exception as error:
-                _log_provider_failure("Tidal", "video lookup", error)
-                return None
+        try:
+            res = await self._run_with_backoff(
+                lambda: self.session.video(video_id), timeout=10.0, semaphore=self.api_semaphore,
+            )
+            if res:
+                self._set_cached("video", video_id, res, 3600.0)
+            return res
+        except Exception as error:
+            _log_provider_failure("Tidal", "video lookup", error)
+            return None
 
     async def get_album(self, album_id: str) -> Optional[Any]:
         return await self._coalesce("album", album_id, lambda: self._get_album_uncached(album_id))
@@ -927,15 +943,16 @@ class TidalHandler:
         cached = self._get_cached("album", album_id)
         if cached is not _CACHE_MISS:
             return cached
-        async with self.api_semaphore:
-            try:
-                res = await self._run_with_backoff(lambda: self.session.album(album_id), timeout=10.0)
-                if res:
-                    self._set_cached("album", album_id, res, 1800.0)
-                return res
-            except Exception as error:
-                _log_provider_failure("Tidal", "album lookup", error)
-                return None
+        try:
+            res = await self._run_with_backoff(
+                lambda: self.session.album(album_id), timeout=10.0, semaphore=self.api_semaphore,
+            )
+            if res:
+                self._set_cached("album", album_id, res, 1800.0)
+            return res
+        except Exception as error:
+            _log_provider_failure("Tidal", "album lookup", error)
+            return None
 
     async def get_playlist(self, playlist_id: str) -> Optional[Any]:
         return await self._coalesce("playlist", playlist_id, lambda: self._get_playlist_uncached(playlist_id))
@@ -946,15 +963,16 @@ class TidalHandler:
         cached = self._get_cached("playlist", playlist_id)
         if cached is not _CACHE_MISS:
             return cached
-        async with self.api_semaphore:
-            try:
-                res = await self._run_with_backoff(lambda: self.session.playlist(playlist_id), timeout=10.0)
-                if res:
-                    self._set_cached("playlist", playlist_id, res, 300.0)
-                return res
-            except Exception as error:
-                _log_provider_failure("Tidal", "playlist lookup", error)
-                return None
+        try:
+            res = await self._run_with_backoff(
+                lambda: self.session.playlist(playlist_id), timeout=10.0, semaphore=self.api_semaphore,
+            )
+            if res:
+                self._set_cached("playlist", playlist_id, res, 300.0)
+            return res
+        except Exception as error:
+            _log_provider_failure("Tidal", "playlist lookup", error)
+            return None
 
     async def get_mix(self, mix_id: str) -> Optional[Any]:
         return await self._coalesce("mix", mix_id, lambda: self._get_mix_uncached(mix_id))
@@ -1052,39 +1070,40 @@ class TidalHandler:
     async def create_user_playlist(self, name: str, description: str = "") -> Optional[Any]:
         if not self.session or not hasattr(self.session, "user"):
             return None
-        async with self.api_semaphore:
-            try:
-                def _create():
-                    user = self.session.user
-                    if hasattr(user, "create_playlist"):
-                        return user.create_playlist(name, description)
-                    return None
-                return await self._run_with_backoff(_create, timeout=15.0)
-            except Exception as error:
-                _log_provider_failure("Tidal", "playlist creation", error)
+        try:
+            def _create():
+                user = self.session.user
+                if hasattr(user, "create_playlist"):
+                    return user.create_playlist(name, description)
                 return None
+            return await self._run_with_backoff(_create, timeout=15.0, semaphore=self.api_semaphore)
+        except Exception as error:
+            _log_provider_failure("Tidal", "playlist creation", error)
+            return None
 
     async def add_track_to_playlist(self, playlist: Any, track_id: int) -> bool:
         if not playlist or not hasattr(playlist, "add"):
             return False
-        async with self.api_semaphore:
-            try:
-                await self._run_with_backoff(lambda: playlist.add([track_id]), timeout=10.0)
-                return True
-            except Exception as error:
-                _log_provider_failure("Tidal", "playlist track addition", error)
-                return False
+        try:
+            await self._run_with_backoff(
+                lambda: playlist.add([track_id]), timeout=10.0, semaphore=self.api_semaphore,
+            )
+            return True
+        except Exception as error:
+            _log_provider_failure("Tidal", "playlist track addition", error)
+            return False
 
     async def remove_track_from_playlist(self, playlist: Any, track_id: int) -> bool:
         if not playlist or not hasattr(playlist, "remove_by_id"):
             return False
-        async with self.api_semaphore:
-            try:
-                await self._run_with_backoff(lambda: playlist.remove_by_id(track_id), timeout=10.0)
-                return True
-            except Exception as error:
-                _log_provider_failure("Tidal", "playlist track removal", error)
-                return False
+        try:
+            await self._run_with_backoff(
+                lambda: playlist.remove_by_id(track_id), timeout=10.0, semaphore=self.api_semaphore,
+            )
+            return True
+        except Exception as error:
+            _log_provider_failure("Tidal", "playlist track removal", error)
+            return False
 
     async def get_items(self, container: Any) -> List[Any]:
         if hasattr(container, "items") and callable(container.items):
@@ -1100,15 +1119,14 @@ class TidalHandler:
                 val = container.items
                 return list(islice(val() if callable(val) else val, MAX_ITEMS))
             return []
-        async with self.api_semaphore:
-            try:
-                items = await self._run_with_backoff(_fetch, timeout=30.0)
-            except asyncio.TimeoutError:
-                log.error("Timed out extracting items from Tidal container")
-                return []
-            except Exception as error:
-                _log_provider_failure("Tidal", "item extraction", error)
-                return []
+        try:
+            items = await self._run_with_backoff(_fetch, timeout=30.0, semaphore=self.api_semaphore)
+        except asyncio.TimeoutError:
+            log.error("Timed out extracting items from Tidal container")
+            return []
+        except Exception as error:
+            _log_provider_failure("Tidal", "item extraction", error)
+            return []
         if len(items) > MAX_ITEMS:
             log.warning(f"Truncating Tidal container from {len(items)} to {MAX_ITEMS} items")
         return items[:MAX_ITEMS]
@@ -1118,30 +1136,33 @@ class TidalHandler:
         offset = 0
         _sparse_supported: Optional[bool] = None
         while len(all_items) < MAX_ITEMS:
-            async with self.api_semaphore:
-                try:
-                    def _fetch(o: int = offset, sparse: Optional[bool] = _sparse_supported) -> _PageResult:
-                        limit = min(PAGINATION_LIMIT, MAX_ITEMS - o)
-                        if sparse is False:
-                            return _PageResult(
-                                items=list(islice(container.items(limit=limit, offset=o), limit)),
-                                sparse_supported=None,
-                            )
-                        try:
-                            result = list(islice(container.items(limit=limit, offset=o, sparse_album=True), limit))
-                            return _PageResult(items=result, sparse_supported=True)
-                        except TypeError:
-                            return _PageResult(
-                                items=list(islice(container.items(limit=limit, offset=o), limit)),
-                                sparse_supported=False,
-                            )
-                    page: _PageResult = await self._run_with_backoff(_fetch, timeout=25.0)
-                except asyncio.TimeoutError:
-                    log.error(f"Pagination timeout at offset {offset}")
-                    raise
-                except Exception as error:
-                    _log_provider_failure("Tidal", f"pagination at offset {offset}", error)
-                    raise
+            try:
+                def _fetch(o: int = offset, sparse: Optional[bool] = _sparse_supported) -> _PageResult:
+                    limit = min(PAGINATION_LIMIT, MAX_ITEMS - o)
+                    if sparse is False:
+                        return _PageResult(
+                            items=list(islice(container.items(limit=limit, offset=o), limit)),
+                            sparse_supported=None,
+                        )
+                    try:
+                        result = list(islice(container.items(limit=limit, offset=o, sparse_album=True), limit))
+                        return _PageResult(items=result, sparse_supported=True)
+                    except TypeError:
+                        return _PageResult(
+                            items=list(islice(container.items(limit=limit, offset=o), limit)),
+                            sparse_supported=False,
+                        )
+                # Acquire per attempt: a retry backoff must not hold a permit
+                # across the sleeps between pagination retries.
+                page: _PageResult = await self._run_with_backoff(
+                    _fetch, timeout=25.0, semaphore=self.api_semaphore,
+                )
+            except asyncio.TimeoutError:
+                log.error(f"Pagination timeout at offset {offset}")
+                raise
+            except Exception as error:
+                _log_provider_failure("Tidal", f"pagination at offset {offset}", error)
+                raise
             if _sparse_supported is None and page.sparse_supported is not None:
                 _sparse_supported = page.sparse_supported
             if not page.items:
@@ -1263,7 +1284,8 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         "_recommendation_lookup_slots", "_lastfm_session", "youtube_resolver", "source_factory", "_closing", "_guild_generations",
         "_persistent_view", "_controller_views", "_controller_locks", "_stop_generations", "public_audio_resolver",
         "_spotify_auth_manager", "_spotify_refresh_token", "_spotify_fingerprint", "_spotify_retry_after",
-        "_spotify_login_states", "_youtube_retry_after",
+        "_spotify_login_states", "_youtube_retry_after", "_youtube_key_fingerprint",
+        "_youtube_build_lock",
         "_spotify_login_views", "_spotify_auth_lock", "_spotify_commit_lock",
         "runtime", "attachment_resolver",
     )
@@ -1301,6 +1323,10 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         self._spotify_commit_lock = asyncio.Lock()
         self.yt: Optional[Any] = None
         self._youtube_retry_after = 0.0
+        # Identifies the API key the installed client was built with, and its
+        # build lock serializes rebuilds so a stale one cannot clobber a newer.
+        self._youtube_key_fingerprint = None
+        self._youtube_build_lock = asyncio.Lock()
         self._tasks: Set[asyncio.Task] = set()
         self._guild_locks: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()
         self._cancel_events: Dict[int, asyncio.Event] = {}
@@ -2069,18 +2095,26 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         return result
 
     async def _initialize_youtube(self, *, retry_if_missing: bool = False) -> None:
-        if retry_if_missing:
-            if self.yt is not None or self._closing:
-                return
-            now = asyncio.get_running_loop().time()
-            if now < self._youtube_retry_after:
-                return
-            self._youtube_retry_after = now + PROVIDER_RETRY_COOLDOWN
-        client: Any | None = None
-        if YOUTUBE_API_AVAILABLE:
+        # One build at a time, with tokens read as the build's own final view:
+        # a concurrent token update can neither interleave two swaps nor let a
+        # stale build replace a newer client.
+        async with self._youtube_build_lock:
+            if retry_if_missing:
+                if self.yt is not None or self._closing:
+                    return
+                now = asyncio.get_running_loop().time()
+                if now < self._youtube_retry_after:
+                    return
+                self._youtube_retry_after = now + PROVIDER_RETRY_COOLDOWN
             tokens = await self.bot.get_shared_api_tokens("youtube")
             key = tokens.get("api_key")
-            if key:
+            fingerprint = f"key:{key or ''}"
+            if self.yt is not None and fingerprint == self._youtube_key_fingerprint:
+                # The installed client already matches this key; a rebuild
+                # would be redundant work in the shared executor.
+                return
+            client: Any | None = None
+            if YOUTUBE_API_AVAILABLE and key:
                 try:
                     from .providers.google_transport import IsolatedHttpRequest
                     client = await self.tidal._run_blocking(
@@ -2090,10 +2124,11 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                     )
                 except Exception as error:
                     _log_provider_failure("YouTube", "client initialization", error)
-        # Swap only after the build; a failed rebuild clears the stale client.
-        self.yt = client
-        if retry_if_missing and client is not None:
-            self._youtube_retry_after = 0.0
+            # Swap only after the build; a failed rebuild clears the stale client.
+            self.yt = client
+            self._youtube_key_fingerprint = fingerprint
+            if retry_if_missing and client is not None:
+                self._youtube_retry_after = 0.0
 
     @commands.Cog.listener()
     async def on_red_api_tokens_update(self, service_name: str, api_tokens: Dict[str, str]) -> None:
@@ -3621,7 +3656,10 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             await self._reply(ctx, "Playnext accepts one track, video, or search. Use play for albums and playlists.")
             return
         external_search = provider_url is None and platform in {"youtube", "soundcloud"}
-        if external_search and (len(query.strip()) > 300 or any(ord(char) < 32 for char in query)):
+        if external_search and (
+            len(query.strip()) > 300
+            or any(ord(char) < 32 or unicodedata.category(char) == "Cc" for char in query)
+        ):
             await self._reply(ctx, "Search terms must be at most 300 characters and contain no control characters.")
             return
         if (provider_url is None and not external_search) or (provider_url is not None and provider_url.provider in {ProviderKind.TIDAL, ProviderKind.SPOTIFY}):
