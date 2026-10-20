@@ -89,3 +89,126 @@ async def test_lastfm_uncertain_first_result_is_not_a_candidate(cog) -> None:
         )
 
     assert candidates == []
+
+
+def _tidal_track(identifier, title, artist, full_name=None):
+    return SimpleNamespace(
+        id=identifier,
+        name=title,
+        full_name=full_name,
+        artist=SimpleNamespace(name=artist),
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_playing_song_in_another_version_is_not_suggested(cog) -> None:
+    """A live take of the playing song is the same music, not a suggestion."""
+    # Tidal stores some live releases with the qualifier inside the title.
+    live = _tidal_track(78, "Doomed (Live at the Royal Albert Hall)", "Bring Me The Horizon")
+    other = _tidal_track(79, "Drown", "Bring Me The Horizon")
+    with (
+        patch.object(
+            type(cog),
+            "_lastfm_similar_tracks",
+            new=AsyncMock(return_value=[
+                ("Bring Me The Horizon", "Doomed (Live at the Royal Albert Hall)"),
+                ("Bring Me The Horizon", "Drown"),
+            ]),
+        ),
+        patch.object(
+            type(cog.tidal), "search", new=AsyncMock(side_effect=[[live], [other]])
+        ),
+    ):
+        candidates = await cog._radio_candidates_limited(
+            1, {"track_id": 1, "title": "Doomed", "artist": "Bring Me The Horizon"}
+        )
+
+    assert candidates == [other]
+
+
+@pytest.mark.asyncio
+async def test_a_live_version_named_through_the_version_field_is_not_suggested(cog) -> None:
+    """The same rule applies when Tidal keeps the qualifier in the version."""
+    live = _tidal_track(
+        78, "Doomed", "Bring Me The Horizon", "Doomed (L.I.V.E. In Sao Paulo)"
+    )
+    other = _tidal_track(79, "Can You Feel My Heart", "Bring Me The Horizon")
+    with (
+        patch.object(
+            type(cog),
+            "_lastfm_similar_tracks",
+            new=AsyncMock(return_value=[
+                ("Bring Me The Horizon", "Doomed (L.I.V.E. In Sao Paulo)"),
+                ("Bring Me The Horizon", "Can You Feel My Heart"),
+            ]),
+        ),
+        patch.object(
+            type(cog.tidal), "search", new=AsyncMock(side_effect=[[live], [other]])
+        ),
+    ):
+        candidates = await cog._radio_candidates_limited(
+            1, {"track_id": 1, "title": "Doomed", "artist": "Bring Me The Horizon"}
+        )
+
+    assert candidates == [other]
+
+
+@pytest.mark.asyncio
+async def test_the_search_fallback_drops_the_playing_song_in_another_version(cog) -> None:
+    live = _tidal_track(78, "Doomed (L.I.V.E. In Sao Paulo)", "Bring Me The Horizon")
+    other = _tidal_track(79, "Can You Feel My Heart", "Bring Me The Horizon")
+    with (
+        patch.object(
+            type(cog), "_lastfm_similar_tracks", new=AsyncMock(return_value=[])
+        ),
+        patch.object(
+            type(cog.tidal), "search", new=AsyncMock(return_value=[live, other])
+        ),
+    ):
+        candidates = await cog._radio_candidates_limited(
+            1, {"track_id": 1, "title": "Doomed", "artist": "Bring Me The Horizon"}
+        )
+
+    assert candidates == [other]
+
+
+@pytest.mark.asyncio
+async def test_a_different_song_by_another_artist_is_still_suggested(cog) -> None:
+    """Only the playing song itself is dropped, not every similar title."""
+    collab = _tidal_track(80, "Bad Habits (feat. Bring Me The Horizon)", "Ed Sheeran")
+    with (
+        patch.object(
+            type(cog),
+            "_lastfm_similar_tracks",
+            new=AsyncMock(return_value=[("Ed Sheeran", "Bad Habits")]),
+        ),
+        patch.object(
+            type(cog.tidal), "search", new=AsyncMock(return_value=[collab])
+        ),
+    ):
+        candidates = await cog._radio_candidates_limited(
+            1, {"track_id": 1, "title": "Doomed", "artist": "Bring Me The Horizon"}
+        )
+
+    assert candidates == [collab]
+
+
+@pytest.mark.asyncio
+async def test_a_live_version_of_another_song_is_still_suggested(cog) -> None:
+    """A different song in another version is a different recording."""
+    live = _tidal_track(81, "Drown (Live)", "Bring Me The Horizon")
+    with (
+        patch.object(
+            type(cog),
+            "_lastfm_similar_tracks",
+            new=AsyncMock(return_value=[("Bring Me The Horizon", "Drown (Live)")]),
+        ),
+        patch.object(
+            type(cog.tidal), "search", new=AsyncMock(return_value=[live])
+        ),
+    ):
+        candidates = await cog._radio_candidates_limited(
+            1, {"track_id": 1, "title": "Doomed", "artist": "Bring Me The Horizon"}
+        )
+
+    assert candidates == [live]

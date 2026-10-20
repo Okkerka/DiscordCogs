@@ -111,6 +111,15 @@ def _log_provider_failure(provider: str, operation: str, error: BaseException) -
     log.warning("%s %s failed (%s)", provider, operation, type(error).__name__)
 
 
+def _base_title(title: Any) -> str:
+    """Return a title without its parenthesised version suffix.
+
+    Tidal names a version "Song (Live at ...)"; the song itself is the part
+    before the parenthesis.
+    """
+    return normalize_identity_text(str(title or "").split("(")[0])
+
+
 def _first_image_url(images: Any) -> str | None:
     """First usable URL from a provider image list, tolerating odd payloads."""
     if not isinstance(images, list):
@@ -2156,6 +2165,30 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             getattr(getattr(track, "artist", None), "name", None),
         )
 
+    @classmethod
+    def _is_playing_song_version(cls, meta: TrackMeta | None, track: Any) -> bool:
+        """Whether a suggestion is the playing song in another version.
+
+        A live, remix or remastered recording of the song that is already
+        playing is the same music, not a different song to suggest.
+        """
+        values = meta or {}
+        current_title = _base_title(values.get("title"))
+        current_artist = normalize_identity_text(values.get("artist"))
+        if not current_title or not current_artist:
+            return False
+        candidate_title = _base_title(
+            getattr(track, "name", None) or getattr(track, "full_name", None)
+        )
+        candidate_artist = normalize_identity_text(
+            getattr(getattr(track, "artist", None), "name", None)
+        )
+        return (
+            bool(candidate_title)
+            and candidate_title == current_title
+            and candidate_artist == current_artist
+        )
+
     def _is_recent_autoplay_track(self, guild_id: int, track: Any) -> bool:
         track_id = str(getattr(track, "id", "") or "")
         signature = self._tidal_track_signature(track)
@@ -2614,6 +2647,9 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                     continue
                 if found_title == current_title and found_artist == current_artist:
                     continue
+                if self._is_playing_song_version(meta, track):
+                    # The playing song in another version is not a suggestion.
+                    continue
                 used_ids.add(track_id)
                 if signature:
                     used_signatures.add(signature)
@@ -2638,6 +2674,9 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                 or track_id in used_ids
                 or (signature and (signature in seen_signatures or signature in used_signatures))
             ):
+                continue
+            if self._is_playing_song_version(meta, track):
+                # The playing song in another version is not a suggestion.
                 continue
             used_ids.add(track_id)
             if signature:
