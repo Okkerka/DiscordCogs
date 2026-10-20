@@ -1,3 +1,4 @@
+import importlib
 import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -19,7 +20,7 @@ async def test_batch_admits_stable_references_in_order_without_resolving_streams
         channel=SimpleNamespace(),
     )
 
-    with patch.object(type(cog.tidal), "get_stream_url", new=AsyncMock()) as stream:
+    with patch.object(type(cog.tidal), "search", new=AsyncMock()) as search:
         queued, skipped = await cog._queue_resolved_chunk(
             ctx,
             native_session,
@@ -30,8 +31,19 @@ async def test_batch_admits_stable_references_in_order_without_resolving_streams
     assert (queued, skipped) == (2, 0)
     assert [entry.primary.identifier for entry in native_session.entries] == ["1", "2"]
     assert len({entry.entry_id for entry in native_session.entries}) == 2
-    stream.assert_not_awaited()
+    search.assert_not_awaited()
     assert not cog._current_meta
+
+
+def test_signed_stream_resolution_happens_only_at_playback_time() -> None:
+    """Stream URLs belong to the playback boundary, never to catalog lookups.
+
+    The catalog handler used to expose its own stream resolution; that path
+    pinned stale signed URLs right after a batch import completed. Its removal
+    is a guarantee: nothing on the handler may resolve streams at all.
+    """
+    module = importlib.import_module("TidalPlayerExp.tidalplayer")
+    assert all("stream" not in name.lower() for name in dir(module.TidalHandler))
 
 
 @pytest.mark.asyncio
@@ -48,11 +60,9 @@ async def test_batch_catalog_resolution_does_not_prefetch_signed_url(cog) -> Non
             type(cog.tidal), "search", new=AsyncMock(return_value=[track])
         ),
         patch.object(type(cog), "_extract_meta", new=AsyncMock(return_value=meta)),
-        patch.object(type(cog.tidal), "get_stream_url", new=AsyncMock()) as get_stream,
     ):
         result = await cog._resolve_and_extract(
             object(), lambda _item: "Artist Song", False
         )
 
     assert result == (track, meta)
-    get_stream.assert_not_awaited()

@@ -188,26 +188,6 @@ async def test_track_start_publishes_native_metadata(cog, native_session) -> Non
 
 
 @pytest.mark.asyncio
-async def test_get_url_is_preferred_without_calling_get_stream(cog) -> None:
-    class Track:
-        id = 530850206
-
-        def __init__(self) -> None:
-            self.get_stream_calls = 0
-
-        def get_url(self) -> str:
-            return "https://stream/legacy"
-
-        def get_stream(self):
-            self.get_stream_calls += 1
-            raise AssertionError("get_stream must not be called when get_url works")
-
-    track = Track()
-    with patch.object(type(cog.tidal), "get_track", new=AsyncMock(return_value=track)):
-        assert await cog.tidal.get_stream_url(track) == "https://stream/legacy"
-
-    assert track.get_stream_calls == 0
-
 @pytest.mark.asyncio
 async def test_failed_playback_reports_static_error_without_advancing_state(cog, native_session):
     current = make_entry()

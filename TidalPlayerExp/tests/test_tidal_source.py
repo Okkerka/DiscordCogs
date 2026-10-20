@@ -538,18 +538,6 @@ async def test_composite_preserves_youtube_cancellation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_actual_handler_fallback_calls_manifest_get_urls(cog) -> None:
-    manifest = _BTSManifest(["https://audio.example/current-shape.flac"])
-    track = _DirectTrack(RuntimeError("direct unavailable"), stream=_Stream(manifest))
-
-    with patch.object(type(cog.tidal), "get_track", new=AsyncMock(return_value=track)):
-        result = await cog.tidal.get_stream_url(SimpleNamespace(id=123))
-
-    assert result == "https://audio.example/current-shape.flac"
-    assert track.get_stream_calls == 1
-
-
-@pytest.mark.asyncio
 async def test_actual_handler_keeps_cancelled_provider_work_bounded(cog) -> None:
     started = threading.Event()
     release = threading.Event()

@@ -15,7 +15,7 @@ SECRET = "https://provider.invalid/audio?secret_token=private-credential"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("method", ["get_track", "get_track_by_isrc", "get_video", "get_similar_albums", "get_user_playlists", "get_user_playlist_by_id"])
+@pytest.mark.parametrize("method", ["get_track", "get_track_by_isrc", "get_video", "get_user_playlists", "get_user_playlist_by_id"])
 async def test_tidal_metadata_failures_do_not_log_sdk_exception(cog, caplog, method) -> None:
     caplog.set_level(logging.DEBUG, logger="red.tidalplayerexp")
     failing = Mock(side_effect=RuntimeError(SECRET))
@@ -25,8 +25,6 @@ async def test_tidal_metadata_failures_do_not_log_sdk_exception(cog, caplog, met
     )
     if method == "get_user_playlists":
         args = ()
-    elif method == "get_similar_albums":
-        args = (SimpleNamespace(similar=failing),)
     elif method == "get_user_playlist_by_id":
         class BrokenPlaylist:
             @property

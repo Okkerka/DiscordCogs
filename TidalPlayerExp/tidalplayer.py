@@ -1,7 +1,7 @@
 """
 TidalPlayerExp - experimental Tidal music integration for Red Discord Bot
 Features: Hi-Res Audio, Album Art, Spotify/YT Importing, MixV2, Video URLs,
-          Hybrid Slash Commands, Similar Albums, UserPlaylist Mgmt, Rich UI
+          Hybrid Slash Commands, UserPlaylist Mgmt, Rich UI
 """
 from __future__ import annotations
 
@@ -858,62 +858,20 @@ class TidalHandler:
         return await self._coalesce("track", track_id, lambda: self._get_track_uncached(track_id))
 
     async def _get_track_uncached(self, track_id: str) -> Optional[Any]:
-        async with self.api_semaphore:
-            try:
-                res = await self._run_with_backoff(lambda: self.session.track(track_id), timeout=10.0)
-                if res:
-                    self._set_cached("track", track_id, res, 3600.0)
-                return res
-            except asyncio.TimeoutError:
-                log.warning(f"Tidal get_track timeout for id {track_id}")
-                return None
-            except Exception as error:
-                _log_provider_failure("Tidal", "track lookup", error)
-                return None
-
-    async def get_track_radio(self, track_id: str) -> List[Any]:
-        """Get Tidal Track Radio candidates, retaining sparse objects by ID."""
-        if not self.session or not track_id:
-            return []
-        cache_key = f"radio:{track_id}"
-        cached = self._get_cached("mix", cache_key)
-        if cached is not _CACHE_MISS:
-            return cached
-
-        return await self._coalesce(
-            "track-radio", cache_key, lambda: self._get_track_radio_uncached(track_id, cache_key)
-        )
-
-    async def _get_track_radio_uncached(self, track_id: str, cache_key: str) -> List[Any]:
-        async with self.api_semaphore:
-            try:
-                def fetch() -> Any:
-                    if hasattr(self.session, "get_track_radio"):
-                        return self.session.get_track_radio(track_id)
-                    track = self.session.track(track_id)
-                    radio_method = getattr(track, "radio", None)
-                    if callable(radio_method):
-                        return radio_method()
-                    raise RuntimeError("Installed tidalapi exposes no Track Radio method")
-                result = await self._run_with_backoff(fetch, timeout=20.0)
-            except Exception as error:
-                _log_provider_failure("Tidal", f"Track Radio lookup for {track_id}", error)
-                return []
-        if isinstance(result, (list, tuple)):
-            tracks = list(result)
-        else:
-            tracks = list(
-                getattr(result, "tracks", None)
-                or getattr(result, "items", None)
-                or []
+        try:
+            res = await self._run_with_backoff(
+                lambda: self.session.track(track_id), timeout=10.0, semaphore=self.api_semaphore,
             )
-        tracks = [track for track in tracks if getattr(track, "id", None)][:25]
-        if tracks:
-            self._set_cached("mix", cache_key, tracks, 300.0)
-            log.info("Tidal Track Radio returned %s candidate(s) for %s.", len(tracks), track_id)
-        else:
-            log.warning("Tidal Track Radio returned no usable tracks for %s.", track_id)
-        return tracks
+            if res:
+                self._set_cached("track", track_id, res, 3600.0)
+            return res
+        except asyncio.TimeoutError:
+            log.warning(f"Tidal get_track timeout for id {track_id}")
+            return None
+        except Exception as error:
+            _log_provider_failure("Tidal", "track lookup", error)
+            return None
+
     async def get_video(self, video_id: str) -> Optional[Any]:
         return await self._coalesce("video", video_id, lambda: self._get_video_uncached(video_id))
 
@@ -985,63 +943,42 @@ class TidalHandler:
             return cached
         res = None
         mix_error: Exception | None = None
-        async with self.api_semaphore:
-            if hasattr(self.session, "mix_v2"):
-                try:
-                    res = await self._run_with_backoff(lambda: self.session.mix_v2(mix_id), timeout=10.0)
-                except Exception as error:
-                    mix_error = error
-            if not res and hasattr(self.session, "mix"):
-                try:
-                    res = await self._run_with_backoff(lambda: self.session.mix(mix_id), timeout=10.0)
-                except Exception as error:
-                    mix_error = error
+        # The two lookups are tried in order; either way each attempt acquires
+        # its permit alone instead of pinning one across both tries.
+        if hasattr(self.session, "mix_v2"):
+            try:
+                res = await self._run_with_backoff(
+                    lambda: self.session.mix_v2(mix_id), timeout=10.0, semaphore=self.api_semaphore,
+                )
+            except Exception as error:
+                mix_error = error
+        if not res and hasattr(self.session, "mix"):
+            try:
+                res = await self._run_with_backoff(
+                    lambda: self.session.mix(mix_id), timeout=10.0, semaphore=self.api_semaphore,
+                )
+            except Exception as error:
+                mix_error = error
         if not res and mix_error is not None:
             _log_provider_failure("Tidal", "mix lookup", mix_error)
         if res:
             self._set_cached("mix", mix_id, res, 300.0)
         return res
 
-    async def get_similar_albums(self, album: Any) -> List[Any]:
-        if not album or not hasattr(album, "similar"):
-            return []
-        async with self.api_semaphore:
-            try:
-                result = await self._run_with_backoff(album.similar, timeout=10.0)
-                return list(result) if result else []
-            except Exception as error:
-                _log_provider_failure("Tidal", "similar albums lookup", error)
-                return []
-
-    async def get_album_review(self, album: Any) -> Optional[str]:
-        if not album or not hasattr(album, "review"):
-            return None
-        async with self.api_semaphore:
-            try:
-                result = await self._run_with_backoff(album.review, timeout=10.0)
-                if isinstance(result, str):
-                    return result
-                if hasattr(result, "text"):
-                    return result.text
-                return str(result) if result else None
-            except Exception:
-                return None
-
     async def get_user_playlists(self) -> List[Any]:
         if not self.session or not hasattr(self.session, "user"):
             return []
-        async with self.api_semaphore:
-            try:
-                def _fetch():
-                    user = self.session.user
-                    if hasattr(user, "playlists"):
-                        val = user.playlists
-                        return list(val() if callable(val) else val)
-                    return []
-                return await self._run_with_backoff(_fetch, timeout=15.0)
-            except Exception as error:
-                _log_provider_failure("Tidal", "user playlists lookup", error)
+        try:
+            def _fetch():
+                user = self.session.user
+                if hasattr(user, "playlists"):
+                    val = user.playlists
+                    return list(val() if callable(val) else val)
                 return []
+            return await self._run_with_backoff(_fetch, timeout=15.0, semaphore=self.api_semaphore)
+        except Exception as error:
+            _log_provider_failure("Tidal", "user playlists lookup", error)
+            return []
 
     async def get_user_playlist_by_id(self, playlist_id: str) -> Optional[Any]:
         if not self.session:
@@ -1188,70 +1125,6 @@ class TidalHandler:
             pass
         return None
 
-    async def get_stream_url(self, track: Any) -> Optional[str]:
-        """Return a current stream URL, sharing only concurrent lookups by track ID."""
-        track_id = str(getattr(track, "id", "") or "")
-        if not track_id:
-            return await self._get_stream_url_uncached(track)
-        return await self._coalesce(
-            "stream-url", track_id, lambda: self._get_stream_url_uncached(track)
-        )
-
-    async def _get_stream_url_uncached(self, track: Any) -> Optional[str]:
-        """Resolve a full Tidal track and return a real stream URL, never a web URL."""
-        track_id = getattr(track, "id", None)
-        resolution_started = asyncio.get_running_loop().time()
-        if track_id:
-            full_track = await self.get_track(str(track_id))
-            if full_track is not None:
-                track = full_track
-            else:
-                log.warning("Could not resolve full Tidal track object for %s.", track_id)
-        async with self.api_semaphore:
-            try:
-                get_url = track.get_url
-                url = await self._run_with_backoff(get_url, timeout=15.0)
-                if url:
-                    log.info(
-                        "Resolved Tidal stream URL for track %s via get_url() in %.2fs.",
-                        track_id,
-                        asyncio.get_running_loop().time() - resolution_started,
-                    )
-                    return url
-            except AttributeError:
-                log.debug("Tidal track %s does not expose get_url(); trying get_stream fallback.", track_id)
-            except Exception as error:
-                _log_provider_failure("Tidal", f"get_url for track {track_id}", error)
-        async with self.api_semaphore:
-            try:
-                def get_urls() -> List[str]:
-                    stream = track.get_stream()
-                    manifest = stream.get_stream_manifest()
-                    if (
-                        manifest.is_mpd
-                        or not manifest.is_bts
-                        or str(manifest.encryption_type).upper() != "NONE"
-                        or manifest.encryption_key
-                        or manifest.is_encrypted
-                    ):
-                        return []
-                    return manifest.get_urls()
-                urls = await self._run_with_backoff(get_urls, timeout=20.0)
-                if urls:
-                    log.info(
-                        "Resolved Tidal stream URL for track %s via get_stream() fallback in %.2fs.",
-                        track_id,
-                        asyncio.get_running_loop().time() - resolution_started,
-                    )
-                    return urls[0]
-            except asyncio.TimeoutError:
-                log.warning("Tidal stream request timed out for track %s.", track_id)
-            except AttributeError:
-                log.warning("Tidal track %s does not expose a compatible stream URL method.", track_id)
-            except Exception as error:
-                _log_provider_failure("Tidal", f"get_stream for track {track_id}", error)
-        log.error("No playable Tidal stream URL available for track %s.", track_id)
-        return None
     def _extract_tracks(self, result: Any) -> List[Any]:
         def _page_items(value: Any) -> List[Any]:
             items = getattr(value, "items", None)
@@ -2227,14 +2100,6 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
     def _is_recent_autoplay_track(self, guild_id: int, track: Any) -> bool:
         track_id = str(getattr(track, "id", "") or "")
         signature = self._tidal_track_signature(track)
-        return bool(
-            (track_id and track_id in self._recent_track_ids[guild_id])
-            or (signature and signature in self._recent_track_signatures[guild_id])
-        )
-
-    def _is_recent_autoplay_meta(self, guild_id: int, meta: TrackMeta) -> bool:
-        track_id = str(meta.get("track_id") or "")
-        signature = self._meta_track_signature(meta)
         return bool(
             (track_id and track_id in self._recent_track_ids[guild_id])
             or (signature and signature in self._recent_track_signatures[guild_id])

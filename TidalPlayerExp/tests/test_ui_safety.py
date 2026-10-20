@@ -83,7 +83,7 @@ def metadata(**changes):
     return meta
 
 
-@pytest.mark.parametrize("factory", ["make_now_playing_embed", "make_queue_embed"])
+@pytest.mark.parametrize("factory", ["make_queue_embed"])
 def test_embeds_escape_metadata_but_preserve_authored_markdown(real_ui, factory):
     embeds, _ = real_ui
     embed = getattr(embeds, factory)(metadata(
@@ -98,7 +98,7 @@ def test_embeds_escape_metadata_but_preserve_authored_markdown(real_ui, factory)
     assert "_\\_album\\_" in embed.description
 
 
-@pytest.mark.parametrize("factory", ["make_now_playing_embed", "make_queue_embed"])
+@pytest.mark.parametrize("factory", ["make_queue_embed"])
 def test_embeds_bound_all_metadata_fields(real_ui, factory):
     embeds, _ = real_ui
     huge = "😀*" * 5000
@@ -136,8 +136,7 @@ async def test_controller_bounds_text_and_thumbnail_and_escapes_next_up(real_ui,
 def test_unusable_share_links_are_omitted(real_ui, url):
     embeds, controller = real_ui
     meta = metadata(share_url=url)
-    for factory in (embeds.make_now_playing_embed, embeds.make_queue_embed):
-        assert all(not field.name.startswith("Open in") for field in factory(meta).fields)
+    assert all(not field.name.startswith("Open in") for field in embeds.make_queue_embed(meta).fields)
     assert "[Open in" not in controller._track_info(meta, autoplay_enabled=False)
 
 
@@ -195,9 +194,9 @@ async def test_large_source_and_suggestion_labels_fit_discord_payload(real_ui, c
     embeds, controller = real_ui
     huge = "😀[" * 5000
     meta = metadata(source=huge, title=huge, artist=huge, album=huge)
-    embed = embeds.make_now_playing_embed(meta)
-    assert len(embed.title.encode("utf-16-le")) // 2 <= 256
-    assert all(len(field.name.encode("utf-16-le")) // 2 <= 256 for field in embed.fields)
+    # The remaining embed surface is the queue card; its total payload stays
+    # bounded even with maximal hostile metadata.
+    assert len(embeds.make_queue_embed(meta)) <= 6000
     view = controller.PlayerControllerView(cog, meta, next_up=meta, recommendations=[
         SimpleNamespace(full_name=huge, artist=SimpleNamespace(name=huge))])
     texts = [item.content for item in view.walk_children() if isinstance(item, real_discord.ui.TextDisplay)]
