@@ -284,7 +284,10 @@ class PlaybackCommands:
         current = session.snapshot().current
         meta = current.meta if current is not None else None
         who = getattr(ctx.author, "mention", None) or "Someone"
-        if not await session.skip():
+        # The entry identity is verified under the session lock, so the card
+        # always names the track the skip actually stopped.
+        entry_id = current.entry_id if current is not None else None
+        if not await session.skip(entry_id=entry_id):
             await self._reply(ctx, "Nothing is playing.")
             return
         await self._reply_notice(ctx, skip_notice(who, meta))

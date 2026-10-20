@@ -93,10 +93,13 @@ async def test_audio_conflict_rejected_before_connect(cog, native_ctx, native_se
 
 
 @pytest.mark.asyncio
-async def test_skip_is_single_native_transition(cog, native_ctx, native_session):
+async def test_skip_without_a_current_track_is_a_no_op_transition(cog, native_ctx, native_session):
     interaction = SimpleNamespace(guild=native_ctx.guild, response=SimpleNamespace(defer=AsyncMock()), followup=SimpleNamespace(send=AsyncMock()))
     await cog.controller_skip(interaction)
-    native_session.skip.assert_awaited_once_with()
+    # An empty snapshot is decided without touching the session: no skip
+    # transition can be spawned for a queue with nothing playing.
+    native_session.skip.assert_not_awaited()
+    interaction.followup.send.assert_awaited_once_with("Nothing is playing.", ephemeral=True)
     assert not cog._current_meta
 
 

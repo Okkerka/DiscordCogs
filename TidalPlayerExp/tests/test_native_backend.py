@@ -168,6 +168,35 @@ async def test_duplicate_connect_reuses_one_session(environment):
 
 
 @pytest.mark.asyncio
+async def test_dead_cancelled_attempt_does_not_stick(environment):
+    """A connector cancelled before its first step cannot block the guild forever.
+
+    Such a task never runs its own cleanup, so the pending attempt stays in
+    the registry invalid and done: every later connect used to fail until a
+    full teardown reclaimed it.
+    """
+    e = environment
+
+    async def cancelled_before_start() -> None:
+        raise asyncio.CancelledError
+
+    dead = e.module._Connection(e.channel.id)
+    dead.invalid = True
+    dead.task = asyncio.create_task(cancelled_before_start())
+    try:
+        await asyncio.wait_for(asyncio.shield(dead.task), 1)
+    except asyncio.CancelledError:
+        pass
+    assert dead.task.done() and dead.task.cancelled()
+    e.backend._pending[e.guild.id] = dead
+
+    session = await e.backend.connect(e.guild, e.channel)
+    assert session is await e.backend.get(e.guild.id)
+    assert e.backend._pending.get(e.guild.id) is not dead
+    await e.backend.close()
+
+
+@pytest.mark.asyncio
 async def test_first_connection_failure_starts_cleanup_retries(environment, monkeypatch):
     e = environment
     tick, sleeping = asyncio.Event(), asyncio.Event()

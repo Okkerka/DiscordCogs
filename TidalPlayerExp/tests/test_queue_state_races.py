@@ -36,7 +36,10 @@ async def test_skip_and_track_start_advance_exactly_once(cog, native_session):
     cog._resend_controller_for_track_start = AsyncMock()
     cog._schedule_controller_recommendations = MagicMock()
 
-    async def skip():
+    async def skip(entry_id=None):
+        # The panel's entry identity is verified under the session lock; the
+        # click may only advance when it matches the current entry.
+        assert entry_id == old.entry_id
         native_session.current = native_session.entries.pop(0)
         await cog.track_started(guild.id, native_session.current)
         return True
@@ -45,7 +48,7 @@ async def test_skip_and_track_start_advance_exactly_once(cog, native_session):
     await cog.controller_skip(make_controller_interaction(guild))
     await cog.track_started(guild.id, first)
 
-    native_session.skip.assert_awaited_once_with()
+    native_session.skip.assert_awaited_once_with(entry_id=old.entry_id)
     assert cog._current_meta[guild.id] == first.meta
     assert native_session.snapshot().queued == (second,)
     cog._resend_controller_for_track_start.assert_awaited_once()

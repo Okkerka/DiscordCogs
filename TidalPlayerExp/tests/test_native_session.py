@@ -252,6 +252,124 @@ async def test_pause_during_rebuffer_starts_the_replacement_paused():
         await session.close()
 
 
+class StrictVoice(Voice):
+    """Discord's voice client rejects pause/resume while nothing is playing."""
+
+    def __init__(self):
+        super().__init__()
+        self.playing = False
+
+    def play(self, source, *, after):
+        super().play(source, after=after)
+        self.playing = True
+
+    def stop(self):
+        self.playing = False
+        super().stop()
+
+    def pause(self):
+        if not self.playing:
+            raise RuntimeError("nothing is playing")
+        self.paused = True
+
+    def resume(self):
+        if not self.playing:
+            raise RuntimeError("nothing is playing")
+        self.paused = False
+
+
+@pytest.mark.asyncio
+async def test_pause_during_source_teardown_is_recorded_for_the_next_entry():
+    """Clicks between a stop and the old source's cleanup must record intent.
+
+    In that window the session owns neither a current entry nor (yet) a
+    replacement, but the old audio source still lingers on the session while a
+    thread cleans it up. ``set_paused`` must not direct the click at that
+    half-dead source: the recording surfaces as a paused start of the next
+    queued track.
+    """
+    import threading
+
+    voice, resolver, factory, sink = StrictVoice(), Resolver(), Factory(), Sink()
+    session = NativePlaybackSession(1, voice, resolver, factory, sink)
+    release_cleanup = threading.Event()
+    try:
+        assert await session.enqueue(entry())
+        await sink.expect("started")
+        source = factory.sources[0]
+        original_cleanup = source.cleanup
+        entered_cleanup = asyncio.Event()
+
+        def blocking_cleanup() -> None:
+            entered_cleanup.set()
+            release_cleanup.wait(2)
+            original_cleanup()
+
+        source.cleanup = blocking_cleanup
+        assert await session.enqueue(entry(2))
+        skipping = asyncio.create_task(session.skip())
+        await asyncio.wait_for(entered_cleanup.wait(), 2)
+
+        # The old source's cleanup is still unwinding: nothing is playing.
+        assert await session.set_paused(True) is True
+        release_cleanup.set()
+        assert await skipping is True
+        # The successor starts with a recorded paused intent instead of a
+        # pause command fired at an already-stopped source.
+        assert voice.played[-1] is not None
+        await sink.expect("started")
+        assert session.snapshot().paused is True
+        assert voice.paused is True
+    finally:
+        release_cleanup.set()
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_scoped_skip_refuses_a_naturally_replaced_current_entry():
+    """A stale panel click must not discard the track that already advanced."""
+    session, voice, resolver, factory, sink = setup()
+    try:
+        assert await session.enqueue(entry(1))
+        assert await session.enqueue(entry(2))
+        await sink.expect("started")
+        shown = session.snapshot().current
+        callback = voice.callbacks[0]
+        await asyncio.to_thread(callback, None)
+        await sink.expect("started")
+        assert session.snapshot().current.entry_id == "2"
+
+        assert await session.skip(entry_id=shown.entry_id) is False
+        assert session.snapshot().current.entry_id == "2"
+        assert session.snapshot().queued == ()
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_scoped_skip_accepts_the_seek_replacement_of_the_same_song():
+    """Seek rebuffers reuse the song identity: the same click still skips it."""
+    session, voice, resolver, factory, sink = setup()
+    try:
+        assert await session.enqueue(entry(1))
+        assert await session.enqueue(entry(2))
+        await sink.expect("started")
+        shown = session.snapshot().current
+
+        assert await session.seek(5)
+        await sink.expect("started")
+        replacement = session.snapshot().current
+        assert replacement.entry_id != shown.entry_id
+        assert replacement.replaces_entry_id == shown.entry_id
+
+        assert await session.skip(entry_id=shown.entry_id) is True
+        await sink.expect("started")
+        assert session.snapshot().current.entry_id == "2"
+        assert session.snapshot().queued == ()
+    finally:
+        await session.close()
+
+
 @pytest.mark.asyncio
 async def test_fifo_pause_resume_and_threaded_duplicate_end():
     session, voice, resolver, factory, sink = setup()

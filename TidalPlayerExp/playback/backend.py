@@ -100,6 +100,13 @@ class NativePlaybackBackend:
         """Coalesce compatible callers and publish only an owned connection."""
         self._validate(guild, channel)
         attempt = self._pending.get(guild.id)
+        if attempt is not None and attempt.invalid and attempt.task is not None and attempt.task.done():
+            # A connector cancelled before its first instruction cannot run its
+            # own finally; reclaim the dead attempt instead of failing every
+            # later connect for this guild until teardown.
+            if self._pending.get(guild.id) is attempt:
+                self._pending.pop(guild.id, None)
+            attempt = None
         if attempt is not None:
             if attempt.invalid or attempt.channel_id != channel.id:
                 raise PlaybackUnavailable()

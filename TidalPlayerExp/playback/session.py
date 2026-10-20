@@ -12,7 +12,7 @@ import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 import discord
 
@@ -303,10 +303,10 @@ class NativePlaybackSession:
                 return False
             if self._current is None and self._source is None:
                 return False
-            if self._source is None:
-                # Rebuffering (seek/volume): record the intent so the waiting
-                # replacement source starts in the requested state instead of
-                # dropping or inverting the click.
+            if self._current is None or self._source is None:
+                # Rebuffering or source teardown (seek/volume/cleanup): record
+                # the intent so a waiting replacement source starts in the
+                # requested state instead of dropping or inverting the click.
                 self._pause_on_start = paused
                 self._paused = paused
                 self._paused_at = time.monotonic() if paused else None
@@ -352,11 +352,13 @@ class NativePlaybackSession:
         self._started_at = self._paused_at = None
         # Register the dependency now, not inside the successor coroutine: a
         # successor can be cancelled before its first instruction executes.
+        # Finished predecessors contribute nothing, and keeping every done
+        # gather in the chain would retain one level per track for the whole
+        # session; only still-running work may be awaited.
         pending: list[Awaitable[object]] = []
-        if self._cleanup_barrier is not None and not self._cleanup_barrier.done():
-            pending.append(self._cleanup_barrier)
-        if previous is not None and not previous.done():
-            pending.append(previous)
+        for dependence in (self._cleanup_barrier, previous):
+            if dependence is not None and not dependence.done():
+                pending.append(dependence)
         self._cleanup_barrier = asyncio.gather(*pending, return_exceptions=True)
         return previous
 
@@ -372,10 +374,22 @@ class NativePlaybackSession:
             raise
         await self._run(ended)
 
-    async def skip(self) -> bool:
-        """Cancel the current preparation/playback and advance once after cleanup."""
+    async def skip(self, entry_id: str | None = None) -> bool:
+        """Cancel the current preparation/playback and advance once after cleanup.
+
+        With ``entry_id`` the request is scoped to the entry the caller showed
+        or announced: a current track that was already replaced (a natural
+        boundary or another skip) reports False instead of discarding a track
+        nobody asked to skip. A seek or rebuffer replacement of the same song
+        still counts, so misses never strand the panel's own click.
+        """
         async with self._lock:
             if self._closed or self._current is None:
+                return False
+            if entry_id is not None and (
+                self._current.entry_id != entry_id
+                and self._current.replaces_entry_id != entry_id
+            ):
                 return False
             ended = self._current
             previous = self._interrupt()

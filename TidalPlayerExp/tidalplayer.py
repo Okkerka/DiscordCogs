@@ -2914,8 +2914,16 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             await interaction.followup.send("Nothing is playing.", ephemeral=True)
             return
         current = session.snapshot().current
-        meta = current.meta if current is not None else None
-        if not await session.skip():
+        if self._closing or generation != self._guild_generations[guild_id]:
+            return
+        if current is None:
+            await interaction.followup.send("Nothing is playing.", ephemeral=True)
+            return
+        # The deferral and lookups could outlive the clicked track. The session
+        # verifies the entry identity under its lock, so a boundary that lands
+        # in between cannot discard the next track.
+        meta = current.meta
+        if not await session.skip(entry_id=current.entry_id):
             await interaction.followup.send("Nothing is playing.", ephemeral=True)
             return
         user = getattr(interaction, "user", None)
