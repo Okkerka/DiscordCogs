@@ -244,7 +244,9 @@ async def test_queue_capacity_stops_catalog_work_and_reports_remaining(cog, play
     assert cog.tidal.search.await_count == 8
     final = playlist_ctx.send.return_value.edit.await_args.kwargs["embed"]
     assert "Queued 2/25" in final.description
-    assert "Skipped 23" in final.description
+    # The rejected third item is a skip; the untouched rest must not be
+    # reported as failures.
+    assert "Skipped 1. 22 not attempted." in final.description
     assert not cog._cancel_events
 
 

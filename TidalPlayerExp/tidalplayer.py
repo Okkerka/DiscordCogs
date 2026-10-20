@@ -2534,7 +2534,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                     break
                 entry = PlaybackEntry(secrets.token_hex(12), item.reference, None, item.meta, ctx.author.id)
                 if not await self._admit_entry(ctx, session, entry, show_embed=False, stop_generation=stop_generation):
-                    skipped = total - queued
+                    skipped += 1
                     interrupted = True
                     break
                 queued += 1
@@ -2564,6 +2564,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             await self._edit_import_status(
                 message, f"{label} collection", status,
                 queued=queued, total=total, skipped=skipped, color=COLOR_BLUE,
+                pending=max(0, total - queued - skipped),
             )
             if cancel is not None:
                 self._release_batch(guild_id, cancel)
@@ -3260,16 +3261,18 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         total: int,
         skipped: int,
         color: int,
+        pending: int = 0,
     ) -> None:
         """Best-effort final edit of a collection-import progress message."""
         if message is None:
             return
         title = f"Import failed: {label}" if status == "Failed" else f"{status} importing {label}"
-        embed = discord.Embed(
-            title=title,
-            description=f"Queued {queued}/{total}. Skipped {skipped}.",
-            color=color,
-        )
+        description = f"Queued {queued}/{total}. Skipped {skipped}."
+        if pending:
+            # An interrupted import never tried everything; name the difference
+            # instead of counting untouched items as failures.
+            description = f"{description} {pending} not attempted."
+        embed = discord.Embed(title=title, description=description, color=color)
         try:
             await message.edit(embed=embed)
         except Exception:
@@ -4001,7 +4004,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                         skipped += 1
                         continue
                     if not await self._admit_entry(ctx, session, entry, show_embed=False, stop_generation=stop_generation):
-                        skipped = total - queued
+                        skipped += 1
                         interrupted = True
                         break
                     queued += 1
@@ -4024,6 +4027,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             await self._edit_import_status(
                 message, "YouTube playlist", status,
                 queued=queued, total=total, skipped=skipped, color=COLOR_RED,
+                pending=max(0, total - queued - skipped),
             )
             self._release_batch(guild_id, cancel)
 

@@ -140,7 +140,7 @@ async def test_public_queue_capacity_reports_remaining(cog, public_ctx, native_s
     await cog.tplay(public_ctx, query="https://soundcloud.com/artist/sets/set")
     assert len(native_session.entries) == 1
     final = public_ctx.send.return_value.edit.await_args.kwargs["embed"]
-    assert "Queued 1/4" in final.description and "Skipped 3" in final.description
+    assert "Queued 1/4" in final.description and "Skipped 1. 2 not attempted." in final.description
     assert not cog._cancel_events
 
 
