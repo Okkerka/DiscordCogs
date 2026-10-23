@@ -347,6 +347,113 @@ async def test_scoped_skip_refuses_a_naturally_replaced_current_entry():
 
 
 @pytest.mark.asyncio
+async def test_skip_inside_a_rebuffer_window_drops_the_parked_replacement():
+    """A click between the seek's park and the replacement's start still acts.
+
+    The seek parked the same song while its old source is still cleaning up,
+    so the replacement is waiting in `_next_entry` with no current track: the
+    click must drop the parked song instead of reporting "nothing to skip".
+    """
+    session, voice, resolver, factory, sink = setup()
+    release = threading.Event()
+    try:
+        assert await session.enqueue(entry(1))
+        await sink.expect("started")
+        shown = session.snapshot().current
+        source = factory.sources[0]
+        original_cleanup = source.cleanup
+        entered = asyncio.Event()
+
+        def blocking_cleanup() -> None:
+            entered.set()
+            release.wait(2)
+            original_cleanup()
+
+        source.cleanup = blocking_cleanup
+        seeking = asyncio.create_task(session.seek(5))
+        await asyncio.wait_for(entered.wait(), 2)
+
+        assert await session.skip(entry_id=shown.entry_id) is True
+        assert session.snapshot().current is None
+        assert session.snapshot().paused is False
+        release.set()
+        await asyncio.gather(seeking)
+
+        # The dropped rebuffer leaves an idle session: nothing replaced the
+        # shown track, and a fresh enqueue starts unpaused.
+        assert session.snapshot().queued == ()
+        assert await session.enqueue(entry(2))
+        await sink.expect("started")
+        assert session.snapshot().current.entry_id == "2"
+        assert session.snapshot().paused is False
+    finally:
+        release.set()
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_unscoped_skip_inside_a_rebuffer_window_drops_the_replacement():
+    session, voice, resolver, factory, sink = setup()
+    release = threading.Event()
+    try:
+        assert await session.enqueue(entry(1))
+        await sink.expect("started")
+        source = factory.sources[0]
+        original_cleanup = source.cleanup
+        entered = asyncio.Event()
+
+        def blocking_cleanup() -> None:
+            entered.set()
+            release.wait(2)
+            original_cleanup()
+
+        source.cleanup = blocking_cleanup
+        seeking = asyncio.create_task(session.seek(5))
+        await asyncio.wait_for(entered.wait(), 2)
+
+        # "Skip whatever is playing" also applies to the pending song.
+        assert await session.skip() is True
+        release.set()
+        await asyncio.gather(seeking)
+        assert session.snapshot().current is None
+        assert session.snapshot().queued == ()
+    finally:
+        release.set()
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_scoped_skip_refuses_an_unrelated_replacement_inside_the_window():
+    session, voice, resolver, factory, sink = setup()
+    release = threading.Event()
+    try:
+        assert await session.enqueue(entry(1))
+        await sink.expect("started")
+        source = factory.sources[0]
+        original_cleanup = source.cleanup
+        entered = asyncio.Event()
+
+        def blocking_cleanup() -> None:
+            entered.set()
+            release.wait(2)
+            original_cleanup()
+
+        source.cleanup = blocking_cleanup
+        seeking = asyncio.create_task(session.seek(5))
+        await asyncio.wait_for(entered.wait(), 2)
+
+        # The parked replacement belongs to entry "1"; a click naming another
+        # entry is refused and the rebuffer continues.
+        assert await session.skip(entry_id="999") is False
+        release.set()
+        await asyncio.gather(seeking)
+        assert session.snapshot().current is not None
+    finally:
+        release.set()
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_scoped_skip_accepts_the_seek_replacement_of_the_same_song():
     """Seek rebuffers reuse the song identity: the same click still skips it."""
     session, voice, resolver, factory, sink = setup()

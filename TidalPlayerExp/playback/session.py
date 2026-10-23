@@ -384,8 +384,25 @@ class NativePlaybackSession:
         still counts, so misses never strand the panel's own click.
         """
         async with self._lock:
-            if self._closed or self._current is None:
+            if self._closed:
                 return False
+            if self._current is None:
+                # Inside a rebuffer window the replacement is parked before it
+                # starts: a click naming the replaced song still means skip,
+                # dropping the parked song instead of no-oping the click.
+                pending = self._next_entry
+                if pending is None:
+                    return False
+                if entry_id is not None and pending.replaces_entry_id != entry_id:
+                    return False
+                self._next_entry = None
+                self._release_entry(pending)
+                # The dropped song takes the recorded seek intent with it.
+                self._pause_on_start = False
+                self._paused = False
+                self._paused_at = None
+                self._running = False
+                return True
             if entry_id is not None and (
                 self._current.entry_id != entry_id
                 and self._current.replaces_entry_id != entry_id
