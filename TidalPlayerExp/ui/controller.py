@@ -209,7 +209,7 @@ class PlayerControllerView(discord.ui.LayoutView):
             return
 
         index = int(select.values[0])
-        if index >= len(self.recommendations):
+        if not 0 <= index < len(self.recommendations):
             await interaction.followup.send(
                 "These suggestions expired. Play a track again to refresh them.",
                 ephemeral=True,

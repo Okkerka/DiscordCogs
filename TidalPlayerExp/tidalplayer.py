@@ -2875,7 +2875,8 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             last = self._controller_last_refresh.get(guild_id, 0.0)
             if now - last < CONTROLLER_REFRESH_COOLDOWN:
                 return
-            self._controller_last_refresh[guild_id] = now
+            # The timestamp is written after a successful edit below: a failed
+            # edit keeps the fast retry available.
         generation = self._stop_generations[guild_id]
         player = await self._get_session_for_guild(guild_id)
         entry = player.snapshot().current if player else None
@@ -2944,6 +2945,8 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                 # Transient edit failure (429/5xx): keep the mapping and retry
                 # on a later refresh instead of abandoning a live panel.
                 log.debug("Could not refresh the controller message for guild %s", guild_id)
+            else:
+                self._controller_last_refresh[guild_id] = now
 
 
     async def controller_toggle_autoplay(self, interaction: discord.Interaction) -> None:
@@ -2984,7 +2987,12 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         guild_id = interaction.guild.id
         if not await safe_defer(interaction):
             return
+        claim = self._stop_generations[guild_id]
         await self._stop_playback(guild_id)
+        if self._stop_generations[guild_id] != claim + 1:
+            # A concurrent stop advanced the generation again while this one
+            # was winding down: one notice per intent is enough.
+            return
         user = getattr(interaction, "user", None)
         who = getattr(user, "mention", None) or "Someone"
         await interaction.followup.send(
@@ -3000,6 +3008,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             return "failed"
         guild_id = interaction.guild.id
         stop_generation = self._stop_generations[guild_id]
+        generation = self._guild_generations[guild_id]
         selected_id = str(getattr(tidal_track, "id", "") or "")
         if not selected_id:
             return "failed"
@@ -3010,12 +3019,16 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             async with self._controller_lock(guild_id):
                 if self._closing or stop_generation != self._stop_generations[guild_id]:
                     return "failed"
+                # A track-start reseal moves the panel generation: a click from
+                # the superseded suggestion list is stale by then.
+                if generation != self._guild_generations[guild_id]:
+                    return "failed"
                 session = await self.backend.get(guild_id)
                 if session is None:
                     return "failed"
                 if await self._is_current_or_queued_track(guild_id, selected_id, signature):
                     return "duplicate"
-                meta = await self._extract_meta(tidal_track, skip_audio_res=True)
+                meta = await self._extract_meta(tidal_track)
                 entry = self._tidal_entry(tidal_track, meta, interaction.user.id)
                 if await self.backend.get(guild_id) is not session or self._closing:
                     return "failed"
@@ -3037,6 +3050,12 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             return "failed"
         except discord.HTTPException:
             return "queued"
+        except Exception as error:
+            # An unexpected provider or entry failure must not escape as a
+            # silent dead click: report the fixed category, let the caller's
+            # "could not queue" notice answer the user.
+            _log_provider_failure("Tidal", "suggestion queue", error)
+            return "failed"
 
     async def _autoplay_allowed(self, guild_id: int, session: PlaybackSession, generation: int) -> bool:
         if self._closing or generation != self._guild_generations[guild_id]:
