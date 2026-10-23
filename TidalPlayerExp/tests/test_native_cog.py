@@ -1,4 +1,5 @@
 """Native command admission and effective playback event integration."""
+import asyncio
 from types import SimpleNamespace
 from dataclasses import replace
 from unittest.mock import AsyncMock, Mock
@@ -82,6 +83,38 @@ async def test_invalid_voice_does_not_fetch_youtube_metadata(cog, native_ctx, na
     await cog._handle_youtube_video(native_ctx, "abcdefghijk")
     cog.youtube_resolver.fetch_metadata.assert_not_called()
     native_session.enqueue.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stale_autoplay_lookup_is_cancelled_by_a_fresh_schedule(cog, native_session):
+    from TidalPlayerExp.tests.test_native_session import entry
+
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_lookup(guild_id, meta):
+        entered.set()
+        await release.wait()
+        return []
+
+    cog._get_recommendations = slow_lookup
+    cog._autoplay_allowed = AsyncMock(return_value=True)
+    cog.tidal = SimpleNamespace(is_logged_in=AsyncMock(return_value=True))
+
+    cog._schedule_autoplay(1, entry(), 0)
+    await asyncio.wait_for(entered.wait(), 2)
+    first = cog._autoplay_tasks[1]
+
+    # A second queue end while the old lookup is parked replaces the task
+    # instead of being silently dropped.
+    cog._schedule_autoplay(1, entry(2), 5)
+    second = cog._autoplay_tasks[1]
+    assert second is not first
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    release.set()
+    await asyncio.wait_for(second, 2)
+    assert cog._autoplay_tasks.get(1) is not second
 
 
 @pytest.mark.asyncio

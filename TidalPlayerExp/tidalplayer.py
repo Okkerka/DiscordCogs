@@ -3078,12 +3078,16 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
     def _schedule_autoplay(self, guild_id: int, previous: PlaybackEntry, generation: int) -> None:
         if previous.primary.kind is SourceKind.ATTACHMENT:
             return
-        task = self._autoplay_tasks.get(guild_id)
-        if task is None or task.done():
-            self._autoplay_tasks[guild_id] = asyncio.create_task(
-                self._run_autoplay(guild_id, previous, generation),
-                name=f"tidalplayerexp-autoplay-{guild_id}",
-            )
+        # Cancel-and-replace: a slow, already-superseded lookup must not stop
+        # the scheduler from registering a task for the fresh queue end â€” the
+        # cancelled task aborts on its own generation check.
+        candidate = self._autoplay_tasks.get(guild_id)
+        if candidate is not None and not candidate.done():
+            candidate.cancel()
+        self._autoplay_tasks[guild_id] = asyncio.create_task(
+            self._run_autoplay(guild_id, previous, generation),
+            name=f"tidalplayerexp-autoplay-{guild_id}",
+        )
 
     async def _interactive_select(self, ctx: commands.Context, tracks: List[Any]) -> Optional[Any]:
         if not tracks:
