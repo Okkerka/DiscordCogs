@@ -36,7 +36,7 @@ from .domain.matching import select_best_tidal_track, select_confident_youtube_t
 from .domain.identity import normalize_identity_text, recording_signature
 from .domain.normalization import (
     FILTER_REGEX, ISRC_PATTERN,
-    YOUTUBE_SKIP_TITLES, clamp_text, ensure_aware as _ensure_aware,
+    YOUTUBE_SKIP_TITLES, ensure_aware as _ensure_aware,
     format_duration, make_tidal_url, utc_now as _utc_now,
 )
 from .ui.embeds import (
@@ -1121,21 +1121,6 @@ class TidalHandler:
             offset += PAGINATION_LIMIT
         return all_items[:MAX_ITEMS]
 
-    async def get_audio_resolution(self, album_obj: Any) -> Optional[Tuple[int, int]]:
-        if not album_obj or not hasattr(album_obj, "get_audio_resolution"):
-            return None
-        try:
-            res = await self._run_blocking(album_obj.get_audio_resolution, timeout=5.0)
-            if res:
-                entry = res[0] if isinstance(res, (list, tuple)) and len(res) > 0 else res
-                if hasattr(entry, "__iter__") and not isinstance(entry, str):
-                    parts = list(entry)
-                    if len(parts) >= 2:
-                        return int(parts[0]), int(parts[1])
-        except Exception:
-            pass
-        return None
-
     def _extract_tracks(self, result: Any) -> List[Any]:
         def _page_items(value: Any) -> List[Any]:
             items = getattr(value, "items", None)
@@ -2053,17 +2038,8 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             pass
         return meta
 
-    async def _extract_meta(self, track: Any, skip_audio_res: bool = False) -> TrackMeta:
-        meta = self._build_meta_sync(track)
-        if meta["quality"] == "HI_RES_LOSSLESS" and not skip_audio_res:
-            album_obj = getattr(track, "album", None)
-            if album_obj:
-                res = await self.tidal.get_audio_resolution(album_obj)
-                if res:
-                    bit_depth, sample_rate = res
-                    khz = sample_rate // 1000 if sample_rate >= 1000 else sample_rate
-                    meta["audio_resolution"] = f"HI-RES LOSSLESS ({bit_depth}-bit / {khz}kHz)"
-        return meta
+    async def _extract_meta(self, track: Any) -> TrackMeta:
+        return self._build_meta_sync(track)
 
 
 
@@ -2246,7 +2222,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         # response. Acknowledge the first slash request as well as queued tracks.
         if show_embed and (was_waiting or getattr(ctx, "interaction", None) is not None):
             try:
-                message = await ctx.send(embed=self._make_queued_embed(entry.meta))
+                message = await ctx.send(embed=make_queue_embed(entry.meta))
                 task = asyncio.create_task(self._delete_after(message, QUEUED_EMBED_DELETE_DELAY))
                 self._tasks.add(task)
             except discord.HTTPException:
@@ -2257,7 +2233,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
 
     async def _load_and_queue_track(
         self, ctx: commands.Context, tidal_track: Any, show_embed: bool = True,
-        skip_audio_res: bool = True, *, session: PlaybackSession | None = None,
+        *, session: PlaybackSession | None = None,
         kind: SourceKind | None = None,
     ) -> bool:
         stop_generation = self._stop_generations[ctx.guild.id]
@@ -2268,7 +2244,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             session = await self._prepare_playback_session(ctx)
         if session is None:
             return False
-        meta = await self._extract_meta(tidal_track, skip_audio_res=skip_audio_res)
+        meta = await self._extract_meta(tidal_track)
         if kind is SourceKind.TIDAL_VIDEO:
             meta["share_url"] = make_tidal_url("video", tidal_track.id)
         try:
@@ -2343,7 +2319,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                     results = await self.tidal.search(f"{video.title} {video.channel or ''}", filter_remixes=False)
                     match = select_confident_youtube_tidal_track(video.title, video.channel or "", results)
                     if match is not None:
-                        tidal_meta = await self._extract_meta(match, skip_audio_res=True)
+                        tidal_meta = await self._extract_meta(match)
                         return PlaybackEntry(
                             secrets.token_hex(12), SourceReference(SourceKind.TIDAL, str(match.id)),
                             reference, tidal_meta, requester_id, fallback_meta=meta,
@@ -2749,10 +2725,6 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             position=position,
         )
 
-    def _make_queued_embed(self, meta: TrackMeta) -> discord.Embed:
-        """Return a compact embed confirming a track was added to the queue."""
-        return make_queue_embed(meta)
-
     async def _resend_controller_for_track_start(
         self, *, guild_id: int, ctx: commands.Context | None = None,
     ) -> bool:
@@ -3086,7 +3058,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                     return
                 if self._is_recent_autoplay_track(guild_id, track):
                     continue
-                meta = await self._extract_meta(track, skip_audio_res=True)
+                meta = await self._extract_meta(track)
                 if not await self._autoplay_allowed(guild_id, session, generation):
                     return
                 entry = self._tidal_entry(track, meta, None)
@@ -3361,7 +3333,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                         track = select_best_tidal_track(query, results)
             if not track:
                 return None
-            meta = await self._extract_meta(track, skip_audio_res=True)
+            meta = await self._extract_meta(track)
             return track, meta
         except Exception as error:
             _log_provider_failure(provider, "batch track resolution", error)
