@@ -168,6 +168,45 @@ async def test_duplicate_connect_reuses_one_session(environment):
 
 
 @pytest.mark.asyncio
+async def test_full_close_after_weaker_removal_still_closes(environment):
+    """An idle sweep's weaker removal must not satisfy a full shutdown.
+
+    The sweep's close re-checks idleness under the session's own lock: if a
+    track arrived in the meantime it skips and keeps the session owned. A
+    shutdown joining that in-flight removal must still close what it skipped
+    instead of inheriting the skip.
+    """
+    e = environment
+    session = await e.backend.connect(e.guild, e.channel)
+    # Active playback in every snapshot the weaker close will re-check.
+    session.state = PlaybackSnapshot(SimpleNamespace(), (), False, e.channel.id)
+    entered, hold = asyncio.Event(), asyncio.Event()
+    original_close = session.close
+
+    async def blocking_close(*, only_if_idle: bool = False):
+        if only_if_idle and not session._idle():
+            # Park the weaker close mid-flight so the shutdown joins it.
+            entered.set()
+            await hold.wait()
+            return False
+        return await original_close(only_if_idle=only_if_idle)
+
+    session.close = blocking_close
+
+    weak = asyncio.create_task(e.backend.close_guild(e.guild.id, only_if_idle=True))
+    await asyncio.wait_for(entered.wait(), 2)
+    closer = asyncio.create_task(e.backend.close())
+    await asyncio.sleep(0)
+    hold.set()
+    await asyncio.wait_for(closer, 2)
+
+    # The full shutdown closed the session the weaker removal had skipped.
+    assert session.closed is True
+    assert not e.backend._removals
+    assert await e.backend.get(e.guild.id) is None
+
+
+@pytest.mark.asyncio
 async def test_dead_cancelled_attempt_does_not_stick(environment):
     """A connector cancelled before its first step cannot block the guild forever.
 
@@ -722,7 +761,7 @@ async def test_cancelled_removal_can_retry_a_cleanup_failure(environment):
     session.close = failing_close
     removal = asyncio.create_task(e.backend.close_guild(1))
     await entered.wait()
-    owned_removal = e.backend._removals[1]
+    owned_removal = e.backend._removals[1][0]
     removal.cancel()
     with pytest.raises(asyncio.CancelledError):
         await removal

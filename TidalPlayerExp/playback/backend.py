@@ -54,7 +54,9 @@ class NativePlaybackBackend:
         self._sessions: dict[int, NativePlaybackSession] = {}
         self._pending: dict[int, _Connection] = {}
         self._retired: set[NativePlaybackSession] = set()
-        self._removals: dict[int, asyncio.Task[None]] = {}
+        # Each removal records its strictness: a weaker (idle-sweep) close must
+        # not satisfy a joining full shutdown by inheritance.
+        self._removals: dict[int, tuple[asyncio.Task[None], bool]] = {}
         self._empty_since: dict[int, float] = {}
         self._closing = False
         self._resolver_closed = False
@@ -248,24 +250,35 @@ class NativePlaybackBackend:
 
     async def close_guild(self, guild_id: int, *, only_if_idle: bool = False) -> None:
         """Invalidate connects and close only this guild's owned resources."""
-        removal = self._removals.get(guild_id)
-        if removal is None:
-            attempt = self._pending.get(guild_id)
-            if attempt is not None:
-                self._invalidate(attempt)
-            removal = asyncio.create_task(self._close_guild(guild_id, attempt, only_if_idle))
-            self._removals[guild_id] = removal
-            removal.add_done_callback(
-                lambda task: self._removal_finished(guild_id, task)
-            )
+        running = self._removals.get(guild_id)
+        if running is not None:
+            await self._join_removal(guild_id, running[0])
+            if only_if_idle or not running[1]:
+                # The joined removal is at least as strict as this request.
+                return
+            # A weaker idle-sweep removal may have skipped a session that just
+            # became active again; a full shutdown must close what it left.
+        attempt = self._pending.get(guild_id)
+        if attempt is not None:
+            self._invalidate(attempt)
+        removal = asyncio.create_task(self._close_guild(guild_id, attempt, only_if_idle))
+        self._removals[guild_id] = (removal, only_if_idle)
+        removal.add_done_callback(
+            lambda task: self._removal_finished(guild_id, task)
+        )
+        await self._join_removal(guild_id, removal)
+
+    async def _join_removal(self, guild_id: int, removal: asyncio.Task[None]) -> None:
         try:
             await asyncio.shield(removal)
         finally:
-            if removal.done() and self._removals.get(guild_id) is removal:
+            entry = self._removals.get(guild_id)
+            if removal.done() and entry is not None and entry[0] is removal:
                 self._removals.pop(guild_id, None)
 
     def _removal_finished(self, guild_id: int, task: asyncio.Task[None]) -> None:
-        if self._removals.get(guild_id) is task:
+        entry = self._removals.get(guild_id)
+        if entry is not None and entry[0] is task:
             self._removals.pop(guild_id, None)
         if not task.cancelled():
             task.exception()
