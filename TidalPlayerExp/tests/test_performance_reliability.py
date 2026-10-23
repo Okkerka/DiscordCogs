@@ -40,7 +40,9 @@ async def test_equivalent_search_queries_share_cache_entry(cog) -> None:
     await cog.tidal.search("artist track")
 
     assert cog.tidal.session.search.call_count == 1
-    assert cog.tidal.session.search.call_args.args[0] == "  Artist   Track  "
+    # The provider is queried with the same normalized text that forms the
+    # shared cache key, not the raw first spelling.
+    assert cog.tidal.session.search.call_args.args[0] == "artist track"
 
 
 def test_controller_duration_formats_hour_long_tracks() -> None:

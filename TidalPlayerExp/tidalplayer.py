@@ -794,7 +794,10 @@ class TidalHandler:
         return await self._coalesce(
             "search",
             cache_key,
-            lambda: self._search_uncached(query, filter_remixes, cache_key),
+            # The provider is queried with the same normalized text the cache
+            # key promises, so a key hit can never answer for a different
+            # literal query.
+            lambda: self._search_uncached(normalized_query, filter_remixes, cache_key),
         )
 
     async def _search_uncached(
@@ -814,8 +817,11 @@ class TidalHandler:
             filtered = self._filter_tracks(tracks) if filter_remixes else tracks
             # Empty pages are cached as well: the filter flag is part of the
             # cache key, so toggling it re-queries while an unchanged
-            # setting reuses the provider's answer.
-            self._set_cached("search", cache_key, filtered, 600.0)
+            # setting reuses the provider's answer. A miss is much cheaper to
+            # re-hit than a result (transient regional rights and catalog
+            # blips), so it gets the short ISRC-style negative TTL instead of
+            # pinning an empty page for ten minutes.
+            self._set_cached("search", cache_key, filtered, 600.0 if filtered else 30.0)
             return filtered
         except asyncio.TimeoutError:
             log.warning("Tidal catalog search timed out")
