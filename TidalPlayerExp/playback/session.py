@@ -162,7 +162,14 @@ class NativePlaybackSession:
             return 0.0
         paused_at = self._paused_at if self._paused_at is not None else time.monotonic()
         elapsed = 0.0 if self._started_at is None else paused_at - self._started_at
-        return max(0.0, self._current.start_time + elapsed)
+        position = self._current.start_time + elapsed
+        duration = self._current.meta["duration"]
+        if duration:
+            # After the track-end callback the runner still awaits the old
+            # source's cleanup thread before the completion block resets the
+            # timers: a finished track must not report a growing position.
+            position = min(position, float(duration))
+        return max(0.0, position)
 
     def _owned(self) -> bool:
         # A voice client can be detached from its guild during teardown.
@@ -304,6 +311,10 @@ class NativePlaybackSession:
             if self._current is None and self._source is None:
                 return False
             if self._current is None or self._source is None:
+                if not self._running:
+                    # The queue ran dry: nothing is coming that could honor
+                    # the click, so the honest answer is "nothing to pause".
+                    return False
                 # Rebuffering or source teardown (seek/volume/cleanup): record
                 # the intent so a waiting replacement source starts in the
                 # requested state instead of dropping or inverting the click.
@@ -653,6 +664,12 @@ class NativePlaybackSession:
                 if not self._queue and self._next_entry is None:
                     self._running = False
                     self._current = None
+                    # Nothing is left to honor a pause recorded for a source
+                    # that is gone; a stale intent must not pause a fresh
+                    # queue a listener starts later.
+                    self._pause_on_start = False
+                    self._paused = False
+                    self._paused_at = None
                     ended = previous
                     entry = None
                 else:

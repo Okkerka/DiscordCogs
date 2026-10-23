@@ -454,6 +454,48 @@ async def test_scoped_skip_refuses_an_unrelated_replacement_inside_the_window():
 
 
 @pytest.mark.asyncio
+async def test_dry_queue_discards_a_stale_pause_intent():
+    """A pause click before the queue dries must not pause a later queue.
+
+    The click is recorded while the finished track's source is still being
+    cleaned up; once the queue runs dry nothing remains to honor it.
+    """
+    session, voice, resolver, factory, sink = setup()
+    release_cleanup = threading.Event()
+    try:
+        assert await session.enqueue(entry(1))
+        await sink.expect("started")
+        source = factory.sources[0]
+        original_cleanup = source.cleanup
+        entered = asyncio.Event()
+
+        def blocking_cleanup() -> None:
+            entered.set()
+            release_cleanup.wait(2)
+            original_cleanup()
+
+        source.cleanup = blocking_cleanup
+        ending = asyncio.create_task(asyncio.to_thread(voice.callbacks[0], None))
+        await asyncio.wait_for(entered.wait(), 2)
+
+        # Recorded during the source-teardown window: the successor was still
+        # possible when the click landed.
+        assert await session.set_paused(True) is True
+        release_cleanup.set()
+        await asyncio.gather(ending)
+        await sink.expect("ended")
+
+        # The dry-queue end consumed the intent instead of banking it.
+        assert session.snapshot().paused is False
+        assert await session.enqueue(entry(2))
+        await sink.expect("started")
+        assert session.snapshot().paused is False
+    finally:
+        release_cleanup.set()
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_scoped_skip_accepts_the_seek_replacement_of_the_same_song():
     """Seek rebuffers reuse the song identity: the same click still skips it."""
     session, voice, resolver, factory, sink = setup()
