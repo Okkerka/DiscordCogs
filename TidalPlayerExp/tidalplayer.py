@@ -650,6 +650,9 @@ class TidalHandler:
                 refresh_method = getattr(self.session, "token_refresh", None)
                 if not callable(refresh_method):
                     log.error("Installed tidalapi session does not expose token refresh support")
+                    # Not an observed logout either; fail soft like any other
+                    # refresh failure instead of banking the pre-swap marker.
+                    self.invalidate_login_cache()
                     return False
 
                 def _refresh() -> TokenSnapshot:
@@ -669,8 +672,10 @@ class TidalHandler:
                 return True
             except Exception as error:
                 _log_provider_failure("Tidal", "token refresh", error)
-                self._login_cache = False
-                self._login_cache_time = asyncio.get_running_loop().time()
+                # A failed refresh is not an observed logout: banking False
+                # would answer "Not authenticated" from cache for the whole
+                # TTL after one transient provider blip. Fail soft instead.
+                self.invalidate_login_cache()
                 return False
 
     def start_refresh_loop(self) -> None:

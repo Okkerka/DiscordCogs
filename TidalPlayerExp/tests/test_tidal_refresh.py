@@ -339,6 +339,9 @@ async def test_failed_refresh_preserves_credentials_and_invalidates_login(fake_b
         assert not await handler.refresh_tokens()
         assert await handler.tokens.restore() == original
         assert handler.tokens.generation == 1
+        # A failed refresh is not an observed logout: the result must not
+        # stay banked as "logged out" for the LOGIN_CACHE_TTL window.
+        assert handler._login_cache is None
         assert not await handler.is_logged_in()
         assert "credential-in-provider-exception" not in caplog.text
     finally:
