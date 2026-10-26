@@ -200,7 +200,7 @@ async def test_resolve_uses_canonical_url_explicit_deno_and_safe_child_environme
     calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
     process = _Process(
         {
-            "url": "https://audio.example/stream",
+            "url": "https://rr1---sn-abc.googlevideo.com/stream",
             "http_headers": {"user-agent": "agent", "Authorization": "secret"},
             "acodec": "opus",
             "vcodec": "none",
@@ -216,6 +216,8 @@ async def test_resolve_uses_canonical_url_explicit_deno_and_safe_child_environme
 
     parent_env = dict(os.environ)
     monkeypatch.setenv("YTDLP_PARENT_ONLY", "secret")
+    monkeypatch.setenv("DISCORD_TOKEN", "deployment-secret")
+    monkeypatch.setenv("TIDAL_CLIENT_SECRET", "provider-secret")
     deno_path = tmp_path / "deno"
     deno_path.write_bytes(b"")
     dependency_root = tmp_path / "downloader-lib"
@@ -231,7 +233,7 @@ async def test_resolve_uses_canonical_url_explicit_deno_and_safe_child_environme
     result = await resolver.resolve(SourceReference(SourceKind.YOUTUBE, VIDEO_ID))
 
     assert isinstance(result, ResolvedSource)
-    assert result.url == "https://audio.example/stream"
+    assert result.url == "https://rr1---sn-abc.googlevideo.com/stream"
     assert dict(result.headers) == {"User-Agent": "agent"}
     assert result.sample_rate == 48000
     assert result.channels == 2
@@ -277,13 +279,21 @@ async def test_resolve_uses_canonical_url_explicit_deno_and_safe_child_environme
     child_env = kwargs["env"]
     assert child_env["YTDLP_NO_PLUGINS"] == "1"
     assert "YTDLP_PARENT_ONLY" not in child_env
-    assert dict(os.environ) == parent_env | {"YTDLP_PARENT_ONLY": "secret"}
+    assert "DISCORD_TOKEN" not in child_env
+    assert "TIDAL_CLIENT_SECRET" not in child_env
+    if "PATH" in parent_env:
+        assert child_env.get("PATH") == parent_env["PATH"]
+    assert dict(os.environ) == parent_env | {
+        "YTDLP_PARENT_ONLY": "secret",
+        "DISCORD_TOKEN": "deployment-secret",
+        "TIDAL_CLIENT_SECRET": "provider-secret",
+    }
 
 
 @pytest.mark.asyncio
 async def test_source_projection_rejects_unsafe_or_non_audio_payloads(tmp_path) -> None:
     base = {
-        "url": "https://audio.example:443/stream",
+        "url": "https://rr1---sn-abc.googlevideo.com:443/stream",
         "http_headers": {},
         "acodec": "opus",
         "vcodec": "none",
@@ -377,7 +387,7 @@ async def test_extractor_metadata_rejects_invalid_durations(tmp_path, value) -> 
 @pytest.mark.parametrize("value, expected", [(243.75, 243), (0, None), (None, None)])
 async def test_resolved_source_accepts_fractional_and_unknown_durations(tmp_path, value, expected) -> None:
     resolver = _resolver_for({
-        "url": "https://audio.example/stream", "http_headers": {},
+        "url": "https://rr1---sn-abc.googlevideo.com/stream", "http_headers": {},
         "acodec": "opus", "vcodec": "none", "duration": value,
     }, tmp_path)
     try:
@@ -619,7 +629,7 @@ async def test_bootstrap_runs_dependency_from_red_target_layout_without_parent_i
     (package / "__init__.py").write_text("import sys\n", encoding="utf-8")
     (package / "__main__.py").write_text(
         "import json, sys\n"
-        "print(json.dumps({'url':'https://audio.example/stream','http_headers':{},"
+        "print(json.dumps({'url':'https://rr1---sn-abc.googlevideo.com/stream','http_headers':{},"
         "'acodec':'opus','vcodec':'none'}))\n",
         encoding="utf-8",
     )
@@ -634,7 +644,7 @@ async def test_bootstrap_runs_dependency_from_red_target_layout_without_parent_i
 
     result = await resolver.resolve(_reference())
 
-    assert result.url == "https://audio.example/stream"
+    assert result.url == "https://rr1---sn-abc.googlevideo.com/stream"
     assert list(sys.path) == parent_path
     assert ("yt_dlp" in sys.modules) == parent_loaded
 
@@ -644,7 +654,7 @@ async def test_close_is_idempotent_and_rejects_new_work(tmp_path) -> None:
     calls: list = []
     resolver = _resolver_for(
         {
-            "url": "https://audio.example/stream",
+            "url": "https://rr1---sn-abc.googlevideo.com/stream",
             "http_headers": {},
             "acodec": "opus",
             "vcodec": "none",

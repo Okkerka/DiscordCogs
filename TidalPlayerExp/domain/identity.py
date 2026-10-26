@@ -7,7 +7,13 @@ from typing import Any
 def normalize_identity_text(value: Any) -> str:
     """Normalize user-visible text for cache keys and recording identity."""
     normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
-    alphanumeric = "".join(char if char.isalnum() else " " for char in normalized)
+    # Casefolding can introduce combining marks (e.g. "İ" becomes "i" plus
+    # U+0307). Treating those as separators would split the word ("i stanbul"),
+    # so drop them instead; every other non-alphanumeric character separates.
+    alphanumeric = "".join(
+        char if char.isalnum() else ("" if unicodedata.combining(char) else " ")
+        for char in normalized
+    )
     return " ".join(alphanumeric.split())
 
 

@@ -15,7 +15,7 @@ from TidalPlayerExp.domain.media_hosts import (
     classify_media_host,
 )
 from TidalPlayerExp.playback.ffmpeg import _public_media_url
-from TidalPlayerExp.providers.youtube_resolver import _valid_https_url
+from TidalPlayerExp.providers.youtube_resolver import _valid_https_url, _valid_media_url
 
 
 @pytest.mark.parametrize("host", [
@@ -104,3 +104,24 @@ def test_resolver_boundary_allows_provider_cdns():
     assert _valid_https_url("https://cdn.example.com/track.mp3") == (
         "https://cdn.example.com/track.mp3"
     )
+
+
+@pytest.mark.parametrize("url", [
+    "https://audio.example/stream",
+    "https://evilgooglevideo.com/stream",
+    "https://googlevideo.com.evil.example/stream",
+    "https://ytimg.com.evil.example/stream",
+])
+def test_media_url_rejects_non_youtube_hosts(url):
+    with pytest.raises(ValueError):
+        _valid_media_url(url)
+
+
+@pytest.mark.parametrize("url", [
+    "https://rr1---sn-abc.googlevideo.com/videoplayback?expire=1",
+    "https://manifest.googlevideo.com/api/manifest/hls_variant/playlist.m3u8",
+    "https://www.youtube.com/stream",
+    "https://i.ytimg.com/vi/abc/audio.webm",
+])
+def test_media_url_accepts_youtube_owned_hosts(url):
+    assert _valid_media_url(url) == url

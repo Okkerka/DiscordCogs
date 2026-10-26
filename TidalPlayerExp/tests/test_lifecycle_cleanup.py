@@ -4,6 +4,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from TidalPlayerExp.playback.errors import PlaybackUnavailable
+
 
 async def _raise_async(error: Exception):
     raise error
@@ -111,7 +113,7 @@ async def test_tidal_handler_unload_drains_refresh_and_inflight_tasks(cog) -> No
     assert all(event.is_set() for event in cancelled)
     assert cog.tidal._refresh_task is None
     assert cog.tidal._inflight == {}
-    executor.shutdown.assert_called_once_with(wait=False)
+    executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
 
 
 @pytest.mark.asyncio
@@ -128,6 +130,19 @@ async def test_own_disconnect_closes_guild_even_when_backend_hides_dead_session(
     assert event.is_set()
     assert guild.id not in cog._current_meta
     view.stop.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_guild_remove_deletes_panel_even_when_voice_close_fails(cog, native_session) -> None:
+    guild = SimpleNamespace(id=43)
+    message = SimpleNamespace(delete=AsyncMock())
+    cog._controller_messages[guild.id] = message
+    cog.backend.close_guild.side_effect = PlaybackUnavailable("secret")
+
+    await cog.on_guild_remove(guild)
+
+    cog.backend.close_guild.assert_awaited_once_with(guild.id)
+    message.delete.assert_awaited_once()
 
 
 @pytest.mark.asyncio

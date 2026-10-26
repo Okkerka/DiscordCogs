@@ -588,7 +588,7 @@ async def test_extraction_cancellation_joins_worker_before_removing_staging(
     finished = threading.Event()
     root = tmp_path / "runtime"
 
-    def blocking_extract(asset, archive, destination, stop):
+    def blocking_extract(asset, archive, destination, stop, **_kwargs):
         loop.call_soon_threadsafe(entered.set)
         assert stop.wait(timeout=5), "cancellation did not stop extraction"
         assert archive.exists(), "staging removed while worker was using it"

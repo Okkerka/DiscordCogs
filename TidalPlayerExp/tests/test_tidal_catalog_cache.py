@@ -32,6 +32,43 @@ async def test_definitive_empty_isrc_result_is_cached_briefly_and_expires(cog) -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("method, sdk_method, category", [
+    ("get_track", "track", "track"),
+    ("get_album", "album", "album"),
+    ("get_playlist", "playlist", "playlist"),
+])
+async def test_definitive_empty_catalogue_result_is_cached_briefly(
+    cog, method, sdk_method, category,
+) -> None:
+    fetch = Mock(return_value=None)
+    cog.tidal.session = SimpleNamespace(**{sdk_method: fetch})
+    lookup = getattr(cog.tidal, method)
+
+    assert await lookup("missing") is None
+    assert await lookup("missing") is None
+    assert fetch.call_count == 1
+    value, expiry = cog.tidal._cache[category]["missing"]
+    assert value is None
+    assert 0 < expiry - asyncio.get_running_loop().time() <= 30
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method, sdk_method", [
+    ("get_track", "track"),
+    ("get_album", "album"),
+    ("get_playlist", "playlist"),
+])
+async def test_catalogue_failure_is_not_negative_cached(cog, method, sdk_method) -> None:
+    fetch = Mock(side_effect=RuntimeError("provider failed"))
+    cog.tidal.session = SimpleNamespace(**{sdk_method: fetch})
+    lookup = getattr(cog.tidal, method)
+
+    assert await lookup("broken") is None
+    assert await lookup("broken") is None
+    assert fetch.call_count == 2
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["exception", "unsupported", "unavailable", "invalid"])
 async def test_isrc_failure_is_not_negative_cached(cog, failure) -> None:
     if failure == "exception":

@@ -158,7 +158,13 @@ def _digest(path: Path, check: Callable[[], None]) -> str:
     return digest.hexdigest()
 
 
-def _extract(asset: _Asset, archive_path: Path, destination: Path, stop: threading.Event) -> str:
+def _extract(
+    asset: _Asset,
+    archive_path: Path,
+    destination: Path,
+    stop: threading.Event,
+    archive_sha256: str | None = None,
+) -> str:
     deadline = time.monotonic() + _EXTRACT_DEADLINE
 
     def check() -> None:
@@ -168,7 +174,10 @@ def _extract(asset: _Asset, archive_path: Path, destination: Path, stop: threadi
             # A slow disk must not masquerade as a corrupt download.
             raise RuntimeRepairError("archive_timeout")
 
-    if _digest(archive_path, check) != asset.sha256:
+    # The download path already hashes every chunk it writes; re-reading a
+    # 100+ MB archive just to verify it doubles install I/O for no benefit.
+    actual_sha256 = archive_sha256 if archive_sha256 is not None else _digest(archive_path, check)
+    if actual_sha256 != asset.sha256:
         raise RuntimeRepairError("checksum_mismatch")
     selected = {asset.binary_member: (destination, _BINARY_LIMIT)}
     if asset.license_member:
@@ -459,18 +468,26 @@ class ManagedRuntime:
         """Stop repairs before cog unload; existing activated binaries stay on disk."""
         self._closed = True
         task = self._task
-        if task is not None:
-            task.cancel()
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError:
-                if not task.done():
-                    raise
-            except RuntimeRepairError:
-                pass
-
-    async def _download(self, session: aiohttp.ClientSession, asset: _Asset, path: Path) -> None:
+        self._task = None
+        if task is None:
+            return
+        task.cancel()
         try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # Cancelling the repair task is expected; a cancellation of the
+            # caller must still propagate even when the task happened to be
+            # done at that instant.
+            if not task.cancelled():
+                raise
+        except RuntimeRepairError:
+            pass
+        finally:
+            self._task = None
+
+    async def _download(self, session: aiohttp.ClientSession, asset: _Asset, path: Path) -> str:
+        try:
+            digest = hashlib.sha256()
             async with session.get(asset.url) as response:
                 if response.status != 200:
                     raise RuntimeRepairError("download_failed")
@@ -483,9 +500,11 @@ class ManagedRuntime:
                         total += len(chunk)
                         if total > asset.size:
                             raise RuntimeRepairError("download_size")
+                        digest.update(chunk)
                         output.write(chunk)
                 if total != asset.size:
                     raise RuntimeRepairError("download_size")
+            return digest.hexdigest()
         except TimeoutError as exc:
             raise RuntimeRepairError("download_timeout") from exc
         except OSError as exc:
@@ -537,10 +556,12 @@ class ManagedRuntime:
             ) as session:
                 for tool, asset in (("ffmpeg", bundle.ffmpeg), ("deno", bundle.deno)):
                     archive = stage / f"{tool}.download"
-                    await self._download(session, asset, archive)
+                    archive_sha256 = await self._download(session, asset, archive)
                     filename = tool + (".exe" if asset.binary_member.endswith(".exe") else "")
                     destination = stage / filename
-                    digest = await _worker(partial(_extract, asset, archive, destination))
+                    digest = await _worker(partial(
+                        _extract, asset, archive, destination, archive_sha256=archive_sha256,
+                    ))
                     archive.unlink()
                     metadata[tool] = filename
                     metadata[tool + "_sha256"] = digest

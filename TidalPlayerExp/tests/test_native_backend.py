@@ -522,6 +522,18 @@ async def test_close_failure_retries_without_skipping_other_resources(environmen
 
 
 @pytest.mark.asyncio
+async def test_connect_refreshes_idle_clock_for_an_existing_session(environment):
+    e = environment
+    session = await e.backend.connect(e.guild, e.channel)
+    e.backend._empty_since[e.guild.id] = 0.0
+    e.backend._clock = lambda: 42.0
+
+    assert await e.backend.connect(e.guild, e.channel) is session
+    assert e.backend._empty_since[e.guild.id] == 42.0
+    await e.backend.close()
+
+
+@pytest.mark.asyncio
 async def test_housekeeping_resets_idle_clock_for_activity(environment):
     e = environment
     now = [0.0]

@@ -10,6 +10,7 @@ from redbot.core import commands
 from .domain.normalization import format_duration
 from .playback.interfaces import PlaybackSession
 from .playback.requests import current_request, playback_request
+from .providers.urls import parse_provider_url
 from .ui.display import escape_display
 from .ui.notice import NoticeView, skip_notice, stop_notice
 
@@ -61,11 +62,23 @@ def _cooldown_query(ctx: commands.Context) -> str:
     return content.lower()
 
 
+_IMPORT_COOLDOWN = 10.0
+_IMPORT_CONTENT_TYPES = frozenset({"album", "playlist", "mix"})
+
+
+def _is_import_query(query: str) -> bool:
+    """Recognise a collection URL without misreading words like 'remix'."""
+    try:
+        parsed = parse_provider_url(query)
+    except ValueError:
+        return False
+    return parsed is not None and parsed.content_type in _IMPORT_CONTENT_TYPES
+
+
 def playback_cooldown(ctx: commands.Context) -> commands.Cooldown:
-    """Per-user cooldown: 3.5s for normal searches/tracks, 10s for playlist/album imports."""
-    query = _cooldown_query(ctx)
-    if any(k in query for k in ("playlist", "album", "mix", "/sets/")):
-        return commands.Cooldown(1, 10.0)
+    """Per-user cooldown: 3.5s for searches/tracks, 10s for playlist/album imports."""
+    if _is_import_query(_cooldown_query(ctx)):
+        return commands.Cooldown(1, _IMPORT_COOLDOWN)
     return commands.Cooldown(1, 3.5)
 
 
@@ -148,12 +161,9 @@ class PlaybackCommands:
         self._cancel_guild_background_tasks(guild_id)
         session = await self.backend.get(guild_id)
         if session is not None:
-            if hasattr(self, "attachment_resolver"):
-                for entry in session.snapshot().queued:
-                    self.attachment_resolver.discard(entry.primary)
-                current = session.snapshot().current
-                if current is not None:
-                    self.attachment_resolver.discard(current.primary)
+            # The session releases each entry's source lease (and with it any
+            # attachment registration) while clearing; discarding here would
+            # either duplicate that or target entries it no longer owns.
             await session.stop(clear_queue=True)
         self._current_entries.pop(guild_id, None)
         self._current_meta.pop(guild_id, None)
@@ -199,8 +209,7 @@ class PlaybackCommands:
         if removed is None:
             await self._reply(ctx, "Invalid queue position. Use queue; 1 is the next song.")
             return
-        if hasattr(self, "attachment_resolver"):
-            self.attachment_resolver.discard(removed.primary)
+        # `session.remove` already released the entry's lease and attachment.
         await self._reply(ctx, f"Removed #{index}: {escape_display(removed.meta['title'])}.")
         await self._refresh_controller(ctx.guild.id, force=True)
 
@@ -220,9 +229,7 @@ class PlaybackCommands:
             await self._reply(ctx, "Join the bot's voice channel to clear the queue.")
             return
         self._cancel_imports(ctx.guild.id)
-        if session is not None and hasattr(self, "attachment_resolver"):
-            for track in session.snapshot().queued:
-                self.attachment_resolver.discard(track.primary)
+        # `clear_queue` releases each removed entry's lease; no extra discard.
         count = await session.clear_queue() if session is not None else 0
         await self._reply(ctx, f"Cleared {count} waiting track(s). Current playback continues.")
         await self._refresh_controller(ctx.guild.id, force=True)
@@ -359,9 +366,13 @@ class PlaybackCommands:
     @commands.admin_or_permissions(manage_guild=True)
     async def autoplay_command(self, ctx: commands.Context, mode: Literal["on", "off"] | None = None) -> None:
         """Show or set automatic recommendations (Manage Server permission required)."""
-        session = await self._control_session(ctx)
-        if session is None:
+        # Toggling autoplay is a server setting, not a transport control: it must
+        # not require the caller to be listening in the bot's voice channel.
+        await self._defer(ctx)
+        if ctx.guild is None or self._closing:
+            await self._reply(ctx, "Playback is unavailable here.")
             return
+        session = await self.backend.get(ctx.guild.id)
         setting = self.config.guild(ctx.guild).autoplay_enabled
         if mode is not None:
             await setting.set(mode == "on")
@@ -371,7 +382,8 @@ class PlaybackCommands:
                     task.cancel()
         enabled = await setting()
         await self._reply(ctx, f"Autoplay: {'on' if enabled else 'off'}.")
-        await self._refresh_controller(ctx.guild.id, force=True)
+        if session is not None:
+            await self._refresh_controller(ctx.guild.id, force=True)
 
     @commands.hybrid_command(name="playnext")
     @commands.guild_only()

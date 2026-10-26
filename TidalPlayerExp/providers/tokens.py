@@ -8,15 +8,15 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 
 @dataclass(frozen=True)
 class TokenSnapshot:
     token_type: str
-    access_token: str
-    refresh_token: str
+    access_token: str = field(repr=False)
+    refresh_token: str = field(repr=False)
     expiry_time: int
 
     @classmethod

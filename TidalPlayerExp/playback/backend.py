@@ -120,6 +120,10 @@ class NativePlaybackBackend:
             if session is not None and self._live(session):
                 if session.snapshot().channel_id != channel.id:
                     raise PlaybackUnavailable()
+                # An explicit connect is play intent: restart the idle clock so
+                # the sweeper cannot disconnect between here and the enqueue
+                # that follows provider resolution.
+                self._empty_since[guild.id] = self._clock()
                 return session
             if any(item.guild_id == guild.id for item in self._retired):
                 raise PlaybackUnavailable()

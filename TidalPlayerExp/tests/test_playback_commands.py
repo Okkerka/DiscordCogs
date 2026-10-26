@@ -277,6 +277,21 @@ async def test_unspecified_or_tidal_search_keeps_catalog_behavior(controls, monk
 
 
 @pytest.mark.asyncio
+async def test_isrc_query_ignores_surrounding_whitespace(controls, monkeypatch):
+    cog, session, sink = controls
+    lookup = AsyncMock(return_value=object())
+    monkeypatch.setattr(type(cog.tidal), "get_track_by_isrc", lookup)
+    cog.check_ready = AsyncMock(return_value=True)
+    cog._prepare_playback_session = AsyncMock(return_value=session)
+    cog._load_and_queue_track = AsyncMock()
+
+    await cog.tplay(context(), query="  isrc:USUM71703861  ")
+
+    lookup.assert_awaited_once_with("USUM71703861")
+    cog._load_and_queue_track.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_platform_selection_does_not_reroute_explicit_links(controls):
     cog, session, sink = controls
     cog._prepare_playback_session = AsyncMock(return_value=session)

@@ -349,10 +349,11 @@ async def test_batch_controller_state_is_initialized_only_after_playback_starts(
         author=SimpleNamespace(id=5),
         channel=SimpleNamespace(id=10),
     )
-    queued, skipped = await cog._queue_resolved_chunk(
+    queued, skipped, reason = await cog._queue_resolved_chunk(
         ctx, native_session, [(SimpleNamespace(id=77), meta)], asyncio.Event(),
     )
     assert (queued, skipped) == (1, 0)
+    assert reason is None
     assert not cog._current_meta
     assert not cog._controller_meta
     native_session.current = native_session.entries.pop(0)
@@ -390,9 +391,10 @@ async def test_youtube_import_stops_when_the_api_repeats_a_page_token(cog) -> No
         return operation()
 
     with patch.object(type(cog.tidal), "_run_blocking", new=run_blocking):
-        tracks = await cog._fetch_all_youtube_tracks("playlist")
+        tracks, truncated = await cog._fetch_all_youtube_tracks("playlist")
 
     assert [item["snippet"]["title"] for item in tracks] == ["First track", "Repeated page"]
+    assert truncated is True
     assert request_count == 2
 
 
@@ -408,7 +410,10 @@ async def test_youtube_import_handles_a_malformed_api_response_without_crashing(
         return operation()
 
     with patch.object(type(cog.tidal), "_run_blocking", new=run_blocking):
-        assert await cog._fetch_all_youtube_tracks("playlist") == []
+        tracks, truncated = await cog._fetch_all_youtube_tracks("playlist")
+
+    assert tracks == []
+    assert truncated is True
 
 
 @pytest.mark.asyncio
@@ -421,7 +426,7 @@ async def test_youtube_playlist_missing_decorative_metadata_allows_keyless_fallb
     cog.yt = SimpleNamespace(playlists=lambda: playlists)
     from TidalPlayerExp.tests.test_youtube_fallback import _context
     ctx = _context()
-    fetch_tracks = AsyncMock(return_value=[])
+    fetch_tracks = AsyncMock(return_value=([], False))
     cog.youtube_resolver.fetch_playlist = AsyncMock(return_value=())
 
     async def run_blocking(_handler, operation, **_kwargs):
@@ -437,7 +442,7 @@ async def test_youtube_playlist_missing_decorative_metadata_allows_keyless_fallb
     fetch_tracks.assert_awaited_once_with("PL123")
     cog.youtube_resolver.fetch_playlist.assert_awaited_once_with("PL123", 100)
     native_session.enqueue.assert_not_awaited()
-    assert "Queued 0/0" in ctx.send.return_value.edit.await_args.kwargs["embed"].description
+    assert ctx.send.return_value.edit.await_args.kwargs["embed"].description == Messages.ERROR_NO_TRACKS_FOUND
 
 
 @pytest.mark.asyncio
@@ -465,6 +470,31 @@ async def test_finished_autoplay_task_does_not_remove_a_newer_task(cog, native_s
     finally:
         replacement.cancel()
         await asyncio.gather(replacement, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_abandoned_recommendation_task_releases_its_slot(cog) -> None:
+    guild_id = 104
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def candidates(*_args):
+        started.set()
+        await release.wait()
+        return []
+
+    cog._radio_candidates = candidates
+    waiter = asyncio.create_task(cog._get_recommendations(guild_id, {"track_id": "123"}))
+    await started.wait()
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    release.set()
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert guild_id not in cog._recommendation_tasks
+    assert guild_id not in cog._recommendation_task_sources
 
 
 @pytest.mark.asyncio

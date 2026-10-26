@@ -32,6 +32,13 @@ def test_structured_candidates_require_title_artist_and_variant_identity(wrong):
     assert select_best_tidal_track(candidate, [wrong]) is None
 
 
+def test_remix_filter_matches_the_version_suffix_in_full_name(cog):
+    plain = track(title="Song", full_name="Song")
+    sped_up = track(title="Song", full_name="Song (Sped Up)")
+
+    assert cog.tidal._filter_tracks([plain, sped_up]) == [plain]
+
+
 def test_structured_metadata_selects_the_matching_recording():
     right = track()
     candidate = NormalizedCandidate("The Night We Met", ("Lord Huron",), duration=208, source="spotify")

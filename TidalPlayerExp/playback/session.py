@@ -17,6 +17,7 @@ from typing import Any, Protocol, cast
 import discord
 
 from ..domain.models import TrackMeta
+from ._tasks import retain_task
 from .errors import PlaybackUnavailable
 from .ffmpeg import AudioSourceFactory
 from .interfaces import PlaybackEventSink, SourceLeases, SourceResolver
@@ -117,6 +118,9 @@ class NativePlaybackSession:
         self._sink_timeout = sink_timeout
         self._lock = asyncio.Lock()
         self._queue: deque[PlaybackEntry] = deque()
+        # `snapshot()` is called several times per command; rebuilding the
+        # tuple each time copies the whole queue. Mutators invalidate this.
+        self._queue_cache: tuple[PlaybackEntry, ...] | None = None
         self._current: PlaybackEntry | None = None
         self._source: _OwnedAudio | None = None
         self._paused = False
@@ -152,8 +156,11 @@ class NativePlaybackSession:
         # A cached channel can be momentarily absent while a move re-identifies.
         channel = getattr(self._voice_client, "channel", None) if self._owned() else None
         channel_id = getattr(channel, "id", None)
+        queue = self._queue_cache
+        if queue is None:
+            queue = self._queue_cache = tuple(self._queue)
         return PlaybackSnapshot(
-            self._current, tuple(self._queue), self._paused, channel_id,
+            self._current, queue, self._paused, channel_id,
             self._volume, self._repeat, self._position(), self._failures >= 3 and not self._running,
         )
 
@@ -189,6 +196,7 @@ class NativePlaybackSession:
                 self._queue.appendleft(entry)
             else:
                 self._queue.append(entry)
+            self._queue_cache = None
             self._failures = 0
             if start_if_idle:
                 self._running = True
@@ -203,6 +211,7 @@ class NativePlaybackSession:
                 return None
             removed = self._queue[index - 1]
             del self._queue[index - 1]
+            self._queue_cache = None
             self._release_entry(removed)
             return removed
 
@@ -214,6 +223,7 @@ class NativePlaybackSession:
         for entry in self._queue:
             self._release_entry(entry)
         self._queue.clear()
+        self._queue_cache = None
 
     async def clear_queue(self) -> int:
         """Clear waiting tracks without interrupting current audio."""
@@ -230,6 +240,7 @@ class NativePlaybackSession:
             moved = self._queue[index - 1]
             del self._queue[index - 1]
             self._queue.insert(destination - 1, moved)
+            self._queue_cache = None
             return True
 
     async def shuffle_queue(self) -> bool:
@@ -240,6 +251,7 @@ class NativePlaybackSession:
             items = list(self._queue)
             random.shuffle(items)
             self._queue = deque(items)
+            self._queue_cache = None
             return True
 
     async def set_repeat(self, mode: str) -> None:
@@ -412,7 +424,18 @@ class NativePlaybackSession:
                 self._pause_on_start = False
                 self._paused = False
                 self._paused_at = None
-                self._running = False
+                if not self._queue:
+                    self._running = False
+                    return True
+                # Dropping the parked replacement must not strand the tracks
+                # already waiting (repeat hand-off can leave a live worker
+                # parked with a non-empty queue). Keep it running, or start a
+                # successor if the worker has already unwound.
+                self._running = True
+                if self._runner is None or self._runner.done():
+                    self._runner = asyncio.create_task(
+                        self._restart(self._cleanup_barrier, None)
+                    )
                 return True
             if entry_id is not None and (
                 self._current.entry_id != entry_id
@@ -523,14 +546,7 @@ class NativePlaybackSession:
 
     def _retain_background_task(self, task: asyncio.Task[None]) -> None:
         """Keep and consume a bounded task whose waiter was cancelled twice."""
-
-        def task_finished(finished: asyncio.Task[None]) -> None:
-            self._retained_tasks.discard(finished)
-            if not finished.cancelled():
-                finished.exception()
-
-        self._retained_tasks.add(task)
-        task.add_done_callback(task_finished)
+        retain_task(self._retained_tasks, task)
 
     async def _notify(
         self, event: str, entry: PlaybackEntry | None, generation: int
@@ -600,7 +616,11 @@ class NativePlaybackSession:
             except asyncio.CancelledError:
                 # A second cancellation must not abandon a shielded creation:
                 # when it eventually finishes, its source has to be cleaned.
-                self._retain_background_task(self._reap_creation(creation))
+                # `_reap_creation` is a coroutine, so it must be wrapped in a
+                # task before being retained.
+                self._retain_background_task(
+                    asyncio.create_task(self._reap_creation(creation))
+                )
                 raise
             except Exception as error:  # noqa: BLE001 - factory owns failed creation cleanup
                 log.warning(
@@ -674,7 +694,11 @@ class NativePlaybackSession:
                     entry = None
                 else:
                     ended = None
-                    entry = self._next_entry if self._next_entry is not None else self._queue.popleft()
+                    if self._next_entry is not None:
+                        entry = self._next_entry
+                    else:
+                        entry = self._queue.popleft()
+                        self._queue_cache = None
                     self._next_entry = None
                     self._current = entry
                     self._generation += 1
@@ -770,7 +794,9 @@ class NativePlaybackSession:
                         # capacity + one and no repeat item is silently lost.
                         if len(self._queue) >= self._capacity:
                             self._next_entry = self._queue.popleft()
+                            self._queue_cache = None
                         self._queue.append(repeated)
+                        self._queue_cache = None
             if failed:
                 await self._notify("failed", entry, generation)
                 previous = None

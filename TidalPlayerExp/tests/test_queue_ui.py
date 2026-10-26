@@ -99,6 +99,16 @@ def test_empty_queue_is_friendly_and_includes_supported_playback_state(real_queu
     assert "Halted: Off" in text
 
 
+def test_zero_volume_is_rendered_as_a_number(real_queue_ui):
+    snapshot = SimpleNamespace(
+        current=None, queued=(), paused=False, channel_id=None, volume=0, repeat="off", halted=False,
+    )
+
+    view, _ = _view(real_queue_ui, snapshot)
+
+    assert "Volume: 0" in _text(view)
+
+
 @pytest.mark.parametrize("mode,label", [("off", "Off"), ("track", "Track"), ("queue", "Queue")])
 def test_repeat_mode_is_rendered_as_a_label_not_a_raw_token(real_queue_ui, mode, label):
     snapshot = SimpleNamespace(

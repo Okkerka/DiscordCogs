@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -138,8 +138,9 @@ async def test_mixed_matching_preserves_order_and_original_fallback(cog, playlis
 async def test_api_playlist_caps_raw_work_and_output_at_1000(cog, playlist_ctx):
     pages = [{"items": [_playlist_item(i) for i in range(start, start + 50)], "nextPageToken": str(start + 50)} for start in range(0, 1100, 50)]
     cog.yt, _, execute = _playlist_client(pages)
-    items = await cog._fetch_all_youtube_tracks(PLAYLIST_ID)
+    items, truncated = await cog._fetch_all_youtube_tracks(PLAYLIST_ID)
     assert len(items) == 1000
+    assert truncated is True
     assert execute.call_count == 20
     assert items[-1]["snippet"]["resourceId"]["videoId"] == "00000000999"
 
@@ -150,7 +151,9 @@ async def test_repeated_page_token_stops_import(cog, playlist_ctx):
         {"items": [_playlist_item(1)], "nextPageToken": "repeat"},
         {"items": [_playlist_item(2)], "nextPageToken": "repeat"},
     ])
-    assert len(await cog._fetch_all_youtube_tracks(PLAYLIST_ID)) == 2
+    items, truncated = await cog._fetch_all_youtube_tracks(PLAYLIST_ID)
+    assert len(items) == 2
+    assert truncated is True
     assert execute.call_count == 2
     assert listing.call_args_list[1].kwargs["pageToken"] == "repeat"
 
@@ -160,7 +163,9 @@ async def test_repeated_page_token_stops_import(cog, playlist_ctx):
 async def test_unusable_pages_have_a_finite_work_budget(cog, playlist_ctx, empty_pages):
     pages = [{"items": [] if empty_pages else [None] * 50, "nextPageToken": str(i)} for i in range(1001)]
     cog.yt, _, execute = _playlist_client(pages)
-    assert await cog._fetch_all_youtube_tracks(PLAYLIST_ID) == []
+    items, truncated = await cog._fetch_all_youtube_tracks(PLAYLIST_ID)
+    assert items == []
+    assert truncated is True
     assert execute.call_count == (1000 if empty_pages else 20)
 
 
@@ -243,11 +248,44 @@ async def test_queue_capacity_stops_catalog_work_and_reports_remaining(cog, play
     assert len(native_session.entries) == 2
     assert cog.tidal.search.await_count == 8
     final = playlist_ctx.send.return_value.edit.await_args.kwargs["embed"]
+    assert "Stopped importing" in final.title
     assert "Queued 2/25" in final.description
     # The rejected third item is a skip; the untouched rest must not be
     # reported as failures.
     assert "Skipped 1. 22 not attempted." in final.description
+    assert "The queue was full; clear it and retry." in final.description
     assert not cog._cancel_events
+
+
+@pytest.mark.asyncio
+async def test_truncated_youtube_listing_is_reported_as_partial(cog, playlist_ctx, native_session):
+    with (
+        patch.object(type(cog), "_youtube_ready", new=AsyncMock(return_value=True)),
+        patch.object(
+            type(cog),
+            "_fetch_all_youtube_tracks",
+            new=AsyncMock(return_value=([_playlist_item(1)], True)),
+        ),
+    ):
+        await cog._handle_youtube_playlist(playlist_ctx, PLAYLIST_ID)
+
+    assert len(native_session.entries) == 1
+    final = playlist_ctx.send.return_value.edit.await_args.kwargs["embed"]
+    assert "Finished" in final.title
+    assert "The playlist listing was partial; later tracks may be missing." in final.description
+
+
+@pytest.mark.asyncio
+async def test_track_list_escapes_provider_collection_name(cog, native_session):
+    ctx = _context()
+    cog.check_ready = AsyncMock(return_value=True)
+    cog._prepare_playback_session = AsyncMock(return_value=native_session)
+    cog._resolve_and_extract = AsyncMock(return_value=None)
+
+    await cog._process_track_list(ctx, [object()], "**evil**", lambda item: item)
+
+    final = ctx.send.return_value.edit.await_args.kwargs["embed"]
+    assert final.description == "Source: \\*\\*evil\\*\\*"
 
 
 @pytest.mark.asyncio

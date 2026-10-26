@@ -265,6 +265,59 @@ async def test_invalid_id_is_rejected_before_extraction(cog, youtube_ctx, native
 
 
 @pytest.mark.asyncio
+async def test_empty_youtube_playlist_reports_no_tracks(cog, youtube_ctx, native_session):
+    cog.youtube_resolver.fetch_playlist = AsyncMock(return_value=[])
+
+    await cog._handle_youtube_playlist(youtube_ctx, "PLempty")
+
+    message = youtube_ctx.send.return_value
+    embed = message.edit.await_args.kwargs["embed"]
+    assert embed.description == Messages.ERROR_NO_TRACKS_FOUND
+    assert native_session.entries == []
+
+
+@pytest.mark.asyncio
+async def test_empty_youtube_playlist_during_stop_stays_cancelled(cog, youtube_ctx, native_session):
+    async def stop_during_fetch(_playlist_id, _limit):
+        cog._stop_generations[youtube_ctx.guild.id] += 1
+        return []
+
+    cog.youtube_resolver.fetch_playlist = AsyncMock(side_effect=stop_during_fetch)
+
+    await cog._handle_youtube_playlist(youtube_ctx, "PLempty")
+
+    message = youtube_ctx.send.return_value
+    embed = message.edit.await_args.kwargs["embed"]
+    assert "Cancelled" in embed.title
+    assert native_session.entries == []
+
+
+@pytest.mark.asyncio
+async def test_empty_youtube_playlist_after_session_change_stays_cancelled(
+    cog, youtube_ctx, native_session,
+):
+    calls = 0
+    original_get = cog.backend.get
+
+    async def replace_session(guild_id):
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            return await original_get(guild_id)
+        return SimpleNamespace()
+
+    cog.backend.get = AsyncMock(side_effect=replace_session)
+    cog.youtube_resolver.fetch_playlist = AsyncMock(return_value=[])
+
+    await cog._handle_youtube_playlist(youtube_ctx, "PLempty")
+
+    message = youtube_ctx.send.return_value
+    embed = message.edit.await_args.kwargs["embed"]
+    assert "Cancelled" in embed.title
+    assert native_session.entries == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("url,playlist", [
     (f"https://youtu.be/{VIDEO_ID}", False),
     (f"https://youtu.be/{VIDEO_ID}?list=PLexample", False),
@@ -292,7 +345,7 @@ async def test_shared_admission_keeps_entry_metadata_and_deletes_confirmation(co
     native_session.current = entry
     monkeypatch.setattr(module, "QUEUED_EMBED_DELETE_DELAY", 0)
 
-    assert await cog._admit_entry(youtube_ctx, native_session, entry)
+    assert await cog._admit_entry(youtube_ctx, native_session, entry) == "queued"
     await asyncio.gather(*cog._tasks)
 
     assert native_session.entries == [entry]

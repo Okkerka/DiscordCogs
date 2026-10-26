@@ -191,7 +191,8 @@ is not a guarantee that every site or individual track currently works.
   YouTube/SoundCloud searches queue the top result from that platform, without
   TIDAL login or extra API keys. The choice affects search text only; supplied
   links keep their provider routing, including TIDAL-first YouTube link matching.
-  Searches are bounded to 300 characters, one result, and a 30-second deadline.
+  Explicit YouTube/SoundCloud searches are bounded to 300 characters, one
+  result, and a 30-second deadline.
 - Use the now-playing panel to pause/resume, skip, stop, choose a suggestion, or
   toggle autoplay. Autoplay generates TIDAL tracks only and needs TIDAL login.
 - Slash `/play` acknowledges queue admission even for the first song, clearing

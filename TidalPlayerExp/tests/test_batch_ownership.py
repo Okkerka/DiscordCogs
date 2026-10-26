@@ -55,6 +55,22 @@ def test_batch_event_release_requires_the_owner(cog) -> None:
     assert 82 not in cog._cancel_events
 
 
+def test_cancelled_batch_can_be_reclaimed_without_the_old_release_clearing_it(cog) -> None:
+    old = cog._claim_batch(84)
+    assert old is not None
+    old.set()
+
+    new = cog._claim_batch(84)
+    assert new is not None and new is not old
+
+    # The stopped import's grace release must not clear the retry's claim.
+    cog._release_batch(84, old)
+    assert cog._cancel_events[84] is new
+
+    cog._release_batch(84, new)
+    assert 84 not in cog._cancel_events
+
+
 @pytest.mark.asyncio
 async def test_cancel_imports_sets_only_the_active_batch_event(cog) -> None:
     guild = SimpleNamespace(id=83)

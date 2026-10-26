@@ -21,7 +21,7 @@ async def test_batch_admits_stable_references_in_order_without_resolving_streams
     )
 
     with patch.object(type(cog.tidal), "search", new=AsyncMock()) as search:
-        queued, skipped = await cog._queue_resolved_chunk(
+        queued, skipped, reason = await cog._queue_resolved_chunk(
             ctx,
             native_session,
             [(first, metas[0]), (second, metas[1])],
@@ -29,10 +29,33 @@ async def test_batch_admits_stable_references_in_order_without_resolving_streams
         )
 
     assert (queued, skipped) == (2, 0)
+    assert reason is None
     assert [entry.primary.identifier for entry in native_session.entries] == ["1", "2"]
     assert len({entry.entry_id for entry in native_session.entries}) == 2
     search.assert_not_awaited()
     assert not cog._current_meta
+
+
+@pytest.mark.asyncio
+async def test_batch_skips_malformed_item_and_keeps_importing(cog, native_session) -> None:
+    good = SimpleNamespace(id=7)
+    meta = make_entry(7, title="Seven", artist="A").meta
+    ctx = SimpleNamespace(
+        guild=SimpleNamespace(id=9),
+        author=SimpleNamespace(id=5),
+        channel=SimpleNamespace(),
+    )
+
+    queued, skipped, reason = await cog._queue_resolved_chunk(
+        ctx,
+        native_session,
+        [(SimpleNamespace(), meta), (good, meta)],
+        asyncio.Event(),
+    )
+
+    assert (queued, skipped) == (1, 1)
+    assert reason is None
+    assert [entry.primary.identifier for entry in native_session.entries] == ["7"]
 
 
 def test_signed_stream_resolution_happens_only_at_playback_time() -> None:

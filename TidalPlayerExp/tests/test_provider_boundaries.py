@@ -94,7 +94,7 @@ async def test_spotify_album_stops_on_repeated_next_cursor(cog) -> None:
                 "tracks": {"items": [first], "next": "same-page"},
             }
         ),
-        _get=MagicMock(
+        next=MagicMock(
             return_value={"items": [second], "next": "same-page"}
         ),
     )
@@ -102,7 +102,7 @@ async def test_spotify_album_stops_on_repeated_next_cursor(cog) -> None:
         tracks, name = await cog._fetch_all_spotify_album_tracks("album")
 
     assert (tracks, name) == ([first, second], "Album")
-    assert cog.sp._get.call_count == 1
+    assert cog.sp.next.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -125,13 +125,13 @@ async def test_spotify_album_rejects_malformed_items(cog) -> None:
                 "tracks": {"items": "not-a-list", "next": "page"},
             }
         ),
-        _get=MagicMock(side_effect=AssertionError("malformed items must stop pagination")),
+        next=MagicMock(side_effect=AssertionError("malformed items must stop pagination")),
     )
     with patch.object(type(cog.tidal), "_run_blocking", new=_run_now):
         tracks, name = await cog._fetch_all_spotify_album_tracks("album")
 
     assert (tracks, name) == ([], "Album")
-    cog.sp._get.assert_not_called()
+    cog.sp.next.assert_not_called()
 
 
 @pytest.mark.asyncio

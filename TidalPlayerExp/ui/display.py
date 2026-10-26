@@ -13,7 +13,7 @@ __all__ = ["clamp_text", "escape_display", "safe_display_url"]
 
 def escape_display(value: object, limit: int = 256) -> str:
     """Render one metadata value as bounded text, without mentions or Markdown."""
-    text = " ".join(str(value or "").split())
+    text = " ".join(str(value if value is not None else "").split())
     text = _MARKDOWN.sub(r"\\\1", text)
     text = text.replace("@", "@\u200b").replace("<", "<\u200b")
     return clamp_text(text, limit)

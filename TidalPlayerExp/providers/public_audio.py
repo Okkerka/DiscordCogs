@@ -215,7 +215,9 @@ class PublicAudioResolver:
             if not isinstance(format_id, str) or "preview" in format_id.casefold():
                 raise ValueError("Preview audio is not supported")
             payload["duration"] = _duration(payload.get("duration"))
-            result = self._worker._source_from_mapping(payload)
+            # Public audio CDNs are provider-owned but not YouTube-owned, so the
+            # YouTube media allowlist cannot apply here.
+            result = self._worker._source_from_mapping(payload, validator=_valid_https_url)
         except Exception:  # noqa: BLE001 - never retain media URL-bearing exception context
             result = None
         if result is None:

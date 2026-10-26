@@ -18,7 +18,7 @@ import unicodedata
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 from urllib.parse import urlsplit
 
 from packaging.version import Version
@@ -47,6 +47,16 @@ _YT_DLP_BOOTSTRAP = (
     "import runpy,sys; sys.path.insert(0,sys.argv[1]); "
     "sys.argv=['yt_dlp',*sys.argv[2:]]; runpy.run_module('yt_dlp',run_name='__main__')"
 )
+_CHILD_ENV_ALLOWLIST = frozenset({
+    "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC",
+    "TEMP", "TMP", "TMPDIR",
+    "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+    "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+    "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "DENO_DIR", "DENO_INSTALL", "DENO_NO_UPDATE_CHECK",
+})
 
 ProcessFactory = Callable[..., Awaitable[Any]]
 log = logging.getLogger("red.tidalplayerexp.youtube")
@@ -106,6 +116,26 @@ def _valid_https_url(value: object, *, limit: int | None = None) -> str:
     if not valid:
         raise ValueError
     return value
+
+
+# The extractor only ever returns YouTube-owned media endpoints. Pinning the
+# suffix is stronger than a DNS check: it cannot be bypassed by a hostname that
+# resolves to loopback, a CNAME, DNS rebinding, or a redirect chain.
+_YOUTUBE_MEDIA_DOMAINS: Final = (
+    "googlevideo.com",
+    "youtube.com",
+    "youtube-nocookie.com",
+    "ytimg.com",
+)
+
+
+def _valid_media_url(value: object) -> str:
+    url = _valid_https_url(value)
+    host = (urlsplit(url).hostname or "").casefold().rstrip(".")
+    if not any(host == domain or host.endswith(f".{domain}") for domain in _YOUTUBE_MEDIA_DOMAINS):
+        raise ValueError
+    return url
+
 
 
 def _positive_int(value: object) -> int | None:
@@ -361,7 +391,15 @@ class YouTubeResolver:
         ]
 
     def _child_env(self) -> dict[str, str]:
-        env = {key: value for key, value in os.environ.items() if not key.upper().startswith("YTDLP_")}
+        # The extractor is a large third-party parser consuming untrusted
+        # provider responses. Forward only runtime, network, and certificate
+        # plumbing so a parser compromise cannot read bot/provider secrets
+        # that the deployment injects through the environment.
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key.upper() in _CHILD_ENV_ALLOWLIST
+        }
         env["YTDLP_NO_PLUGINS"] = "1"
         return env
 
@@ -473,10 +511,14 @@ class YouTubeResolver:
         batch_acquired = False
 
         try:
+            # Batch backpressure is deliberately outside the extraction
+            # deadline: waiting for another guild's import must not consume
+            # this caller's provider budget and fail with a misleading
+            # timeout. Command cancellation still releases the lane.
+            if batch:
+                await self._batch_slots.acquire()
+                batch_acquired = True
             async with asyncio.timeout(deadline) as timeout:
-                if batch:
-                    await self._batch_slots.acquire()
-                    batch_acquired = True
                 await self._slots.acquire()
                 slot_acquired = True
                 try:
@@ -505,13 +547,17 @@ class YouTubeResolver:
         except Exception:  # noqa: BLE001 - child/process output is untrusted
             raise SourceResolutionError() from None
         finally:
-            if child is not None:
-                reaped = await self._cleanup_child(child, release_slot=True)
-                slot_handed_off = slot_handed_off or not reaped
-            if slot_acquired and not slot_handed_off and child is None:
-                self._slots.release()
-            if batch_acquired:
-                self._batch_slots.release()
+            try:
+                if child is not None:
+                    reaped = await self._cleanup_child(child, release_slot=True)
+                    slot_handed_off = slot_handed_off or not reaped
+                if slot_acquired and not slot_handed_off and child is None:
+                    self._slots.release()
+            finally:
+                # A second cancellation during child cleanup must not leak
+                # the process-wide batch lane and wedge every later import.
+                if batch_acquired:
+                    self._batch_slots.release()
 
     async def _cleanup_child(self, child: Any, *, release_slot: bool) -> bool:
         async with self._state_lock:
@@ -707,11 +753,13 @@ class YouTubeResolver:
             raise SourceResolutionError() from None
 
     @staticmethod
-    def _source_from_mapping(payload: object) -> ResolvedSource:
+    def _source_from_mapping(
+        payload: object, *, validator: Callable[[object], str] = _valid_media_url,
+    ) -> ResolvedSource:
         if not isinstance(payload, Mapping):
             raise TypeError
         try:
-            url = _valid_https_url(payload.get("url"))
+            url = validator(payload.get("url"))
             acodec = payload.get("acodec")
             vcodec = payload.get("vcodec")
             if not isinstance(acodec, str) or vcodec != "none":

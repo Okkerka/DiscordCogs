@@ -32,6 +32,24 @@ async def test_interactive_search_bounds_and_escapes_provider_metadata(cog, monk
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("duration", [None, -1])
+async def test_interactive_search_renders_unknown_duration_without_crashing(cog, monkeypatch, duration):
+    import TidalPlayerExp.tidalplayer as module
+
+    monkeypatch.setattr(module.TrackSelectView, "wait_for_selection", AsyncMock(return_value=None))
+    message = SimpleNamespace(delete=AsyncMock())
+    ctx = SimpleNamespace(author=SimpleNamespace(id=1), send=AsyncMock(return_value=message))
+    tracks = [SimpleNamespace(
+        name="Song", artist=SimpleNamespace(name="Artist"), album=None, duration=duration,
+    )]
+
+    await cog._interactive_select(ctx, tracks)
+
+    description = ctx.send.call_args.kwargs["embed"].description
+    assert "`[Unknown]`" in description
+
+
+@pytest.mark.asyncio
 async def test_interactive_search_cancellation_stops_view_and_deletes_prompt(cog, monkeypatch):
     import TidalPlayerExp.tidalplayer as module
 

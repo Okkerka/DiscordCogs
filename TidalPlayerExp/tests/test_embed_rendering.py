@@ -123,7 +123,11 @@ def test_controller_track_info_defaults_to_tidal(cog) -> None:
     assert f"[Open in TIDAL]({url})" in info
 
 
-@pytest.mark.parametrize("source,label", [("soundcloud", "SoundCloud"), ("bandcamp", "Bandcamp")])
+@pytest.mark.parametrize("source,label", [
+    ("soundcloud", "SoundCloud"),
+    ("bandcamp", "Bandcamp"),
+    ("youtube", "YouTube"),
+])
 def test_public_audio_source_labels_do_not_claim_tidal_quality(cog, source, label):
     controller = importlib.import_module("TidalPlayerExp.ui.controller")
     info = controller._track_info(
@@ -135,6 +139,13 @@ def test_public_audio_source_labels_do_not_claim_tidal_quality(cog, source, labe
     assert f"**Source:** {label} audio" in info
     assert "**Catalog quality:**" not in info
     assert "**Delivery:** Discord Opus" in info
+
+
+def test_display_source_labels_fallback_slugs() -> None:
+    from TidalPlayerExp.ui.embeds import display_source
+
+    assert display_source({"source": "youtube"}) == "YouTube"
+    assert display_source({"source": "tidal_video"}) == "TIDAL"
 
 
 def test_controller_quality_labels_match_catalog_states(cog) -> None:

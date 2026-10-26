@@ -35,9 +35,15 @@ def test_playback_cooldown_returns_longer_duration_for_playlists() -> None:
     cd_playlist = playback_cooldown(ctx_playlist)
     assert cd_playlist.per == 10.0
 
-    ctx_album = SimpleNamespace(kwargs={"query": "https://spotify.com/album/xyz"}, args=(), message=None, interaction=None)
+    ctx_album = SimpleNamespace(kwargs={"query": "https://open.spotify.com/album/xyz"}, args=(), message=None, interaction=None)
     cd_album = playback_cooldown(ctx_album)
     assert cd_album.per == 10.0
+
+    # Ordinary words that merely contain a collection name stay on the short
+    # cooldown instead of being misread as imports.
+    for ordinary in ("remix", "Album Leaf", "playlist"):
+        ctx = SimpleNamespace(kwargs={"query": ordinary}, args=(), message=None, interaction=None)
+        assert playback_cooldown(ctx).per == 3.5
 
 
 def test_playback_cooldown_reads_the_query_from_a_slash_invocation() -> None:

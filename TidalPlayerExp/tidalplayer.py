@@ -10,7 +10,7 @@ import logging
 import os
 import secrets
 import unicodedata
-from collections.abc import Awaitable, Mapping
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Mapping
 from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -110,6 +110,12 @@ __red_end_user_data_statement__ = (
 def _log_provider_failure(provider: str, operation: str, error: BaseException) -> None:
     """Log provider failures without formatting credential-bearing exception text."""
     log.warning("%s %s failed (%s)", provider, operation, type(error).__name__)
+
+
+def _discard_task_exception(task: asyncio.Task[Any]) -> None:
+    """Consume a task's terminal exception so asyncio never logs it unobserved."""
+    if not task.cancelled():
+        task.exception()
 
 
 def _base_title(title: Any) -> str:
@@ -682,6 +688,10 @@ class TidalHandler:
         if self._refresh_task:
             self._refresh_task.cancel()
         self._refresh_task = asyncio.create_task(self._auto_refresh_tokens())
+        # The loop is replaced/cancelled during unload; consume its terminal
+        # exception so a failure never surfaces as "Task exception was never
+        # retrieved" on the event loop.
+        self._refresh_task.add_done_callback(_discard_task_exception)
 
     async def unload(self) -> None:
         tasks = set(self._inflight.values())
@@ -693,7 +703,9 @@ class TidalHandler:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._inflight.clear()
         self._refresh_task = None
-        self._executor.shutdown(wait=False)
+        # Queued jobs hold provider sessions and would run after the cog is
+        # gone; only in-flight work is allowed to finish.
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     async def logout(self) -> None:
         """Atomically clear persisted and in-memory OAuth state."""
@@ -875,9 +887,14 @@ class TidalHandler:
             )
             if res:
                 self._set_cached("track", track_id, res, 3600.0)
+            else:
+                # Negative-cache misses like the ISRC path: a deleted or
+                # region-locked track would otherwise be re-requested by every
+                # import retry.
+                self._set_cached("track", track_id, None, 30.0)
             return res
         except asyncio.TimeoutError:
-            log.warning(f"Tidal get_track timeout for id {track_id}")
+            log.warning("Tidal track lookup timed out.")
             return None
         except Exception as error:
             _log_provider_failure("Tidal", "track lookup", error)
@@ -918,6 +935,8 @@ class TidalHandler:
             )
             if res:
                 self._set_cached("album", album_id, res, 1800.0)
+            else:
+                self._set_cached("album", album_id, None, 30.0)
             return res
         except Exception as error:
             _log_provider_failure("Tidal", "album lookup", error)
@@ -938,6 +957,8 @@ class TidalHandler:
             )
             if res:
                 self._set_cached("playlist", playlist_id, res, 300.0)
+            else:
+                self._set_cached("playlist", playlist_id, None, 30.0)
             return res
         except Exception as error:
             _log_provider_failure("Tidal", "playlist lookup", error)
@@ -1137,7 +1158,13 @@ class TidalHandler:
     def _filter_tracks(self, tracks: List[Any]) -> List[Any]:
         if not tracks:
             return []
-        return [t for t in tracks if not FILTER_REGEX.search(getattr(t, "name", "") or "")]
+        def haystack(track: Any) -> str:
+            # The version suffix (sped up, slowed, nightcore) lives in the
+            # provider's full_name; matching only name lets variants through.
+            name = getattr(track, "name", "") or ""
+            full_name = getattr(track, "full_name", "") or ""
+            return f"{name} {full_name}" if full_name else name
+        return [t for t in tracks if not FILTER_REGEX.search(haystack(t))]
 
 
 class TidalPlayerExp(PlaybackCommands, commands.Cog):
@@ -1392,7 +1419,12 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         return lock
 
     def _claim_batch(self, guild_id: int) -> asyncio.Event | None:
-        if guild_id in self._cancel_events:
+        existing = self._cancel_events.get(guild_id)
+        # A set event belongs to a batch that was already cancelled and whose
+        # owner may still be winding down; a new import may take the slot now.
+        # The old owner's release is identity-checked, so it cannot drop the
+        # replacement claim.
+        if existing is not None and not existing.is_set():
             return None
         event = asyncio.Event()
         self._cancel_events[guild_id] = event
@@ -1568,11 +1600,17 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         if self.bot.get_guild(guild_id) is None:
             self._stop_generations.pop(guild_id, None)
             self._guild_generations.pop(guild_id, None)
-        await self.backend.close_guild(guild_id)
-        if message is not None:
-            # A voice move/disconnect still leaves the text panel visible; drop
-            # it instead of abandoning a message with dead buttons.
-            await _delete_message_safe(message)
+        try:
+            await self.backend.close_guild(guild_id)
+        except PlaybackUnavailable:
+            # Voice disposal can fail while the guild is going away; the panel
+            # must still be dropped so it does not keep dead buttons.
+            log.debug("Could not close voice backend for guild %s", guild_id)
+        finally:
+            if message is not None:
+                # A voice move/disconnect still leaves the text panel visible; drop
+                # it instead of abandoning a message with dead buttons.
+                await _delete_message_safe(message)
 
     @commands.Cog.listener()
     async def on_cog_add(self, cog: commands.Cog) -> None:
@@ -2178,10 +2216,13 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
     async def _queue_resolved_chunk(
         self, ctx: commands.Context, session: PlaybackSession,
         resolved_chunk: List[Optional[Tuple[Any, TrackMeta]]], cancel_event: asyncio.Event,
-    ) -> Tuple[int, int]:
+    ) -> Tuple[int, int, str | None]:
+        """Queue one resolved chunk; the third value is a stop reason or None."""
         queued = skipped = 0
+        reason = None
         for result in resolved_chunk:
             if cancel_event.is_set() or self._closing or await self.backend.get(ctx.guild.id) is not session:
+                reason = "cancelled"
                 break
             if result is None:
                 skipped += 1
@@ -2192,6 +2233,13 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                 accepted = await session.enqueue(entry)
             except (ValueError, PlaybackUnavailable):
                 accepted = False
+                reason = "cancelled"
+            except (AttributeError, KeyError, TypeError):
+                # One malformed provider item must not abort the whole import.
+                skipped += 1
+                continue
+            else:
+                reason = None if accepted else "capacity"
             if accepted:
                 self._guild_generations[ctx.guild.id] += 1
                 queued += 1
@@ -2199,15 +2247,68 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                 skipped += 1
                 cancel_event.set()
                 break
-        return queued, skipped
+        return queued, skipped, reason
 
-    async def _admit_entry(self, ctx: commands.Context, session: PlaybackSession, entry: PlaybackEntry, *, show_embed: bool = True, stop_generation: int | None = None) -> bool:
+    async def _admit_collection_entries(
+        self,
+        ctx: commands.Context,
+        session: PlaybackSession,
+        entries: AsyncIterable[PlaybackEntry | BaseException],
+        *,
+        guild_id: int,
+        stop_generation: int,
+        cancel: asyncio.Event,
+        message: discord.Message,
+        title: str,
+        color: int,
+        total: int,
+    ) -> Tuple[int, int, bool, bool]:
+        """Admit a collection import stream, reporting progress as it goes.
+
+        Provider-specific fetching stays in the caller; this owns the shared
+        cancellation, admission, progress and failure-counting rules so both
+        collection importers behave the same way.
+        """
+        queued = skipped = processed = 0
+        capacity_hit = False
+        interrupted = False
+        async for item in entries:
+            if (cancel.is_set() or self._closing
+                    or stop_generation != self._stop_generations[guild_id]
+                    or await self.backend.get(guild_id) is not session):
+                interrupted = True
+                break
+            if isinstance(item, BaseException):
+                # One unavailable provider item must not abort the import.
+                skipped += 1
+                processed += 1
+            else:
+                outcome = await self._admit_entry(
+                    ctx, session, item, show_embed=False, stop_generation=stop_generation,
+                )
+                processed += 1
+                if outcome != "queued":
+                    skipped += 1
+                    capacity_hit = outcome == "capacity"
+                    interrupted = True
+                    break
+                queued += 1
+            if processed % SEARCH_BATCH_SIZE == 0:
+                await self._edit_progress_message(message, discord.Embed(
+                    title=title,
+                    description=f"Queued {queued}/{total}. Skipped {skipped}.",
+                    color=color,
+                ))
+        return queued, skipped, capacity_hit, interrupted
+
+    async def _admit_entry(self, ctx: commands.Context, session: PlaybackSession, entry: PlaybackEntry, *, show_embed: bool = True, stop_generation: int | None = None) -> str:
+        """Admit one entry; returns ``queued``, ``cancelled`` or ``capacity``."""
         if (self._closing or await self.backend.get(ctx.guild.id) is not session
                 or request_is_cancelled(self, ctx)
                 or (stop_generation is not None and stop_generation != self._stop_generations[ctx.guild.id])):
             if show_embed:
                 await ctx.send(embed=_error_embed("Playback request cancelled or voice session changed. Please try again."))
-            return False
+            return "cancelled"
         snapshot = session.snapshot()
         was_waiting = snapshot.current is not None or bool(snapshot.queued)
         request = current_request(self, ctx)
@@ -2215,7 +2316,9 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         if not accepted:
             if show_embed:
                 await ctx.send(embed=_error_embed("The queue is full or the voice session ended."))
-            return False
+            # Distinguish a full queue from a user cancellation: bulk imports
+            # report the two very differently.
+            return "capacity"
         self._guild_generations[ctx.guild.id] += 1
         self._playback_channels[ctx.guild.id] = ctx.channel
         # A separately posted player panel does not complete a deferred slash
@@ -2229,7 +2332,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                 log.debug("Could not send queued confirmation in guild %s", ctx.guild.id)
         if was_waiting and show_embed:
             await self._refresh_controller(ctx.guild.id, force=True)
-        return True
+        return "queued"
 
     async def _load_and_queue_track(
         self, ctx: commands.Context, tidal_track: Any, show_embed: bool = True,
@@ -2252,7 +2355,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         except (TypeError, ValueError):
             await ctx.send(embed=_error_embed(Messages.ERROR_FETCH_FAILED))
             return False
-        return await self._admit_entry(ctx, session, entry, show_embed=show_embed, stop_generation=stop_generation)
+        return (await self._admit_entry(ctx, session, entry, show_embed=show_embed, stop_generation=stop_generation)) == "queued"
 
     @staticmethod
     def _youtube_watch_url(video_id: str) -> str:
@@ -2366,6 +2469,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         message: discord.Message | None = None
         queued = skipped = total = 0
         status = "Cancelled"
+        capacity_hit = False
         try:
             if parsed.content_type == "track":
                 item = await self.public_audio_resolver.fetch_metadata(
@@ -2378,24 +2482,20 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             message = await ctx.send(embed=discord.Embed(title=f"Importing {label} collection", color=COLOR_BLUE))
             items = await self.public_audio_resolver.fetch_collection(parsed.identifier, 100)
             total = len(items)
-            interrupted = False
-            for item in items:
-                if (cancel.is_set() or self._closing or stop_generation != self._stop_generations[guild_id]
-                        or await self.backend.get(guild_id) is not session):
-                    interrupted = True
-                    break
-                entry = PlaybackEntry(secrets.token_hex(12), item.reference, None, item.meta, ctx.author.id)
-                if not await self._admit_entry(ctx, session, entry, show_embed=False, stop_generation=stop_generation):
-                    skipped += 1
-                    interrupted = True
-                    break
-                queued += 1
-                if queued % SEARCH_BATCH_SIZE == 0:
-                    await self._edit_progress_message(message, discord.Embed(
-                        title=f"Importing {label} collection",
-                        description=f"Queued {queued}/{total}. Skipped {skipped}.", color=COLOR_BLUE,
-                    ))
-            status = self._import_status(interrupted, cancel)
+
+            async def entries() -> AsyncIterator[PlaybackEntry]:
+                for item in items:
+                    yield PlaybackEntry(
+                        secrets.token_hex(12), item.reference, None, item.meta, ctx.author.id,
+                    )
+
+            queued, skipped, capacity_hit, interrupted = await self._admit_collection_entries(
+                ctx, session, entries(),
+                guild_id=guild_id, stop_generation=stop_generation, cancel=cancel,
+                message=message, title=f"Importing {label} collection",
+                color=COLOR_BLUE, total=total,
+            )
+            status = self._import_status(interrupted, cancel, capacity=capacity_hit)
             if queued:
                 await self._refresh_controller(guild_id, force=True)
         except asyncio.CancelledError:
@@ -2416,7 +2516,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             await self._edit_import_status(
                 message, f"{label} collection", status,
                 queued=queued, total=total, skipped=skipped, color=COLOR_BLUE,
-                pending=max(0, total - queued - skipped),
+                pending=max(0, total - queued - skipped), capacity=capacity_hit,
             )
             if cancel is not None:
                 self._release_batch(guild_id, cancel)
@@ -2583,8 +2683,10 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         track_id = str(values.get("track_id") or "")
         if track_id:
             return f"id:{track_id}"
-        title = str(values.get("title") or "").casefold().strip()
-        artist = str(values.get("artist") or "").casefold().strip()
+        # Use the same identity normalization as matching so punctuation and
+        # Unicode variants of one recording share a recommendation cache entry.
+        title = normalize_identity_text(values.get("title"))
+        artist = normalize_identity_text(values.get("artist"))
         return f"text:{artist}\x00{title}" if title or artist else ""
 
     def _cached_recommendations(self, guild_id: int, meta: TrackMeta | None) -> List[Any]:
@@ -2620,6 +2722,11 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                 # A cancelled final waiter may leave this task to finish alone.
                 if not completed.cancelled():
                     completed.exception()
+                # The result is only useful while pinned for coalescing; with
+                # every waiter gone the completed task must not linger.
+                if self._recommendation_tasks.get(guild_id) is completed:
+                    self._recommendation_tasks.pop(guild_id, None)
+                    self._recommendation_task_sources.pop(guild_id, None)
 
             task.add_done_callback(_consume_result)
             self._recommendation_tasks[guild_id] = task
@@ -3097,7 +3204,14 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             artist = getattr(artist_obj, "name", "Unknown") if artist_obj else "Unknown"
             album_obj = getattr(t, "album", None)
             album = getattr(album_obj, "name", None) if album_obj else None
-            dur = format_duration(getattr(t, "duration", 0))
+            raw_duration = getattr(t, "duration", 0)
+            dur = (
+                format_duration(raw_duration)
+                if isinstance(raw_duration, int)
+                and not isinstance(raw_duration, bool)
+                and raw_duration > 0
+                else "Unknown"
+            )
             line = f"**{i + 1}.** {escape_display(name, 200)} \u2014 {escape_display(artist, 160)}"
             if album:
                 line += f" *({escape_display(album, 160)})*"
@@ -3118,8 +3232,11 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         return selected
 
     @staticmethod
-    def _import_status(interrupted: bool, cancel: asyncio.Event) -> str:
+    def _import_status(interrupted: bool, cancel: asyncio.Event, *, capacity: bool = False) -> str:
         """One status rule for every collection import: nothing else counts as finished."""
+        if capacity:
+            # A full queue is neither a user cancellation nor a provider fault.
+            return "Stopped"
         return "Cancelled" if interrupted or cancel.is_set() else "Finished"
 
     @staticmethod
@@ -3133,6 +3250,8 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         skipped: int,
         color: int,
         pending: int = 0,
+        capacity: bool = False,
+        partial: bool = False,
     ) -> None:
         """Best-effort final edit of a collection-import progress message."""
         if message is None:
@@ -3143,6 +3262,12 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             # An interrupted import never tried everything; name the difference
             # instead of counting untouched items as failures.
             description = f"{description} {pending} not attempted."
+        if capacity:
+            description = f"{description} The queue was full; clear it and retry."
+        if partial and status == "Finished":
+            # The counted total is only what the provider listed; say so rather
+            # than presenting a truncated listing as the whole playlist.
+            description = f"{description} The playlist listing was partial; later tracks may be missing."
         embed = discord.Embed(title=title, description=description, color=color)
         try:
             await message.edit(embed=embed)
@@ -3192,7 +3317,9 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             if not isinstance(resp, dict):
                 break
             page = resp.get("items")
-            if not isinstance(page, list):
+            if not isinstance(page, list) or not page:
+                # An empty page cannot advance the offset; bail out instead of
+                # re-requesting the same window forever.
                 break
             all_items.extend(
                 item
@@ -3207,7 +3334,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             ):
                 break
             seen_next.add(next_url)
-            offset += 100
+            offset += len(page)
         return all_items[:MAX_ITEMS]
 
     async def _fetch_all_spotify_album_tracks(self, album_id: str, album_meta: dict | None = None) -> Tuple[List[Any], str]:
@@ -3228,23 +3355,23 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             if not isinstance(page, list):
                 return [], album_name
             all_items.extend(item for item in page if isinstance(item, dict))
-            next_url = tracks.get("next")
+            # `tracks` is the album's embedded paging object. Follow it with
+            # spotipy's public pagination helper rather than its private `_get`,
+            # which may not survive a spotipy upgrade.
+            resp = tracks
+            next_url = resp.get("next")
             seen_next_urls: set[str] = set()
-            max_pages = (MAX_ITEMS + PAGINATION_LIMIT - 1) // PAGINATION_LIMIT
-            pages = 1
             while (
                 isinstance(next_url, str)
                 and next_url
                 and next_url not in seen_next_urls
                 and len(all_items) < MAX_ITEMS
-                and pages < max_pages
             ):
                 seen_next_urls.add(next_url)
                 resp = await self._run_spotify(
-                    lambda client, u=next_url: client._get(u),
+                    lambda client, r=resp: client.next(r),
                     timeout=20.0,
                 )
-                pages += 1
                 if not isinstance(resp, dict):
                     break
                 page = resp.get("items")
@@ -3263,11 +3390,13 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             log.warning("Spotify album %s exceeds %s tracks; truncating import.", album_id, MAX_ITEMS)
         return all_items[:MAX_ITEMS], album_name
 
-    async def _fetch_all_youtube_tracks(self, playlist_id: str) -> List[Any]:
+    async def _fetch_all_youtube_tracks(self, playlist_id: str) -> Tuple[List[Any], bool]:
+        """Return the playlist items and whether the listing stopped early."""
         all_items: List[Any] = []
         page_token: Optional[str] = None
         seen_page_tokens: set[str] = set()
         raw_count = 0
+        truncated = False
         while raw_count < MAX_ITEMS:
             if page_token:
                 if page_token in seen_page_tokens:
@@ -3275,6 +3404,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                         "YouTube repeated a playlist page token for playlist %s; stopping import.",
                         playlist_id,
                     )
+                    truncated = True
                     break
                 seen_page_tokens.add(page_token)
             kwargs: Dict[str, Any] = {"part": "snippet", "playlistId": playlist_id, "maxResults": 50}
@@ -3285,10 +3415,12 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             )
             if not isinstance(resp, dict):
                 log.warning("YouTube returned a malformed playlist response for playlist %s.", playlist_id)
+                truncated = True
                 break
             items = resp.get("items", [])
             if not isinstance(items, list):
                 log.warning("YouTube returned malformed playlist items for playlist %s.", playlist_id)
+                truncated = True
                 break
             remaining = MAX_ITEMS - raw_count
             raw_count += max(1, len(items))
@@ -3302,10 +3434,14 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                 if title not in YOUTUBE_SKIP_TITLES:
                     all_items.append(item)
             next_page_token = resp.get("nextPageToken")
-            if not isinstance(next_page_token, str) or not next_page_token or len(all_items) >= MAX_ITEMS:
+            if not isinstance(next_page_token, str) or not next_page_token:
+                break
+            if raw_count >= MAX_ITEMS:
+                # More pages exist but the item cap was reached.
+                truncated = True
                 break
             page_token = next_page_token
-        return all_items[:MAX_ITEMS]
+        return all_items[:MAX_ITEMS], truncated
 
     async def _resolve_and_extract(
         self,
@@ -3376,7 +3512,10 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         if cancel_event is None:
             await ctx.send(embed=_error_embed(Messages.ERROR_BATCH_IN_PROGRESS))
             return
-        trunc_name = clamp_text(name, 50)
+        # Provider-controlled collection names are untrusted: escape before
+        # clamping so titles and the Source line cannot inject Markdown.
+        source_name = escape_display(name, 100)
+        trunc_name = clamp_text(source_name, 50)
         total = len(items)
         initial_embed = discord.Embed(
             title=Messages.PROGRESS_QUEUEING.format(name=trunc_name, count=total), color=color
@@ -3391,6 +3530,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             raise
         queued, skipped, last_up = 0, 0, 0
         interrupted = False
+        capacity_hit = False
         try:
             for chunk_start in range(0, total, SEARCH_BATCH_SIZE):
                 if cancel_event.is_set():
@@ -3405,11 +3545,15 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                     for item in chunk_items
                 ]
                 resolved_chunk = await asyncio.gather(*tasks)
-                chunk_queued, chunk_skipped = await self._queue_resolved_chunk(
+                chunk_queued, chunk_skipped, chunk_reason = await self._queue_resolved_chunk(
                     ctx, player, list(resolved_chunk), cancel_event
                 )
                 queued += chunk_queued
                 skipped += chunk_skipped
+                if chunk_reason is not None:
+                    capacity_hit = chunk_reason == "capacity"
+                    interrupted = True
+                    break
                 current_count = min(chunk_start + len(chunk_items), total)
                 if current_count - last_up >= BATCH_UPDATE_INTERVAL or current_count == total:
                     upd = discord.Embed(
@@ -3425,19 +3569,25 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                     last_up = current_count
                 if PROGRESS_SLEEP_INTERVAL:
                     await asyncio.sleep(PROGRESS_SLEEP_INTERVAL)
-            status = self._import_status(interrupted, cancel_event)
+            status = self._import_status(interrupted, cancel_event, capacity=capacity_hit)
             if status == "Finished":
                 final = discord.Embed(
                     title=Messages.SUCCESS_PARTIAL_QUEUE.format(queued=queued, total=total, skipped=skipped),
-                    description=f"Source: {clamp_text(name, 100)}",
+                    description=f"Source: {source_name}",
                     color=color,
                 )
             else:
                 # A cancelled import must not report a success title for a
                 # partial queue.
+                description = f"Queued {queued}/{total}. Skipped {skipped}."
+                pending = max(0, total - queued - skipped)
+                if pending:
+                    description += f" {pending} not attempted."
+                if capacity_hit:
+                    description += " The queue was full; clear it and retry."
                 final = discord.Embed(
                     title=f"{status} importing {trunc_name}",
-                    description=f"Queued {queued}/{total}. Skipped {skipped}.",
+                    description=description,
                     color=color,
                 )
             if thumbnail_url:
@@ -3511,14 +3661,20 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
     async def _play_request(self, ctx: commands.Context, *, query: str, platform: Literal["tidal", "youtube", "soundcloud"] | None = None) -> None:
         """Handle regular provider links, ISRCs, and search queries."""
         await self._defer(ctx)
-        if not query or not query.strip():
+        # Normalize once: every downstream matcher (URL, ISRC, search) should
+        # see the same text, or a stray trailing space defeats anchored ISRC
+        # detection while the empty check still passes.
+        query = query.strip() if isinstance(query, str) else ""
+        if not query:
             await self._reply(ctx, "Use `play <link/search>` or `playfile` for uploaded audio. See `musichelp`.")
             return
         if self._closing or not self._initialized:
             await ctx.send(embed=_error_embed(Messages.ERROR_STILL_LOADING))
             return
         try:
-            provider_url = parse_provider_url(query)
+            # ``isrc:`` is search syntax, not a URL scheme; validating it as a
+            # provider URL would reject every ISRC before the ISRC branch runs.
+            provider_url = None if ISRC_PATTERN.match(query) else parse_provider_url(query)
         except MalformedProviderURL:
             await ctx.send(embed=_error_embed(Messages.ERROR_INVALID_URL.format(platform="provider", content_type="link")))
             return
@@ -3531,7 +3687,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             return
         external_search = provider_url is None and platform in {"youtube", "soundcloud"}
         if external_search and (
-            len(query.strip()) > 300
+            len(query) > 300
             or any(ord(char) < 32 or unicodedata.category(char) == "Cc" for char in query)
         ):
             await self._reply(ctx, "Search terms must be at most 300 characters and contain no control characters.")
@@ -3727,7 +3883,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             session = await self._prepare_playback_session(ctx)
             if session is not None:
                 entry = PlaybackEntry(secrets.token_hex(12), reference, None, metadata, ctx.author.id)
-                admitted = await self._admit_entry(ctx, session, entry)
+                admitted = (await self._admit_entry(ctx, session, entry)) == "queued"
         finally:
             if not admitted:
                 snapshot = session.snapshot() if session is not None else None
@@ -3830,12 +3986,15 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
         message: discord.Message | None = None
         queued = skipped = total = 0
         status = "Cancelled"
+        capacity_hit = False
+        truncated = False
+        no_tracks = False
         try:
             message = await ctx.send(embed=discord.Embed(title="Importing YouTube playlist", color=COLOR_RED))
             videos: list[YouTubeVideoMetadata] = []
             if await self._youtube_ready():
                 try:
-                    items = await self._fetch_all_youtube_tracks(playlist_id)
+                    items, truncated = await self._fetch_all_youtube_tracks(playlist_id)
                     for item in items:
                         try:
                             snippet = item["snippet"]
@@ -3848,44 +4007,49 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
                     _log_provider_failure("YouTube", "playlist API", error)
             if not videos and not cancel.is_set():
                 videos = list(await self.youtube_resolver.fetch_playlist(playlist_id, 100))
+                # The keyless resolver stops at 100 entries, so reaching that
+                # bound means the playlist may hold more.
+                truncated = len(videos) >= 100
             deduplicated: dict[str, YouTubeVideoMetadata] = {}
             for video in videos:
                 if video.title.casefold() not in YOUTUBE_SKIP_TITLES:
                     deduplicated.setdefault(video.video_id, video)
             videos = list(deduplicated.values())[:MAX_ITEMS]
             total = len(videos)
-            interrupted = False
-            for start in range(0, total, SEARCH_BATCH_SIZE):
-                if (cancel.is_set() or self._closing or stop_generation != self._stop_generations[guild_id]
-                        or await self.backend.get(guild_id) is not session):
-                    interrupted = True
-                    break
-                entries = await asyncio.gather(
-                    *(self._youtube_entry(video, ctx.author.id) for video in videos[start:start + SEARCH_BATCH_SIZE]),
-                    return_exceptions=True,
-                )
-                for entry in entries:
-                    if (cancel.is_set() or self._closing or stop_generation != self._stop_generations[guild_id]
-                            or await self.backend.get(guild_id) is not session):
-                        interrupted = True
-                        break
-                    if isinstance(entry, BaseException):
-                        # One unavailable video must not abort the whole
-                        # playlist; count it as skipped and keep importing.
-                        skipped += 1
-                        continue
-                    if not await self._admit_entry(ctx, session, entry, show_embed=False, stop_generation=stop_generation):
-                        skipped += 1
-                        interrupted = True
-                        break
-                    queued += 1
-                if interrupted:
-                    break
-                await self._edit_progress_message(message, discord.Embed(
-                    title="Importing YouTube playlist",
-                    description=f"Queued {queued}/{total}. Skipped {skipped}.", color=COLOR_RED,
-                ))
-            status = self._import_status(interrupted, cancel)
+            session_current = await self.backend.get(guild_id) is session
+            # A playlist that resolved to nothing usable is a failure, not a
+            # successful "Queued 0/0" import. A stop, shutdown, or session
+            # change during resolution stays on the interrupted path.
+            no_tracks = (
+                total == 0
+                and not cancel.is_set()
+                and not self._closing
+                and stop_generation == self._stop_generations[guild_id]
+                and session_current
+            )
+            interrupted = total == 0 and not no_tracks
+
+            async def entries() -> AsyncIterator[PlaybackEntry | BaseException]:
+                for start in range(0, total, SEARCH_BATCH_SIZE):
+                    batch = await asyncio.gather(
+                        *(self._youtube_entry(video, ctx.author.id)
+                          for video in videos[start:start + SEARCH_BATCH_SIZE]),
+                        return_exceptions=True,
+                    )
+                    for entry in batch:
+                        yield entry
+
+            queued, skipped, capacity_hit, interrupted = await self._admit_collection_entries(
+                ctx, session, entries(),
+                guild_id=guild_id, stop_generation=stop_generation, cancel=cancel,
+                message=message, title="Importing YouTube playlist",
+                color=COLOR_RED, total=total,
+            )
+            if total == 0 and not no_tracks:
+                # Nothing was yielded, so the stream could not report the stop
+                # or session change that made the empty result unusable.
+                interrupted = True
+            status = self._import_status(interrupted, cancel, capacity=capacity_hit)
             if queued:
                 await self._refresh_controller(guild_id, force=True)
         except asyncio.CancelledError:
@@ -3895,11 +4059,18 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             _log_provider_failure("YouTube", "playlist import", error)
             await ctx.send(embed=_error_embed(Messages.ERROR_FETCH_FAILED))
         finally:
-            await self._edit_import_status(
-                message, "YouTube playlist", status,
-                queued=queued, total=total, skipped=skipped, color=COLOR_RED,
-                pending=max(0, total - queued - skipped),
-            )
+            if no_tracks and message is not None:
+                try:
+                    await message.edit(embed=_error_embed(Messages.ERROR_NO_TRACKS_FOUND))
+                except Exception:
+                    pass
+            else:
+                await self._edit_import_status(
+                    message, "YouTube playlist", status,
+                    queued=queued, total=total, skipped=skipped, color=COLOR_RED,
+                    pending=max(0, total - queued - skipped), capacity=capacity_hit,
+                    partial=truncated,
+                )
             self._release_batch(guild_id, cancel)
 
     @commands.hybrid_command(name="tidalsearch")
@@ -4030,6 +4201,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
     @commands.guild_only()
     async def tpl_add(self, ctx: commands.Context, playlist_id: str, *, query: str):
         """Add a track (by search or ISRC) to one of your playlists."""
+        query = query.strip()
         if not await self.check_ready(ctx):
             return
         pl = await self.tidal.get_user_playlist_by_id(playlist_id)
@@ -4044,7 +4216,9 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
             filter_remixes = await self.config.guild(ctx.guild).filter_remixes()
             results = await self.tidal.search(query, filter_remixes=filter_remixes)
             if results:
-                track = results[0]
+                # Match the query like every other search path instead of
+                # grabbing the first result, which is often a cover or remix.
+                track = select_best_tidal_track(query, results)
         if not track:
             await ctx.send(embed=_error_embed(Messages.ERROR_NO_TRACKS_FOUND))
             return

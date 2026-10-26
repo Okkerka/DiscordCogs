@@ -111,12 +111,17 @@ def classify_media_host(hostname: str) -> str:
             address = address.ipv4_mapped
         if address.is_loopback:
             return LOOPBACK
+        # is_global is False for every non-routable range, including shared
+        # carrier-grade NAT space (100.64.0.0/10) that the individual flags
+        # above would classify as public. Keep the explicit flags too:
+        # multicast is reported as global by the standard library.
         if (
             address.is_private
             or address.is_link_local
             or address.is_multicast
             or address.is_reserved
             or address.is_unspecified
+            or not address.is_global
         ):
             return BLOCKED
         return PUBLIC

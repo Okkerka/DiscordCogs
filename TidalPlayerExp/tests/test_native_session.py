@@ -392,6 +392,42 @@ async def test_skip_inside_a_rebuffer_window_drops_the_parked_replacement():
 
 
 @pytest.mark.asyncio
+async def test_skip_inside_a_rebuffer_window_advances_to_queued_track():
+    """Skipping a parked replacement must not strand the rest of the queue."""
+    session, voice, resolver, factory, sink = setup()
+    release = threading.Event()
+    try:
+        assert await session.enqueue(entry(1))
+        assert await session.enqueue(entry(2))
+        await sink.expect("started")
+        shown = session.snapshot().current
+        source = factory.sources[0]
+        original_cleanup = source.cleanup
+        entered = asyncio.Event()
+
+        def blocking_cleanup() -> None:
+            entered.set()
+            release.wait(2)
+            original_cleanup()
+
+        source.cleanup = blocking_cleanup
+        seeking = asyncio.create_task(session.seek(5))
+        await asyncio.wait_for(entered.wait(), 2)
+
+        assert await session.skip(entry_id=shown.entry_id) is True
+        release.set()
+        await asyncio.gather(seeking)
+
+        await sink.expect("started")
+        snapshot = session.snapshot()
+        assert snapshot.current.entry_id == "2"
+        assert snapshot.queued == ()
+    finally:
+        release.set()
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_unscoped_skip_inside_a_rebuffer_window_drops_the_replacement():
     session, voice, resolver, factory, sink = setup()
     release = threading.Event()

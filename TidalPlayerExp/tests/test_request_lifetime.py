@@ -74,7 +74,7 @@ async def test_search_defers_before_provider_readiness(cog):
 async def test_aborted_admission_finishes_slash_response(cog, native_session):
     ctx = context()
     cog._stop_generations[1] = 1
-    assert not await cog._admit_entry(ctx, native_session, make_entry(), stop_generation=0)
+    assert await cog._admit_entry(ctx, native_session, make_entry(), stop_generation=0) == "cancelled"
     assert ctx.send.await_count == 1
 
 
@@ -88,3 +88,6 @@ async def test_full_queue_stops_further_batch_resolution(cog, native_session):
     await cog._process_track_list(ctx, list(range(24)), "Collection", lambda item: item)
     assert cog._resolve_and_extract.await_count <= 8
     assert native_session.enqueue.await_count == 1
+    final = ctx.send.return_value.edit.await_args.kwargs["embed"]
+    assert "Stopped importing" in final.title
+    assert "The queue was full; clear it and retry." in final.description

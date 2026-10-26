@@ -24,6 +24,7 @@ import discord
 from discord import oggparse
 
 from ..domain.media_hosts import LOOPBACK, PUBLIC, classify_media_host
+from ._tasks import retain_task
 from .errors import PlaybackStartError, PlaybackUnavailable
 from .models import ResolvedSource
 
@@ -132,6 +133,10 @@ class _StderrReader:
                 target=self._drain, args=(stream,), name="tidal_ffmpeg_stderr", daemon=True,
             )
             self._thread.start()
+
+    def clear_reason(self) -> None:
+        """Forget a transient provider warning once audio flow has resumed."""
+        self.reason = None
 
     def _drain(self, stream: BinaryIO) -> None:
         tail = b""
@@ -451,6 +456,11 @@ class _FFmpegAudioSource(discord.AudioSource):
             return b""
         if self._copied and not _opus_packet_is_20ms(packet):
             raise _InvalidPacketDuration
+        # A packet arriving after a diagnostic proves the connection recovered.
+        # Clear the sticky reason so an early "reconnect" warning cannot fail a
+        # track that played to completion; only an error that outlives the last
+        # packet survives to the EOF check.
+        self._stderr.clear_reason()
         return packet
 
     def prime(self) -> None:
@@ -591,7 +601,9 @@ class FFmpegSourceFactory:
             return
         if self._capability_task is task:
             self._capability_task = None
-        self._record_failure("capability_probe_failed")
+        # Keep the doctor's "<category> (exit=...)" shape so its filter shows
+        # the single most actionable startup failure.
+        self._record_failure("capability_probe_failed (exit=unknown)")
 
     async def close(self) -> None:
         """Reject new work and account for the factory's bounded background work."""
@@ -745,14 +757,7 @@ class FFmpegSourceFactory:
 
     def _retain_background_task(self, task: asyncio.Task[None]) -> None:
         """Keep and consume a bounded task whose caller was cancelled."""
-
-        def task_finished(finished: asyncio.Task[None]) -> None:
-            self._cleanup_tasks.discard(finished)
-            if not finished.cancelled():
-                finished.exception()
-
-        self._cleanup_tasks.add(task)
-        task.add_done_callback(task_finished)
+        retain_task(self._cleanup_tasks, task)
 
     async def _construct(
         self, capability: FFmpegCapability, source: ResolvedSource, *, copied: bool

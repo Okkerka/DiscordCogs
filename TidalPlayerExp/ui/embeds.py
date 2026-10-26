@@ -46,7 +46,14 @@ class Messages:
 
 def display_source(meta: TrackMeta) -> str:
     source = str(meta.get("source") or "Tidal")
-    return {"soundcloud": "SoundCloud", "bandcamp": "Bandcamp"}.get(source.casefold(), source)
+    # Fallback entries carry the enum slug ("youtube", "tidal_video"); the UI
+    # labels the same sources with their proper names elsewhere.
+    return {
+        "soundcloud": "SoundCloud",
+        "bandcamp": "Bandcamp",
+        "youtube": "YouTube",
+        "tidal_video": "TIDAL",
+    }.get(source.casefold(), source)
 
 
 def source_link_label(meta: TrackMeta) -> str:

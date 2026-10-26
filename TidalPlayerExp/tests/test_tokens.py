@@ -122,6 +122,13 @@ class TestTokenSnapshot:
         with pytest.raises((AttributeError, TypeError)):
             snap.access_token = "mutated"  # type: ignore[misc]
 
+    def test_repr_redacts_credentials(self) -> None:
+        snap = TokenSnapshot("Bearer", "secret-access-value", "secret-refresh-value", 9_999_999_999)
+        rendered = repr(snap)
+        assert "secret-access-value" not in rendered
+        assert "secret-refresh-value" not in rendered
+        assert "Bearer" in rendered
+
 
 # ---------------------------------------------------------------------------
 # TokenRepository

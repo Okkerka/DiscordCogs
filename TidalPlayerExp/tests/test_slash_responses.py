@@ -28,7 +28,7 @@ async def test_first_track_admission_completes_slash_response_only(cog, native_s
         interaction=object() if slash else None,
         send=AsyncMock(return_value=SimpleNamespace(delete=AsyncMock())),
     )
-    assert await cog._admit_entry(ctx, native_session, queued)
+    assert await cog._admit_entry(ctx, native_session, queued) == "queued"
     if slash:
         ctx.send.assert_awaited_once()
         assert ctx.send.await_args.kwargs["embed"].title == "Song added to the queue"
