@@ -217,3 +217,52 @@ async def test_vision_failure_does_not_search_invented_observations(cog):
         )
     assert cog._ask_groq.await_count == 1
     assert not cog._operations
+
+
+def test_incidental_gif_in_replied_message_is_skipped():
+    collector = ImageCollector()
+    collector.add_message(
+        SimpleNamespace(
+            attachments=[
+                attachment(
+                    filename="animation.gif", content_type="image/gif", url="https://cdn.discordapp.com/attachments/10/9/a.gif"
+                ),
+                attachment(2),
+            ],
+            embeds=[],
+        ),
+        explicit=False,
+    )
+    assert collector.urls == [attachment(2).url]
+
+
+def test_incidental_oversized_reply_image_is_skipped():
+    collector = ImageCollector()
+    collector.add_message(
+        SimpleNamespace(attachments=[attachment(size=9 * 1024 * 1024)], embeds=[]),
+        explicit=False,
+    )
+    assert collector.urls == []
+
+
+def test_incidental_untrusted_embed_image_is_skipped():
+    collector = ImageCollector()
+    collector.add_message(
+        SimpleNamespace(
+            attachments=[],
+            embeds=[
+                discord.Embed.from_dict(
+                    {"image": {"url": "https://example.org/tracker.png"}}
+                )
+            ],
+        ),
+        explicit=False,
+    )
+    assert collector.urls == []
+
+
+def test_explicit_gif_attachment_is_rejected():
+    with pytest.raises(ProviderError, match="GIF"):
+        ImageCollector().add_attachment(
+            attachment(filename="a.gif", content_type="image/gif"), explicit=True
+        )

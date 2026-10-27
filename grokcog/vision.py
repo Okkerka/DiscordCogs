@@ -53,11 +53,18 @@ class ImageCollector:
     urls: list[str] = field(default_factory=list)
     known_bytes: int = 0
 
-    def _add(self, url: str, size: int = 0) -> None:
-        url = validate_image_url(url)
+    def _add(self, url: str, size: int = 0, *, explicit: bool = True) -> None:
+        try:
+            url = validate_image_url(url)
+        except ProviderError:
+            if explicit:
+                raise
+            return
         if url in self.urls:
             return
         if len(self.urls) >= 3:
+            if not explicit:
+                return
             raise ProviderError(
                 "Use at most 3 images per question, including images in the replied-to message."
             )
@@ -66,15 +73,22 @@ class ImageCollector:
             or size > 8 * 1024 * 1024
             or self.known_bytes + size > 16 * 1024 * 1024
         ):
+            if not explicit:
+                return
             raise ProviderError("Use images up to 8 MB each and 16 MB total.")
         self.known_bytes += size
         self.urls.append(url)
 
     def add_attachment(
-        self, attachment: discord.Attachment, *, explicit: bool = False
+        self, attachment: discord.Attachment, *, explicit: bool = True
     ) -> None:
-        """Include supported image attachments; ignore unrelated files unless explicitly selected."""
-        mime = attachment.content_type or ""
+        """Include supported image attachments; skip unrelated or unusable files.
+
+        An image the user explicitly attached is an error when unusable. A GIF, an
+        oversized file or an untrusted embed in a replied-to message is incidental
+        context and must not sink the whole question.
+        """
+        mime = (attachment.content_type or "").lower()
         suffix = attachment.filename.rsplit(".", 1)[-1].lower()
         if mime not in {"image/png", "image/jpeg", "image/webp"} and suffix not in {
             "png",
@@ -82,19 +96,23 @@ class ImageCollector:
             "jpeg",
             "webp",
         }:
-            if explicit or mime.startswith("image/"):
+            if explicit:
                 raise ProviderError(
                     "Use a PNG, JPEG or WebP image. Video, GIF and document reading are not supported."
                 )
             return
-        self._add(attachment.url, attachment.size)
+        self._add(attachment.url, attachment.size, explicit=explicit)
 
-    def add_message(self, message: discord.Message) -> None:
-        """Collect attachments and embedded images, excluding author icons/avatars."""
+    def add_message(self, message: discord.Message, *, explicit: bool = False) -> None:
+        """Collect attachments and embedded images, excluding author icons/avatars.
+
+        The invoking message is explicit evidence; a replied-to message is incidental
+        context, so unusable visuals there are skipped instead of failing the request.
+        """
         for attachment in getattr(message, "attachments", []):
-            self.add_attachment(attachment)
+            self.add_attachment(attachment, explicit=explicit)
         for embed in getattr(message, "embeds", []):
             for visual in (embed.image, embed.thumbnail):
                 url = visual.proxy_url or visual.url
                 if url:
-                    self._add(url)
+                    self._add(url, explicit=explicit)

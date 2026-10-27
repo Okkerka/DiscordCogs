@@ -705,3 +705,170 @@ async def test_actual_weapon_ranking_description_reaches_search(cog):
     quoted = json.loads(query.split("\n\nUser question:", 1)[0].split("\n", 1)[1])
     assert description in quoted and footer in quoted
     assert cog._run_request.call_args.args[2] is True
+
+@pytest.mark.asyncio
+async def test_validation_failure_does_not_consume_cooldown(cog):
+    await cog.config.cooldown_seconds.set(3600)
+    ctx = context()
+    cog._run_request = AsyncMock(return_value=answer())
+    await cog._process(ctx, "is this true?")
+    assert "which claim" in ctx.send.call_args.args[0].lower()
+    await cog._process(ctx, "what is 9x9?")
+    ctx.reply.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_provider_error_does_not_consume_cooldown(cog):
+    await cog.config.cooldown_seconds.set(3600)
+    ctx = context()
+    cog._run_request = AsyncMock(side_effect=ProviderError("provider down"))
+    await cog._process(ctx, "first")
+    cog._run_request = AsyncMock(return_value=answer())
+    await cog._process(ctx, "second")
+    ctx.reply.assert_awaited_once()
+    assert "provider down" in ctx.send.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_prefix_cancel_acknowledges_once(cog):
+    stream_ctx = context()
+    started = asyncio.Event()
+
+    async def request(*args):
+        started.set()
+        await asyncio.Event().wait()
+
+    cog._run_request = request
+    task = asyncio.create_task(cog._process(stream_ctx, "one"))
+    await started.wait()
+
+    cancel_ctx = context()
+    await GrokCog.grok_cancel.callback(cog, cancel_ctx)
+    await asyncio.gather(task, return_exceptions=True)
+    cancel_ctx.send.assert_awaited_once()
+    assert "cancelled" in cancel_ctx.send.call_args.args[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_slash_cancel_acknowledges_once(cog):
+    stream_ctx = context(slash=True)
+    started = asyncio.Event()
+
+    async def request(*args):
+        started.set()
+        await asyncio.Event().wait()
+
+    cog._run_request = request
+    task = asyncio.create_task(cog._process(stream_ctx, "one"))
+    await started.wait()
+
+    cancel_ctx = context(slash=True)
+    await GrokCog.grok_cancel.callback(cog, cancel_ctx)
+    await asyncio.gather(task, return_exceptions=True)
+    cancel_ctx.send.assert_not_awaited()
+    assert "cancelled" in stream_ctx.send.call_args.args[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_mention_with_only_an_image_asks_about_it(cog):
+    bot_user = SimpleNamespace(id=99)
+    cog.bot = SimpleNamespace(
+        user=bot_user,
+        cog_disabled_in_guild=AsyncMock(return_value=False),
+        allowed_by_whitelist_blacklist=AsyncMock(return_value=True),
+        ignored_channel_or_guild=AsyncMock(return_value=True),
+        get_context=AsyncMock(return_value=context()),
+    )
+    cog._process = AsyncMock()
+    image = SimpleNamespace(
+        url="https://cdn.discordapp.com/attachments/1/2/a.png",
+        filename="a.png",
+        content_type="image/png",
+        size=10,
+    )
+    await cog.on_message(
+        SimpleNamespace(
+            author=SimpleNamespace(bot=False),
+            guild=SimpleNamespace(id=20),
+            channel=SimpleNamespace(id=10),
+            content="<@99>",
+            mentions=[bot_user],
+            reference=None,
+            attachments=[image],
+            embeds=[],
+        )
+    )
+    cog._process.assert_awaited_once()
+    assert cog._process.call_args.args[1] == "What does this image say?"
+
+
+@pytest.mark.asyncio
+async def test_mention_without_text_or_image_is_ignored(cog):
+    bot_user = SimpleNamespace(id=99)
+    cog.bot = SimpleNamespace(
+        user=bot_user,
+        cog_disabled_in_guild=AsyncMock(return_value=False),
+        allowed_by_whitelist_blacklist=AsyncMock(return_value=True),
+        ignored_channel_or_guild=AsyncMock(return_value=True),
+        get_context=AsyncMock(return_value=context()),
+    )
+    cog._process = AsyncMock()
+    await cog.on_message(
+        SimpleNamespace(
+            author=SimpleNamespace(bot=False),
+            guild=SimpleNamespace(id=20),
+            channel=SimpleNamespace(id=10),
+            content="<@99>",
+            mentions=[bot_user],
+            reference=None,
+            attachments=[],
+            embeds=[],
+        )
+    )
+    cog._process.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_grok_without_arguments_shows_help(cog):
+    ctx = context()
+    ctx.command = SimpleNamespace(qualified_name="grok")
+    ctx.send_help = AsyncMock()
+    await GrokCog.grok.callback(cog, ctx)
+    ctx.send_help.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_grok_with_only_an_image_asks_about_it(cog):
+    ctx = context()
+    cog._process = AsyncMock()
+    image = SimpleNamespace(
+        url="https://cdn.discordapp.com/attachments/1/2/a.png",
+        filename="a.png",
+        content_type="image/png",
+        size=10,
+    )
+    await GrokCog.grok.callback(cog, ctx, image=image)
+    assert cog._process.call_args.args[1] == "What does this image say?"
+
+
+@pytest.mark.asyncio
+async def test_model_list_chunks_on_line_boundaries(cog):
+    models = [f"vendor/model-{index:03d}-" + "x" * 60 for index in range(40)]
+    cog._models = AsyncMock(return_value=models)
+    ctx = context()
+    await GrokCog.grok_models.callback(cog, ctx)
+    sent = [call.args[0] for call in ctx.send.await_args_list]
+    assert len(sent) > 1
+    assert "\n".join(sent) == "\n".join(models)
+    assert all(len(chunk) <= 1800 for chunk in sent)
+
+
+def test_answer_pages_split_on_boundaries_and_close_code_fences():
+    text = "```python\n" + "\n".join(f"print({index})" for index in range(900)) + "\n```"
+    pages = answer_pages({"answer": text, "sources": []})
+    descriptions = [embed.description for embed in pages]
+    assert len(descriptions) > 1
+    for description in descriptions:
+        assert description.count("```") % 2 == 0
+    assert "print(0)" in descriptions[0]
+    assert "print(899)" in descriptions[-1]

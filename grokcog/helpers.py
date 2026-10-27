@@ -198,6 +198,35 @@ def response_answer(data: dict, selected: str, search: bool) -> Answer:
     return answer
 
 
+def split_pages(text: str, limit: int = 3800) -> list[str]:
+    """Split text near a paragraph, line or word boundary instead of mid-token.
+
+    Code fences are closed on the page that ends inside them and reopened on the
+    next page, so Discord never renders a half-finished block.
+    """
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        window = remaining[:limit]
+        cut = window.rfind("\n\n")
+        if cut < limit // 2:
+            cut = window.rfind("\n")
+        if cut < limit // 2:
+            cut = window.rfind(" ")
+        if cut <= 0:
+            cut = limit
+        piece = remaining[:cut].rstrip()
+        rest = remaining[cut:].lstrip("\n")
+        if piece.count("```") % 2:
+            piece += "\n```"
+            rest = "```\n" + rest
+        chunks.append(piece)
+        remaining = rest
+    if remaining.strip():
+        chunks.append(remaining)
+    return chunks or ["No response."]
+
+
 def answer_pages(data: Answer) -> list[discord.Embed]:
     """Split the full answer into Discord-sized pages."""
     text = data.get("answer") or "No response."
@@ -207,7 +236,7 @@ def answer_pages(data: Answer) -> list[discord.Embed]:
             f"{i}. [{discord.utils.escape_markdown(source['title'])}]({source['url'].replace(')', '%29').replace('(', '%28')})"
             for i, source in enumerate(sources, 1)
         )
-    chunks = [text[i : i + 3800] for i in range(0, len(text), 3800)]
+    chunks = split_pages(text)
     pages = []
     for index, chunk in enumerate(chunks, 1):
         embed = discord.Embed(

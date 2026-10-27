@@ -296,7 +296,7 @@ class GrokCog(commands.Cog):
         image_inputs: ImageCollector | None = None,
     ) -> str:
         if image_inputs is not None:
-            image_inputs.add_message(message)
+            image_inputs.add_message(message, explicit=True)
         reference = message.reference
         if not reference:
             if not (image_inputs and image_inputs.urls) and re.fullmatch(
@@ -470,13 +470,13 @@ class GrokCog(commands.Cog):
                 self._cooldowns = {
                     uid: ts for uid, ts in self._cooldowns.items() if now - ts < 3600
                 }
-                remaining = self._cooldowns.get(user_id, -3600) + cooldown - now
-                if remaining > 0:
+                last = self._cooldowns.get(user_id)
+                if last is not None and now - last < cooldown:
+                    remaining = cooldown - (now - last)
                     await ctx.send(
                         f"Please wait {remaining:.1f}s before another question."
                     )
                     return
-                self._cooldowns[user_id] = now
                 image_inputs = ImageCollector()
                 if image:
                     image_inputs.add_attachment(image, explicit=True)
@@ -535,6 +535,10 @@ class GrokCog(commands.Cog):
                         self._cache[key] = (time.monotonic(), result)
                         while len(self._cache) > 256:
                             self._cache.pop(next(iter(self._cache)))
+                if cooldown:
+                    # Only a request that produced an answer consumes the cooldown;
+                    # validation, cancellation and provider errors stay free.
+                    self._cooldowns[user_id] = time.monotonic()
                 pages = answer_pages(result)
                 view = AnswerPages(user_id, pages) if len(pages) > 1 else None
                 if view:
@@ -550,9 +554,12 @@ class GrokCog(commands.Cog):
                     sent = await ctx.send(**kwargs)
                 if view:
                     view.message = sent
-                async with self.config.user(ctx.author).all() as stats:
-                    stats["request_count"] = stats.get("request_count", 0) + 1
-                    stats["last_request_time"] = time.time()
+                try:
+                    async with self.config.user(ctx.author).all() as stats:
+                        stats["request_count"] = stats.get("request_count", 0) + 1
+                        stats["last_request_time"] = time.time()
+                except Exception:  # noqa: BLE001 -- stats must never fail a delivered answer
+                    log.warning("Could not record assistant usage stats")
         except asyncio.CancelledError:
             if self._ready.is_set() and ctx.interaction is not None:
                 try:
@@ -603,18 +610,29 @@ class GrokCog(commands.Cog):
         elif not (is_mention or is_reply_to_me):
             return
         content = re.sub(rf"<@!?{self.bot.user.id}>", "", msg.content).strip()
-        if content:
-            await self._process(ctx, content)
+        if not content:
+            has_image = bool(msg.attachments) or (
+                isinstance(replied, discord.Message) and bool(replied.attachments)
+            )
+            if not has_image:
+                return
+            content = "What does this image say?"
+        await self._process(ctx, content)
 
     @commands.hybrid_group(name="grok", fallback="ask", invoke_without_command=True)
     async def grok(
         self,
         ctx: commands.Context,
         *,
-        question: str,
+        question: str | None = None,
         image: discord.Attachment | None = None,
     ) -> None:
         """Ask a question; fact checks automatically search for evidence."""
+        if not (question and question.strip()):
+            if image is None:
+                await ctx.send_help(ctx.command)
+                return
+            question = "What does this image say?"
         await self._process(ctx, question, image=image)
 
     @grok.command(name="search")
@@ -632,13 +650,15 @@ class GrokCog(commands.Cog):
     async def grok_cancel(self, ctx: commands.Context) -> None:
         """Cancel your current question or queued request."""
         task = self._active.get(ctx.author.id)
-        if task:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        await ctx.send(
-            "Request cancelled." if task else "You have no active request.",
-            ephemeral=True,
-        )
+        if task is None:
+            await ctx.send("You have no active request.", ephemeral=True)
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        # A cancelled interaction answers itself inside _process; prefix invocations
+        # have no followup, so the confirmation is sent here instead.
+        if ctx.interaction is None:
+            await ctx.send("Request cancelled.", ephemeral=True)
 
     @grok.command(name="stats")
     async def grok_stats(self, ctx: commands.Context) -> None:
@@ -676,7 +696,7 @@ class GrokCog(commands.Cog):
                         }
                     )
                     if epoch == self._cache_epoch:
-                        self._models_cache = (now, models)
+                        self._models_cache = (time.monotonic(), models)
                     return models
         except asyncio.TimeoutError as exc:
             raise ProviderError(
@@ -695,10 +715,21 @@ class GrokCog(commands.Cog):
             except ProviderError as exc:
                 await ctx.send(str(exc))
                 return
-            text = "\n".join(models) or "No models available."
-            for offset in range(0, len(text), 1800):
+            entries = models or ["No models available."]
+            chunks: list[str] = []
+            current = ""
+            for entry in entries:
+                candidate = f"{current}\n{entry}" if current else entry
+                if len(candidate) > 1800:
+                    chunks.append(current)
+                    current = entry
+                else:
+                    current = candidate
+            if current:
+                chunks.append(current)
+            for chunk in chunks:
                 await ctx.send(
-                    text[offset : offset + 1800],
+                    chunk,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
 
