@@ -118,6 +118,23 @@ def _discard_task_exception(task: asyncio.Task[Any]) -> None:
         task.exception()
 
 
+async def _await_detached(
+    future: "asyncio.Future[Any]", timeout: Optional[float] = None
+) -> Any:
+    """Await ``future`` without cancelling or reporting on its behalf.
+
+    ``asyncio.shield`` installs a late-exception logger on the inner future
+    when its waiter is abandoned (Python 3.14), so a provider error arriving
+    after a timeout or cancellation is written to the loop exception handler
+    even when the owner retrieves it. ``asyncio.wait`` leaves the future
+    running for its owner, whose callbacks stay the only readers.
+    """
+    done, _ = await asyncio.wait((future,), timeout=timeout)
+    if not done:
+        raise asyncio.TimeoutError
+    return future.result()
+
+
 def _base_title(title: Any) -> str:
     """Return a title without its parenthesised version suffix.
 
@@ -468,8 +485,9 @@ class TidalHandler:
                     completed.exception()
 
             task.add_done_callback(_cleanup)
-        # Do not let cancellation of one Discord command cancel the shared request.
-        return await asyncio.shield(task)
+        # Do not let cancellation of one Discord command cancel the shared
+        # request, and do not let an abandoned shield report its late error.
+        return await _await_detached(task)
 
     async def _run_blocking(self, func: Callable[[], Any], timeout: float = 10.0) -> Any:
         if timeout <= 0:
@@ -493,9 +511,9 @@ class TidalHandler:
                 completed.exception()
 
         future.add_done_callback(_completed)
-        # Shielding is deliberate: cancelling the waiter must not falsely free
+        # Detaching is deliberate: cancelling the waiter must not falsely free
         # a worker while its synchronous provider request is still running.
-        return await asyncio.wait_for(asyncio.shield(future), timeout=remaining)
+        return await _await_detached(future, timeout=remaining)
 
     async def _await_device_login(self, future: Any, login_url: Any) -> None:
         """Wait for tidalapi's device-code future without pinning an executor worker.
@@ -2734,7 +2752,7 @@ class TidalPlayerExp(PlaybackCommands, commands.Cog):
 
         failed = False
         try:
-            recommendations = await asyncio.shield(task)
+            recommendations = await _await_detached(task)
         except asyncio.CancelledError:
             raise
         except Exception as error:

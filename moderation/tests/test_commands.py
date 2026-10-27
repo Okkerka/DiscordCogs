@@ -160,3 +160,29 @@ async def test_purge_anchors_before_slash_invocation_and_rejects_human_bot_filte
     await cog._purge_messages(ctx, 100, "bots")
     assert channel.purge.call_args.kwargs["before"].id == 123
     assert ctx.send.call_args.kwargs["ephemeral"]
+
+
+@pytest.mark.asyncio
+async def test_guild_join_loads_moderation_caches():
+    cog = object.__new__(Moderation)
+    cog._blocked_cache = {}
+    cog._moderator_cache = {}
+    cog.config = SimpleNamespace(
+        guild_from_id=lambda _gid: SimpleNamespace(
+            all=AsyncMock(return_value={"blocked_users": [11], "moderators": [22]})
+        )
+    )
+    await Moderation.on_guild_join(cog, SimpleNamespace(id=7))
+    assert cog._blocked_cache[7] == {11}
+    assert cog._moderator_cache[7] == {22}
+    assert not hasattr(Moderation, "on_guild_add")
+
+
+@pytest.mark.asyncio
+async def test_slowmode_rejects_non_decimal_digits():
+    cog = object.__new__(Moderation)
+    channel = SimpleNamespace(mention="#test", edit=AsyncMock())
+    ctx = SimpleNamespace(send=AsyncMock())
+    await Moderation.slowmode.callback(cog, ctx, "²", channel=channel)
+    channel.edit.assert_not_awaited()
+    assert "Invalid duration" in ctx.send.await_args.args[0]

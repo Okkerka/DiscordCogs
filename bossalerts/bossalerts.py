@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -60,6 +61,7 @@ class BossAlerts(commands.Cog):
             doom_offset=DEFAULT_ALERT_OFFSET_SECONDS,
         )
         self._scheduler_tasks: dict[str, asyncio.Task[None]] = {}
+        self._cleanup_tasks: set[asyncio.Task[None]] = set()
 
     async def cog_load(self) -> None:
         self._scheduler_tasks["parasol"] = asyncio.create_task(
@@ -70,9 +72,22 @@ class BossAlerts(commands.Cog):
         )
 
     def cog_unload(self) -> None:
-        for task in self._scheduler_tasks.values():
+        for task in (*self._scheduler_tasks.values(), *self._cleanup_tasks):
             task.cancel()
         self._scheduler_tasks.clear()
+        self._cleanup_tasks.clear()
+
+    def _schedule_cleanup(self, coroutine: Awaitable[None]) -> None:
+        """Track a delayed message cleanup so unload cannot leave it running."""
+        task = asyncio.create_task(coroutine)
+        self._cleanup_tasks.add(task)
+
+        def _finished(completed: asyncio.Task[None]) -> None:
+            self._cleanup_tasks.discard(completed)
+            if not completed.cancelled():
+                completed.exception()
+
+        task.add_done_callback(_finished)
 
     def _get_reference_timestamps(self, boss_key: str) -> list[int]:
         match boss_key:
@@ -228,7 +243,7 @@ class BossAlerts(commands.Cog):
             )
             delete_after = (spawn_ts + offset) - time.time()
             if delete_after > 0:
-                asyncio.create_task(self._delete_message_after(delete_after, msg))
+                self._schedule_cleanup(self._delete_message_after(delete_after, msg))
         except discord.Forbidden:
             log.warning(
                 "Missing send permission in guild=%s channel=%s",
@@ -283,13 +298,13 @@ class BossAlerts(commands.Cog):
     ) -> None:
         if ctx.guild is None:
             response = await ctx.send("This command can only be used in a server.")
-            asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
+            self._schedule_cleanup(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
             return
 
         target_channel = channel or ctx.channel
         if not isinstance(target_channel, discord.TextChannel):
             response = await ctx.send("Target channel must be a text channel.")
-            asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
+            self._schedule_cleanup(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
             return
 
         guild_config = self.config.guild(ctx.guild)
@@ -316,13 +331,13 @@ class BossAlerts(commands.Cog):
             f"Alerts fire {offset // 60} minutes before each spawn.\n"
             f"Next spawn: <t:{next_spawn_ts}:F> ({next_minutes} min)."
         )
-        asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
+        self._schedule_cleanup(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
 
     async def _set_offset(self, ctx: commands.Context, boss_key: str, minutes: int) -> None:
         """Store the lead time this server wants for its alerts."""
         if ctx.guild is None:
             response = await ctx.send("This command can only be used in a server.")
-            asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
+            self._schedule_cleanup(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
             return
 
         offset = minutes * 60
@@ -331,7 +346,7 @@ class BossAlerts(commands.Cog):
                 f"Choose a lead time between {MIN_ALERT_OFFSET_SECONDS // 60} and "
                 f"{MAX_ALERT_OFFSET_SECONDS // 60} minutes."
             )
-            asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
+            self._schedule_cleanup(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
             return
 
         guild_config = self.config.guild(ctx.guild)
@@ -343,7 +358,7 @@ class BossAlerts(commands.Cog):
             f"{label} alerts now fire {minutes} minutes before each spawn.\n"
             f"Next spawn: <t:{next_spawn_ts}:F> (<t:{next_spawn_ts}:R>)."
         )
-        asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
+        self._schedule_cleanup(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
 
     async def _toggle_alert(
         self,
@@ -353,7 +368,7 @@ class BossAlerts(commands.Cog):
     ) -> None:
         if ctx.guild is None:
             response = await ctx.send("This command can only be used in a server.")
-            asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
+            self._schedule_cleanup(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
             return
 
         guild_config = self.config.guild(ctx.guild)
@@ -363,12 +378,12 @@ class BossAlerts(commands.Cog):
         label = self._get_label(boss_key)
         status_text = "enabled" if state else "disabled"
         response = await ctx.send(f"{label} alerts {status_text}.")
-        asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
+        self._schedule_cleanup(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
 
     async def _clear_alert_target(self, ctx: commands.Context, boss_key: str) -> None:
         if ctx.guild is None:
             response = await ctx.send("This command can only be used in a server.")
-            asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
+            self._schedule_cleanup(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
             return
 
         guild_config = self.config.guild(ctx.guild)
@@ -390,12 +405,12 @@ class BossAlerts(commands.Cog):
                 raise ValueError(f"Unsupported boss key: {boss_key}")
 
         response = await ctx.send(f"{label} alerts cleared.")
-        asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
+        self._schedule_cleanup(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
 
     async def _show_status(self, ctx: commands.Context, boss_key: str) -> None:
         if ctx.guild is None:
             response = await ctx.send("This command can only be used in a server.")
-            asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
+            self._schedule_cleanup(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
             return
 
         guild_config = self.config.guild(ctx.guild)
@@ -428,7 +443,7 @@ class BossAlerts(commands.Cog):
             f"Offset: {offset // 60} minutes before spawn\n"
             f"Next spawn: <t:{next_spawn_ts}:F> ({next_minutes} min)."
         )
-        asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
+        self._schedule_cleanup(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
 
     async def _show_next(self, ctx: commands.Context, boss_key: str) -> None:
         guild_config = self.config.guild(ctx.guild) if ctx.guild else None
@@ -442,7 +457,7 @@ class BossAlerts(commands.Cog):
         response = await ctx.send(
             f"Next {label} spawn: <t:{next_spawn_ts}:F> (<t:{next_spawn_ts}:R>)."
         )
-        asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
+        self._schedule_cleanup(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
 
     async def _show_list(self, ctx: commands.Context, boss_key: str) -> None:
         label = self._get_label(boss_key)
@@ -473,7 +488,7 @@ class BossAlerts(commands.Cog):
         response = await ctx.send(
             f"**{label} daily schedule** (next 24 hours):\n" + "\n".join(lines)
         )
-        asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
+        self._schedule_cleanup(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
 
     async def _sync_scheduler(self, ctx: commands.Context, boss_key: str) -> None:
         label = self._get_label(boss_key)
@@ -503,7 +518,7 @@ class BossAlerts(commands.Cog):
             f"Next spawn: <t:{next_spawn_ts}:F> (<t:{next_spawn_ts}:R>)\n"
             f"Minutes remaining: {minutes_remaining}"
         )
-        asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
+        self._schedule_cleanup(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
 
     @commands.group(name="parasol")
     @commands.guild_only()
@@ -668,14 +683,14 @@ class BossAlerts(commands.Cog):
     ) -> None:
         if isinstance(error, commands.MissingPermissions):
             response = await ctx.send("You need Manage Server to use this command.")
-            asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
+            self._schedule_cleanup(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
             return
         if isinstance(error, commands.BadArgument):
             response = await ctx.send("Invalid channel or role.")
-            asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
+            self._schedule_cleanup(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
             return
         if isinstance(error, commands.TooManyArguments):
             response = await ctx.send("Too many arguments.")
-            asyncio.create_task(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
+            self._schedule_cleanup(self._delete_messages_after(AUTO_DELETE_DELAY, ctx.message, response))
             return
         raise error

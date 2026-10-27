@@ -183,9 +183,10 @@ class RandomText(commands.Cog):
     async def send_split_message(self, channel, text: str) -> None:
         """Send at most three embed pages, with a plaintext permission fallback."""
         destination = getattr(channel, "channel", channel)
-        use_embed = (
-            not getattr(destination, "guild", None)
-            or destination.permissions_for(destination.guild.me).embed_links
+        guild = getattr(destination, "guild", None)
+        me = getattr(guild, "me", None) if guild is not None else None
+        use_embed = guild is None or (
+            me is not None and destination.permissions_for(me).embed_links
         )
         size = 4000 if use_embed else 1900
         text = text[: size * 3 - 1] + "…" if len(text) > size * 3 else text
@@ -417,7 +418,9 @@ class RandomText(commands.Cog):
             entries = root.findall("{http://www.w3.org/2005/Atom}entry")
             random.shuffle(entries)
             for entry in entries:
-                title = entry.findtext("{http://www.w3.org/2005/Atom}title", "").strip()
+                title = self.clean_content(
+                    entry.findtext("{http://www.w3.org/2005/Atom}title", "")
+                )
                 if title and await self.check_cache("showerthought", title):
                     return f"🚿 **Shower Thought:**\n{title}"
         return None
@@ -489,7 +492,10 @@ class RandomText(commands.Cog):
             return
         if not await self.bot.allowed_by_whitelist_blacklist(message.author):
             return
-        permissions = message.channel.permissions_for(message.guild.me)
+        me = message.guild.me
+        if me is None:
+            return
+        permissions = message.channel.permissions_for(me)
         can_send = (
             permissions.send_messages_in_threads
             if isinstance(message.channel, discord.Thread)
@@ -681,6 +687,7 @@ class RandomText(commands.Cog):
     @commands.Cog.listener()
     async def on_guild_remove(self, guild: discord.Guild) -> None:
         self._settings.pop(guild.id, None)
+        self._busy.discard(guild.id)
 
     async def red_delete_data_for_user(self, *, requester: str, user_id: int) -> None:
         """No user records are persisted by this cog."""

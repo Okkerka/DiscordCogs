@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import random
 import re
 import shlex
@@ -223,7 +224,11 @@ class Utilities(commands.Cog):
     @commands.hybrid_command(aliases=["latency", "botping"])
     async def status(self, ctx):
         """Show the bot's current gateway latency."""
-        await ctx.send(f"Bot latency: `{round(ctx.bot.latency * 1000)} ms`")
+        latency_ms = ctx.bot.latency * 1000
+        if not math.isfinite(latency_ms):
+            # Discord reports NaN until the first gateway heartbeat completes.
+            return await ctx.send("Bot latency: `unknown`")
+        await ctx.send(f"Bot latency: `{round(latency_ms)} ms`")
 
     @commands.hybrid_command(aliases=["8ball"])
     async def eightball(self, ctx, *, question: str):
@@ -251,6 +256,7 @@ class Utilities(commands.Cog):
 
     @commands.hybrid_command()
     @commands.guild_only()
+    @commands.bot_has_permissions(add_reactions=True, embed_links=True)
     async def poll(self, ctx, *, question: str):
         """Create a reaction poll; separate the question and optional choices with |."""
         if len(question) > 3000:
@@ -332,7 +338,7 @@ class Utilities(commands.Cog):
         """
         expression = expression.strip().lower()
         
-        if expression.isdigit():
+        if expression.isdecimal():
             sides = int(expression)
             if not 2 <= sides <= 1000:
                 return await ctx.send("❌ Number of sides must be between 2 and 1000.")
@@ -459,9 +465,11 @@ class Utilities(commands.Cog):
         hawk_users = set(await config.hawk_users())
         added, already = [], []
         for user in users:
-            (hawk_users.add(user.id) or added.append(user.display_name)) if user.id not in hawk_users else already.append(
-                user.display_name
-            )
+            if user.id in hawk_users:
+                already.append(user.display_name)
+            else:
+                hawk_users.add(user.id)
+                added.append(user.display_name)
         await config.hawk_users.set(list(hawk_users))
         msg = (f"🐦 Added: {', '.join(f'**{n}**' for n in added)}" if added else "") + (
             f"\nAlready in hawk list: {', '.join(already)}" if already else ""
@@ -678,7 +686,10 @@ class Utilities(commands.Cog):
         # Prefix output remains in its source channel. Slash output is always private.
         if channel.id != ctx.channel.id and not ctx.interaction:
             return await ctx.send("Use quote in the source channel, or /quote for a private cross-channel quote.")
-        for member in (ctx.author, ctx.guild.me):
+        me = ctx.guild.me
+        if me is None:
+            return await ctx.send("I could not verify channel permissions.", ephemeral=True)
+        for member in (ctx.author, me):
             perms = channel.permissions_for(member)
             if not (perms.view_channel and perms.read_message_history):
                 return await ctx.send("You and I both need access to that channel's message history.", ephemeral=True)

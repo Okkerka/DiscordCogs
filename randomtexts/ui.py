@@ -51,6 +51,10 @@ class RandomTextView(discord.ui.LayoutView):
         self._preview_busy = False
         cog._views.add(self)
 
+    def stop(self) -> None:
+        self.cog._views.discard(self)
+        super().stop()
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if (
             self.is_finished()

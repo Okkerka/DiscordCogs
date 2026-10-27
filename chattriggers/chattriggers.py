@@ -224,7 +224,10 @@ class ChatTriggers(commands.Cog):
         target = getattr(getattr(user, "voice", None), "channel", None)
         if target is None:
             return "Sound skipped: join a voice channel first."
-        permissions = target.permissions_for(channel.guild.me)
+        me = getattr(channel.guild, "me", None)
+        if me is None:
+            return "Sound skipped: bot member unavailable."
+        permissions = target.permissions_for(me)
         if not permissions.connect or not permissions.speak:
             return "Sound skipped: missing Connect or Speak permission."
         async with self._audio_locks[channel.guild.id]:
@@ -288,7 +291,10 @@ class ChatTriggers(commands.Cog):
         if self._closed:
             return "Cog unloaded."
         if any(data.get(key) for key in ("title", "desc", "gif")):
-            permissions = channel.permissions_for(channel.guild.me)
+            me = getattr(channel.guild, "me", None)
+            if me is None:
+                return sound_status
+            permissions = channel.permissions_for(me)
             if permissions.embed_links:
                 embed = discord.Embed(
                     title=(data.get("title") or "")[:256] or None,
@@ -365,7 +371,10 @@ class ChatTriggers(commands.Cog):
             or not message.content
         ):
             return
-        permissions = message.channel.permissions_for(message.guild.me)
+        me = message.guild.me
+        if me is None:
+            return
+        permissions = message.channel.permissions_for(me)
         can_send = (
             permissions.send_messages_in_threads
             if isinstance(message.channel, discord.Thread)

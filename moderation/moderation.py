@@ -114,7 +114,7 @@ class Moderation(commands.Cog):
         return self._moderator_cache.get(guild_id, set())
 
     @commands.Cog.listener()
-    async def on_guild_add(self, guild: discord.Guild) -> None:
+    async def on_guild_join(self, guild: discord.Guild) -> None:
         """Load a newly joined guild, so its moderation rules apply at once."""
         try:
             guild_data = await self.config.guild_from_id(guild.id).all()
@@ -933,9 +933,13 @@ class Moderation(commands.Cog):
 
     def _can_target(self, ctx: commands.Context, member: discord.Member) -> bool:
         """Require both moderator and bot hierarchy, excluding the owner and bot itself."""
-        return (member != ctx.guild.owner and member != ctx.guild.me
-                and member.top_role < ctx.guild.me.top_role
-                and (ctx.author == ctx.guild.owner or member.top_role < ctx.author.top_role))
+        me = ctx.guild.me
+        owner = ctx.guild.owner
+        if me is None or owner is None:
+            return False
+        return (member != owner and member != me
+                and member.top_role < me.top_role
+                and (ctx.author == owner or member.top_role < ctx.author.top_role))
 
     @commands.hybrid_group(invoke_without_command=True, fallback="member")
     @commands.guild_only()
@@ -1148,7 +1152,7 @@ class Moderation(commands.Cog):
         """
         channel = channel or ctx.channel
 
-        if duration.isdigit():
+        if duration.isdecimal():
             seconds = int(duration)
         else:
             try:
