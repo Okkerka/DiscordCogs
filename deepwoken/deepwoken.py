@@ -69,13 +69,18 @@ STAT_ALIASES = {
     "agility": "AGI", "agi": "AGI", "intelligence": "INT", "int": "INT", "charisma": "CHA", "cha": "CHA",
     "willpower": "WLL", "will": "WLL", "wll": "WLL", "mind": "MND", "body": "BDY", "bdy": "BDY",
 }
-STAT_PATTERN = "|".join(sorted(set(STAT_ALIASES.values())))
+STAT_CODES = frozenset(STAT_ALIASES.values())
+STAT_PATTERN = "|".join(sorted(STAT_CODES))
+_PROFICIENCY_ALIASES = frozenset({"prof", "proficiency"})
 
-RANKING_EXCLUSIONS = {
+RANKING_EXCLUSIONS = frozenset({
     "Ebonshard Lexicon", "The Rock", "The Endless Wave", "Unsung Scythern", "Worldpainter Brush",
     "Keyblade", "Soulshot", "Metal Greatsword", "Prototype Railblade", "Par's Glaive", "Saintsblade",
     "Ferractine", "Formless Shard", "Handcuffs", "Sovereign Bangle",
-}
+})
+_NORMALIZED_RANKING_EXCLUSIONS = frozenset(
+    normalize_name(name) for name in RANKING_EXCLUSIONS
+)
 RANKING_PAGE_SIZE = 15
 DISCORD_EMBED_TITLE_LIMIT = 256
 DISCORD_EMBED_DESCRIPTION_LIMIT = 4096
@@ -84,12 +89,26 @@ DISCORD_EMBED_FIELD_NAME_LIMIT = 256
 DISCORD_EMBED_FIELD_VALUE_LIMIT = 1024
 DISCORD_EMBED_TOTAL_LIMIT = 6000
 DISCORD_MESSAGE_LIMIT = 2000
-LOOKUP_FIELD_COUNT = 12
+LOOKUP_FIELDS = (
+    ("Requirements", "Requirements"),
+    ("Base Damage", "Base Damage"),
+    ("Scaled Damage", "Scaled Damage"),
+    ("Scaling", "Scaling"),
+    ("Armor Penetration", "Armor Penetration"),
+    ("Chip Damage", "Chip Damage"),
+    ("Posture Damage", "Posture Damage"),
+    ("Range", "Range"),
+    ("Swing Speed", "Swing Speed"),
+    ("Endlag", "Endlag"),
+    ("Tags", "Tags"),
+)
+LOOKUP_FIELD_COUNT = 1 + len(LOOKUP_FIELDS)
 LOOKUP_FIELD_VALUE_LIMIT = min(
     400,
     DISCORD_EMBED_FIELD_VALUE_LIMIT,
     DISCORD_EMBED_TOTAL_LIMIT // LOOKUP_FIELD_COUNT,
 )
+LOOKUP_FOOTER = "Example: [p]dwweapon heavy 100 medium 100 prof 6"
 MULTIPLE_MATCH_NAME_LIMIT = 160
 UPDATE_CONFLICT_SAMPLE_SIZE = 3
 UPDATE_CONFLICT_NAME_LIMIT = 80
@@ -155,14 +174,13 @@ class Deepwoken(commands.Cog):
         return looks_numeric or has_proficiency
 
     def _row_score(self, row: dict[str, Any]) -> int:
-        score = 0
         requirements = str(row.get("Requirements") or "")
         scaling = str(row.get("Scaling") or "")
-        if self._requirements(requirements): score += 4
-        if "CRAZY SLOTS" in requirements.upper(): score += 4
-        if ":" in scaling: score += 4
-        if self._number(row.get("Base Damage")) is not None: score += 2
-        if "x" in str(row.get("Swing Speed") or "").lower(): score += 2
+        score = int(bool(self._requirements(requirements))) * 4
+        score += int("CRAZY SLOTS" in requirements.upper()) * 4
+        score += int(":" in scaling) * 4
+        score += int(self._number(row.get("Base Damage")) is not None) * 2
+        score += int("x" in str(row.get("Swing Speed") or "").lower()) * 2
         return score
 
     def _load_preferred_weapons(self) -> list[dict[str, Any]]:
@@ -202,7 +220,7 @@ class Deepwoken(commands.Cog):
             if headers != WORKBOOK_HEADERS:
                 raise WorkbookSchemaError("Workbook has an unexpected weapon schema.")
 
-            best_rows: dict[str, dict[str, Any]] = {}
+            best_rows: dict[str, tuple[int, dict[str, Any]]] = {}
             blank_name_rows: list[dict[str, Any]] = []
             for values in sheet.iter_rows(min_row=2, values_only=True):
                 row = dict(zip(headers, values))
@@ -212,9 +230,11 @@ class Deepwoken(commands.Cog):
                         blank_name_rows.append(row)
                     continue
                 key = normalize_name(name)
-                if key not in best_rows or self._row_score(row) > self._row_score(best_rows[key]):
-                    best_rows[key] = row
-            rows = [*blank_name_rows, *best_rows.values()]
+                score = self._row_score(row)
+                current = best_rows.get(key)
+                if current is None or score > current[0]:
+                    best_rows[key] = (score, row)
+            rows = [*blank_name_rows, *(row for _score, row in best_rows.values())]
             try:
                 validate_workbook_semantics(
                     rows,
@@ -232,30 +252,64 @@ class Deepwoken(commands.Cog):
             workbook.close()
 
     def _parse_stat_query(self, args: tuple[str, ...]) -> tuple[dict[str, int], int] | None:
-        if len(args) < 2 or args[0].casefold() not in STAT_ALIASES:
+        if len(args) < 2:
             return None
-        first_stat = STAT_ALIASES[args[0].casefold()]
-        if len(args) == 3 and (stat_value := self._integer(args[1])) is not None and (prof_value := self._integer(args[2])) is not None:
-            stats, prof = {first_stat: stat_value}, prof_value
-            return (stats, prof) if 0 <= stats[first_stat] <= 100 and 0 <= prof <= 6 else None
-        stats, index, prof = {}, 0, 0
+        first_stat = STAT_ALIASES.get(args[0].casefold())
+        if first_stat is None:
+            return None
+
+        # Legacy shorthand: "<stat> <value> <proficiency>".
+        if len(args) == 3:
+            stat_value = self._integer(args[1])
+            prof_value = self._integer(args[2])
+            if stat_value is not None and prof_value is not None:
+                return self._validated_stat_query(
+                    {first_stat: stat_value}, prof_value, first_stat
+                )
+
+        stats: dict[str, int] = {}
+        prof = 0
+        index = 0
         while index < len(args):
             token = args[index].casefold()
-            if token in {"prof", "proficiency"}:
-                if index + 1 >= len(args) or (value := self._integer(args[index + 1])) is None: return None
-                prof, index = value, index + 2
-            elif token in STAT_ALIASES and index + 1 < len(args) and (value := self._integer(args[index + 1])) is not None:
-                stats[STAT_ALIASES[token]], index = value, index + 2
-            else:
+            if token in _PROFICIENCY_ALIASES:
+                if index + 1 >= len(args):
+                    return None
+                value = self._integer(args[index + 1])
+                if value is None:
+                    return None
+                prof = value
+                index += 2
+                continue
+            stat = STAT_ALIASES.get(token)
+            if stat is None or index + 1 >= len(args):
                 return None
-        return (stats, prof) if first_stat in stats and all(0 <= x <= 100 for x in stats.values()) and 0 <= prof <= 6 else None
+            value = self._integer(args[index + 1])
+            if value is None:
+                return None
+            stats[stat] = value
+            index += 2
+        return self._validated_stat_query(stats, prof, first_stat)
+
+    @staticmethod
+    def _validated_stat_query(
+        stats: dict[str, int],
+        prof: int,
+        required_stat: str,
+    ) -> tuple[dict[str, int], int] | None:
+        if required_stat not in stats or not 0 <= prof <= 6:
+            return None
+        if any(not 0 <= value <= 100 for value in stats.values()):
+            return None
+        return stats, prof
 
     def _meets_requirements(self, row: dict[str, Any], stats: dict[str, int]) -> bool:
         return all(stats.get(stat, 0) >= required for stat, required in self._requirements(row.get("Requirements")).items())
 
     def _damage(self, row: dict[str, Any], stats: dict[str, int], prof: int) -> float | None:
         base = self._number(row.get("Base Damage"))
-        if base is None: return None
+        if base is None:
+            return None
         damage = base
         for stat, scale in self._scaling(row.get("Scaling")).items():
             damage += 0.00075 * base * scale * stats.get(stat, 0) * (1 + prof * 0.065)
@@ -277,9 +331,12 @@ class Deepwoken(commands.Cog):
         return dps if math.isfinite(dps) else None
 
     def _rankable(self, row: dict[str, Any]) -> bool:
-        if str(row.get("Name") or "").strip() in RANKING_EXCLUSIONS: return False
-        if str(row.get("Weapon Class") or "") in {"Special / Other", "Elemental", "Fighting Style"}: return False
-        return not any(value > 100 for value in self._requirements(row.get("Requirements")).values())
+        if normalize_name(row.get("Name")) in _NORMALIZED_RANKING_EXCLUSIONS:
+            return False
+        if str(row.get("Weapon Class") or "") in {"Special / Other", "Elemental", "Fighting Style"}:
+            return False
+        requirements = self._requirements(row.get("Requirements"))
+        return not any(value > 100 for value in requirements.values())
 
     @commands.hybrid_command(name="dwweapon", aliases=["dw", "weapon"])
     async def dwweapon(self, ctx: commands.Context, *, query: str = "") -> None:
@@ -381,16 +438,15 @@ class Deepwoken(commands.Cog):
                 )
                 active_snapshot = tuple(dict(row) for row in self.weapons)
                 result = reconcile_weapons(parsed_rows, active_snapshot)
-                recognized_stats = frozenset(STAT_ALIASES.values())
                 validate_candidate(
                     result.rows,
                     active_unique_count=len(active_snapshot),
                     source_unique_count=result.source_unique_count,
-                    recognized_stats=recognized_stats,
+                    recognized_stats=STAT_CODES,
                     ranking_exclusions=RANKING_EXCLUSIONS,
                 )
                 representative_pages = self._ranking_pages(
-                    {stat: 100 for stat in recognized_stats},
+                    {stat: 100 for stat in STAT_CODES},
                     6,
                     weapons=result.rows,
                 )
@@ -555,16 +611,21 @@ class Deepwoken(commands.Cog):
         text = re.sub(r"\s+", " ", text).strip() or "Unknown"
         return Deepwoken._bounded_embed_text(text, UPDATE_CONFLICT_NAME_LIMIT)
 
-    async def _lookup(self, ctx: commands.Context, query: str):
-        query = normalize_name(query)
-        exact = [row for row in self.weapons if normalize_name(row.get("Name")) == query]
-        matches = exact or [row for row in self.weapons if query in normalize_name(row.get("Name"))]
+    async def _lookup(self, ctx: commands.Context, query: str) -> None:
+        query_key = normalize_name(query)
+        exact = [row for row in self.weapons if normalize_name(row.get("Name")) == query_key]
+        matches = exact or [
+            row for row in self.weapons if query_key in normalize_name(row.get("Name"))
+        ]
         if not matches:
             await ctx.send("Weapon not found.")
             return
+        matches.sort(key=lambda row: normalize_name(row.get("Name")))
         if len(matches) > 1:
             names = [
-                self._safe_discord_text(row["Name"], MULTIPLE_MATCH_NAME_LIMIT, fallback="Unknown")
+                self._safe_discord_text(
+                    row.get("Name"), MULTIPLE_MATCH_NAME_LIMIT, fallback="Unknown"
+                )
                 for row in matches[:10]
             ]
             message = "Multiple matches: " + ", ".join(names)
@@ -589,17 +650,17 @@ class Deepwoken(commands.Cog):
             ),
             inline=False,
         )
-        fields = [("Requirements", "Requirements"), ("Base Damage", "Base Damage"), ("Scaled Damage", "Scaled Damage"), ("Scaling", "Scaling"), ("Armor Penetration", "Armor Penetration"), ("Chip Damage", "Chip Damage"), ("Posture Damage", "Posture Damage"), ("Range", "Range"), ("Swing Speed", "Swing Speed"), ("Endlag", "Endlag"), ("Tags", "Tags")]
-        for label, key in fields:
+        for label, key in LOOKUP_FIELDS:
+            value = row.get(key)
             embed.add_field(
                 name=self._safe_discord_text(label, DISCORD_EMBED_FIELD_NAME_LIMIT),
                 value=self._safe_discord_text(
-                    "N/A" if row.get(key) in (None, "") else row[key],
-                    min(LOOKUP_FIELD_VALUE_LIMIT, DISCORD_EMBED_FIELD_VALUE_LIMIT),
+                    "N/A" if value in (None, "") else value,
+                    LOOKUP_FIELD_VALUE_LIMIT,
                 ),
                 inline=label != "Requirements",
             )
-        embed.set_footer(text="Example: [p]dwweapon heavy 100 medium 100 prof 6")
+        embed.set_footer(text=LOOKUP_FOOTER)
         await ctx.send(embed=embed)
 
     @commands.hybrid_command(name="dwreload")

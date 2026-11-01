@@ -63,6 +63,12 @@ _TAG_ORDER = ("Crazy Slots", "Hybrid", "Elemental", "Offhand", "Bleed")
 _NUMBER = re.compile(r"[-+]?\d+(?:\.\d+)?")
 _SCALING = re.compile(r"([A-Z]{2,4})\s*:\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
 _REQUIREMENTS = re.compile(r"(\d+)\s*([A-Z]{2,4})", re.IGNORECASE)
+_STAT_CODE_ALIASES = {"AGL": "AGI"}
+_STAT_CODE = re.compile(
+    r"\b(" + "|".join(_STAT_CODE_ALIASES) + r")\b",
+    re.IGNORECASE,
+)
+_NAME_SPACING = re.compile(r"\s+([()\[\]])")
 _XML_ILLEGAL_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 _NON_RANKABLE_CLASSES = frozenset({
     "special / other",
@@ -294,8 +300,14 @@ def install_runtime_workbook(
 
 
 def normalize_name(value: object) -> str:
-    """Return the stable comparison key for a displayed weapon name."""
-    return unicodedata.normalize("NFKC", str(value) if value is not None else "").strip().casefold()
+    """Return the stable comparison key for a displayed weapon name.
+
+    Unicode compatibility forms, casing, repeated whitespace, and harmless
+    spacing before bracketed suffixes are source formatting differences.
+    """
+    text = unicodedata.normalize("NFKC", str(value) if value is not None else "")
+    text = _WHITESPACE.sub(" ", text).strip().casefold()
+    return _NAME_SPACING.sub(r"\1", text)
 
 
 def _number(value: CellValue) -> float | None:
@@ -398,6 +410,13 @@ def _remove_exact_path(path: Path | None) -> None:
         pass
 
 
+def _normalize_stat_codes(value: CellValue) -> str:
+    return _STAT_CODE.sub(
+        lambda match: _STAT_CODE_ALIASES[match.group(1).upper()],
+        _display_text(value),
+    )
+
+
 def source_to_workbook_row(row: ParsedWeapon) -> WeaponRow:
     """Map one canonical source row into the workbook's fixed fifteen columns."""
     if len(row.cells) != len(_SOURCE_COLUMNS):
@@ -412,11 +431,17 @@ def source_to_workbook_row(row: ParsedWeapon) -> WeaponRow:
         numeric = bleed_match.group(1)
         bleed_listed = float(numeric) if "." in numeric else int(numeric)
 
+    mapped = {
+        column: _display_text(source_values[column]) for column in _SOURCE_COLUMNS
+    }
+    mapped["Requirements"] = _normalize_stat_codes(source_values["Requirements"])
+    mapped["Scaling"] = _normalize_stat_codes(source_values["Scaling"])
+
     return {
         "Weapon Class": _display_text(row.source_class),
         "Weapon Type": _display_text(row.weapon_type),
         "Tags": "Bleed" if _BLEED_MARKER.search(name) else "",
-        **{column: _display_text(source_values[column]) for column in _SOURCE_COLUMNS},
+        **mapped,
         "Bleed Listed": bleed_listed,
     }
 

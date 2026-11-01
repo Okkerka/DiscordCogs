@@ -100,8 +100,26 @@ class WeaponWorkbookMappingTests(unittest.TestCase):
         self.assertEqual(row["Scaled Damage"], "27.1 (+4.1 BLD)")
         self.assertEqual(row["Bleed Listed"], 4.1)
 
+    def test_stat_code_typos_are_normalized_for_workbook_consumers(self):
+        source = parsed_weapon(
+            "Withered Phantomcleave",
+            requirements="40 AGL",
+            scaling="AGL: 8.4",
+        )
+
+        row = source_to_workbook_row(source)
+
+        self.assertEqual(row["Requirements"], "40 AGI")
+        self.assertEqual(row["Scaling"], "AGI: 8.4")
+
 
 class WeaponReconciliationTests(unittest.TestCase):
+    def test_normalize_name_ignores_formatting_only_differences(self):
+        self.assertEqual(
+            normalize_name("Flareblood Kamas (Bleed)"),
+            normalize_name("  flareblood   kamas(Bleed)  "),
+        )
+
     def test_exact_duplicates_collapse_by_trimmed_unicode_casefolded_name(self):
         first = parsed_weapon("  Café Blade  ", weapon_class="Medium", weapon_type="Sword")
         duplicate = parsed_weapon("CAFE\u0301 BLADE", weapon_class="Medium", weapon_type="Sword")

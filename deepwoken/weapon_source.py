@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 import html
 import json
+import logging
 import re
 from typing import Protocol
 
@@ -15,8 +16,11 @@ API_URL = "https://deepwoken.fandom.com/api.php"
 MAX_RESPONSE_BYTES = 1_000_000
 REQUEST_TIMEOUT_SECONDS = 15
 USER_AGENT = "DiscordCogs-DeepwokenWeaponUpdater/1.0"
-SOURCE_COLUMN_COUNT = 11
 _READ_CHUNK_BYTES = 64 * 1024
+_LOGGER = logging.getLogger(__name__)
+
+# Canonical lookup fields. Parsing maps wiki headers onto this shape so the
+# workbook and reconciliation layers never depend on a table's column order.
 _SOURCE_HEADER_CELLS = (
     "Name",
     "Requirements",
@@ -30,41 +34,61 @@ _SOURCE_HEADER_CELLS = (
     "Endlag",
     "Scaled Damage",
 )
-_CRAZY_SLOTS_HEADER_CELLS = (
-    "Name",
-    "Base Damage",
-    "Scaling",
-    "Penetration",
-    "Chip Damage",
-    "Posture Damage",
-    "Range",
-    "Swing Speed",
-    "Endlag",
-    "Scaled Damage",
+_CRAZY_SLOTS_TEMPLATE = "AllCrazySlotsWeapons"
+_FIELD_ALIASES = {
+    "name": "Name",
+    "requirements": "Requirements",
+    "requirement": "Requirements",
+    "base damage": "Base Damage",
+    "scaling": "Scaling",
+    "armor penetration": "Armor Penetration",
+    "penetration": "Armor Penetration",
+    "chip damage": "Chip Damage",
+    "posture damage": "Posture Damage",
+    "max posture bonus": "Posture Damage",
+    "posture bonus": "Posture Damage",
+    "parry posture restoration": "Posture Damage",
+    "posture restoration": "Posture Damage",
+    "range": "Range",
+    "swing speed": "Swing Speed",
+    "endlag": "Endlag",
+    "scaled damage": "Scaled Damage",
+}
+# Display-only columns that must not become lookup fields.
+_IGNORED_HEADER_LABELS = frozenset(
+    {
+        "hybrid type",
+        "offhand cooldown",
+        "provides talent(s)?",
+        "provides talent",
+        "talents",
+    }
 )
-_HYBRID_HEADER_CELLS = (
-    "Name",
-    "Hybrid Type",
-    *_SOURCE_HEADER_CELLS[1:],
+_STANDARD_REQUIRED_FIELDS = frozenset(_SOURCE_HEADER_CELLS)
+_CRAZY_SLOTS_REQUIRED_FIELDS = _STANDARD_REQUIRED_FIELDS - {"Requirements"}
+_POSTURE_REQUIRED_FIELDS = frozenset({"Name", "Requirements", "Posture Damage"})
+_PISTOL_REQUIRED_FIELDS = frozenset(
+    {
+        "Name",
+        "Requirements",
+        "Base Damage",
+        "Armor Penetration",
+        "Chip Damage",
+        "Posture Damage",
+        "Range",
+    }
 )
 _OFFHAND_TABLE_SCHEMAS = {
-    "Shields": (
-        ("Name", "Requirements", "Max Posture Bonus"),
-        "Shield",
-        "posture",
-    ),
+    "Shields": ("Shield", "posture", _POSTURE_REQUIRED_FIELDS),
     "Parrying Daggers": (
-        ("Name", "Requirements", "Parry Posture Restoration"),
         "Parrying Dagger",
         "posture",
+        _POSTURE_REQUIRED_FIELDS,
     ),
     "Offhand Pistols": (
-        (
-            "Name", "Requirements", "Base Damage", "Penetration",
-            "Chip Damage", "Posture Damage", "Range", "Offhand Cooldown",
-        ),
         "Offhand Pistol",
         "pistol",
+        _PISTOL_REQUIRED_FIELDS,
     ),
 }
 
@@ -79,16 +103,6 @@ TEMPLATE_SOURCES: Mapping[str, str] = {
     "AllCrazySlotsWeapons": "Crazy Slots",
     "AllExclusiveWeapons": "Exclusive",
     "AllOffhandWeapons": "Offhand",
-}
-
-_TEMPLATE_HEADER_CELLS = {
-    "AllLightWeapons": _SOURCE_HEADER_CELLS,
-    "AllMediumWeapons": _SOURCE_HEADER_CELLS,
-    "AllHeavyWeapons": _SOURCE_HEADER_CELLS,
-    "AllHybridWeapons": _HYBRID_HEADER_CELLS,
-    "AllElementalWeapons": _SOURCE_HEADER_CELLS,
-    "AllCrazySlotsWeapons": _CRAZY_SLOTS_HEADER_CELLS,
-    "AllExclusiveWeapons": _SOURCE_HEADER_CELLS,
 }
 
 WEAPON_TYPE_ALIASES = {
@@ -109,7 +123,8 @@ WEAPON_TYPE_ALIASES = {
 _MAX_CELL_CHARACTERS = 20_000
 _ROW_BOUNDARY = re.compile(r"(?m)^\s*\|-[^\r\n]*$")
 _TABLE_BLOCK = re.compile(r"(?ms)^\s*\{\|.*?^\s*\|\}")
-_COLSPAN_ELEVEN = re.compile(r"\bcolspan\s*=\s*['\"]?11\b", re.IGNORECASE)
+_COLSPAN = re.compile(r"\bcolspan\s*=", re.IGNORECASE)
+_LEADING_PIPES = re.compile(r"^\s*\|+\s*")
 _COLLAPSIBLE_BLOCK = re.compile(
     r"(?is)<(div|span)\b[^>]{0,2048}\b(?:mw-)?collapsible\b[^>]{0,2048}>.*?</\1\s*>"
 )
@@ -311,111 +326,107 @@ async def _read_bounded_body(content: _ResponseContent) -> bytes:
 
 
 def parse_template(payload: TemplatePayload) -> list[ParsedWeapon]:
-    """Parse one expanded table without allowing malformed rows to shift fields."""
-    if payload.template == "AllOffhandWeapons":
-        return _parse_offhand_template(payload)
+    """Parse one expanded table by mapping its headers onto canonical fields."""
+    try:
+        if payload.template == "AllOffhandWeapons":
+            return _parse_offhand_template(payload)
+        return _parse_standard_template(payload)
+    except WeaponSourceError as error:
+        _LOGGER.warning("Unable to parse %s: %s", payload.template, error)
+        raise
 
-    expected_header = _TEMPLATE_HEADER_CELLS.get(payload.template)
-    if expected_header is None or not _has_exact_header(payload, payload.template, expected_header):
+
+def _parse_standard_template(payload: TemplatePayload) -> list[ParsedWeapon]:
+    header, field_map = _find_header(payload.wikitext)
+    required = (
+        _CRAZY_SLOTS_REQUIRED_FIELDS
+        if payload.template == _CRAZY_SLOTS_TEMPLATE
+        else _STANDARD_REQUIRED_FIELDS
+    )
+    if not required <= set(field_map.values()):
         raise WeaponSourceError("Malformed weapon source.")
+
     weapon_type = "Unknown"
     parsed: list[ParsedWeapon] = []
-    for raw_row in _ROW_BOUNDARY.split(payload.wikitext):
-        row = raw_row.split("\n|}", 1)[0].strip()
-        if not row or row.startswith("{|"):
-            continue
-        if _is_expected_header_row(row, expected_header):
-            continue
+    skipped = 0
+    for row in _iter_table_rows(payload.wikitext):
         cells = _split_top_level_cells(row)
         if _is_category_row(row, cells):
             heading = _normalize_weapon_type(cells[0])
             if heading and payload.template != "AllHybridWeapons":
                 weapon_type = heading
             continue
-        if not row.lstrip().startswith(("|", "!")):
+        if len(cells) != len(header):
+            skipped += 1
             continue
-        if len(cells) != len(expected_header):
-            raise WeaponSourceError("Malformed weapon source.")
-        if payload.template == "AllHybridWeapons":
-            cells = [cells[0], *cells[2:]]
-        elif payload.template == "AllCrazySlotsWeapons":
-            cells = [cells[0], "Crazy Slots", *cells[1:]]
-        normalized = tuple(_normalize_cell(cell) for cell in cells)
-        if not normalized[0]:
-            raise WeaponSourceError("Malformed weapon source.")
+        values = {
+            field: _normalize_cell(cells[index])
+            for index, field in field_map.items()
+        }
+        canonical = _canonical_standard_cells(values, payload.template)
+        if not canonical[0]:
+            skipped += 1
+            continue
         parsed.append(
             ParsedWeapon(
                 source_template=payload.template,
                 source_class=payload.weapon_class,
                 weapon_type=weapon_type,
-                cells=normalized,
+                cells=canonical,
             )
+        )
+
+    if skipped:
+        _LOGGER.warning(
+            "Skipped %d malformed row(s) in %s.",
+            skipped,
+            payload.template,
         )
     if not parsed:
         raise WeaponSourceError("Required weapon source has no valid rows.")
     return parsed
 
 
-def _is_expected_header_row(row: str, expected: tuple[str, ...]) -> bool:
-    """Recognize only the template's exact documented header."""
-    if not row.lstrip().startswith("!"):
-        return False
-    cells = _split_top_level_cells(row, delimiter="!!")
-    return tuple(_normalize_cell(cell) for cell in cells) == expected
-
-
-def _has_exact_header(
-    payload: TemplatePayload,
-    template: str,
-    expected: tuple[str, ...],
-) -> bool:
-    """Gate an alternate schema on both its fixed template and exact header."""
-    if payload.template != template:
-        return False
-    for line in payload.wikitext.splitlines():
-        if not line.lstrip().startswith("!"):
-            continue
-        cells = _split_top_level_cells(line, delimiter="!!")
-        return tuple(_normalize_cell(cell) for cell in cells) == expected
-    return False
-
-
 def _parse_offhand_template(payload: TemplatePayload) -> list[ParsedWeapon]:
     """Map only the three documented Offhand table layouts to lookup-only cells."""
     parsed: list[ParsedWeapon] = []
     seen_captions: set[str] = set()
+    skipped = 0
     for block in _TABLE_BLOCK.findall(payload.wikitext):
-        caption_lines = [line for line in block.splitlines() if line.lstrip().startswith("|+")]
-        header_lines = [line for line in block.splitlines() if line.lstrip().startswith("!")]
-        if len(caption_lines) != 1 or len(header_lines) != 1:
-            raise WeaponSourceError("Malformed weapon source.")
+        caption_lines = [
+            line for line in block.splitlines() if line.lstrip().startswith("|+")
+        ]
+        if not caption_lines:
+            continue
         caption = _normalize_cell(caption_lines[0].lstrip()[2:])
-        header = tuple(
-            _normalize_cell(cell)
-            for cell in _split_top_level_cells(header_lines[0], delimiter="!!")
-        )
         schema = _OFFHAND_TABLE_SCHEMAS.get(caption)
-        if schema is None or header != schema[0] or caption in seen_captions:
+        if schema is None:
+            continue
+        if caption in seen_captions:
             raise WeaponSourceError("Malformed weapon source.")
         seen_captions.add(caption)
-        weapon_type, adapter = schema[1], schema[2]
+
+        weapon_type, adapter, required = schema
+        header, field_map = _find_header(block)
+        if not required <= set(field_map.values()):
+            raise WeaponSourceError("Malformed weapon source.")
+
         table_count = 0
-        for raw_row in _ROW_BOUNDARY.split(block)[1:]:
-            row = raw_row.split("\n|}", 1)[0].strip()
-            if not row:
-                continue
+        for row in _iter_table_rows(block):
             cells = _split_top_level_cells(row)
-            if row.lstrip().startswith("!"):
-                if tuple(_normalize_cell(cell) for cell in cells) == header:
-                    continue
-                raise WeaponSourceError("Malformed weapon source.")
-            expected_count = 3 if adapter == "posture" else 8
-            if len(cells) != expected_count:
-                raise WeaponSourceError("Malformed weapon source.")
-            normalized = tuple(_normalize_cell(cell) for cell in cells)
-            if not normalized[0]:
-                raise WeaponSourceError("Malformed weapon source.")
-            canonical = _canonical_offhand_cells(normalized, adapter)
+            if _is_category_row(row, cells):
+                continue
+            if len(cells) != len(header):
+                skipped += 1
+                continue
+            values = {
+                field: _normalize_cell(cells[index])
+                for index, field in field_map.items()
+            }
+            canonical = _canonical_offhand_cells(values, adapter)
+            if not canonical[0]:
+                skipped += 1
+                continue
             parsed.append(
                 ParsedWeapon(
                     source_template=payload.template,
@@ -427,24 +438,101 @@ def _parse_offhand_template(payload: TemplatePayload) -> list[ParsedWeapon]:
             table_count += 1
         if table_count == 0:
             raise WeaponSourceError("Required weapon source has no valid rows.")
+
     if seen_captions != set(_OFFHAND_TABLE_SCHEMAS):
         raise WeaponSourceError("Malformed weapon source.")
+    if skipped:
+        _LOGGER.warning(
+            "Skipped %d malformed row(s) in %s.",
+            skipped,
+            payload.template,
+        )
     return parsed
 
 
-def _canonical_offhand_cells(cells: tuple[str, ...], adapter: str) -> tuple[str, ...]:
+def _iter_table_rows(block: str) -> Iterator[str]:
+    for raw_row in _ROW_BOUNDARY.split(block):
+        row = raw_row.split("\n|}", 1)[0].strip()
+        if not row or row.startswith(("{|", "|+")):
+            continue
+        if any(line.lstrip().startswith("{|") for line in row.splitlines()):
+            continue
+        if row.lstrip().startswith("!"):
+            continue
+        yield row
+
+
+def _find_header(wikitext: str) -> tuple[list[str], dict[int, str]]:
+    for line in wikitext.splitlines():
+        if not line.lstrip().startswith("!"):
+            continue
+        cells = _header_cells(line)
+        if cells is None:
+            continue
+        field_map = _map_headers(cells)
+        if "Name" in field_map.values():
+            return cells, field_map
+    raise WeaponSourceError("Malformed weapon source.")
+
+
+def _header_cells(line: str) -> list[str] | None:
+    for delimiter in ("!!", "||"):
+        cells = _split_top_level_cells(line, delimiter=delimiter)
+        if len(cells) > 1:
+            return cells
+    return None
+
+
+def _map_headers(cells: list[str]) -> dict[int, str]:
+    field_map: dict[int, str] = {}
+    seen: set[str] = set()
+    for index, cell in enumerate(cells):
+        label = _normalize_cell(cell).casefold()
+        if label in _IGNORED_HEADER_LABELS:
+            continue
+        field = _FIELD_ALIASES.get(label)
+        if field is None:
+            continue
+        if field in seen:
+            raise WeaponSourceError("Malformed weapon source.")
+        seen.add(field)
+        field_map[index] = field
+    return field_map
+
+
+def _canonical_standard_cells(
+    values: Mapping[str, str],
+    template: str,
+) -> tuple[str, ...]:
+    cells = [values.get(field, "") for field in _SOURCE_HEADER_CELLS]
+    if template == _CRAZY_SLOTS_TEMPLATE and not cells[1]:
+        cells[1] = "Crazy Slots"
+    return tuple(cells)
+
+
+def _canonical_offhand_cells(
+    values: Mapping[str, str],
+    adapter: str,
+) -> tuple[str, ...]:
+    cells = {field: "" for field in _SOURCE_HEADER_CELLS}
+    cells["Name"] = values.get("Name", "")
+    cells["Requirements"] = values.get("Requirements", "")
     if adapter == "posture":
-        name, requirements, posture = cells
-        return (name, requirements, "", "", "", "", posture, "", "", "", "")
-    name, requirements, base, penetration, chip, posture, weapon_range, _cooldown = cells
-    return (
-        name, requirements, base, "", penetration, chip, posture, weapon_range,
-        "", "", "",
-    )
+        cells["Posture Damage"] = values.get("Posture Damage", "")
+    else:
+        for field in (
+            "Base Damage",
+            "Armor Penetration",
+            "Chip Damage",
+            "Posture Damage",
+            "Range",
+        ):
+            cells[field] = values.get(field, "")
+    return tuple(cells[field] for field in _SOURCE_HEADER_CELLS)
 
 
 def _is_category_row(row: str, cells: list[str]) -> bool:
-    return len(cells) == 1 and bool(_COLSPAN_ELEVEN.search(row))
+    return len(cells) == 1 and bool(_COLSPAN.search(row))
 
 
 def _split_top_level_cells(row: str, *, delimiter: str = "||") -> list[str]:
@@ -511,6 +599,7 @@ def _normalize_weapon_type(value: str) -> str:
 def _normalize_cell(value: str) -> str:
     value = value[:_MAX_CELL_CHARACTERS]
     value = _ATTRIBUTE_PREFIX.sub("", value)
+    value = _LEADING_PIPES.sub("", value)
     value = _COLLAPSIBLE_BLOCK.sub("", value)
     value = _LINE_BREAK.sub(" ", value)
     for _ in range(3):

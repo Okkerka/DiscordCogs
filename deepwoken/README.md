@@ -27,7 +27,9 @@ See [Red's slash command guide](https://docs.discord.red/en/stable/guide_slash_a
 Updates use the bot's Red cog-data directory: one active `weapons.xlsx` and one
 overwritten `weapons.backup.xlsx`. Temporary candidates are cleaned up. Invalid
 updates preserve the active list; missing or invalid runtime data uses the bundled
-workbook. Conflicting wiki rows are reported and trusted existing rows retained;
+workbook. Individually malformed wiki rows are skipped and logged instead of
+rejecting the whole update, while a table that loses a required column still fails
+safely. Conflicting wiki rows are reported and trusted existing rows retained;
 new weapons with conflicting statistics are excluded until their source is consistent.
 
 Rankings enforce numeric stat requirements. Non-stat unlock alternatives are not

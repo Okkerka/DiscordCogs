@@ -346,9 +346,12 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def source_payload_rows(rows, *, revision=123):
-        header = "!Name!!Requirements!!Base Damage!!Scaling!!Armor Penetration!!Chip Damage!!Posture Damage!!Range!!Swing Speed!!Endlag!!Scaled Damage"
-        category = '| colspan="11" | [[Greatswords]]'
-        rendered_rows = ["| " + " || ".join(str(value) for value in row) for row in rows]
+        header = "!Name!!Requirements!!Base Damage!!Scaling!!Armor Penetration!!Chip Damage!!Posture Damage!!Range!!Swing Speed!!Endlag!!Scaled Damage!!Provides Talent(s)?"
+        category = '| colspan="12" | [[Greatswords]]'
+        rendered_rows = [
+            "| " + " || ".join([*(str(value) for value in row), "-"])
+            for row in rows
+        ]
         wikitext = "{|\n|-\n" + header + "\n|-\n" + category
         for row in rendered_rows:
             wikitext += "\n|-\n" + row
