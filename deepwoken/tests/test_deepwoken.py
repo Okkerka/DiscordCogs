@@ -289,6 +289,19 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
         await self.cog._lookup(ctx, "frost blade")
         self.assertEqual(len(ctx.embeds), 1)
 
+    async def test_lookup_recovers_from_minor_name_typo(self):
+        self.cog.weapons = [self.complete_row("Cordiverge Severants (Bleed)")]
+        ctx = FakeContext()
+        await self.cog._lookup(ctx, "Cordivige Severants")
+        self.assertEqual(len(ctx.embeds), 1)
+        self.assertIn("Cordiverge Severants", ctx.embeds[0].title)
+
+    async def test_unrelated_name_does_not_fuzzy_match(self):
+        self.cog.weapons = [self.complete_row("Cordiverge Severants (Bleed)")]
+        ctx = FakeContext()
+        await self.cog._lookup(ctx, "Completely Different Weapon")
+        self.assertEqual(ctx.messages, ["Weapon not found."])
+
     def setUp(self):
         self.runtime_directory = TemporaryDirectory()
         global runtime_data_path

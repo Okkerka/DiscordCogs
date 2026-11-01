@@ -10,9 +10,11 @@ Examples below use `>` as the bot prefix.
 | Update from the wiki (bot owner) | `>dwweapon updatelist` | `/dwweapon query:updatelist` |
 | Reload saved data (bot owner) | `>dwreload` | `/dwreload` |
 
-`>dw` and `>weapon` remain prefix aliases. Stats range from 0 to 100 and
-proficiency from 0 to 6. Include any required attributes or attunements in the
-query. Stat ordering does not affect the ranking; anyone can use the page controls.
+`>dw` and `>weapon` remain prefix aliases. Lookup is case-insensitive, ignores
+harmless name formatting, and suggests the closest match for minor typos. Stats
+range from 0 to 100 and proficiency from 0 to 6. Include any required attributes
+or attunements in the query. Stat ordering does not affect the ranking; anyone can
+use the page controls.
 
 After updating and loading the cog, a bot owner can enable slash commands with:
 

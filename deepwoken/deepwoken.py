@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import asyncio
+from difflib import get_close_matches
 import logging
 import math
 import re
@@ -109,6 +110,9 @@ LOOKUP_FIELD_VALUE_LIMIT = min(
     DISCORD_EMBED_TOTAL_LIMIT // LOOKUP_FIELD_COUNT,
 )
 LOOKUP_FOOTER = "Example: [p]dwweapon heavy 100 medium 100 prof 6"
+_FUZZY_LOOKUP_CUTOFF = 0.8
+_FUZZY_LOOKUP_MIN_LENGTH = 5
+_LOOKUP_SUFFIX = re.compile(r"\s*\([^()]*\)\s*$")
 MULTIPLE_MATCH_NAME_LIMIT = 160
 UPDATE_CONFLICT_SAMPLE_SIZE = 3
 UPDATE_CONFLICT_NAME_LIMIT = 80
@@ -611,12 +615,32 @@ class Deepwoken(commands.Cog):
         text = re.sub(r"\s+", " ", text).strip() or "Unknown"
         return Deepwoken._bounded_embed_text(text, UPDATE_CONFLICT_NAME_LIMIT)
 
+    def _fuzzy_lookup_matches(self, query: str) -> list[dict[str, Any]]:
+        """Return close name matches for minor spelling mistakes."""
+        query_key = _LOOKUP_SUFFIX.sub("", query).strip()
+        if len(query_key) < _FUZZY_LOOKUP_MIN_LENGTH:
+            return []
+        rows_by_key: dict[str, dict[str, Any]] = {}
+        for row in self.weapons:
+            key = _LOOKUP_SUFFIX.sub("", normalize_name(row.get("Name"))).strip()
+            if key:
+                rows_by_key.setdefault(key, row)
+        close_keys = get_close_matches(
+            query_key,
+            rows_by_key,
+            n=10,
+            cutoff=_FUZZY_LOOKUP_CUTOFF,
+        )
+        return [rows_by_key[key] for key in close_keys]
+
     async def _lookup(self, ctx: commands.Context, query: str) -> None:
         query_key = normalize_name(query)
         exact = [row for row in self.weapons if normalize_name(row.get("Name")) == query_key]
         matches = exact or [
             row for row in self.weapons if query_key in normalize_name(row.get("Name"))
         ]
+        if not matches:
+            matches = self._fuzzy_lookup_matches(query_key)
         if not matches:
             await ctx.send("Weapon not found.")
             return
