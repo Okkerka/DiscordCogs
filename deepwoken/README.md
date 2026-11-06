@@ -7,14 +7,23 @@ Examples below use `>` as the bot prefix.
 | --- | --- | --- |
 | Look up a weapon | `>dwweapon Enforcer's Axe` | `/dwweapon query:Enforcer's Axe` |
 | Rank eligible weapons | `>dwweapon heavy 100 medium 100 prof 6` | `/dwweapon query:heavy 100 medium 100 prof 6` |
+| Rank against resistance | `>dwweapon heavy 100 medium 100 prof 6 res 35 50` | `/dwweapon query:heavy 100 medium 100 prof 6 res 35 50` |
 | Update from the wiki (bot owner) | `>dwweapon updatelist` | `/dwweapon query:updatelist` |
 | Reload saved data (bot owner) | `>dwreload` | `/dwreload` |
 
 `>dw` and `>weapon` remain prefix aliases. Lookup is case-insensitive, ignores
 harmless name formatting, and suggests the closest match for minor typos. Stats
-range from 0 to 100 and proficiency from 0 to 6. Include any required attributes
-or attunements in the query. Stat ordering does not affect the ranking; anyone can
-use the page controls.
+range from 0 to 100 and proficiency from 0 to 6. Stats not listed in the query
+count as 0, so include every required attribute or attunement. Attunements accept
+names and short forms such as `flame`/`fire`, `frost`/`ice`, `lightning`/`thunder`,
+`wind`/`gale`, `shadow`, `blood`/`bloodrend`, and `ironsing`/`metal`/`iron`.
+Stat ordering does not affect the ranking; anyone can use the page controls.
+
+Add `res 35 50` to a stat query to compare damage against 35% and 50%
+resistance. Effective resistance is `RES * (1 - PEN/100)`, and weapon PEN caps
+at 50%. Each result shows its normal PEN and 3-star PEN (+15%, capped at 50%)
+with DPS and M1 at every requested resistance. Results are sorted by the first
+resistance.
 
 After updating and loading the cog, a bot owner can enable slash commands with:
 
@@ -35,8 +44,11 @@ safely. Conflicting wiki rows are reported and trusted existing rows retained;
 new weapons with conflicting statistics are excluded until their source is consistent.
 
 Rankings enforce numeric stat requirements. Non-stat unlock alternatives are not
-modeled. DPS includes listed endlag but excludes bleed, criticals, procs, enchants,
-talents, penetration and resistance; lookup-only offhands are not DPS-ranked.
+modeled. `M1` is the scaled damage of one hit at the supplied stats and
+proficiency. Swing Speed is a multiplier over a 0.5-second baseline swing, not a
+duration in seconds, so `DPS = M1 / (0.5 / Swing Speed + Endlag)`. DPS excludes
+bleed, criticals, procs, enchants, talents, penetration and resistance unless a
+`res` query is used; lookup-only offhands are not DPS-ranked.
 
 Development checks (Python 3.10+, with Red/discord.py and openpyxl installed):
 

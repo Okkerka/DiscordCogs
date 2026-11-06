@@ -560,6 +560,41 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
             {"MED": 50},
         )
 
+    def test_ironsing_and_iron_resolve_to_metal(self):
+        self.assertEqual(
+            self.cog._parse_stat_query(("ironsing", "80")),
+            ({"MTL": 80}, 0),
+        )
+        self.assertEqual(
+            self.cog._parse_stat_query(("iron", "80")),
+            ({"MTL": 80}, 0),
+        )
+
+    async def test_ironsing_multi_stat_query_ranks_metal_weapon(self):
+        self.cog.weapons = [
+            self.weapon(
+                "Ironsing Blade",
+                "Heavy",
+                "80 HVY80 MTL",
+                "HVY: 5MTL: 5",
+                20,
+            )
+        ]
+        ctx = FakeContext()
+
+        await self.cog._weapon_query(
+            ctx,
+            "heavy", "80",
+            "blood", "80",
+            "ironsing", "80",
+            "flame", "80",
+            "light", "80",
+        )
+
+        self.assertEqual(len(ctx.embeds), 1)
+        self.assertIn("Ironsing Blade", ctx.embeds[0].description)
+        self.assertIn("MTL 80", ctx.embeds[0].title)
+
     async def test_multiple_weapon_stats_share_one_order_independent_ranking(self):
         self.cog.weapons = [
             self.weapon("Heavy Only", "Heavy", "100 HVY", "HVY: 10", 20),
@@ -597,6 +632,109 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(ctx.embeds), 2)
         for index in range(20):
             self.assertIn(f"Weapon {index:02}", rendered)
+
+    def test_resistance_modifiers_split_from_stat_query(self):
+        self.assertEqual(
+            self.cog._extract_resistances(("heavy", "100", "res", "35", "50")),
+            (("heavy", "100"), (35, 50)),
+        )
+        self.assertEqual(
+            self.cog._extract_resistances(("heavy", "100", "res", "35", "res", "50")),
+            (("heavy", "100"), (35, 50)),
+        )
+        self.assertEqual(
+            self.cog._extract_resistances(("heavy", "100", "res", "35%", "50%")),
+            (("heavy", "100"), (35, 50)),
+        )
+        self.assertIsNone(self.cog._extract_resistances(("heavy", "100", "res")))
+        self.assertIsNone(self.cog._extract_resistances(("heavy", "100", "res", "101")))
+        self.assertIsNone(
+            self.cog._extract_resistances(("heavy", "100", "res", "35", "50", "60"))
+        )
+
+    def test_resistance_damage_applies_penetration_and_caps_at_fifty_percent(self):
+        row = self.weapon("Pen Blade", "Heavy", "0 HVY", "HVY: 5", 20)
+        row["Armor Penetration"] = "20%"
+
+        self.assertEqual(self.cog._penetration(row), 20)
+        self.assertAlmostEqual(self.cog._damage_after_resistance(100, 50, 20), 60)
+        self.assertAlmostEqual(self.cog._damage_after_resistance(100, 35, 0), 65)
+
+        row["Armor Penetration"] = "80%"
+        self.assertEqual(self.cog._penetration(row), 50)
+        self.assertAlmostEqual(self.cog._damage_after_resistance(100, 50, 50), 75)
+
+        row["Armor Penetration"] = "-"
+        self.assertEqual(self.cog._penetration(row), 0)
+
+    async def test_resistance_ranking_orders_by_first_target_and_shows_three_star_pen(self):
+        low_pen = self.weapon("Low Pen", "Heavy", "0 HVY", "HVY: 5", 20)
+        low_pen["Armor Penetration"] = "0%"
+        high_pen = self.weapon("High Pen", "Heavy", "0 HVY", "HVY: 5", 20)
+        high_pen["Armor Penetration"] = "20%"
+        capped_pen = self.weapon("Capped Pen", "Heavy", "0 HVY", "HVY: 5", 20)
+        capped_pen["Armor Penetration"] = "45%"
+        self.cog.weapons = [low_pen, capped_pen, high_pen]
+
+        ctx = FakeContext()
+        await self.cog._weapon_query(
+            ctx,
+            "heavy", "100", "prof", "6", "res", "35", "50",
+        )
+
+        self.assertEqual(len(ctx.embeds), 1)
+        description = ctx.embeds[0].description
+        self.assertIn("35%/50% RES", ctx.embeds[0].title)
+        self.assertIn("`PEN:` 20% (3★ 35%)", description)
+        self.assertIn("`PEN:` 45% (3★ 50%)", description)
+        self.assertIn("`35% RES:`", description)
+        self.assertIn("`50% RES:`", description)
+        self.assertLess(description.index("Capped Pen"), description.index("High Pen"))
+        self.assertLess(description.index("High Pen"), description.index("Low Pen"))
+
+    async def test_resistance_ranking_paginates_eight_per_page(self):
+        self.cog.weapons = [
+            self.weapon(f"Weapon {index:02}", "Heavy", "0 HVY", "HVY: 5", 40 - index)
+            for index in range(9)
+        ]
+        ctx = FakeContext()
+
+        await self.cog._weapon_query(ctx, "heavy", "100", "res", "35", "50")
+
+        self.assertEqual(len(ctx.embeds), 2)
+        self.assertEqual(ctx.embeds[0].description.count("`DPS:`"), 8)
+        self.assertEqual(ctx.embeds[1].description.count("`DPS:`"), 1)
+
+    def test_resistance_ranking_pages_fit_discord_embed_limits(self):
+        self.cog.weapons = [
+            self.complete_row(f"{index:02}-" + "W" * 20_000)
+            for index in range(9)
+        ]
+        stats = {stat: 100 for stat in set(STAT_ALIASES.values())}
+
+        pages = self.cog._ranking_pages(stats, 6, resistances=(35, 50))
+
+        self.assertEqual(len(pages), 2)
+        self.assertTrue(all(len(page.title) <= 256 for page in pages))
+        self.assertTrue(all(len(page.description) <= 4096 for page in pages))
+        self.assertTrue(all(len(page.footer) <= 2048 for page in pages))
+        self.assertEqual(pages[0].description.count("`DPS:`"), 8)
+        self.assertEqual(pages[1].description.count("`DPS:`"), 1)
+
+    async def test_invalid_resistance_query_reports_valid_range(self):
+        self.cog.weapons = []
+        ctx = FakeContext()
+        await self.cog._weapon_query(ctx, "heavy", "100", "res", "101")
+        self.assertEqual(len(ctx.messages), 1)
+        self.assertIn("0 to 100", ctx.messages[0])
+
+        ctx = FakeContext()
+        await self.cog._weapon_query(ctx, "res", "35")
+        self.assertIn("need a stat query", ctx.messages[0])
+
+        ctx = FakeContext()
+        await self.cog._weapon_query(ctx, "Pen Blade", "res", "35")
+        self.assertIn("need a valid stat query", ctx.messages[0])
 
     def test_ranking_pages_fit_discord_embed_limits_with_maximum_source_names(self):
         self.cog.weapons = [

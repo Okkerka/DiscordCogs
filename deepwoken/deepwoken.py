@@ -66,7 +66,8 @@ STAT_ALIASES = {
     "flame": "FIR", "fire": "FIR", "fir": "FIR", "frost": "ICE", "ice": "ICE",
     "lightning": "LTN", "thunder": "LTN", "ltn": "LTN", "wind": "WND", "gale": "WND", "wnd": "WND",
     "shadow": "SDW", "sdw": "SDW", "blood": "BLD", "bloodrend": "BLD", "bld": "BLD",
-    "metal": "MTL", "mtl": "MTL", "strength": "STR", "str": "STR", "fortitude": "FTD", "ftd": "FTD",
+    "metal": "MTL", "mtl": "MTL", "ironsing": "MTL", "iron": "MTL",
+    "strength": "STR", "str": "STR", "fortitude": "FTD", "ftd": "FTD",
     "agility": "AGI", "agi": "AGI", "intelligence": "INT", "int": "INT", "charisma": "CHA", "cha": "CHA",
     "willpower": "WLL", "will": "WLL", "wll": "WLL", "mind": "MND", "body": "BDY", "bdy": "BDY",
 }
@@ -110,6 +111,11 @@ LOOKUP_FIELD_VALUE_LIMIT = min(
     DISCORD_EMBED_TOTAL_LIMIT // LOOKUP_FIELD_COUNT,
 )
 LOOKUP_FOOTER = "Example: [p]dwweapon heavy 100 medium 100 prof 6"
+_RESISTANCE_TOKENS = frozenset({"res", "resist", "resistance"})
+_MAX_RESISTANCE_VALUES = 2
+_PENETRATION_CAP = 50.0
+_THREE_STAR_PENETRATION_BONUS = 15.0
+_RESISTANCE_PAGE_SIZE = 8
 _FUZZY_LOOKUP_CUTOFF = 0.8
 _FUZZY_LOOKUP_MIN_LENGTH = 5
 _LOOKUP_SUFFIX = re.compile(r"\s*\([^()]*\)\s*$")
@@ -255,6 +261,36 @@ class Deepwoken(commands.Cog):
         finally:
             workbook.close()
 
+    @classmethod
+    def _extract_resistances(
+        cls,
+        args: tuple[str, ...],
+    ) -> tuple[tuple[str, ...], tuple[int, ...]] | None:
+        """Split optional `res <percent> [percent]` modifiers from a stat query."""
+        remaining: list[str] = []
+        resistances: list[int] = []
+        index = 0
+        while index < len(args):
+            token = args[index].casefold()
+            if token not in _RESISTANCE_TOKENS:
+                remaining.append(args[index])
+                index += 1
+                continue
+            index += 1
+            values: list[int] = []
+            while index < len(args):
+                value = cls._integer(args[index].removesuffix("%"))
+                if value is None:
+                    break
+                values.append(value)
+                index += 1
+            if not values or any(not 0 <= value <= 100 for value in values):
+                return None
+            resistances.extend(values)
+        if len(resistances) > _MAX_RESISTANCE_VALUES:
+            return None
+        return tuple(remaining), tuple(dict.fromkeys(resistances))
+
     def _parse_stat_query(self, args: tuple[str, ...]) -> tuple[dict[str, int], int] | None:
         if len(args) < 2:
             return None
@@ -328,11 +364,30 @@ class Deepwoken(commands.Cog):
         if (damage is None or speed is None or speed <= 0 or endlag < 0
                 or not all(math.isfinite(value) for value in (damage, speed, endlag))):
             return None
+        # Swing Speed is a multiplier over a 0.5-second baseline swing, not
+        # a duration in seconds. Listed Endlag is added to the cycle.
         duration = 0.5 / speed + endlag
         if duration <= 0:
             return None
         dps = damage / duration
         return dps if math.isfinite(dps) else None
+
+    @classmethod
+    def _penetration(cls, row: dict[str, Any]) -> float:
+        value = cls._number(row.get("Armor Penetration"))
+        if value is None or not math.isfinite(value):
+            return 0.0
+        return min(max(value, 0.0), _PENETRATION_CAP)
+
+    @staticmethod
+    def _damage_after_resistance(
+        damage: float,
+        resistance: float,
+        penetration: float,
+    ) -> float:
+        resistance_fraction = min(max(resistance, 0.0), 100.0) / 100.0
+        penetration_fraction = min(max(penetration, 0.0), _PENETRATION_CAP) / 100.0
+        return damage * (1.0 - resistance_fraction * (1.0 - penetration_fraction))
 
     def _rankable(self, row: dict[str, Any]) -> bool:
         if normalize_name(row.get("Name")) in _NORMALIZED_RANKING_EXCLUSIONS:
@@ -345,6 +400,9 @@ class Deepwoken(commands.Cog):
     @commands.hybrid_command(name="dwweapon", aliases=["dw", "weapon"])
     async def dwweapon(self, ctx: commands.Context, *, query: str = "") -> None:
         """Look up a weapon or rank a build, e.g. heavy 100 medium 100 prof 6.
+
+        Append `res 35 50` to a stat query to compare damage against those
+        resistances, including normal and 3-star penetration.
 
         Parameters
         ----------
@@ -361,7 +419,10 @@ class Deepwoken(commands.Cog):
     async def _weapon_query(self, ctx: commands.Context, *args: str) -> None:
         """Look up a weapon or rank every weapon usable with a multi-stat build."""
         if not args:
-            await ctx.send("Use `[p]dwweapon <name>` or `[p]dwweapon heavy 100 medium 100 prof 6`.")
+            await ctx.send(
+                "Use `[p]dwweapon <name>` or `[p]dwweapon heavy 100 medium 100 "
+                "prof 6`. Add `res 35 50` for resistance damage."
+            )
             return
         if args[0].casefold() == "updatelist":
             if len(args) != 1:
@@ -369,13 +430,31 @@ class Deepwoken(commands.Cog):
                 return
             await self._update_weapon_list(ctx)
             return
-        parsed = self._parse_stat_query(args)
+        extracted = self._extract_resistances(args)
+        if extracted is None:
+            await ctx.send(
+                "Invalid resistance query. Use `res` followed by one or two values "
+                "from 0 to 100, e.g. `res 35 50`."
+            )
+            return
+        stat_args, resistances = extracted
+        parsed = self._parse_stat_query(stat_args)
         if parsed:
-            await self._compare(ctx, *parsed)
-        elif self._looks_like_stat_query(args):
+            await self._compare(ctx, *parsed, resistances=resistances)
+        elif resistances and not stat_args:
+            await ctx.send(
+                "Resistance calculations need a stat query, e.g. "
+                "`[p]dwweapon heavy 100 medium 100 prof 6 res 35 50`."
+            )
+        elif self._looks_like_stat_query(stat_args):
             await ctx.send("Invalid stat query. Stats must be from 0 to 100 and proficiency must be from 0 to 6.")
+        elif resistances:
+            await ctx.send(
+                "Resistance calculations need a valid stat query, e.g. "
+                "`[p]dwweapon heavy 100 medium 100 prof 6 res 35 50`."
+            )
         else:
-            await self._lookup(ctx, " ".join(args))
+            await self._lookup(ctx, " ".join(stat_args))
 
     def _ranking_pages(
         self,
@@ -383,41 +462,127 @@ class Deepwoken(commands.Cog):
         prof: int,
         *,
         weapons: Sequence[WeaponRow] | None = None,
+        resistances: Sequence[int] = (),
     ) -> list[discord.Embed]:
-        ranked = []
+        ranked: list[tuple[float, float, float, WeaponRow]] = []
         for row in self.weapons if weapons is None else weapons:
-            if not self._rankable(row): continue
-            if not self._scaling(row.get("Scaling")).keys() & stats.keys(): continue
-            if not self._meets_requirements(row, stats): continue
+            if not self._rankable(row):
+                continue
+            if not self._scaling(row.get("Scaling")).keys() & stats.keys():
+                continue
+            if not self._meets_requirements(row, stats):
+                continue
             damage = self._damage(row, stats, prof)
             dps = self._dps_for_damage(row, damage)
-            if damage is not None and dps is not None: ranked.append((dps, damage, row))
+            if damage is None or dps is None:
+                continue
+            rank_dps = dps
+            if resistances:
+                resisted = self._damage_after_resistance(
+                    damage,
+                    resistances[0],
+                    self._penetration(row),
+                )
+                rank_dps = self._dps_for_damage(row, resisted)
+                if rank_dps is None:
+                    continue
+            ranked.append((rank_dps, dps, damage, row))
         if not ranked:
             return []
-        ranked.sort(key=lambda item: (-item[0], str(item[2].get("Name") or "").casefold()))
+        ranked.sort(
+            key=lambda item: (
+                -item[0],
+                normalize_name(item[3].get("Name")),
+            )
+        )
         stat_text = " | ".join(f"{stat} {value}" for stat, value in sorted(stats.items()))
+        resistance_text = "/".join(f"{value}%" for value in resistances)
+        page_size = _RESISTANCE_PAGE_SIZE if resistances else RANKING_PAGE_SIZE
         pages = []
-        for start in range(0, len(ranked), RANKING_PAGE_SIZE):
+        for start in range(0, len(ranked), page_size):
             lines = []
-            for position, (dps, damage, row) in enumerate(ranked[start:start + RANKING_PAGE_SIZE], start + 1):
+            for position, (_rank_dps, dps, damage, row) in enumerate(
+                ranked[start:start + page_size],
+                start + 1,
+            ):
                 name = self._safe_discord_text(row.get("Name") or "Unknown", 128)
                 label = self._safe_discord_text(row.get("Weapon Type") or "Unknown", 32)
-                if str(row.get("Weapon Class") or "") == "Crazy Slots": label += " | Crazy Slots"
+                if str(row.get("Weapon Class") or "") == "Crazy Slots":
+                    label += " | Crazy Slots"
                 dps_text = self._bounded_embed_text(f"{dps:.2f}", 24)
                 damage_text = self._bounded_embed_text(f"{damage:.2f}", 24)
-                lines.append(f"`{position:>2}.` **{name}** ({label})\n`DPS:` {dps_text} | `M1:` {damage_text}")
+                weapon_lines = [
+                    f"`{position:>2}.` **{name}** ({label})\n"
+                    f"`DPS:` {dps_text} | `M1:` {damage_text}"
+                ]
+                if resistances:
+                    penetration = self._penetration(row)
+                    star_penetration = min(
+                        penetration + _THREE_STAR_PENETRATION_BONUS,
+                        _PENETRATION_CAP,
+                    )
+                    weapon_lines[0] += (
+                        f" | `PEN:` {penetration:g}% "
+                        f"(3★ {star_penetration:g}%)"
+                    )
+                    for resistance in resistances:
+                        normal_damage = self._damage_after_resistance(
+                            damage,
+                            resistance,
+                            penetration,
+                        )
+                        star_damage = self._damage_after_resistance(
+                            damage,
+                            resistance,
+                            star_penetration,
+                        )
+                        normal_dps = self._dps_for_damage(row, normal_damage)
+                        star_dps = self._dps_for_damage(row, star_damage)
+                        if normal_dps is None or star_dps is None:
+                            continue
+                        weapon_lines.append(
+                            f"`{resistance}% RES:` {normal_dps:.2f} DPS / "
+                            f"{normal_damage:.2f} M1 | `3★:` {star_dps:.2f} DPS / "
+                            f"{star_damage:.2f} M1"
+                        )
+                lines.extend(weapon_lines)
+            title_parts = ["Weapon ranking"]
+            if resistance_text:
+                title_parts.append(f"{resistance_text} RES")
+            title_parts.extend([stat_text, f"Prof {prof}"])
             title = self._bounded_embed_text(
-                f"Weapon ranking | {stat_text} | Prof {prof}",
+                " | ".join(title_parts),
                 DISCORD_EMBED_TITLE_LIMIT,
             )
             description = "\n".join(lines)
             embed = discord.Embed(title=title, description=description, colour=discord.Colour.blurple())
-            embed.set_footer(text=f"Showing {start + 1}-{min(start + RANKING_PAGE_SIZE, len(ranked))} of {len(ranked)}. Numeric stat requirements are enforced; non-stat unlock alternatives are not modeled. Crazy Slots and qualifying hybrids are included. DPS includes listed Endlag; bleed, crits, procs, enchants, talents, PEN, and resistance are excluded.")
+            footer = (
+                f"Showing {start + 1}-{min(start + page_size, len(ranked))} of {len(ranked)}. "
+                "Numeric stat requirements are enforced and unlisted stats count as 0; "
+                "non-stat unlock alternatives are not modeled. Crazy Slots and qualifying "
+                "hybrids are included. DPS = M1 / (0.5 / swing speed + endlag); bleed, "
+                "crits, procs, enchants, and talents are excluded."
+            )
+            if resistances:
+                footer += (
+                    " Sorted by the first resistance. Effective RES = RES * "
+                    "(1 - PEN/100), PEN caps at 50%, and 3★ adds +15% PEN."
+                )
+            else:
+                footer += " PEN and resistance are excluded."
+            embed.set_footer(text=footer)
             pages.append(embed)
         return pages
 
-    async def _compare(self, ctx: commands.Context, stats: dict[str, int], prof: int):
-        pages = self._ranking_pages(stats, prof)
+    async def _compare(
+        self,
+        ctx: commands.Context,
+        stats: dict[str, int],
+        prof: int,
+        *,
+        resistances: Sequence[int] = (),
+    ) -> None:
+        pages = self._ranking_pages(stats, prof, resistances=resistances)
         if not pages:
             await ctx.send("No rankable weapons meet those exact stats.")
             return
