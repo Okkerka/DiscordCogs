@@ -128,8 +128,8 @@ _USAGE_GUIDE = (
     "and 3★ PEN damage. 3★ adds +15% PEN; PEN caps at 50%, and effective "
     "resistance is `RES * (1 - PEN/100)`.\n\n"
     "**Sorting**\n"
-    "`... res 35 50 sort 50` sorts by 50% RES DPS.\n"
-    "`... res 35 50 sort 50 m1` sorts by 50% RES M1 damage.\n"
+    "`... res 35 50 sort 50` sorts by 50% RES DPS (normal PEN).\n"
+    "`... res 35 50 sort 50 m1` sorts by 50% RES M1 damage with 3★ PEN.\n"
     "Without `sort`, results use the first `res` value. The `sort` target must "
     "match one of the `res` values.\n\n"
     "Aliases: `[p]dw`, `[p]weapon`. Bot owner: `[p]dwweapon updatelist`, "
@@ -459,8 +459,8 @@ class Deepwoken(commands.Cog):
 
         Append `res 35 50` to a stat query to compare damage against those
         resistances, including normal and 3-star penetration. Add `sort 50`
-        to order by one of the requested resistances, or `sort 50 m1` to
-        order by resisted M1 damage.
+        to order by DPS at one of the requested resistances, or `sort 50 m1`
+        to order by 3-star M1 damage.
 
         Parameters
         ----------
@@ -540,7 +540,7 @@ class Deepwoken(commands.Cog):
             if sort_resistance in resistances
             else (resistances[0] if resistances else None)
         )
-        ranked: list[tuple[float, float, float, WeaponRow]] = []
+        ranked: list[tuple[float, float, float, float, float, WeaponRow]] = []
         for row in self.weapons if weapons is None else weapons:
             if not self._rankable(row):
                 continue
@@ -552,12 +552,18 @@ class Deepwoken(commands.Cog):
             dps = self._dps_for_damage(row, damage)
             if damage is None or dps is None:
                 continue
+            penetration = self._penetration(row)
+            star_penetration = min(
+                penetration + _THREE_STAR_PENETRATION_BONUS,
+                _PENETRATION_CAP,
+            )
             if sort_by_m1:
+                # Mirror the 3★ column: +15% PEN, capped like normal PEN.
                 rank_value = (
                     self._damage_after_resistance(
                         damage,
                         sort_target,
-                        self._penetration(row),
+                        star_penetration,
                     )
                     if sort_target is not None
                     else damage
@@ -568,18 +574,20 @@ class Deepwoken(commands.Cog):
                     resisted = self._damage_after_resistance(
                         damage,
                         sort_target,
-                        self._penetration(row),
+                        penetration,
                     )
                     rank_value = self._dps_for_damage(row, resisted)
                     if rank_value is None:
                         continue
-            ranked.append((rank_value, dps, damage, row))
+            ranked.append(
+                (rank_value, dps, damage, penetration, star_penetration, row)
+            )
         if not ranked:
             return []
         ranked.sort(
             key=lambda item: (
                 -item[0],
-                normalize_name(item[3].get("Name")),
+                normalize_name(item[5].get("Name")),
             )
         )
         stat_text = " | ".join(f"{stat} {value}" for stat, value in sorted(stats.items()))
@@ -593,7 +601,14 @@ class Deepwoken(commands.Cog):
             lines = []
             if resistances:
                 lines.extend([f"Stats: {compact_stats}", ""])
-            for position, (_rank_value, dps, damage, row) in enumerate(
+            for position, (
+                _rank_value,
+                dps,
+                damage,
+                penetration,
+                star_penetration,
+                row,
+            ) in enumerate(
                 ranked[start:start + page_size],
                 start + 1,
             ):
@@ -602,11 +617,6 @@ class Deepwoken(commands.Cog):
                 if str(row.get("Weapon Class") or "") == "Crazy Slots":
                     label += " | Crazy Slots"
                 if resistances:
-                    penetration = self._penetration(row)
-                    star_penetration = min(
-                        penetration + _THREE_STAR_PENETRATION_BONUS,
-                        _PENETRATION_CAP,
-                    )
                     weapon_lines = [
                         f"**{position}. {name}** ({label}) · "
                         f"PEN {penetration:g}% (3★ {star_penetration:g}%)",
@@ -656,7 +666,7 @@ class Deepwoken(commands.Cog):
             description = "\n".join(lines)
             embed = discord.Embed(title=title, description=description, colour=discord.Colour.blurple())
             if resistances:
-                sort_metric = "M1" if sort_by_m1 else "DPS"
+                sort_metric = "M1 (3★)" if sort_by_m1 else "DPS"
                 footer = (
                     f"Showing {start + 1}-{min(start + page_size, len(ranked))} of {len(ranked)} · "
                     f"Sorted by {sort_target}% RES {sort_metric}. Each target shows normal and "

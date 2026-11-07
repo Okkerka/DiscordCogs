@@ -788,7 +788,31 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
             ctx_m1.embeds[0].description.index("Fast Blade"),
         )
         self.assertIn("Sorted by 35% RES DPS", ctx_dps.embeds[0].footer)
-        self.assertIn("Sorted by 35% RES M1", ctx_m1.embeds[0].footer)
+        self.assertIn("Sorted by 35% RES M1 (3★)", ctx_m1.embeds[0].footer)
+
+    async def test_resistance_m1_sort_uses_three_star_penetration(self):
+        flat = self.weapon("Flat Blade", "Heavy", "0 HVY", "HVY: 5", 13.5)
+        flat["Armor Penetration"] = "50%"
+        star = self.weapon("Star Blade", "Heavy", "0 HVY", "HVY: 5", 20)
+        star["Armor Penetration"] = "0%"
+        self.cog.weapons = [flat, star]
+
+        ctx_dps = FakeContext()
+        await self.cog._weapon_query(
+            ctx_dps,
+            "heavy", "100", "res", "35", "50", "sort", "50",
+        )
+        ctx_m1 = FakeContext()
+        await self.cog._weapon_query(
+            ctx_m1,
+            "heavy", "100", "res", "35", "50", "sort", "50", "m1",
+        )
+
+        dps_description = ctx_dps.embeds[0].description
+        m1_description = ctx_m1.embeds[0].description
+        self.assertLess(dps_description.index("Flat Blade"), dps_description.index("Star Blade"))
+        self.assertLess(m1_description.index("Star Blade"), m1_description.index("Flat Blade"))
+        self.assertIn("Sorted by 50% RES M1 (3★)", ctx_m1.embeds[0].footer)
 
     async def test_usage_guide_explains_lookup_ranking_and_sorting(self):
         ctx = FakeContext()
