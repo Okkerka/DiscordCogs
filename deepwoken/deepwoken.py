@@ -111,8 +111,33 @@ LOOKUP_FIELD_VALUE_LIMIT = min(
     DISCORD_EMBED_TOTAL_LIMIT // LOOKUP_FIELD_COUNT,
 )
 LOOKUP_FOOTER = "Example: [p]dwweapon heavy 100 medium 100 prof 6"
+_USAGE_GUIDE = (
+    "**Deepwoken weapon lookup & ranking**\n\n"
+    "**Look up a weapon**\n"
+    "`[p]dwweapon Enforcer's Axe`\n"
+    "Case-insensitive; ignores formatting and tolerates small typos.\n\n"
+    "**Rank a build**\n"
+    "`[p]dwweapon heavy 100 medium 100 prof 6`\n"
+    "Use light/medium/heavy, attunements (flame, frost, thunder, wind, shadow, "
+    "blood, metal or ironsing), and attributes. Stats are 0-100 and proficiency "
+    "is 0-6. Unlisted stats count as 0 and numeric requirements are enforced. "
+    "DPS = M1 / (0.5 / swing speed + endlag).\n\n"
+    "**Resistance damage**\n"
+    "`[p]dwweapon heavy 100 medium 100 prof 6 res 35 50`\n"
+    "`res` takes one or two resistance percentages. Each result shows normal PEN "
+    "and 3★ PEN damage. 3★ adds +15% PEN; PEN caps at 50%, and effective "
+    "resistance is `RES * (1 - PEN/100)`.\n\n"
+    "**Sorting**\n"
+    "`... res 35 50 sort 50` sorts by 50% RES DPS.\n"
+    "`... res 35 50 sort 50 m1` sorts by 50% RES M1 damage.\n"
+    "Without `sort`, results use the first `res` value. The `sort` target must "
+    "match one of the `res` values.\n\n"
+    "Aliases: `[p]dw`, `[p]weapon`. Bot owner: `[p]dwweapon updatelist`, "
+    "`[p]dwreload`."
+)
 _RESISTANCE_TOKENS = frozenset({"res", "resist", "resistance"})
 _SORT_TOKEN = "sort"
+_M1_SORT_TOKEN = "m1"
 _MAX_RESISTANCE_VALUES = 2
 _PENETRATION_CAP = 50.0
 _THREE_STAR_PENETRATION_BONUS = 15.0
@@ -297,12 +322,13 @@ class Deepwoken(commands.Cog):
         cls,
         args: tuple[str, ...],
         resistances: tuple[int, ...],
-    ) -> tuple[tuple[str, ...], int | None] | None:
-        """Split an optional `sort <requested resistance>` modifier."""
+    ) -> tuple[tuple[str, ...], int | None, bool] | None:
+        """Split an optional `sort <requested resistance> [m1]` modifier."""
         if not resistances:
-            return tuple(args), None
+            return tuple(args), None, False
         remaining: list[str] = []
         sort_resistance: int | None = None
+        sort_by_m1 = False
         index = 0
         while index < len(args):
             if args[index].casefold() != _SORT_TOKEN:
@@ -316,7 +342,10 @@ class Deepwoken(commands.Cog):
                 return None
             sort_resistance = value
             index += 2
-        return tuple(remaining), sort_resistance
+            if index < len(args) and args[index].casefold() == _M1_SORT_TOKEN:
+                sort_by_m1 = True
+                index += 1
+        return tuple(remaining), sort_resistance, sort_by_m1
 
     def _parse_stat_query(self, args: tuple[str, ...]) -> tuple[dict[str, int], int] | None:
         if len(args) < 2:
@@ -430,7 +459,8 @@ class Deepwoken(commands.Cog):
 
         Append `res 35 50` to a stat query to compare damage against those
         resistances, including normal and 3-star penetration. Add `sort 50`
-        to order by one of the requested resistances.
+        to order by one of the requested resistances, or `sort 50 m1` to
+        order by resisted M1 damage.
 
         Parameters
         ----------
@@ -447,11 +477,7 @@ class Deepwoken(commands.Cog):
     async def _weapon_query(self, ctx: commands.Context, *args: str) -> None:
         """Look up a weapon or rank every weapon usable with a multi-stat build."""
         if not args:
-            await ctx.send(
-                "Use `[p]dwweapon <name>` or `[p]dwweapon heavy 100 medium 100 "
-                "prof 6`. Add `res 35 50` for resistance damage and `sort 50` "
-                "to order by that target."
-            )
+            await ctx.send(_USAGE_GUIDE)
             return
         if args[0].casefold() == "updatelist":
             if len(args) != 1:
@@ -471,10 +497,10 @@ class Deepwoken(commands.Cog):
         if sort_args is None:
             await ctx.send(
                 "Invalid sort query. Use `sort` after `res` with one of the "
-                "requested values, e.g. `res 35 50 sort 50`."
+                "requested values, e.g. `res 35 50 sort 50 m1`."
             )
             return
-        stat_args, sort_resistance = sort_args
+        stat_args, sort_resistance, sort_by_m1 = sort_args
         parsed = self._parse_stat_query(stat_args)
         if parsed:
             await self._compare(
@@ -482,6 +508,7 @@ class Deepwoken(commands.Cog):
                 *parsed,
                 resistances=resistances,
                 sort_resistance=sort_resistance,
+                sort_by_m1=sort_by_m1,
             )
         elif resistances and not stat_args:
             await ctx.send(
@@ -506,6 +533,7 @@ class Deepwoken(commands.Cog):
         weapons: Sequence[WeaponRow] | None = None,
         resistances: Sequence[int] = (),
         sort_resistance: int | None = None,
+        sort_by_m1: bool = False,
     ) -> list[discord.Embed]:
         sort_target = (
             sort_resistance
@@ -524,17 +552,28 @@ class Deepwoken(commands.Cog):
             dps = self._dps_for_damage(row, damage)
             if damage is None or dps is None:
                 continue
-            rank_dps = dps
-            if sort_target is not None:
-                resisted = self._damage_after_resistance(
-                    damage,
-                    sort_target,
-                    self._penetration(row),
+            if sort_by_m1:
+                rank_value = (
+                    self._damage_after_resistance(
+                        damage,
+                        sort_target,
+                        self._penetration(row),
+                    )
+                    if sort_target is not None
+                    else damage
                 )
-                rank_dps = self._dps_for_damage(row, resisted)
-                if rank_dps is None:
-                    continue
-            ranked.append((rank_dps, dps, damage, row))
+            else:
+                rank_value = dps
+                if sort_target is not None:
+                    resisted = self._damage_after_resistance(
+                        damage,
+                        sort_target,
+                        self._penetration(row),
+                    )
+                    rank_value = self._dps_for_damage(row, resisted)
+                    if rank_value is None:
+                        continue
+            ranked.append((rank_value, dps, damage, row))
         if not ranked:
             return []
         ranked.sort(
@@ -554,7 +593,7 @@ class Deepwoken(commands.Cog):
             lines = []
             if resistances:
                 lines.extend([f"Stats: {compact_stats}", ""])
-            for position, (_rank_dps, dps, damage, row) in enumerate(
+            for position, (_rank_value, dps, damage, row) in enumerate(
                 ranked[start:start + page_size],
                 start + 1,
             ):
@@ -617,9 +656,10 @@ class Deepwoken(commands.Cog):
             description = "\n".join(lines)
             embed = discord.Embed(title=title, description=description, colour=discord.Colour.blurple())
             if resistances:
+                sort_metric = "M1" if sort_by_m1 else "DPS"
                 footer = (
                     f"Showing {start + 1}-{min(start + page_size, len(ranked))} of {len(ranked)} · "
-                    f"Sorted by {sort_target}% RES DPS. Each target shows normal and "
+                    f"Sorted by {sort_target}% RES {sort_metric}. Each target shows normal and "
                     "3★ damage as DPS / M1. 3★ adds +15% PEN (cap 50%); effective "
                     "RES = RES * (1 - PEN/100). Bleed, crits, procs, enchants, and "
                     "talents are excluded."
@@ -645,12 +685,14 @@ class Deepwoken(commands.Cog):
         *,
         resistances: Sequence[int] = (),
         sort_resistance: int | None = None,
+        sort_by_m1: bool = False,
     ) -> None:
         pages = self._ranking_pages(
             stats,
             prof,
             resistances=resistances,
             sort_resistance=sort_resistance,
+            sort_by_m1=sort_by_m1,
         )
         if not pages:
             await ctx.send("No rankable weapons meet those exact stats.")

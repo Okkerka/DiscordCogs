@@ -24,7 +24,9 @@ resistance. Effective resistance is `RES * (1 - PEN/100)`, and weapon PEN caps
 at 50%. Each result shows its normal PEN and 3-star PEN (+15%, capped at 50%)
 with DPS and M1 at every requested resistance. Results default to the first
 requested resistance; add `sort 50` to order by another requested target, for
-example `res 35 50 sort 50`. The sort value must match one of the `res` values.
+example `res 35 50 sort 50`. Append `m1` to sort by resisted M1 damage instead
+of resisted DPS, for example `res 35 50 sort 50 m1`. The sort value must match
+one of the `res` values.
 
 After updating and loading the cog, a bot owner can enable slash commands with:
 

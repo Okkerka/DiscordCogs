@@ -655,22 +655,36 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
     def test_resistance_sort_modifier_selects_requested_target(self):
         self.assertEqual(
             self.cog._extract_resistance_sort(("heavy", "100", "sort", "50"), (35, 50)),
-            (("heavy", "100"), 50),
+            (("heavy", "100"), 50, False),
         )
         self.assertEqual(
             self.cog._extract_resistance_sort(
                 ("heavy", "100", "sort", "50%"),
                 (35, 50),
             ),
-            (("heavy", "100"), 50),
+            (("heavy", "100"), 50, False),
+        )
+        self.assertEqual(
+            self.cog._extract_resistance_sort(
+                ("heavy", "100", "sort", "50", "m1"),
+                (35, 50),
+            ),
+            (("heavy", "100"), 50, True),
+        )
+        self.assertEqual(
+            self.cog._extract_resistance_sort(
+                ("heavy", "100", "sort", "35%", "M1"),
+                (35, 50),
+            ),
+            (("heavy", "100"), 35, True),
         )
         self.assertEqual(
             self.cog._extract_resistance_sort(("heavy", "100"), (35, 50)),
-            (("heavy", "100"), None),
+            (("heavy", "100"), None, False),
         )
         self.assertEqual(
             self.cog._extract_resistance_sort(("heavy", "100", "sort", "50"), ()),
-            (("heavy", "100", "sort", "50"), None),
+            (("heavy", "100", "sort", "50"), None, False),
         )
         self.assertIsNone(
             self.cog._extract_resistance_sort(("heavy", "100", "sort", "60"), (35, 50))
@@ -747,6 +761,53 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(fifty_description.index("High Pen"), fifty_description.index("Low Pen"))
         self.assertIn("Sorted by 35% RES DPS", ctx_first.embeds[0].footer)
         self.assertIn("Sorted by 50% RES DPS", ctx_fifty.embeds[0].footer)
+
+    async def test_resistance_sort_modifier_can_rank_by_m1(self):
+        fast = self.weapon("Fast Blade", "Heavy", "0 HVY", "HVY: 5", 10)
+        fast["Swing Speed"] = "2x"
+        slow = self.weapon("Slow Blade", "Heavy", "0 HVY", "HVY: 5", 20)
+        self.cog.weapons = [fast, slow]
+
+        ctx_dps = FakeContext()
+        await self.cog._weapon_query(
+            ctx_dps,
+            "heavy", "100", "res", "35", "sort", "35",
+        )
+        ctx_m1 = FakeContext()
+        await self.cog._weapon_query(
+            ctx_m1,
+            "heavy", "100", "res", "35", "sort", "35", "m1",
+        )
+
+        self.assertLess(
+            ctx_dps.embeds[0].description.index("Fast Blade"),
+            ctx_dps.embeds[0].description.index("Slow Blade"),
+        )
+        self.assertLess(
+            ctx_m1.embeds[0].description.index("Slow Blade"),
+            ctx_m1.embeds[0].description.index("Fast Blade"),
+        )
+        self.assertIn("Sorted by 35% RES DPS", ctx_dps.embeds[0].footer)
+        self.assertIn("Sorted by 35% RES M1", ctx_m1.embeds[0].footer)
+
+    async def test_usage_guide_explains_lookup_ranking_and_sorting(self):
+        ctx = FakeContext()
+
+        await self.cog._weapon_query(ctx)
+
+        self.assertEqual(len(ctx.messages), 1)
+        guide = ctx.messages[0]
+        for text in (
+            "Look up a weapon",
+            "Rank a build",
+            "Resistance damage",
+            "sort 50 m1",
+            "Unlisted stats count as 0",
+            "3★",
+            "dwreload",
+        ):
+            self.assertIn(text, guide)
+        self.assertLessEqual(len(guide), 2000)
 
     async def test_resistance_ranking_paginates_eight_per_page(self):
         self.cog.weapons = [
