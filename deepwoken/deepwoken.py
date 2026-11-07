@@ -112,6 +112,7 @@ LOOKUP_FIELD_VALUE_LIMIT = min(
 )
 LOOKUP_FOOTER = "Example: [p]dwweapon heavy 100 medium 100 prof 6"
 _RESISTANCE_TOKENS = frozenset({"res", "resist", "resistance"})
+_SORT_TOKEN = "sort"
 _MAX_RESISTANCE_VALUES = 2
 _PENETRATION_CAP = 50.0
 _THREE_STAR_PENETRATION_BONUS = 15.0
@@ -291,6 +292,32 @@ class Deepwoken(commands.Cog):
             return None
         return tuple(remaining), tuple(dict.fromkeys(resistances))
 
+    @classmethod
+    def _extract_resistance_sort(
+        cls,
+        args: tuple[str, ...],
+        resistances: tuple[int, ...],
+    ) -> tuple[tuple[str, ...], int | None] | None:
+        """Split an optional `sort <requested resistance>` modifier."""
+        if not resistances:
+            return tuple(args), None
+        remaining: list[str] = []
+        sort_resistance: int | None = None
+        index = 0
+        while index < len(args):
+            if args[index].casefold() != _SORT_TOKEN:
+                remaining.append(args[index])
+                index += 1
+                continue
+            if sort_resistance is not None or index + 1 >= len(args):
+                return None
+            value = cls._integer(args[index + 1].removesuffix("%"))
+            if value is None or value not in resistances:
+                return None
+            sort_resistance = value
+            index += 2
+        return tuple(remaining), sort_resistance
+
     def _parse_stat_query(self, args: tuple[str, ...]) -> tuple[dict[str, int], int] | None:
         if len(args) < 2:
             return None
@@ -402,7 +429,8 @@ class Deepwoken(commands.Cog):
         """Look up a weapon or rank a build, e.g. heavy 100 medium 100 prof 6.
 
         Append `res 35 50` to a stat query to compare damage against those
-        resistances, including normal and 3-star penetration.
+        resistances, including normal and 3-star penetration. Add `sort 50`
+        to order by one of the requested resistances.
 
         Parameters
         ----------
@@ -421,7 +449,8 @@ class Deepwoken(commands.Cog):
         if not args:
             await ctx.send(
                 "Use `[p]dwweapon <name>` or `[p]dwweapon heavy 100 medium 100 "
-                "prof 6`. Add `res 35 50` for resistance damage."
+                "prof 6`. Add `res 35 50` for resistance damage and `sort 50` "
+                "to order by that target."
             )
             return
         if args[0].casefold() == "updatelist":
@@ -438,9 +467,22 @@ class Deepwoken(commands.Cog):
             )
             return
         stat_args, resistances = extracted
+        sort_args = self._extract_resistance_sort(stat_args, resistances)
+        if sort_args is None:
+            await ctx.send(
+                "Invalid sort query. Use `sort` after `res` with one of the "
+                "requested values, e.g. `res 35 50 sort 50`."
+            )
+            return
+        stat_args, sort_resistance = sort_args
         parsed = self._parse_stat_query(stat_args)
         if parsed:
-            await self._compare(ctx, *parsed, resistances=resistances)
+            await self._compare(
+                ctx,
+                *parsed,
+                resistances=resistances,
+                sort_resistance=sort_resistance,
+            )
         elif resistances and not stat_args:
             await ctx.send(
                 "Resistance calculations need a stat query, e.g. "
@@ -463,7 +505,13 @@ class Deepwoken(commands.Cog):
         *,
         weapons: Sequence[WeaponRow] | None = None,
         resistances: Sequence[int] = (),
+        sort_resistance: int | None = None,
     ) -> list[discord.Embed]:
+        sort_target = (
+            sort_resistance
+            if sort_resistance in resistances
+            else (resistances[0] if resistances else None)
+        )
         ranked: list[tuple[float, float, float, WeaponRow]] = []
         for row in self.weapons if weapons is None else weapons:
             if not self._rankable(row):
@@ -477,10 +525,10 @@ class Deepwoken(commands.Cog):
             if damage is None or dps is None:
                 continue
             rank_dps = dps
-            if resistances:
+            if sort_target is not None:
                 resisted = self._damage_after_resistance(
                     damage,
-                    resistances[0],
+                    sort_target,
                     self._penetration(row),
                 )
                 rank_dps = self._dps_for_damage(row, resisted)
@@ -496,11 +544,16 @@ class Deepwoken(commands.Cog):
             )
         )
         stat_text = " | ".join(f"{stat} {value}" for stat, value in sorted(stats.items()))
+        compact_stats = " · ".join(
+            f"{stat} {value}" for stat, value in sorted(stats.items())
+        )
         resistance_text = "/".join(f"{value}%" for value in resistances)
         page_size = _RESISTANCE_PAGE_SIZE if resistances else RANKING_PAGE_SIZE
         pages = []
         for start in range(0, len(ranked), page_size):
             lines = []
+            if resistances:
+                lines.extend([f"Stats: {compact_stats}", ""])
             for position, (_rank_dps, dps, damage, row) in enumerate(
                 ranked[start:start + page_size],
                 start + 1,
@@ -509,22 +562,17 @@ class Deepwoken(commands.Cog):
                 label = self._safe_discord_text(row.get("Weapon Type") or "Unknown", 32)
                 if str(row.get("Weapon Class") or "") == "Crazy Slots":
                     label += " | Crazy Slots"
-                dps_text = self._bounded_embed_text(f"{dps:.2f}", 24)
-                damage_text = self._bounded_embed_text(f"{damage:.2f}", 24)
-                weapon_lines = [
-                    f"`{position:>2}.` **{name}** ({label})\n"
-                    f"`DPS:` {dps_text} | `M1:` {damage_text}"
-                ]
                 if resistances:
                     penetration = self._penetration(row)
                     star_penetration = min(
                         penetration + _THREE_STAR_PENETRATION_BONUS,
                         _PENETRATION_CAP,
                     )
-                    weapon_lines[0] += (
-                        f" | `PEN:` {penetration:g}% "
-                        f"(3★ {star_penetration:g}%)"
-                    )
+                    weapon_lines = [
+                        f"**{position}. {name}** ({label}) · "
+                        f"PEN {penetration:g}% (3★ {star_penetration:g}%)",
+                        f"**Base** {dps:.2f} DPS / {damage:.2f} M1",
+                    ]
                     for resistance in resistances:
                         normal_damage = self._damage_after_resistance(
                             damage,
@@ -541,35 +589,50 @@ class Deepwoken(commands.Cog):
                         if normal_dps is None or star_dps is None:
                             continue
                         weapon_lines.append(
-                            f"`{resistance}% RES:` {normal_dps:.2f} DPS / "
-                            f"{normal_damage:.2f} M1 | `3★:` {star_dps:.2f} DPS / "
+                            f"**{resistance}% RES** {normal_dps:.2f} DPS / "
+                            f"{normal_damage:.2f} M1 · **3★** {star_dps:.2f} DPS / "
                             f"{star_damage:.2f} M1"
                         )
-                lines.extend(weapon_lines)
-            title_parts = ["Weapon ranking"]
-            if resistance_text:
-                title_parts.append(f"{resistance_text} RES")
-            title_parts.extend([stat_text, f"Prof {prof}"])
-            title = self._bounded_embed_text(
-                " | ".join(title_parts),
-                DISCORD_EMBED_TITLE_LIMIT,
-            )
-            description = "\n".join(lines)
-            embed = discord.Embed(title=title, description=description, colour=discord.Colour.blurple())
-            footer = (
-                f"Showing {start + 1}-{min(start + page_size, len(ranked))} of {len(ranked)}. "
-                "Numeric stat requirements are enforced and unlisted stats count as 0; "
-                "non-stat unlock alternatives are not modeled. Crazy Slots and qualifying "
-                "hybrids are included. DPS = M1 / (0.5 / swing speed + endlag); bleed, "
-                "crits, procs, enchants, and talents are excluded."
-            )
+                    lines.extend(weapon_lines)
+                    lines.append("")
+                else:
+                    dps_text = self._bounded_embed_text(f"{dps:.2f}", 24)
+                    damage_text = self._bounded_embed_text(f"{damage:.2f}", 24)
+                    lines.append(
+                        f"`{position:>2}.` **{name}** ({label})\n"
+                        f"`DPS:` {dps_text} | `M1:` {damage_text}"
+                    )
+            if resistances and lines and not lines[-1]:
+                lines.pop()
             if resistances:
-                footer += (
-                    " Sorted by the first resistance. Effective RES = RES * "
-                    "(1 - PEN/100), PEN caps at 50%, and 3★ adds +15% PEN."
+                title = self._bounded_embed_text(
+                    f"Weapon ranking · {resistance_text} RES · Prof {prof}",
+                    DISCORD_EMBED_TITLE_LIMIT,
                 )
             else:
-                footer += " PEN and resistance are excluded."
+                title = self._bounded_embed_text(
+                    f"Weapon ranking | {stat_text} | Prof {prof}",
+                    DISCORD_EMBED_TITLE_LIMIT,
+                )
+            description = "\n".join(lines)
+            embed = discord.Embed(title=title, description=description, colour=discord.Colour.blurple())
+            if resistances:
+                footer = (
+                    f"Showing {start + 1}-{min(start + page_size, len(ranked))} of {len(ranked)} · "
+                    f"Sorted by {sort_target}% RES DPS. Each target shows normal and "
+                    "3★ damage as DPS / M1. 3★ adds +15% PEN (cap 50%); effective "
+                    "RES = RES * (1 - PEN/100). Bleed, crits, procs, enchants, and "
+                    "talents are excluded."
+                )
+            else:
+                footer = (
+                    f"Showing {start + 1}-{min(start + page_size, len(ranked))} of {len(ranked)}. "
+                    "Numeric stat requirements are enforced and unlisted stats count as 0; "
+                    "non-stat unlock alternatives are not modeled. Crazy Slots and qualifying "
+                    "hybrids are included. DPS = M1 / (0.5 / swing speed + endlag); bleed, "
+                    "crits, procs, enchants, and talents are excluded. PEN and resistance "
+                    "are excluded."
+                )
             embed.set_footer(text=footer)
             pages.append(embed)
         return pages
@@ -581,8 +644,14 @@ class Deepwoken(commands.Cog):
         prof: int,
         *,
         resistances: Sequence[int] = (),
+        sort_resistance: int | None = None,
     ) -> None:
-        pages = self._ranking_pages(stats, prof, resistances=resistances)
+        pages = self._ranking_pages(
+            stats,
+            prof,
+            resistances=resistances,
+            sort_resistance=sort_resistance,
+        )
         if not pages:
             await ctx.send("No rankable weapons meet those exact stats.")
             return

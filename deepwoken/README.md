@@ -7,7 +7,7 @@ Examples below use `>` as the bot prefix.
 | --- | --- | --- |
 | Look up a weapon | `>dwweapon Enforcer's Axe` | `/dwweapon query:Enforcer's Axe` |
 | Rank eligible weapons | `>dwweapon heavy 100 medium 100 prof 6` | `/dwweapon query:heavy 100 medium 100 prof 6` |
-| Rank against resistance | `>dwweapon heavy 100 medium 100 prof 6 res 35 50` | `/dwweapon query:heavy 100 medium 100 prof 6 res 35 50` |
+| Rank against resistance | `>dwweapon heavy 100 medium 100 prof 6 res 35 50 sort 50` | `/dwweapon query:heavy 100 medium 100 prof 6 res 35 50 sort 50` |
 | Update from the wiki (bot owner) | `>dwweapon updatelist` | `/dwweapon query:updatelist` |
 | Reload saved data (bot owner) | `>dwreload` | `/dwreload` |
 
@@ -22,8 +22,9 @@ Stat ordering does not affect the ranking; anyone can use the page controls.
 Add `res 35 50` to a stat query to compare damage against 35% and 50%
 resistance. Effective resistance is `RES * (1 - PEN/100)`, and weapon PEN caps
 at 50%. Each result shows its normal PEN and 3-star PEN (+15%, capped at 50%)
-with DPS and M1 at every requested resistance. Results are sorted by the first
-resistance.
+with DPS and M1 at every requested resistance. Results default to the first
+requested resistance; add `sort 50` to order by another requested target, for
+example `res 35 50 sort 50`. The sort value must match one of the `res` values.
 
 After updating and loading the cog, a bot owner can enable slash commands with:
 

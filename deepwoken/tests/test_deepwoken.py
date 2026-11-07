@@ -652,6 +652,39 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
             self.cog._extract_resistances(("heavy", "100", "res", "35", "50", "60"))
         )
 
+    def test_resistance_sort_modifier_selects_requested_target(self):
+        self.assertEqual(
+            self.cog._extract_resistance_sort(("heavy", "100", "sort", "50"), (35, 50)),
+            (("heavy", "100"), 50),
+        )
+        self.assertEqual(
+            self.cog._extract_resistance_sort(
+                ("heavy", "100", "sort", "50%"),
+                (35, 50),
+            ),
+            (("heavy", "100"), 50),
+        )
+        self.assertEqual(
+            self.cog._extract_resistance_sort(("heavy", "100"), (35, 50)),
+            (("heavy", "100"), None),
+        )
+        self.assertEqual(
+            self.cog._extract_resistance_sort(("heavy", "100", "sort", "50"), ()),
+            (("heavy", "100", "sort", "50"), None),
+        )
+        self.assertIsNone(
+            self.cog._extract_resistance_sort(("heavy", "100", "sort", "60"), (35, 50))
+        )
+        self.assertIsNone(
+            self.cog._extract_resistance_sort(("heavy", "100", "sort"), (35, 50))
+        )
+        self.assertIsNone(
+            self.cog._extract_resistance_sort(
+                ("heavy", "100", "sort", "35", "sort", "50"),
+                (35, 50),
+            )
+        )
+
     def test_resistance_damage_applies_penetration_and_caps_at_fifty_percent(self):
         row = self.weapon("Pen Blade", "Heavy", "0 HVY", "HVY: 5", 20)
         row["Armor Penetration"] = "20%"
@@ -685,12 +718,35 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(ctx.embeds), 1)
         description = ctx.embeds[0].description
         self.assertIn("35%/50% RES", ctx.embeds[0].title)
-        self.assertIn("`PEN:` 20% (3★ 35%)", description)
-        self.assertIn("`PEN:` 45% (3★ 50%)", description)
-        self.assertIn("`35% RES:`", description)
-        self.assertIn("`50% RES:`", description)
+        self.assertIn("PEN 20% (3★ 35%)", description)
+        self.assertIn("PEN 45% (3★ 50%)", description)
+        self.assertIn("**35% RES**", description)
+        self.assertIn("**50% RES**", description)
+        self.assertNotIn("`", description)
         self.assertLess(description.index("Capped Pen"), description.index("High Pen"))
         self.assertLess(description.index("High Pen"), description.index("Low Pen"))
+
+    async def test_resistance_sort_modifier_changes_ranking_target(self):
+        low_pen = self.weapon("Low Pen", "Heavy", "0 HVY", "HVY: 5", 20)
+        low_pen["Armor Penetration"] = "10%"
+        high_pen = self.weapon("High Pen", "Heavy", "0 HVY", "HVY: 5", 16)
+        high_pen["Armor Penetration"] = "45%"
+        self.cog.weapons = [low_pen, high_pen]
+
+        ctx_first = FakeContext()
+        await self.cog._weapon_query(ctx_first, "heavy", "100", "res", "35", "50")
+        ctx_fifty = FakeContext()
+        await self.cog._weapon_query(
+            ctx_fifty,
+            "heavy", "100", "res", "35", "50", "sort", "50",
+        )
+
+        first_description = ctx_first.embeds[0].description
+        fifty_description = ctx_fifty.embeds[0].description
+        self.assertLess(first_description.index("Low Pen"), first_description.index("High Pen"))
+        self.assertLess(fifty_description.index("High Pen"), fifty_description.index("Low Pen"))
+        self.assertIn("Sorted by 35% RES DPS", ctx_first.embeds[0].footer)
+        self.assertIn("Sorted by 50% RES DPS", ctx_fifty.embeds[0].footer)
 
     async def test_resistance_ranking_paginates_eight_per_page(self):
         self.cog.weapons = [
@@ -702,8 +758,8 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
         await self.cog._weapon_query(ctx, "heavy", "100", "res", "35", "50")
 
         self.assertEqual(len(ctx.embeds), 2)
-        self.assertEqual(ctx.embeds[0].description.count("`DPS:`"), 8)
-        self.assertEqual(ctx.embeds[1].description.count("`DPS:`"), 1)
+        self.assertEqual(ctx.embeds[0].description.count("**Base**"), 8)
+        self.assertEqual(ctx.embeds[1].description.count("**Base**"), 1)
 
     def test_resistance_ranking_pages_fit_discord_embed_limits(self):
         self.cog.weapons = [
@@ -718,8 +774,8 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(len(page.title) <= 256 for page in pages))
         self.assertTrue(all(len(page.description) <= 4096 for page in pages))
         self.assertTrue(all(len(page.footer) <= 2048 for page in pages))
-        self.assertEqual(pages[0].description.count("`DPS:`"), 8)
-        self.assertEqual(pages[1].description.count("`DPS:`"), 1)
+        self.assertEqual(pages[0].description.count("**Base**"), 8)
+        self.assertEqual(pages[1].description.count("**Base**"), 1)
 
     async def test_invalid_resistance_query_reports_valid_range(self):
         self.cog.weapons = []
@@ -735,6 +791,30 @@ class DeepwokenTests(unittest.IsolatedAsyncioTestCase):
         ctx = FakeContext()
         await self.cog._weapon_query(ctx, "Pen Blade", "res", "35")
         self.assertIn("need a valid stat query", ctx.messages[0])
+
+    async def test_invalid_resistance_sort_query_reports_usage(self):
+        self.cog.weapons = []
+        invalid_queries = (
+            ("heavy", "100", "res", "35", "50", "sort", "60"),
+            ("heavy", "100", "res", "35", "50", "sort"),
+            ("heavy", "100", "res", "35", "50", "sort", "35", "sort", "50"),
+        )
+
+        for query in invalid_queries:
+            with self.subTest(query=query):
+                ctx = FakeContext()
+                await self.cog._weapon_query(ctx, *query)
+                self.assertEqual(len(ctx.messages), 1)
+                self.assertIn("Invalid sort query", ctx.messages[0])
+
+    async def test_sort_word_does_not_block_weapon_lookup(self):
+        self.cog.weapons = [self.weapon("Sort Blade", "Heavy", "0 HVY", "HVY: 5", 20)]
+        ctx = FakeContext()
+
+        await self.cog._weapon_query(ctx, "Sort", "Blade")
+
+        self.assertEqual(len(ctx.embeds), 1)
+        self.assertIn("Sort Blade", ctx.embeds[0].title)
 
     def test_ranking_pages_fit_discord_embed_limits_with_maximum_source_names(self):
         self.cog.weapons = [
